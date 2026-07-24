@@ -211,6 +211,11 @@ watchdog:
   task_stall_recipients:
     - general
     - lead
+  # Recipients for helper-staleness alerts. Default: [general, lead].
+  # Filtered against the instances: map (ghost-inbox guard).
+  helper_staleness_recipients:
+    - general
+    - lead
   # Recipient for the decision-timeout auto-default (operator-proceed) emission.
   # Default: general.
   decision_timeout_recipient: general
