@@ -95,7 +95,7 @@ pub const DEFAULT_WAIT_TIMEOUT: Duration = Duration::from_secs(65);
 
 #[derive(Clone, Debug)]
 enum SlotResult {
-    Cached(Value),
+    Cached(Value, usize),
     Oversized,
     Errored(String),
 }
@@ -315,7 +315,7 @@ impl DedupCache {
         }
 
         match result {
-            Some(SlotResult::Cached(v)) => v,
+            Some(SlotResult::Cached(v, _)) => v,
             Some(SlotResult::Oversized) => oversized_error(),
             Some(SlotResult::Errored(detail)) => handler_errored(&detail),
             None => in_progress_error(),
@@ -337,8 +337,8 @@ impl DedupCache {
                     _ => None,
                 };
                 match &outcome {
-                    SlotResult::Cached(v) => {
-                        let bytes = estimated_bytes(v);
+                    SlotResult::Cached(v, bytes) => {
+                        let bytes = *bytes;
                         entry.state = EntryState::Cached(v.clone());
                         entry.response_bytes = bytes;
                         bytes_delta = bytes;
@@ -490,6 +490,12 @@ enum CheckOutcome {
 // RAII completion guard
 // ---------------------------------------------------------------------------
 
+#[cfg(test)]
+thread_local! {
+    static ESTIMATED_BYTES_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 struct InProgressGuard<'a> {
     cache: &'a DedupCache,
     request_id: String,
@@ -499,10 +505,11 @@ struct InProgressGuard<'a> {
 impl InProgressGuard<'_> {
     fn complete(&mut self, response: Value) {
         self.completed = true;
-        let outcome = if estimated_bytes(&response) > self.cache.per_entry_cap {
+        let response_bytes = estimated_bytes(&response);
+        let outcome = if response_bytes > self.cache.per_entry_cap {
             SlotResult::Oversized
         } else {
-            SlotResult::Cached(response)
+            SlotResult::Cached(response, response_bytes)
         };
         self.cache.finalize(&self.request_id, outcome);
     }
@@ -528,6 +535,8 @@ impl Drop for InProgressGuard<'_> {
 // ---------------------------------------------------------------------------
 
 fn estimated_bytes(v: &Value) -> usize {
+    #[cfg(test)]
+    ESTIMATED_BYTES_CALLS.with(|calls| calls.set(calls.get() + 1));
     serde_json::to_string(v).map(|s| s.len()).unwrap_or(0)
 }
 
@@ -739,6 +748,39 @@ mod tests {
         );
         assert_eq!(resp1, resp2, "duplicate must observe original response");
         assert_eq!(resp1["n"], 1);
+    }
+
+    #[test]
+    fn fresh_cacheable_response_counts_bytes_once() {
+        ESTIMATED_BYTES_CALLS.with(|calls| calls.set(0));
+        let cache = DedupCache::default();
+
+        let first = cache.dispatch(
+            Some("req-byte-count"),
+            0,
+            Duration::from_secs(5),
+            || json!({"ok": true, "result": {"text": "payload"}}),
+        );
+        let expected_bytes = serde_json::to_string(&first)
+            .expect("test response must serialize")
+            .len();
+
+        let inner = cache.inner.lock().expect("dedup inner mutex");
+        assert_eq!(
+            inner.entries["req-byte-count"].response_bytes, expected_bytes,
+            "cached response byte accounting must remain exact"
+        );
+        drop(inner);
+
+        let cached = cache.dispatch(Some("req-byte-count"), 0, Duration::from_secs(5), || {
+            panic!("cache hit must not execute the handler")
+        });
+        assert_eq!(cached, first);
+        assert_eq!(
+            ESTIMATED_BYTES_CALLS.with(std::cell::Cell::get),
+            1,
+            "fresh cacheable response must serialize once for byte accounting"
+        );
     }
 
     /// (b) Different request_ids — both handlers execute. Cache must not
