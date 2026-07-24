@@ -2100,6 +2100,34 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    // Ghost-inbox guard rollout (t-20260724035332273132-42380-3): an idle
+    // alert whose recipient has no fleet.yaml instance must be dropped at the
+    // route seam, not enqueued into a ghost inbox nobody drains (the archived
+    // lead.jsonl held 4 idle-watchdog entries). A missing fleet.yaml stays
+    // permissive — `route_idle_alert_delivers_via_bus` above covers that.
+    #[test]
+    fn route_idle_alert_skips_ghost_recipient() {
+        let home = tmp_home("ghost-recipient");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  general: {}\n",
+        )
+        .unwrap();
+        route_idle_alert(&home, "lead", "dev_idle_watchdog", "idle 1800s", None);
+        assert!(
+            alert_payloads(&home, "lead").is_empty(),
+            "lead has no fleet.yaml instance — alert must be dropped (ghost-inbox guard)"
+        );
+        // A recipient that DOES have an instance keeps working on the same home.
+        route_idle_alert(&home, "general", "dev_idle_watchdog", "idle 1800s", None);
+        assert_eq!(
+            alert_payloads(&home, "general").len(),
+            1,
+            "existing-instance recipient must still be alerted"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     // ── #1084/#2548 watchdog CLI tests (moved from the retired `watchdog` MCP tool) ──
 
     #[test]
