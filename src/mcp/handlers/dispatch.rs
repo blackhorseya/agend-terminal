@@ -27,8 +27,9 @@
 use crate::deployments::DeploymentRuntime;
 use crate::identity::Sender;
 use serde_json::{json, Value};
+use std::collections::HashMap;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
 use super::{
     binding_state, channel, ci, comms, instance, restart, review_assignment, schedule, task,
@@ -112,26 +113,49 @@ pub(crate) type HandlerFn = fn(&HandlerCtx<'_>) -> Value;
 /// `send.message`, `delete_instance.instance`, action-based `task`/`decision`)
 /// keep their `required[]` and are hard-rejected here. A new tool that declares
 /// a field its handler defaults will trip the pinning test below.
-fn validate_args(tool: &str, def: &Value, args: &Value) -> Option<Value> {
-    let schema = &def["inputSchema"];
-    if let Some(required) = schema["required"].as_array() {
-        for req in required.iter().filter_map(Value::as_str) {
-            // Rank8: treat a present-but-JSON-null value as missing. `args.get`
-            // returns `Some(Value::Null)` for `{"req": null}`, so a bare
-            // `is_none()` let null slip through — the handler then defaulted it
-            // (e.g. `as_str().unwrap_or("")` → an empty reply) and the failure
-            // surfaced opaquely downstream (Telegram 400) instead of here. A
-            // legit empty string is NOT null, so `""` still passes.
-            if args.get(req).is_none_or(Value::is_null) {
-                return Some(json!({
-                    "error": format!("{tool}: missing required parameter '{req}'")
-                }));
-            }
+struct ValidationFields {
+    required: Vec<String>,
+    properties: Option<Vec<String>>,
+}
+
+fn validation_fields(definition: &Value) -> ValidationFields {
+    let schema = &definition["inputSchema"];
+    let required = schema["required"]
+        .as_array()
+        .map(|fields| {
+            fields
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default();
+    let properties = schema["properties"]
+        .as_object()
+        .map(|fields| fields.keys().cloned().collect());
+    ValidationFields {
+        required,
+        properties,
+    }
+}
+
+fn validate_args(tool: &str, fields: &ValidationFields, args: &Value) -> Option<Value> {
+    for req in &fields.required {
+        // Rank8: treat a present-but-JSON-null value as missing. `args.get`
+        // returns `Some(Value::Null)` for `{"req": null}`, so a bare
+        // `is_none()` let null slip through — the handler then defaulted it
+        // (e.g. `as_str().unwrap_or("")` → an empty reply) and the failure
+        // surfaced opaquely downstream (Telegram 400) instead of here. A
+        // legit empty string is NOT null, so `""` still passes.
+        if args.get(req).is_none_or(Value::is_null) {
+            return Some(json!({
+                "error": format!("{tool}: missing required parameter '{req}'")
+            }));
         }
     }
-    if let (Some(props), Some(obj)) = (schema["properties"].as_object(), args.as_object()) {
+    if let (Some(properties), Some(obj)) = (&fields.properties, args.as_object()) {
         for key in obj.keys() {
-            if !props.contains_key(key) {
+            if !properties.iter().any(|property| property == key) {
                 tracing::warn!(
                     tool, param = %key,
                     "#1602: unknown parameter (ignored) — not in the tool's inputSchema"
@@ -142,22 +166,57 @@ fn validate_args(tool: &str, def: &Value, args: &Value) -> Option<Value> {
     None
 }
 
+type ValidationFieldSets = HashMap<&'static str, ValidationFields>;
+
+struct RequiredFieldCache {
+    fields: OnceLock<ValidationFieldSets>,
+}
+
+impl RequiredFieldCache {
+    const fn new() -> Self {
+        Self {
+            fields: OnceLock::new(),
+        }
+    }
+
+    fn validation_fields(
+        &self,
+        entries: &[crate::mcp::registry::ToolEntry],
+    ) -> &ValidationFieldSets {
+        self.fields.get_or_init(|| {
+            entries
+                .iter()
+                .map(|entry| (entry.name, validation_fields(&(entry.definition)())))
+                .collect()
+        })
+    }
+}
+
+fn try_dispatch_with_cache(
+    tool: &str,
+    ctx: &HandlerCtx<'_>,
+    entries: &[crate::mcp::registry::ToolEntry],
+    cache: &RequiredFieldCache,
+) -> Option<Value> {
+    entries
+        .iter()
+        .find(|entry| entry.name == tool)
+        .map(|entry| {
+            if let Some(fields) = cache.validation_fields(entries).get(entry.name) {
+                if let Some(err) = validate_args(entry.name, fields, ctx.args) {
+                    return err;
+                }
+            }
+            (entry.handler)(ctx)
+        })
+}
+
 /// Look the `tool` name up in the registry. Returns `Some(value)`
 /// on hit; returns `None` if the tool isn't registered — the caller
 /// falls back to the inline `match` in `mod.rs` for un-migrated arms.
 pub(super) fn try_dispatch(tool: &str, ctx: &HandlerCtx<'_>) -> Option<Value> {
-    crate::mcp::registry::all()
-        .iter()
-        .find(|entry| entry.name == tool)
-        .map(|entry| {
-            // #1602: enforce the declared inputSchema at the single dispatch
-            // chokepoint — a missing required param is rejected with a clear
-            // named error instead of failing late inside the handler.
-            if let Some(err) = validate_args(entry.name, &(entry.definition)(), ctx.args) {
-                return err;
-            }
-            (entry.handler)(ctx)
-        })
+    static CACHE: RequiredFieldCache = RequiredFieldCache::new();
+    try_dispatch_with_cache(tool, ctx, crate::mcp::registry::all(), &CACHE)
 }
 
 // ---------------------------------------------------------------------
@@ -510,6 +569,22 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    std::thread_local! {
+        static DEFINITION_CONSTRUCTIONS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    }
+
+    fn counted_definition() -> Value {
+        DEFINITION_CONSTRUCTIONS.with(|count| count.set(count.get() + 1));
+        json!({
+            "name": "required-field-probe",
+            "inputSchema": {
+                "type": "object",
+                "properties": {"token": {"type": "string"}},
+                "required": ["token"]
+            }
+        })
+    }
+
     fn ctx_for<'a>(home: &'a Path, args: &'a Value, instance: &'a str) -> HandlerCtx<'a> {
         static EMPTY_SENDER: Option<Sender> = None;
         HandlerCtx {
@@ -827,7 +902,8 @@ mod tests {
         // reply requires `message` (post-#1602 rename); omitting it is the
         // exact bug the operator hit (a mis-named param became an empty reply).
         let def = crate::mcp::tools::def_reply();
-        let err = validate_args("reply", &def, &json!({})).expect("must reject");
+        let fields = validation_fields(&def);
+        let err = validate_args("reply", &fields, &json!({})).expect("must reject");
         assert_eq!(
             err["error"], "reply: missing required parameter 'message'",
             "must name the tool + the missing param: {err}"
@@ -838,12 +914,13 @@ mod tests {
     fn validate_passes_when_required_present_and_unknown_only_warns() {
         // `message` present → no reject; an unknown key only warns (no reject).
         let def = crate::mcp::tools::def_reply();
+        let fields = validation_fields(&def);
         assert!(
-            validate_args("reply", &def, &json!({"message": "hi"})).is_none(),
+            validate_args("reply", &fields, &json!({"message": "hi"})).is_none(),
             "valid call must pass"
         );
         assert!(
-            validate_args("reply", &def, &json!({"message": "hi", "bogus": 1})).is_none(),
+            validate_args("reply", &fields, &json!({"message": "hi", "bogus": 1})).is_none(),
             "unknown param must warn, not reject"
         );
     }
@@ -895,8 +972,9 @@ mod tests {
                 !declares_required,
                 "{tool}: '{field}' is handler-defaulted — it must NOT be declared required[]"
             );
+            let fields = validation_fields(def);
             assert!(
-                validate_args(tool, def, args).is_none(),
+                validate_args(tool, &fields, args).is_none(),
                 "{tool}: omitting handler-defaulted '{field}' must pass validation"
             );
         }
@@ -915,7 +993,8 @@ mod tests {
         ];
         for case in &cases {
             let (tool, def, field) = (case.0, &case.1, case.2);
-            let err = validate_args(tool, def, &json!({})).expect("must reject");
+            let fields = validation_fields(def);
+            let err = validate_args(tool, &fields, &json!({})).expect("must reject");
             assert_eq!(
                 err["error"],
                 format!("{tool}: missing required parameter '{field}'"),
@@ -937,6 +1016,69 @@ mod tests {
         );
     }
 
+    #[test]
+    fn repeated_validation_constructs_definition_once_and_preserves_required_checks() {
+        let entry = crate::mcp::registry::ToolEntry {
+            name: "required-field-probe",
+            definition: counted_definition,
+            handler: dispatch_list_instances,
+            class: crate::mcp::registry::ToolClass::READ_ONLY,
+        };
+        let entries = [entry];
+        let cache = RequiredFieldCache::new();
+        let home = std::env::temp_dir();
+
+        DEFINITION_CONSTRUCTIONS.with(|count| count.set(0));
+        let missing = json!({});
+        let ctx = ctx_for(&home, &missing, "");
+        let result = try_dispatch_with_cache("required-field-probe", &ctx, &entries, &cache)
+            .expect("registered probe must route");
+        assert_eq!(
+            result["error"],
+            "required-field-probe: missing required parameter 'token'"
+        );
+
+        let complete = json!({"token": "ok"});
+        let ctx = ctx_for(&home, &complete, "");
+        assert!(
+            try_dispatch_with_cache("required-field-probe", &ctx, &entries, &cache).is_some(),
+            "complete args must pass validation"
+        );
+        DEFINITION_CONSTRUCTIONS.with(|count| {
+            assert_eq!(
+                count.get(),
+                1,
+                "repeated validation must construct the live definition once"
+            )
+        });
+    }
+
+    #[test]
+    #[tracing_test::traced_test]
+    fn cached_validation_warns_for_unknown_property() {
+        let entry = crate::mcp::registry::ToolEntry {
+            name: "required-field-warning-probe",
+            definition: counted_definition,
+            handler: dispatch_list_instances,
+            class: crate::mcp::registry::ToolClass::READ_ONLY,
+        };
+        let entries = [entry];
+        let cache = RequiredFieldCache::new();
+        let home = std::env::temp_dir();
+        let args = json!({"token": "ok", "bogus": 1});
+        let ctx = ctx_for(&home, &args, "");
+
+        assert!(
+            try_dispatch_with_cache("required-field-warning-probe", &ctx, &entries, &cache)
+                .is_some(),
+            "unknown properties remain warn-only"
+        );
+        assert!(
+            logs_contain("#1602: unknown parameter (ignored)"),
+            "cached production validation must retain the unknown-key warning"
+        );
+    }
+
     // ── Rank8 bug-audit: present-but-JSON-null required field ───────────────
     // `{"message": null}` slipped through validation because `args.get(req)`
     // returns `Some(Value::Null)` (not `None`), so `is_none()` saw it as
@@ -950,7 +1092,8 @@ mod tests {
         // one, with the SAME named error — caught early at the validator, never
         // forwarded as an empty reply.
         let def = crate::mcp::tools::def_reply();
-        let err = validate_args("reply", &def, &json!({"message": null}))
+        let fields = validation_fields(&def);
+        let err = validate_args("reply", &fields, &json!({"message": null}))
             .expect("a null required field must reject like a missing one");
         assert_eq!(
             err["error"], "reply: missing required parameter 'message'",
@@ -964,8 +1107,9 @@ mod tests {
         // real present value (null=absent, ""=present) and must still pass, so
         // the fix never wrongly blocks a caller that means to send "".
         let def = crate::mcp::tools::def_reply();
+        let fields = validation_fields(&def);
         assert!(
-            validate_args("reply", &def, &json!({"message": ""})).is_none(),
+            validate_args("reply", &fields, &json!({"message": ""})).is_none(),
             "empty-string message is a present value, not null — must not be rejected"
         );
     }
@@ -986,7 +1130,9 @@ mod tests {
             let mut obj = serde_json::Map::new();
             obj.insert(field.to_string(), serde_json::Value::Null);
             let args = serde_json::Value::Object(obj);
-            let err = validate_args(tool, def, &args).expect("a null required field must reject");
+            let fields = validation_fields(def);
+            let err =
+                validate_args(tool, &fields, &args).expect("a null required field must reject");
             assert_eq!(
                 err["error"],
                 format!("{tool}: missing required parameter '{field}'"),
