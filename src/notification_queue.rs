@@ -49,13 +49,57 @@ fn draining_path(home: &Path, agent_name: &str) -> PathBuf {
     queue_path(home, agent_name).with_extension("draining")
 }
 
+/// #2965: in-memory buffer for coalesced input-activity timestamps.
+/// Drained by `flush_pending_input_activity` at the ~1s `sync_badges` cadence.
+static PENDING_INPUT: std::sync::Mutex<Vec<(PathBuf, String, i64)>> =
+    std::sync::Mutex::new(Vec::new());
+
 pub fn record_input_activity(home: &Path, agent_name: &str) {
-    agent_ops::save_metadata(
-        home,
-        agent_name,
-        COMPOSE_METADATA_KEY,
-        json!(chrono::Utc::now().timestamp_millis()),
-    );
+    let ts = chrono::Utc::now().timestamp_millis();
+    if let Ok(mut pending) = PENDING_INPUT.lock() {
+        if let Some(entry) = pending
+            .iter_mut()
+            .find(|(h, a, _)| h.as_path() == home && a == agent_name)
+        {
+            entry.2 = ts;
+        } else {
+            pending.push((home.to_path_buf(), agent_name.to_owned(), ts));
+        }
+    }
+}
+
+/// #2965: flush any in-memory pending input-activity timestamps to disk.
+/// Called from the ~1s `sync_badges` cadence so keystrokes coalesce into
+/// at most one durable metadata write per window instead of one per keystroke.
+pub fn flush_pending_input_activity(home: &Path) {
+    let to_flush = {
+        let mut pending = match PENDING_INPUT.lock() {
+            Ok(p) => p,
+            Err(_) => return,
+        };
+        let mut kept = Vec::new();
+        let mut flushed = Vec::new();
+        for entry in std::mem::take(&mut *pending) {
+            if entry.0.as_path() == home {
+                flushed.push(entry);
+            } else {
+                kept.push(entry);
+            }
+        }
+        *pending = kept;
+        flushed
+    };
+    for (_, agent, ts) in to_flush {
+        agent_ops::save_metadata(home, &agent, COMPOSE_METADATA_KEY, json!(ts));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn pending_input_count_for(home: &Path) -> usize {
+    PENDING_INPUT
+        .lock()
+        .map(|p| p.iter().filter(|e| e.0 == home).count())
+        .unwrap_or(0)
 }
 
 /// Sprint 54 P2-3: record a submit-key keystroke (e.g. claude `\r`).
@@ -1024,6 +1068,7 @@ mod tests {
         let (typed0, submit0) = read_input_submit_timestamps(&home, "agent1");
         assert_eq!((typed0, submit0), (0, 0));
         record_input_activity(&home, "agent1");
+        flush_pending_input_activity(&home);
         std::thread::sleep(Duration::from_millis(2));
         record_submit_activity(&home, "agent1");
         let (typed1, submit1) = read_input_submit_timestamps(&home, "agent1");
@@ -1064,6 +1109,7 @@ mod tests {
 
         // WRITE a compose keystroke (no submit) → `<uuid>.json` via the resolver.
         record_input_activity(&home, "fixup-x");
+        flush_pending_input_activity(&home);
 
         // READ must see it through the SAME resolver. Pre-fix this reads the
         // never-written `<name>.json` and returns 0 → assert fails (RED).
@@ -1093,6 +1139,7 @@ mod tests {
     fn typed_only_leaves_submit_zero() {
         let home = tmp_home("typed_only");
         record_input_activity(&home, "agent1");
+        flush_pending_input_activity(&home);
         let (typed, submit) = read_input_submit_timestamps(&home, "agent1");
         assert!(typed > 0);
         assert_eq!(
@@ -1601,5 +1648,100 @@ mod tests {
             "drain-lock test setups must use `acquire_drain_lock` (retry-past-Err), \
              not a raw drain-lock `try_acquire_file_lock` — see #2666 / flake recurrence #3"
         );
+    }
+
+    // ── #2965: input-activity coalesce ──
+
+    /// RED: `record_input_activity` must NOT perform a durable metadata
+    /// write on every call — the write is deferred to
+    /// `flush_pending_input_activity`.
+    #[test]
+    fn input_activity_coalesced_not_flushed_immediately() {
+        let home = tmp_home("coalesce_not_imm");
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        record_input_activity(&home, "agent1");
+        let (typed, _) = read_input_submit_timestamps(&home, "agent1");
+        assert_eq!(
+            typed, 0,
+            "record_input_activity must not write to disk immediately — \
+             keystrokes coalesce until the next flush (got typed={typed})"
+        );
+        flush_pending_input_activity(&home);
+        assert_eq!(pending_input_count_for(&home), 0);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// RED: after an explicit flush the coalesced timestamp must be
+    /// durable on disk and readable by the draft-state machinery.
+    #[test]
+    fn coalesced_input_flushed_on_explicit_call() {
+        let home = tmp_home("coalesce_flush");
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        record_input_activity(&home, "agent1");
+        flush_pending_input_activity(&home);
+        let (typed, _) = read_input_submit_timestamps(&home, "agent1");
+        assert!(
+            typed > 0,
+            "flush_pending_input_activity must persist the pending timestamp \
+             (got typed=0 — flush is a no-op or lost the entry)"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2965: N rapid keystrokes must coalesce into a single pending
+    /// entry (same agent), not N entries — proving the upsert, not
+    /// just the deferral.
+    #[test]
+    fn multiple_keystrokes_coalesce_to_one_pending_entry() {
+        let home = tmp_home("multi_coalesce");
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        for _ in 0..10 {
+            record_input_activity(&home, "agent1");
+        }
+        assert_eq!(
+            pending_input_count_for(&home),
+            1,
+            "10 keystrokes for the same agent must coalesce to 1 pending entry"
+        );
+        flush_pending_input_activity(&home);
+        let (typed, _) = read_input_submit_timestamps(&home, "agent1");
+        assert!(
+            typed > 0,
+            "coalesced timestamp must be persisted after flush"
+        );
+        assert_eq!(
+            pending_input_count_for(&home),
+            0,
+            "flush must drain all pending entries for this home"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// #2965: submit remains immediately durable and the ordering
+    /// (input < submit) produces no false live-draft after flush.
+    #[test]
+    fn submit_immediate_no_false_draft_after_flush() {
+        let home = tmp_home("submit_order");
+        std::fs::create_dir_all(home.join("metadata")).unwrap();
+        record_input_activity(&home, "agent1");
+        record_submit_activity(&home, "agent1");
+        // Submit is on disk already; input is still pending.
+        let (typed_pre, submit_pre) = read_input_submit_timestamps(&home, "agent1");
+        assert_eq!(typed_pre, 0, "input must still be pending (not flushed)");
+        assert!(submit_pre > 0, "submit must be immediately durable");
+        // Now flush input.
+        flush_pending_input_activity(&home);
+        let (typed, submit) = read_input_submit_timestamps(&home, "agent1");
+        assert!(
+            submit >= typed,
+            "submit (called after input) must be >= typed — no false draft \
+             (got typed={typed} submit={submit})"
+        );
+        assert_ne!(
+            draft_state(&home, "agent1"),
+            DraftState::Drafting,
+            "after submit, draft state must not be Drafting"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 }
