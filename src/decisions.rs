@@ -378,18 +378,63 @@ pub fn list_pending(home: &Path) -> Vec<Decision> {
 /// "you asked something" badge without each caller re-scanning `decisions/`
 /// (the same disk-I/O-storm shape `should_sync_notifications` already
 /// documents and throttles for the notification badge).
+#[derive(Clone)]
 pub struct PendingDecisionCounts {
     pub total: usize,
     pub by_author: std::collections::HashMap<String, usize>,
 }
 
+/// #3031: memoized result of the last [`count_pending`] scan, keyed by the
+/// decisions directory and its modified time.
+///
+/// The TUI badge re-tallies once a second (`app::DECISION_SYNC_INTERVAL`), and
+/// each tally previously re-read and re-parsed every file in `decisions/` — a
+/// cost that grows with total history, not with the pending count. Decisions
+/// mutate rarely compared to that cadence, so nearly every tally can be served
+/// from the previous one.
+///
+/// Keying on the directory mtime is sound because every canonical decision
+/// write goes through [`save`] → `store::atomic_write`, which lands a temp file
+/// in this same directory and `rename`s it into place; creates, updates and
+/// deletes all move the directory's mtime, including ones made by another
+/// process. A write that bypasses `atomic_write` does not, and is unsupported.
+static PENDING_COUNT_CACHE: std::sync::Mutex<
+    Option<(
+        std::path::PathBuf,
+        std::time::SystemTime,
+        PendingDecisionCounts,
+    )>,
+> = std::sync::Mutex::new(None);
+
 pub fn count_pending(home: &Path) -> PendingDecisionCounts {
+    let dir = decisions_dir(home);
+    // No readable mtime (directory absent, or a stat error): bypass the cache
+    // entirely rather than guessing — scan, and leave any existing entry alone.
+    let mtime = std::fs::metadata(&dir).and_then(|m| m.modified()).ok();
+
+    if let Some(mtime) = mtime {
+        if let Ok(cache) = PENDING_COUNT_CACHE.lock() {
+            if let Some((cached_dir, cached_mtime, counts)) = cache.as_ref() {
+                if cached_dir == &dir && cached_mtime == &mtime {
+                    return counts.clone();
+                }
+            }
+        }
+    }
+
     let mut by_author: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
     for d in list_pending(home) {
         *by_author.entry(d.author).or_insert(0) += 1;
     }
     let total = by_author.values().sum();
-    PendingDecisionCounts { total, by_author }
+    let counts = PendingDecisionCounts { total, by_author };
+
+    if let Some(mtime) = mtime {
+        if let Ok(mut cache) = PENDING_COUNT_CACHE.lock() {
+            *cache = Some((dir, mtime, counts.clone()));
+        }
+    }
+    counts
 }
 
 pub fn list(home: &Path, args: &Value) -> Value {
@@ -1239,7 +1284,15 @@ mod tests {
 
     // ── #2524 P2b / #2313 — count_pending badge helper ──
 
+    // #3031: `count_pending` memoizes on the decisions-dir mtime in a single
+    // process-global slot, so concurrent `count_pending` calls from other tests
+    // would evict the entry mid-test and make the cache-reuse assertion flaky.
+    // Every `count_pending` caller in the suite shares this serial group (the
+    // two #2313 tests below included) — they are the complete set.
+    use serial_test::serial;
+
     #[test]
+    #[serial(decisions_count_cache)]
     fn count_pending_buckets_by_author_2313() {
         let home = tmp_home("count-pending-buckets-2313");
         post(
@@ -1277,6 +1330,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(decisions_count_cache)]
     fn count_pending_excludes_answered_2313() {
         let home = tmp_home("count-pending-answered-2313");
         let created = post(
@@ -1299,6 +1353,149 @@ mod tests {
             "answered question must drop out of the tally"
         );
         assert!(counts.by_author.is_empty());
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #3031 — count_pending memoization keyed by decisions-dir mtime ──
+
+    /// Two `count_pending` calls over a directory whose mtime has not moved must
+    /// run exactly one underlying scan.
+    ///
+    /// Observed black-box, with no counter or production instrumentation: the
+    /// decision file is rewritten IN PLACE (`fs::write`), deliberately bypassing
+    /// `store::atomic_write`. A plain overwrite moves the FILE's mtime but not
+    /// the DIRECTORY's, so a second scan would see the edit and report a
+    /// different tally. Reporting the first call's tally is therefore only
+    /// possible if the second call did not scan at all.
+    ///
+    /// This pins cache reuse only. It is not writer support: mutating a decision
+    /// outside `atomic_write` is unsupported, and the stale read below is the
+    /// accepted consequence of that, not a behaviour callers may rely on.
+    #[test]
+    #[serial(decisions_count_cache)]
+    fn count_pending_reuses_load_when_directory_unchanged_3031() {
+        let home = tmp_home("count-pending-cache-reuse-3031");
+        let created = post(
+            &home,
+            "alice",
+            &serde_json::json!({"title": "Q1", "content": "?", "needs_answer": true}),
+        );
+        post(
+            &home,
+            "alice",
+            &serde_json::json!({"title": "Q2", "content": "?", "needs_answer": true}),
+        );
+        let id = created["id"].as_str().expect("id").to_string();
+
+        let first = count_pending(&home);
+        assert_eq!(first.total, 2, "precondition: two pending questions");
+
+        let path = decision_path(&home, &id);
+        let dir_mtime_before = std::fs::metadata(decisions_dir(&home))
+            .and_then(|m| m.modified())
+            .expect("decisions dir mtime");
+        let raw = std::fs::read_to_string(&path).expect("read decision");
+        let mut doc: serde_json::Value = serde_json::from_str(&raw).expect("parse decision");
+        doc["archived"] = serde_json::Value::Bool(true);
+        std::fs::write(&path, serde_json::to_string(&doc).expect("serialize"))
+            .expect("in-place write");
+        let dir_mtime_after = std::fs::metadata(decisions_dir(&home))
+            .and_then(|m| m.modified())
+            .expect("decisions dir mtime");
+        assert_eq!(
+            dir_mtime_before, dir_mtime_after,
+            "test precondition: an in-place file rewrite must not move the directory mtime"
+        );
+
+        let second = count_pending(&home);
+        assert_eq!(
+            second.total, 2,
+            "unchanged directory mtime must reuse the first scan's counts \
+             (a re-scan would see the in-place edit and report 1)"
+        );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// A canonical decision write (`post` → `save` → `store::atomic_write`, i.e.
+    /// temp file in the same directory + `rename`) moves the directory mtime and
+    /// must invalidate the memoized tally. Guards the cache against serving
+    /// stale counts on the real mutation path; passes with or without the cache.
+    #[test]
+    #[serial(decisions_count_cache)]
+    fn count_pending_refreshes_after_atomic_mutation_3031() {
+        let home = tmp_home("count-pending-cache-refresh-3031");
+        post(
+            &home,
+            "alice",
+            &serde_json::json!({"title": "Q1", "content": "?", "needs_answer": true}),
+        );
+        post(
+            &home,
+            "alice",
+            &serde_json::json!({"title": "Q2", "content": "?", "needs_answer": true}),
+        );
+
+        let first = count_pending(&home);
+        assert_eq!(first.total, 2, "precondition: two pending questions");
+        let dir_mtime_before = std::fs::metadata(decisions_dir(&home))
+            .and_then(|m| m.modified())
+            .expect("decisions dir mtime");
+
+        post(
+            &home,
+            "bob",
+            &serde_json::json!({"title": "Q3", "content": "?", "needs_answer": true}),
+        );
+
+        let dir_mtime_after = std::fs::metadata(decisions_dir(&home))
+            .and_then(|m| m.modified())
+            .expect("decisions dir mtime");
+        assert_ne!(
+            dir_mtime_before, dir_mtime_after,
+            "test precondition: an atomic decision write must move the directory \
+             mtime (if this fires, the filesystem's mtime granularity is too \
+             coarse to distinguish the two writes, not a cache defect)"
+        );
+
+        let second = count_pending(&home);
+        assert_eq!(
+            second.total, 3,
+            "atomic decision write must refresh the memoized counts"
+        );
+        assert_eq!(second.by_author.get("bob"), Some(&1));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// When the decisions directory has no readable metadata (it does not exist
+    /// yet), the memoization is bypassed entirely: the call still reports a real
+    /// tally, and nothing is stored that could shadow a later valid directory.
+    #[test]
+    #[serial(decisions_count_cache)]
+    fn count_pending_bypasses_cache_when_metadata_unreadable_3031() {
+        let missing = std::env::temp_dir().join(format!(
+            "agend-decisions-missing-{}-3031",
+            std::process::id()
+        ));
+        std::fs::remove_dir_all(&missing).ok();
+
+        let counts = count_pending(&missing);
+        assert_eq!(counts.total, 0, "absent decisions dir tallies zero");
+        assert!(counts.by_author.is_empty());
+
+        let home = tmp_home("count-pending-bypass-3031");
+        post(
+            &home,
+            "alice",
+            &serde_json::json!({"title": "Q", "content": "?", "needs_answer": true}),
+        );
+        let counts = count_pending(&home);
+        assert_eq!(
+            counts.total, 1,
+            "a valid directory must not be shadowed by the earlier metadata failure"
+        );
+
         std::fs::remove_dir_all(&home).ok();
     }
 
