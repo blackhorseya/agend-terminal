@@ -7,6 +7,19 @@
 
 ## [Unreleased]
 
+## [0.11.2] — 2026-07-23
+
+### Changed
+
+- **Monorepo 整併** — `agentic-git-core` 與 `agentic-git` 原始碼現在內嵌於主倉庫；release workflow 按依賴順序發布 crate（core → shim → root），並帶 index 傳播重試（#2929）。
+- **既有 source checkout 若 `vendor/agentic-git` submodule 已初始化** — 先確認 submodule worktree 是乾淨的（先保存任何 local WIP），再執行 `git submodule deinit -f vendor/agentic-git`，接著 `git pull --ff-only`，切換到 repository 內建 workspace。
+
+## [0.11.1] — 2026-07-23
+
+### Fixed
+
+- **Release archive 驗證** — Unix release packaging 改為直接檢查每個預期 binary，避免跨平台建置成功後因 `pipefail`／SIGPIPE 被誤判為失敗。
+
 ## [0.11.0] — 2026-07-23
 
 自 0.10.0 起共 212 個 commit。本版聚焦於可靠的開發工作流接續、更安全的 worktree 生命週期，以及 backend/runtime 對等。
@@ -601,7 +614,9 @@ Tray-resident arc、Task #9 Option C dual-track elimination、codebase-review co
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.0...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.11.2...HEAD
+[0.11.2]: https://github.com/suzuke/agend-terminal/compare/v0.11.1...v0.11.2
+[0.11.1]: https://github.com/suzuke/agend-terminal/compare/v0.11.0...v0.11.1
 [0.11.0]: https://github.com/suzuke/agend-terminal/compare/v0.10.0...v0.11.0
 [0.10.0]: https://github.com/suzuke/agend-terminal/compare/v0.9.0...v0.10.0
 [0.9.0]: https://github.com/suzuke/agend-terminal/compare/v0.8.0...v0.9.0
