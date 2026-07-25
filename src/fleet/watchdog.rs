@@ -10,8 +10,12 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 /// `fleet.yaml` top-level `watchdog:` block. Every field is optional; an omitted
-/// field uses the built-in default. Defaults reproduce the pre-migration
-/// hard-coded behaviour exactly.
+/// field uses the built-in default. Recipient resolution — explicitly
+/// configured or default — then passes the ghost-inbox guard: names absent
+/// from the `instances:` map are skipped at emit time, and a missing or
+/// unparseable fleet.yaml is fail-open (no filtering). See
+/// [`drop_ghost_recipients`] / [`recipient_has_instance`] and the
+/// `watchdog` section of `docs/FEATURE-fleet.md`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct WatchdogConfig {
     /// Legacy **single-agent mode** override for the dev-vantage idle watchdog.
@@ -75,14 +79,16 @@ pub fn resolve_fleet_idle_recipient(home: &Path) -> String {
         .unwrap_or_else(|| "lead".to_string())
 }
 
-/// Recipients for task-stall warnings. Default `[general, lead]`.
+/// Recipients for task-stall warnings. Default `[general, lead]`, filtered
+/// against the `instances:` map (ghost-inbox guard — see
+/// [`drop_ghost_recipients`]).
 pub fn resolve_task_stall_recipients(home: &Path) -> Vec<String> {
-    if let Some(w) = load(home) {
-        if !w.task_stall_recipients.is_empty() {
-            return w.task_stall_recipients;
-        }
-    }
-    vec!["general".to_string(), "lead".to_string()]
+    let base = match load(home) {
+        Some(w) if !w.task_stall_recipients.is_empty() => w.task_stall_recipients,
+        _ => vec!["general".to_string(), "lead".to_string()],
+    };
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    drop_ghost_recipients(home, base, "task_stall", &WARNED)
 }
 
 /// Recipients for helper-staleness alerts. Default `[general, lead]`. No env
@@ -101,22 +107,46 @@ pub fn resolve_helper_staleness_recipients(home: &Path) -> Vec<String> {
         Some(w) if !w.helper_staleness_recipients.is_empty() => w.helper_staleness_recipients,
         _ => vec!["general".to_string(), "lead".to_string()],
     };
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    drop_ghost_recipients(home, base, "helper_staleness", &WARNED)
+}
+
+/// Ghost-inbox guard shared by every list-shaped recipient resolver
+/// (t-20260724035332273132-42380-3 rollout of the #2951 guard): drop names
+/// with no fleet.yaml instance — enqueueing to one just grows
+/// `~/.agend/inbox/<name>.jsonl` forever with nobody to drain it. A
+/// missing/unparseable fleet.yaml skips the filter (no fleet = no
+/// restriction, mirroring `tasks::acl::instance_exists`). `warned` is the
+/// caller's per-resolver dedup latch so each resolver warns at most once per
+/// process.
+fn drop_ghost_recipients(
+    home: &Path,
+    base: Vec<String>,
+    resolver: &'static str,
+    warned: &'static AtomicBool,
+) -> Vec<String> {
     let Some(instances) = fleet_instance_names(home) else {
         return base;
     };
     let (kept, dropped): (Vec<String>, Vec<String>) =
         base.into_iter().partition(|r| instances.contains(r));
-    if !dropped.is_empty() {
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if !WARNED.swap(true, Ordering::Relaxed) {
-            tracing::warn!(
-                dropped = ?dropped,
-                "helper-staleness recipients without a fleet.yaml instance \
-                 skipped (ghost-inbox guard)"
-            );
-        }
+    if !dropped.is_empty() && !warned.swap(true, Ordering::Relaxed) {
+        tracing::warn!(
+            resolver,
+            dropped = ?dropped,
+            "watchdog recipients without a fleet.yaml instance skipped \
+             (ghost-inbox guard)"
+        );
     }
     kept
+}
+
+/// Ghost-inbox guard for a single already-resolved recipient, used at the
+/// emit seams whose resolvers return one name (idle route, decision-timeout
+/// deliver): `true` when the name has a fleet.yaml instance, or when
+/// fleet.yaml is missing/unparseable (permissive — no fleet, no restriction).
+pub(crate) fn recipient_has_instance(home: &Path, name: &str) -> bool {
+    fleet_instance_names(home).is_none_or(|set| set.contains(name))
 }
 
 /// The fleet.yaml `instances:` name set; `None` when fleet.yaml is missing or
@@ -178,6 +208,10 @@ mod tests {
         }
     }
 
+    /// Pure PARSER coverage: any recipient name is accepted at parse time.
+    /// Whether it is ever alerted is the delivery-time roster-filter contract
+    /// (ghost-inbox guard) — pinned separately at the resolvers and emit
+    /// seams.
     #[test]
     fn parses_watchdog_block() {
         let _g = env_guard();
@@ -214,7 +248,8 @@ instances: {}
         let _g = env_guard();
         clear_env();
         let home = tmp_home("defaults");
-        write_fleet(&home, "instances: {}\n");
+        // Recipients need instances since the ghost-inbox guard rollout.
+        write_fleet(&home, "instances:\n  general: {}\n  lead: {}\n");
         assert_eq!(resolve_idle_watchdog_agent(&home), None);
         assert_eq!(resolve_dev_idle_recipient(&home), "lead");
         // #1563: fleet-idle default must be lead, not general.
@@ -244,7 +279,8 @@ watchdog:
   task_stall_recipients:
     - yaml-a
   decision_timeout_recipient: yaml-dec
-instances: {}
+instances:
+  yaml-a: {}
 "#,
         );
         assert_eq!(resolve_dev_idle_recipient(&home), "yaml-dev");
@@ -274,7 +310,7 @@ instances: {}
         clear_env();
         std::env::set_var("AGEND_TASK_STALL_RECIPIENTS", " alice, bob ,, carol ");
         let home = tmp_home("stall-split");
-        write_fleet(&home, "instances: {}\n");
+        write_fleet(&home, "instances:\n  general: {}\n  lead: {}\n");
         assert_eq!(
             resolve_task_stall_recipients(&home),
             vec!["general".to_string(), "lead".to_string()]
@@ -325,6 +361,58 @@ instances: {}
             "no fleet.yaml = no restriction — unfiltered built-in default"
         );
         for h in [partial, all_ghost, no_yaml] {
+            fs::remove_dir_all(&h).ok();
+        }
+    }
+
+    /// Ghost-guard rollout (t-20260724035332273132-42380-3): the task-stall
+    /// recipient list must get the same `instances:` filter as
+    /// helper-staleness — pre-fix its `[general, lead]` default fed the same
+    /// ghost inbox.
+    #[test]
+    fn task_stall_recipients_filtered_by_instances() {
+        let _g = env_guard();
+        clear_env();
+        let home = tmp_home("stall-filter");
+        write_fleet(&home, "instances:\n  general: {}\n");
+        assert_eq!(
+            resolve_task_stall_recipients(&home),
+            vec!["general".to_string()],
+            "lead has no instance — must be dropped from the task-stall default"
+        );
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// Contract pins (#3007 primary review): an EXPLICITLY configured
+    /// non-roster recipient is dropped exactly like a default one — every
+    /// watchdog recipient must name a fleet instance — and a malformed
+    /// fleet.yaml is fail-open (the unfiltered built-in default still
+    /// resolves).
+    #[test]
+    fn explicit_non_roster_dropped_and_malformed_fleet_fails_open() {
+        let _g = env_guard();
+        clear_env();
+        let explicit = tmp_home("explicit-non-roster");
+        write_fleet(
+            &explicit,
+            "watchdog:\n  task_stall_recipients:\n    - ghost-x\ninstances:\n  general: {}\n",
+        );
+        assert_eq!(
+            resolve_task_stall_recipients(&explicit),
+            Vec::<String>::new(),
+            "an explicitly configured non-roster recipient must be dropped"
+        );
+        let malformed = tmp_home("malformed-fleet");
+        // An UNCLOSED flow mapping — a genuine parse error, not merely an
+        // unexpected-but-valid document (which would parse to an empty
+        // `instances:` map and legitimately filter everything).
+        write_fleet(&malformed, "{ definitely-not-yaml\n");
+        assert_eq!(
+            resolve_task_stall_recipients(&malformed),
+            vec!["general".to_string(), "lead".to_string()],
+            "unparseable fleet.yaml must be fail-open: unfiltered built-in default"
+        );
+        for h in [explicit, malformed] {
             fs::remove_dir_all(&h).ok();
         }
     }
