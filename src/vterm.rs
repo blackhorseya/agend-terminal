@@ -364,6 +364,8 @@ pub struct VTerm {
     /// caching across frames; VTerm is single-threaded (main render thread only),
     /// so the interior mutability never races.
     snapshot_scratch: std::cell::RefCell<Vec<Cell>>,
+    #[cfg(test)]
+    read_scrollback_rows: std::cell::Cell<usize>,
 }
 
 /// alacritty scrollback cap for every [`VTerm`] (its `Config::scrolling_history`).
@@ -401,6 +403,8 @@ impl VTerm {
             cols,
             rows,
             snapshot_scratch: std::cell::RefCell::new(Vec::new()),
+            #[cfg(test)]
+            read_scrollback_rows: std::cell::Cell::new(0),
         }
     }
 
@@ -803,19 +807,31 @@ impl VTerm {
     }
 
     /// Read scrollback history + visible screen as plain text (ANSI stripped).
-    /// Returns the last `max_lines` lines. Walks from `topmost_line()` to
-    /// `bottommost_line()` via `safe_cell` — same pattern as `tail_lines`.
+    /// Returns the last `max_lines` lines. Scans upward from `bottommost_line()`
+    /// via `safe_cell`, skipping trailing blank rows and stopping after the
+    /// requested window.
     pub fn read_scrollback(&self, max_lines: usize) -> String {
         let grid = self.term.grid();
         let cols = grid.columns();
         let top = grid.topmost_line();
         let bot = grid.bottommost_line();
 
-        // Read ALL lines first (trim blanks before windowing so content
-        // above trailing blank padding is not lost — gemini-banner case).
+        if max_lines == 0 || top > bot {
+            return String::new();
+        }
+
+        // Read upward from the last non-blank row. Keep blank rows inside the
+        // requested window so the result matches trimming before windowing,
+        // but never retain the whole scrollback grid.
         let mut lines: Vec<String> = Vec::new();
-        let mut row = top;
-        while row <= bot {
+        let mut started = false;
+        let mut reached_top = false;
+        let mut look_behind = false;
+        let mut row = bot;
+        loop {
+            #[cfg(test)]
+            self.read_scrollback_rows
+                .set(self.read_scrollback_rows.get() + 1);
             let mut line = String::with_capacity(cols);
             let mut col = 0;
             while col < cols {
@@ -828,29 +844,39 @@ impl VTerm {
                 line.push(ch);
                 col += 1;
             }
-            lines.push(line.trim_end().to_string());
-            row += 1;
+            let trimmed = line.trim_end();
+            if look_behind {
+                if !trimmed.is_empty() {
+                    break;
+                }
+            } else if started || !trimmed.is_empty() {
+                started = true;
+                lines.push(trimmed.to_string());
+                if lines.len() == max_lines {
+                    if lines.last().is_some_and(|line| line.is_empty()) {
+                        look_behind = true;
+                    } else {
+                        break;
+                    }
+                }
+            }
+            if row == top {
+                reached_top = true;
+                break;
+            }
+            row -= 1;
         }
 
-        // Trim blank lines at both ends BEFORE windowing
-        let first = lines
-            .iter()
-            .position(|l| !l.is_empty())
-            .unwrap_or(lines.len());
-        let last = lines
-            .iter()
-            .rposition(|l| !l.is_empty())
-            .map(|i| i + 1)
-            .unwrap_or(first);
-        let trimmed = &lines[first..last];
-
-        // Window to last max_lines
-        let result = if trimmed.len() > max_lines {
-            &trimmed[trimmed.len() - max_lines..]
+        lines.reverse();
+        let first = if reached_top {
+            lines
+                .iter()
+                .position(|line| !line.is_empty())
+                .unwrap_or(lines.len())
         } else {
-            trimmed
+            0
         };
-        result.join("\n")
+        lines[first..].join("\n")
     }
 
     /// Return the last `n` visible rows of the screen as plain text,
@@ -1572,6 +1598,10 @@ fn write_color(out: &mut Vec<u8>, color: Color, is_fg: bool) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "vterm_scrollback_tests.rs"]
+mod scrollback_tests;
 
 #[cfg(test)]
 mod tests {
@@ -2437,75 +2467,6 @@ mod tests {
         let main = vt.tail_lines(10);
         assert!(main.contains("MAIN SCREEN"), "main screen restored");
         assert!(!main.contains("ALT SCREEN"), "alt screen text gone");
-    }
-
-    #[test]
-    fn read_scrollback_returns_visible_and_history() {
-        let mut vt = VTerm::new(80, 5);
-        // Write 10 lines into a 5-row terminal — first 5 scroll into history
-        for i in 1..=10 {
-            vt.process(format!("line{i}\r\n").as_bytes());
-        }
-        let text = vt.read_scrollback(100);
-        assert!(
-            text.contains("line1"),
-            "scrollback must include history line1, got: {text}"
-        );
-        assert!(
-            text.contains("line10"),
-            "scrollback must include visible line10, got: {text}"
-        );
-    }
-
-    #[test]
-    fn read_scrollback_limits_to_n_lines() {
-        let mut vt = VTerm::new(80, 5);
-        for i in 1..=20 {
-            vt.process(format!("line{i}\r\n").as_bytes());
-        }
-        let text = vt.read_scrollback(3);
-        let lines: Vec<&str> = text.lines().collect();
-        assert!(
-            lines.len() <= 3,
-            "read_scrollback(3) must return at most 3 lines, got {}",
-            lines.len()
-        );
-    }
-
-    #[test]
-    fn read_scrollback_empty_terminal() {
-        let vt = VTerm::new(80, 24);
-        let text = vt.read_scrollback(100);
-        assert!(text.is_empty(), "empty terminal must return empty string");
-    }
-
-    #[test]
-    fn read_scrollback_trims_leading_blanks_then_windows() {
-        // Gemini-banner case: content at top, then 120+ blank padding rows.
-        // With a 50-line window, the old code captures the last 50 rows
-        // (all blank) and returns empty despite real content above.
-        let mut vt = VTerm::new(80, 10);
-        // Content first
-        for i in 1..=5 {
-            vt.process(format!("TESTLINE{i}\r\n").as_bytes());
-        }
-        // Then push 120 blank lines (simulates gemini padding)
-        for _ in 0..120 {
-            vt.process(b"\r\n");
-        }
-        let text = vt.read_scrollback(50);
-        assert!(
-            text.contains("TESTLINE1"),
-            "content above blank padding must surface, got: '{text}'"
-        );
-    }
-
-    #[test]
-    fn read_scrollback_empty_pty_still_returns_empty() {
-        // Regression guard: empty PTY must still return empty string
-        let vt = VTerm::new(80, 24);
-        let text = vt.read_scrollback(100);
-        assert!(text.is_empty(), "empty PTY must return empty string");
     }
 
     // #700 regression guard: alacritty_terminal stores mouse-mode bits
