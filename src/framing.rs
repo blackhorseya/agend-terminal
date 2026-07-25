@@ -26,9 +26,11 @@ pub fn write_tagged(w: &mut impl Write, tag: u8, data: &[u8]) -> std::io::Result
             "frame too large",
         ));
     }
-    w.write_all(&[tag])?;
-    w.write_all(&(data.len() as u32).to_be_bytes())?;
-    w.write_all(data)?;
+    let mut frame = Vec::with_capacity(1 + 4 + data.len());
+    frame.push(tag);
+    frame.extend_from_slice(&(data.len() as u32).to_be_bytes());
+    frame.extend_from_slice(data);
+    w.write_all(&frame)?;
     w.flush()
 }
 
@@ -61,6 +63,24 @@ pub fn write_resize(w: &mut impl Write, cols: u16, rows: u16) -> std::io::Result
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[derive(Default)]
+    struct RecordingWriter {
+        writes: Vec<Vec<u8>>,
+        flushes: usize,
+    }
+
+    impl std::io::Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.writes.push(buf.to_vec());
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            self.flushes += 1;
+            Ok(())
+        }
+    }
 
     #[test]
     fn write_frame_read_roundtrip() {
@@ -214,6 +234,18 @@ mod tests {
         let result = write_tagged(&mut buf, TAG_DATA, &data);
         assert!(result.is_err());
         assert_eq!(result.unwrap_err().kind(), std::io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn write_tagged_writes_one_frame_then_flushes_2990() {
+        let mut writer = RecordingWriter::default();
+        write_tagged(&mut writer, TAG_DATA, b"payload").expect("write");
+
+        let mut expected = vec![TAG_DATA];
+        expected.extend_from_slice(&(7u32).to_be_bytes());
+        expected.extend_from_slice(b"payload");
+        assert_eq!(writer.writes, vec![expected]);
+        assert_eq!(writer.flushes, 1);
     }
 
     #[test]
