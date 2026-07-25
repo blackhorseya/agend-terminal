@@ -328,8 +328,13 @@ pub(crate) fn active_bypass_layer() -> &'static str {
 /// incidents, pattern `plugins/grafana-mcp`). Deliberately NOT added to
 /// `is_mutating_local`: that list also gates `strip_target_overrides`, and
 /// stripping `-C` from `git -C <dir> sparse-checkout` would break legit
-/// helpers (see the #1463 (B) rationale). Inline single-token check per the
-/// #2950 KISS review — no new predicate abstraction.
+/// helpers (see the #1463 (B) rationale). The flip side (#2950 primary
+/// review): because the `-C` survives, `sparse-checkout` must also stay OUT
+/// of `KNOWN_SUBCOMMANDS` — behind a leading `-C` the cwd-based foreign guard
+/// here never fires, and the surviving `-C` would carry the write to any
+/// non-foreign target, canonical included. Only the bare (cwd-targeted) form
+/// is a policy path. Inline single-token check per the #2950 KISS review —
+/// no new predicate abstraction.
 pub(crate) fn apply_foreign_repo_passthrough(
     action: Action,
     subcmd: &str,
@@ -766,12 +771,13 @@ pub(crate) fn classify(
 /// global — `git gc`, an alias — is unaffected; there is no global redirecting it.)
 // Groups (in `classify` order): read-only (status..reflog); config/help/passthrough
 // (config..clone); push; mutating (commit..apply); checkout/switch/worktree;
-// flag-discriminated (restore/update-ref/symbolic-ref); default-arm policy
-// paths that must stay recognized behind leading globals (sparse-checkout —
-// the sparse-pollution fix routes `git -C <foreign> sparse-checkout ...`
-// through classify's `_` arm + the foreign-repo passthrough instead of the
-// fail-closed unknown-global deny; the deny stays intact for genuinely
-// unknown tokens).
+// flag-discriminated (restore/update-ref/symbolic-ref).
+// `sparse-checkout` is DELIBERATELY absent (#2950 primary review): it is
+// outside `is_mutating_local`, so recognizing it here would let the caller's
+// `-C` survive `strip_target_overrides` on a bound `ChdirPass` and redirect
+// the write to any non-foreign target — including the canonical source repo.
+// The `-C` form therefore fails closed; the foreign-cwd incident shape is
+// handled by `apply_foreign_repo_passthrough` on the bare form.
 pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "status",
     "log",
@@ -817,7 +823,6 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "symbolic-ref",
     "submodule",
     "submodule--helper",
-    "sparse-checkout",
 ];
 
 pub(crate) fn is_known_git_subcommand(s: &str) -> bool {
