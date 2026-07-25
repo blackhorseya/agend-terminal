@@ -93,6 +93,41 @@ fn progress_path(home: &Path, task_id: &str) -> PathBuf {
     progress_dir(home).join(format!("{task_id}.json"))
 }
 
+/// #3026: a send is the hottest tool in the fleet and every one carrying a
+/// task_id lands here, paying mkdir + flock + `atomic_write` — and
+/// `atomic_write` fsyncs twice on Unix (temp file, then parent dir after the
+/// rename). Suppress the rewrite while the PERSISTED stamp is younger than this
+/// window. Value equality cannot be used instead: the payload embeds
+/// `Utc::now()`, so it differs on every call.
+///
+/// The trade is bounded and FAIL-LOUD. A consumer can see a stamp up to this
+/// many seconds stale. The idle thresholds are configured rather than fixed
+/// floors: they default to 1800s (fleet) and 3600s (dev), which leaves three
+/// orders of magnitude of headroom, but runtime-config.json can lower them and
+/// the per-agent scan uses an instance's own `timeout_secs` when set, so that
+/// headroom is not guaranteed. Against anti-stall it is not automatically
+/// smaller either — that threshold is `eta_secs * 1.5`, and an `eta_secs` of 1
+/// puts it at 1.5s, well inside this window. Every one of those cases fails in
+/// the safe direction: an older stamp makes elapsed-since-progress look LARGER,
+/// so a stall warning can fire early but can never be suppressed.
+///
+/// `ProgressSource` is forensic-only (it records which hook kept a task fresh).
+/// A source transition occurring inside the window is coalesced away, so the
+/// recorded source can lag the true latest hook by up to this many seconds.
+/// Accepted deliberately — no separate metadata channel is added for it.
+const COALESCE_WINDOW_SECS: i64 = 5;
+
+/// True when `prev` is recent enough to skip the rewrite. Anything uncertain
+/// writes: a missing/malformed/future-version sidecar reads as `None`, and a
+/// stamp dated in the FUTURE (clock skew, restored backup) yields a negative
+/// elapsed and is rejected too — otherwise a bad stamp could suppress every
+/// future touch and silently freeze the liveness signal.
+fn within_coalesce_window(prev: Option<chrono::DateTime<chrono::Utc>>) -> bool {
+    let Some(prev) = prev else { return false };
+    let elapsed = chrono::Utc::now().signed_duration_since(prev);
+    elapsed >= chrono::Duration::zero() && elapsed < chrono::Duration::seconds(COALESCE_WINDOW_SECS)
+}
+
 /// Touch progress for a task — writes (or overwrites) the sidecar
 /// with `last_progress_at = now()` and the supplied `source` tag.
 /// Atomic via temp + fsync + rename. Per-task lock prevents
@@ -120,6 +155,14 @@ pub(crate) fn touch(home: &Path, task_id: &str, source: ProgressSource) {
             return;
         }
     };
+    // #3026 (r1): the freshness decision must be made UNDER the sidecar lock.
+    // Read outside it and two concurrent callers can both observe the same stale
+    // stamp and both proceed to write — the coalescing would then silently not
+    // hold under exactly the concurrency it exists to damp.
+    if within_coalesce_window(read_last_progress_at(home, task_id)) {
+        return;
+    }
+    record_sidecar_write(task_id);
     let payload = ProgressSidecar {
         schema_version: SCHEMA_VERSION,
         task_id: task_id.to_string(),
@@ -207,6 +250,54 @@ pub(crate) fn touch_progress_for_branch(home: &Path, branch: &str) -> Option<Str
     None
 }
 
+/// #3026 (r1) test seam: every sidecar WRITE that survives the under-lock
+/// freshness check records its task_id here. Keyed by task rather than a bare
+/// counter so a concurrently running test touching a DIFFERENT task cannot
+/// perturb an assertion.
+/// #3026 (r1): record a sidecar write. The CALL SITE is unconditional on
+/// purpose — an inline test-only cfg attribute above the `last_alerted`
+/// anchors would truncate the source scan in
+/// `tests/idle_watchdog_last_alerted_gc_daemon_dispatch_idle.rs`, which slices
+/// production source at the FIRST such attribute (and would match it inside a
+/// doc comment too, hence the prose here).
+#[cfg(not(test))]
+fn record_sidecar_write(_key: &str) {}
+
+#[cfg(test)]
+fn record_sidecar_write(key: &str) {
+    WRITES.lock().push(key.to_string());
+}
+
+#[cfg(test)]
+static WRITES: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+/// #3026 (r1): how many sidecar writes `task_id` has taken in this process.
+#[cfg(test)]
+pub(crate) fn writes_for(task_id: &str) -> usize {
+    WRITES
+        .lock()
+        .iter()
+        .filter(|t| t.as_str() == task_id)
+        .count()
+}
+
+/// #3026 test seam: seed the sidecar at an arbitrary instant so the coalescing
+/// window is exercisable from the real caller's tests without a wall-clock
+/// sleep. Compiles out of release builds.
+#[cfg(test)]
+pub(crate) fn seed_progress_at(home: &Path, task_id: &str, ts: chrono::DateTime<chrono::Utc>) {
+    let _ = std::fs::create_dir_all(progress_dir(home));
+    let payload = ProgressSidecar {
+        schema_version: SCHEMA_VERSION,
+        task_id: task_id.to_string(),
+        last_progress_at: ts.to_rfc3339(),
+        source: ProgressSource::Broadcast.as_str().to_string(),
+    };
+    if let Ok(body) = serde_json::to_string_pretty(&payload) {
+        let _ = std::fs::write(progress_path(home, task_id), body);
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
@@ -244,9 +335,12 @@ mod tests {
     #[test]
     fn touch_subsequent_overwrites_with_latest_timestamp() {
         let home = tmp_home("touch-overwrite");
-        touch(&home, "t-test-2", ProgressSource::Broadcast);
-        let first = read_last_progress_at(&home, "t-test-2").unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(1100));
+        // #3026: the previous 1100ms sleep no longer separates the two touches
+        // — that gap is inside the coalescing window, so the second write would
+        // (correctly) be suppressed. Seed a stamp older than the window instead;
+        // this asserts the same overwrite contract and drops a wall-clock sleep.
+        let first = chrono::Utc::now() - chrono::Duration::seconds(COALESCE_WINDOW_SECS + 1);
+        seed_progress_at(&home, "t-test-2", first);
         touch(&home, "t-test-2", ProgressSource::CiPush);
         let second = read_last_progress_at(&home, "t-test-2").unwrap();
         assert!(

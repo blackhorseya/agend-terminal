@@ -123,6 +123,187 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    // ── #3026: coalesce the per-send progress/activity sidecar writes ──────
+
+    fn tmp_home_3026(tag: &str) -> std::path::PathBuf {
+        static COUNTER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        let id = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("agend-3026-{}-{}-{}", std::process::id(), tag, id));
+        std::fs::create_dir_all(&dir).ok();
+        dir
+    }
+
+    fn send_3026(home: &std::path::Path, task_id: &str, agent: &str) {
+        enforce_send_invariants(
+            home,
+            &json!({"request_kind": "update", "task_id": task_id}),
+            &Sender::new(agent),
+        );
+    }
+
+    /// #3026 RED — the real send gate touches BOTH sidecars on every accepted
+    /// send (`task_progress::touch` + `idle_watchdog::touch_agent_activity`),
+    /// each a mkdir + flock + `atomic_write` = two fsyncs. Back-to-back sends
+    /// must pay that chain once, not twice.
+    ///
+    /// Deterministic with no sleep: the window is judged against the PERSISTED
+    /// stamp, and both payloads embed `Utc::now()`, so an unchanged stamp after
+    /// the second send is proof that no write occurred.
+    #[test]
+    fn repeat_send_inside_window_skips_both_writes_3026() {
+        let home = tmp_home_3026("inside");
+        send_3026(&home, "t-3026-in", "agent-3026");
+        let progress_first =
+            crate::daemon::task_progress::read_last_progress_at(&home, "t-3026-in")
+                .expect("first send must create the progress sidecar");
+        let activity_first =
+            crate::daemon::idle_watchdog::read_agent_last_active(&home, "agent-3026")
+                .expect("first send must create the activity sidecar");
+
+        send_3026(&home, "t-3026-in", "agent-3026");
+
+        assert_eq!(
+            crate::daemon::task_progress::read_last_progress_at(&home, "t-3026-in"),
+            Some(progress_first),
+            "a second send inside the window must not rewrite the progress sidecar"
+        );
+        assert_eq!(
+            crate::daemon::idle_watchdog::read_agent_last_active(&home, "agent-3026"),
+            Some(activity_first),
+            "a second send inside the window must not rewrite the activity sidecar"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3026 — past the window BOTH writes must happen, and the worst-case
+    /// staleness it leaves is bounded by the window. That is three orders of
+    /// magnitude under the fixed idle floors (1800s / 3600s); against
+    /// anti-stall's `eta_secs * 1.5` it need not be smaller (eta may be 1), but
+    /// the direction is fail-loud — an older stamp can only make a stall warning
+    /// fire early, never hide one.
+    #[test]
+    fn send_after_window_persists_both_and_stays_fresh_3026() {
+        let home = tmp_home_3026("after");
+        // Literal 6s on purpose: reading production's own constant here would
+        // make the test blind to that constant changing.
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(6);
+        crate::daemon::task_progress::seed_progress_at(&home, "t-3026-out", stale);
+        crate::daemon::idle_watchdog::seed_activity_at(&home, "agent-3026", stale);
+
+        send_3026(&home, "t-3026-out", "agent-3026");
+
+        let progress = crate::daemon::task_progress::read_last_progress_at(&home, "t-3026-out")
+            .expect("progress sidecar readable");
+        let activity = crate::daemon::idle_watchdog::read_agent_last_active(&home, "agent-3026")
+            .expect("activity sidecar readable");
+        assert!(
+            progress > stale,
+            "a send past the window must persist progress: seeded={stale} after={progress}"
+        );
+        assert!(
+            activity > stale,
+            "a send past the window must persist activity: seeded={stale} after={activity}"
+        );
+        for (label, ts) in [("progress", progress), ("activity", activity)] {
+            let lag = chrono::Utc::now().signed_duration_since(ts).num_seconds();
+            assert!(
+                lag <= 5,
+                "{label} staleness must stay within the 5s window (lag={lag}s) — \
+                 three orders under the 1800s idle floor; against anti-stall the \
+                 direction is fail-loud, never suppressing"
+            );
+        }
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3026 (r1) — the freshness decision must be made UNDER the sidecar lock.
+    /// Read outside it and N concurrent senders can all observe the same stale
+    /// stamp and all proceed to write, so the coalescing would silently fail in
+    /// exactly the concurrency it exists to damp. Deterministic and sleep-free:
+    /// a `Barrier` releases every thread at once, and the write recorders are
+    /// keyed by task/agent so a parallel test touching different names cannot
+    /// perturb the counts.
+    #[test]
+    fn concurrent_sends_write_each_sidecar_once_3026() {
+        const THREADS: usize = 8;
+        let home = tmp_home_3026("concurrent");
+        let task = "t-3026-conc";
+        let agent = "agent-3026-conc";
+        // Seed both stale, so every thread would otherwise decide to write.
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(6);
+        crate::daemon::task_progress::seed_progress_at(&home, task, stale);
+        crate::daemon::idle_watchdog::seed_activity_at(&home, agent, stale);
+        let progress_before = crate::daemon::task_progress::writes_for(task);
+        let activity_before = crate::daemon::idle_watchdog::writes_for(agent);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(THREADS));
+        let handles: Vec<_> = (0..THREADS)
+            .map(|_| {
+                let home = home.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    send_3026(&home, task, agent);
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().expect("worker thread");
+        }
+
+        assert_eq!(
+            crate::daemon::task_progress::writes_for(task) - progress_before,
+            1,
+            "{THREADS} concurrent sends must produce exactly ONE progress write"
+        );
+        assert_eq!(
+            crate::daemon::idle_watchdog::writes_for(agent) - activity_before,
+            1,
+            "{THREADS} concurrent sends must produce exactly ONE activity write"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// #3026 — the coalescing must live in the shared owners (`touch` /
+    /// `touch_agent_activity`), NOT in this gate:
+    /// `comms_delegate::handle_delegate_task` is a second production caller of
+    /// `task_progress::touch` and has to inherit the behavior without its own
+    /// patch. Calling the owner directly is what pins that placement.
+    #[test]
+    fn coalescing_lives_in_the_touch_owner_not_this_gate_3026() {
+        let home = tmp_home_3026("owner");
+        crate::daemon::task_progress::touch(
+            &home,
+            "t-3026-owner",
+            crate::daemon::task_progress::ProgressSource::Broadcast,
+        );
+        let first = crate::daemon::task_progress::read_last_progress_at(&home, "t-3026-owner")
+            .expect("sidecar created");
+        crate::daemon::task_progress::touch(
+            &home,
+            "t-3026-owner",
+            crate::daemon::task_progress::ProgressSource::CiVerdict,
+        );
+        assert_eq!(
+            crate::daemon::task_progress::read_last_progress_at(&home, "t-3026-owner"),
+            Some(first),
+            "touch itself must coalesce so every caller inherits it"
+        );
+
+        crate::daemon::idle_watchdog::touch_agent_activity(&home, "agent-3026");
+        let activity_first =
+            crate::daemon::idle_watchdog::read_agent_last_active(&home, "agent-3026")
+                .expect("sidecar created");
+        crate::daemon::idle_watchdog::touch_agent_activity(&home, "agent-3026");
+        assert_eq!(
+            crate::daemon::idle_watchdog::read_agent_last_active(&home, "agent-3026"),
+            Some(activity_first),
+            "touch_agent_activity itself must coalesce so every caller inherits it"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     #[test]
     fn empty_task_id_rejected_with_actionable_hint() {
         let result = validate_task_id_present(&json!({}));

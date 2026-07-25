@@ -157,6 +157,33 @@ pub(crate) fn gc_stale_activity_sidecars(home: &Path) {
     }
 }
 
+/// #3026: every accepted send from a named sender lands here, paying mkdir +
+/// flock + `atomic_write` — and `atomic_write` fsyncs twice on Unix (temp file,
+/// then parent dir after the rename). Suppress the rewrite while the PERSISTED
+/// stamp is younger than this window. Value equality cannot be used instead:
+/// the payload embeds `Utc::now()`, so it differs on every call.
+///
+/// The trade is bounded and one-directional — the watchdogs can see a stamp up
+/// to this many seconds stale. Those thresholds are configured, not fixed:
+/// `fleet_idle_threshold_secs` and `dev_idle_threshold_secs` default to 1800 and
+/// 3600 but are overridable via runtime-config.json (#1085), and the per-agent
+/// scan narrows further to an instance's own `timeout_secs`. Even a short
+/// override stays safe in the direction that matters: skipping the rewrite
+/// leaves the OLDER stamp, so idleness reads LARGER — an alert may fire early,
+/// it cannot be suppressed.
+const COALESCE_WINDOW_SECS: i64 = 5;
+
+/// True when `prev` is recent enough to skip the rewrite. Anything uncertain
+/// writes: a missing/malformed/future-version sidecar reads as `None`, and a
+/// stamp dated in the FUTURE (clock skew, restored backup) yields a negative
+/// elapsed and is rejected too — otherwise a bad stamp could suppress every
+/// future touch and silently freeze the agent's liveness signal.
+fn within_coalesce_window(prev: Option<chrono::DateTime<chrono::Utc>>) -> bool {
+    let Some(prev) = prev else { return false };
+    let elapsed = chrono::Utc::now().signed_duration_since(prev);
+    elapsed >= chrono::Duration::zero() && elapsed < chrono::Duration::seconds(COALESCE_WINDOW_SECS)
+}
+
 /// Touch agent activity — atomically write `last_active_at = now()`.
 /// Best-effort; IO failures are logged and swallowed.
 pub(crate) fn touch_agent_activity(home: &Path, agent: &str) {
@@ -172,6 +199,14 @@ pub(crate) fn touch_agent_activity(home: &Path, agent: &str) {
         Ok(l) => l,
         Err(_) => return,
     };
+    // #3026 (r1): the freshness decision must be made UNDER the sidecar lock.
+    // Read outside it and two concurrent callers can both observe the same stale
+    // stamp and both proceed to write — the coalescing would then silently not
+    // hold under exactly the concurrency it exists to damp.
+    if within_coalesce_window(read_agent_last_active(home, agent)) {
+        return;
+    }
+    record_sidecar_write(agent);
     let payload = ActivitySidecar {
         schema_version: SCHEMA_VERSION,
         agent: agent.to_string(),
@@ -567,6 +602,49 @@ pub(crate) fn fleet_ack_status() -> Option<i64> {
         Some(ts)
     } else {
         None
+    }
+}
+
+/// #3026 (r1) test seam: every sidecar WRITE that survives the under-lock
+/// freshness check records its agent here. Keyed by agent rather than a bare
+/// counter so a concurrently running test touching a DIFFERENT agent cannot
+/// perturb an assertion.
+/// #3026 (r1): record a sidecar write. The CALL SITE is unconditional on
+/// purpose — an inline test-only cfg attribute above the `last_alerted`
+/// anchors would truncate the source scan in
+/// `tests/idle_watchdog_last_alerted_gc_daemon_dispatch_idle.rs`, which slices
+/// production source at the FIRST such attribute (and would match it inside a
+/// doc comment too, hence the prose here).
+#[cfg(not(test))]
+fn record_sidecar_write(_key: &str) {}
+
+#[cfg(test)]
+fn record_sidecar_write(key: &str) {
+    WRITES.lock().push(key.to_string());
+}
+
+#[cfg(test)]
+static WRITES: parking_lot::Mutex<Vec<String>> = parking_lot::Mutex::new(Vec::new());
+
+/// #3026 (r1): how many sidecar writes `agent` has taken in this process.
+#[cfg(test)]
+pub(crate) fn writes_for(agent: &str) -> usize {
+    WRITES.lock().iter().filter(|a| a.as_str() == agent).count()
+}
+
+/// #3026 test seam: seed the sidecar at an arbitrary instant so the coalescing
+/// window is exercisable from the real caller's tests without a wall-clock
+/// sleep. Compiles out of release builds.
+#[cfg(test)]
+pub(crate) fn seed_activity_at(home: &Path, agent: &str, ts: chrono::DateTime<chrono::Utc>) {
+    let _ = std::fs::create_dir_all(activity_dir(home));
+    let payload = ActivitySidecar {
+        schema_version: SCHEMA_VERSION,
+        agent: agent.to_string(),
+        last_active_at: ts.to_rfc3339(),
+    };
+    if let Ok(body) = serde_json::to_string_pretty(&payload) {
+        let _ = std::fs::write(activity_path(home, agent), body);
     }
 }
 
@@ -967,18 +1045,7 @@ mod tests {
     /// Helper: write an activity sidecar with a back-dated timestamp
     /// so tests can simulate elapsed time without sleeping.
     fn write_activity_at(home: &Path, agent: &str, ts: chrono::DateTime<chrono::Utc>) {
-        let dir = activity_dir(home);
-        std::fs::create_dir_all(&dir).unwrap();
-        let payload = ActivitySidecar {
-            schema_version: SCHEMA_VERSION,
-            agent: agent.to_string(),
-            last_active_at: ts.to_rfc3339(),
-        };
-        std::fs::write(
-            activity_path(home, agent),
-            serde_json::to_string_pretty(&payload).unwrap(),
-        )
-        .unwrap();
+        super::seed_activity_at(home, agent, ts);
     }
 
     /// #1438 test helper: create an Open task on the board owned by `owner`.
