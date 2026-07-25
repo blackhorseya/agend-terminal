@@ -437,6 +437,26 @@ pub fn merge_metadata(home: &Path, name: &str, info: &mut Value) {
     }
 }
 
+#[cfg(test)]
+std::thread_local! {
+    static METADATA_RMW_COUNT: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+#[cfg(test)]
+fn note_metadata_rmw() {
+    METADATA_RMW_COUNT.with(|count| count.set(count.get() + 1));
+}
+
+#[cfg(test)]
+pub(crate) fn reset_metadata_rmw_count() {
+    METADATA_RMW_COUNT.with(|count| count.set(0));
+}
+
+#[cfg(test)]
+pub(crate) fn take_metadata_rmw_count() -> usize {
+    METADATA_RMW_COUNT.with(|count| count.replace(0))
+}
+
 /// Persist a single metadata key/value for an instance.
 ///
 /// #1886 C2: locked read-modify-write (flock spans load→modify→write) so two
@@ -448,6 +468,8 @@ pub fn save_metadata(home: &Path, instance_name: &str, key: &str, value: Value) 
     let meta_dir = home.join("metadata");
     std::fs::create_dir_all(&meta_dir).ok();
     let meta_path = metadata_path_resolved(home, instance_name);
+    #[cfg(test)]
+    note_metadata_rmw();
     // #1647: log on failure — this metadata is read back by `merge_metadata`, and
     // the MCP set_* handlers return OK regardless, so a dropped write was a silent
     // operator-set-but-lost.
@@ -481,6 +503,8 @@ pub fn update_metadata(
     let meta_dir = home.join("metadata");
     std::fs::create_dir_all(&meta_dir).ok();
     let meta_path = metadata_path_resolved(home, instance_name);
+    #[cfg(test)]
+    note_metadata_rmw();
     persist_or_log!(
         crate::store::with_json_state_or_create::<Value, _, _, _>(
             &meta_path,
@@ -494,6 +518,19 @@ pub fn update_metadata(
     );
 }
 
+/// Locked read-modify-write of an instance's full metadata object.
+pub(crate) fn update_metadata_object(home: &Path, instance_name: &str, f: impl FnOnce(&mut Value)) {
+    let meta_dir = home.join("metadata");
+    std::fs::create_dir_all(&meta_dir).ok();
+    let meta_path = metadata_path_resolved(home, instance_name);
+    #[cfg(test)]
+    note_metadata_rmw();
+    persist_or_log!(
+        crate::store::with_json_state_or_create::<Value, _, _, _>(&meta_path, || json!({}), f,),
+        "update_metadata_object"
+    );
+}
+
 /// Persist multiple metadata key/value pairs in a single locked read-modify-write.
 /// #1886 C2: the flock spans the whole load→modify→write (not just the write), so
 /// concurrent `save_metadata`/`save_metadata_batch` on the same instance never read
@@ -502,6 +539,8 @@ pub fn save_metadata_batch(home: &Path, instance_name: &str, entries: &[(&str, V
     let meta_dir = home.join("metadata");
     std::fs::create_dir_all(&meta_dir).ok();
     let meta_path = metadata_path_resolved(home, instance_name);
+    #[cfg(test)]
+    note_metadata_rmw();
     // #1647: log on failure — see save_metadata.
     persist_or_log!(
         crate::store::with_json_state_or_create::<Value, _, _, _>(
@@ -1253,13 +1292,19 @@ mod tests {
                     json!(remaining)
                 });
             }));
-            // Append thread: add a fresh id aI (mirrors telegram inbound).
+            // Append thread: add a fresh id aI and its fallback id atomically
+            // (mirrors telegram inbound).
             let home_a = home.clone();
             handles.push(std::thread::spawn(move || {
-                update_metadata(&home_a, "agent-z", "pending_pickup_ids", |current| {
+                update_metadata_object(&home_a, "agent-z", |meta| {
+                    let current = meta
+                        .get("pending_pickup_ids")
+                        .cloned()
+                        .unwrap_or(Value::Null);
                     let mut ids: Vec<Value> = current.as_array().cloned().unwrap_or_default();
                     ids.push(json!({ "msg_id": format!("a{i}") }));
-                    json!(ids)
+                    meta["pending_pickup_ids"] = json!(ids);
+                    meta["last_message_id"] = json!(i);
                 });
             }));
         }
@@ -1280,6 +1325,12 @@ mod tests {
             final_ids, expected,
             "after concurrent append+filter the set must be exactly the appended ids \
              (no processed id resurrected, no append lost)"
+        );
+        assert!(
+            meta["last_message_id"]
+                .as_u64()
+                .is_some_and(|id| id < P as u64),
+            "the fallback id must come from one complete append transaction"
         );
     }
 
