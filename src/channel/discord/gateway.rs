@@ -2,6 +2,11 @@ use super::*;
 use crate::channel::ChannelEvent;
 use std::sync::mpsc;
 
+pub(super) const GATEWAY_EVENT_TYPES: twilight_gateway::EventTypeFlags =
+    twilight_gateway::EventTypeFlags::READY
+        .union(twilight_gateway::EventTypeFlags::MESSAGE_CREATE)
+        .union(twilight_gateway::EventTypeFlags::CHANNEL_DELETE);
+
 // ---------------------------------------------------------------------------
 // Gateway connection (#2562 P0)
 // ---------------------------------------------------------------------------
@@ -111,10 +116,10 @@ pub(crate) fn start_gateway(
                 return;
             };
             rt.block_on(async move {
-                use twilight_gateway::{EventTypeFlags, Shard, ShardId, StreamExt as _};
+                use twilight_gateway::{Shard, ShardId, StreamExt as _};
                 let mut shard = Shard::new(ShardId::ONE, token, intents);
                 loop {
-                    match shard.next_event(EventTypeFlags::all()).await {
+                    match shard.next_event(GATEWAY_EVENT_TYPES).await {
                         Some(Ok(event)) => {
                             if let Some(mapped) = gateway_event_to_channel_event(event, &allowlist)
                             {
