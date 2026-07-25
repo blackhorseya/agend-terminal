@@ -149,10 +149,17 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
 
     let now_rfc3339 = chrono::Utc::now().to_rfc3339();
 
-    let mut watch = std::fs::read_to_string(&watch_path)
+    let existing = std::fs::read_to_string(&watch_path)
         .ok()
-        .and_then(|s| serde_json::from_str::<Value>(&s).ok())
-        .unwrap_or_else(|| {
+        .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    // Re-arming an unwatch TOMBSTONE? Same predicate as `sweep.rs`
+    // (`auto_arm_optout` + no subscribers), read from the PRE-EXISTING file —
+    // before this call appends its subscriber or removes the optout below.
+    let tombstone_rearm = existing.as_ref().is_some_and(|w| {
+        w.get("auto_arm_optout").and_then(|v| v.as_bool()) == Some(true)
+            && crate::daemon::ci_watch::parse_subscribers(w).is_empty()
+    });
+    let mut watch = existing.unwrap_or_else(|| {
             json!({
                 "repo": repo,
                 "branch": branch,
@@ -234,6 +241,32 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     // the human/agent decision to watch again clears the auto-arm optout.
     if let Some(obj) = watch.as_object_mut() {
         obj.remove("auto_arm_optout");
+        // A tombstone re-arm starts a fresh notification epoch: these cursors
+        // record what the previous epoch's (now gone) subscribers were already
+        // told, so keeping them suppresses a still-terminal run at the same
+        // head. Rotating `generation_id` in this SAME write makes an in-flight
+        // old-generation poll lose the `flush_watch_state` CAS instead of
+        // restoring them. Keys are removed, not nulled: every field is
+        // `#[serde(default)]` and `last_notified_by_workflow` is a plain
+        // `BTreeMap`, so a null would make the watch unreadable to the poller.
+        if tombstone_rearm {
+            for key in [
+                "last_notified_by_workflow",
+                "last_run_id",
+                "last_notified_head_sha",
+                "last_notified_conclusion",
+                "last_notified_run_attempt",
+                "last_notified_run_conclusion",
+                "last_terminal_seen_at",
+                "terminal_since",
+            ] {
+                obj.remove(key);
+            }
+            obj.insert(
+                "generation_id".to_string(),
+                json!(uuid::Uuid::new_v4().to_string()),
+            );
+        }
     }
     // Refresh expires_at on each subscribe — keeps the watch alive
     // as long as at least one agent stays interested.
@@ -635,111 +668,6 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
         resp["setup_warning"] = json!(w);
     }
     resp
-}
-
-pub(crate) fn handle_defer_ci(home: &Path, args: &Value, instance_name: &str) -> Value {
-    let repository = match args["repository"].as_str().filter(|s| !s.is_empty()) {
-        Some(r) => r,
-        None => {
-            return json!({"error": "missing required 'repository'", "code": "missing_repository"})
-        }
-    };
-    let branch = match args["branch"].as_str().filter(|s| !s.is_empty()) {
-        Some(b) => b,
-        None => return json!({"error": "missing required 'branch'", "code": "missing_branch"}),
-    };
-    let correlation = format!("{repository}@{branch}");
-    let episode = match args["episode"].as_str().filter(|s| !s.is_empty()) {
-        Some(e) => e,
-        None => return json!({"error": "missing required 'episode'", "code": "missing_episode"}),
-    };
-    let wake_task_id = match args["wake_task_id"].as_str().filter(|s| !s.is_empty()) {
-        Some(t) => t,
-        None => {
-            return json!({"error": "missing required 'wake_task_id'", "code": "missing_wake_task_id"})
-        }
-    };
-    let reason = match args["reason"].as_str().filter(|s| !s.is_empty()) {
-        Some(r) => r,
-        None => {
-            return json!({"error": "missing required non-empty 'reason'", "code": "missing_reason"})
-        }
-    };
-    let defer_secs = match args["defer_secs"].as_i64() {
-        Some(s) if (60..=3600).contains(&s) => s,
-        Some(s) => {
-            return json!({
-                "error": format!("defer_secs {s} outside 60..3600"),
-                "code": "invalid_defer_secs"
-            })
-        }
-        None => {
-            return json!({
-                "error": "missing required 'defer_secs'",
-                "code": "missing_defer_secs"
-            })
-        }
-    };
-    match crate::tasks::load_routed(home, wake_task_id) {
-        Ok(rt) => {
-            if matches!(
-                rt.record().status,
-                crate::task_events::TaskStatus::Done | crate::task_events::TaskStatus::Cancelled
-            ) {
-                return json!({
-                    "error": format!("wake_task_id '{wake_task_id}' is already terminal"),
-                    "code": "wake_task_terminal"
-                });
-            }
-        }
-        Err(_) => {
-            return json!({
-                "error": format!("wake_task_id '{wake_task_id}' not found"),
-                "code": "wake_task_not_found"
-            });
-        }
-    }
-
-    let tracks = crate::daemon::ci_handoff_track::list(home);
-    let track = tracks.iter().find(|(_, t)| {
-        t.correlation == correlation.as_str()
-            && t.ci_handoff_episode.as_deref() == Some(episode)
-            && (instance_name.is_empty() || t.target == instance_name)
-    });
-    let Some((_, track)) = track else {
-        return json!({"error": "no matching track found", "code": "track_not_found"});
-    };
-    let target = &track.target;
-
-    use crate::daemon::ci_handoff_track::{DeferOutcome, DeferRequest};
-    let req = DeferRequest {
-        target,
-        correlation: &correlation,
-        episode,
-        deferred_by: if instance_name.is_empty() {
-            "operator"
-        } else {
-            instance_name
-        },
-        wake_task_id,
-        reason,
-        defer_secs,
-    };
-    match crate::daemon::ci_handoff_track::defer_track(home, &req) {
-        DeferOutcome::Deferred => json!({"ok": true, "deferred": true}),
-        DeferOutcome::AlreadyDeferred => {
-            json!({"ok": true, "deferred": true, "already_deferred": true})
-        }
-        DeferOutcome::EpisodeMismatch => {
-            json!({"error": "episode mismatch (CAS)", "code": "episode_mismatch"})
-        }
-        DeferOutcome::TrackNotFound => {
-            json!({"error": "track not found under lock", "code": "track_not_found"})
-        }
-        DeferOutcome::LockFailed => {
-            json!({"error": "lock acquisition failed", "code": "lock_failed"})
-        }
-    }
 }
 
 /// #813: build the default `CiProvider` for a repo URL. Mirrors
