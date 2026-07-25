@@ -3,6 +3,13 @@
 use crate::channel::dedup::DedupKey;
 use crate::channel::telegram::error::*;
 use crate::channel::telegram::state::*;
+use std::sync::OnceLock;
+
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+#[cfg(test)]
+static CLIENT_BUILD_COUNT: AtomicUsize = AtomicUsize::new(0);
 
 /// CR-2026-06-14: after a successful notify retry to a RECREATED topic, record a
 /// dedup claim keyed on the NEW topic id. The original claim (recorded before the
@@ -18,6 +25,39 @@ fn rekey_dedup_for_recreated_topic(
 ) {
     let key = DedupKey::new("telegram:notify", instance, Some(i64::from(new_tid)), text);
     let _ = crate::channel::dedup::global(home).record_and_check(key);
+}
+
+/// Build the Telegram HTTP client once and cheaply clone its handle per Bot.
+fn telegram_client() -> reqwest::Client {
+    static CLIENT: OnceLock<reqwest::Client> = OnceLock::new();
+    CLIENT
+        .get_or_init(|| {
+            #[cfg(test)]
+            CLIENT_BUILD_COUNT.fetch_add(1, Ordering::Relaxed);
+
+            // AUDIT2-006 (A): give the Telegram client an explicit request
+            // timeout so a black-holed API connection cannot park a delivery
+            // indefinitely. Start from teloxide's recommended settings.
+            match teloxide::net::default_reqwest_settings()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+            {
+                Ok(client) => client,
+                Err(e) => {
+                    // Preserve the old fallback semantics: retry with
+                    // teloxide's default client settings, without the custom
+                    // timeout, so a builder failure does not drop the send.
+                    tracing::warn!(
+                        error = %e,
+                        "AUDIT2-006: telegram client builder failed — using default (no request timeout)"
+                    );
+                    teloxide::net::default_reqwest_settings()
+                        .build()
+                        .expect("teloxide default client builder failed")
+                }
+            }
+        })
+        .clone()
 }
 
 /// Send a notification to Telegram (instance topic or general).
@@ -133,22 +173,7 @@ pub(crate) fn send_telegram_job(job: crate::daemon::delivery_worker::TelegramSen
     block_on_value(async move {
         use teloxide::payloads::SendMessageSetters;
         use teloxide::prelude::Requester;
-        // AUDIT2-006 (A): give the Telegram client an explicit request timeout so
-        // a black-holed API connection can't park this delivery indefinitely. We
-        // start from teloxide's recommended settings (keep-alive etc.) and only
-        // add the timeout. On the (effectively impossible) builder failure, fall
-        // back to teloxide's default client — losing the timeout but never the
-        // send.
-        let bot = match teloxide::net::default_reqwest_settings()
-            .timeout(std::time::Duration::from_secs(10))
-            .build()
-        {
-            Ok(client) => teloxide::Bot::with_client(&token, client),
-            Err(e) => {
-                tracing::warn!(error = %e, "AUDIT2-006: telegram client builder failed — using default (no request timeout)");
-                teloxide::Bot::new(&token)
-            }
-        };
+        let bot = teloxide::Bot::with_client(&token, telegram_client());
         let chat_id = teloxide::types::ChatId(group_id);
         let result: anyhow::Result<()> = async {
             // Test seam: force the first send to fail without a network call.
@@ -252,6 +277,19 @@ mod tests {
         *FORCED_SEND_ERROR.lock() = Some(err);
     }
 
+    fn forced_job(home: &Path, text: &str) -> crate::daemon::delivery_worker::TelegramSendJob {
+        crate::daemon::delivery_worker::TelegramSendJob {
+            home: home.to_path_buf(),
+            instance: "C".to_string(),
+            text: text.to_string(),
+            disable_notification: false,
+            token: "fake".to_string(),
+            group_id: -100_777,
+            topic_id: None,
+            dedup_key: notify_key(home, "C", text),
+        }
+    }
+
     /// Serialize against the process-global env + dedup cache + forced-error seam.
     fn guard() -> parking_lot::MutexGuard<'static, ()> {
         static G: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
@@ -318,6 +356,28 @@ mod tests {
         );
 
         std::env::remove_var("NOTIFY_MED1_TOKEN");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn send_jobs_build_one_client_2976() {
+        let _g = guard();
+        let home = tmp_home("client-reuse");
+        let start = CLIENT_BUILD_COUNT.load(Ordering::Relaxed);
+
+        for text in ["first notification", "second notification"] {
+            set_forced_send_error(anyhow::anyhow!("forced client-reuse test error"));
+            super::send_telegram_job(forced_job(&home, text));
+        }
+
+        let built = CLIENT_BUILD_COUNT.load(Ordering::Relaxed) - start;
+        assert!(
+            built <= 1,
+            "two send jobs must build at most one shared HTTP client, got {built}"
+        );
+        if start == 0 {
+            assert_eq!(built, 1, "the first send job must build the shared client");
+        }
         std::fs::remove_dir_all(&home).ok();
     }
 
