@@ -7,11 +7,17 @@
 //! ChdirPass'd it into the bound worktree — `core.sparseCheckout` plus cone
 //! patterns landed in the worktree's `config.worktree` and the agent's working
 //! tree was silently emptied while `git status` kept reporting clean. The
-//! leading-global form `git -C <foreign> sparse-checkout ...` was denied
-//! outright (`sparse-checkout` was not a recognized subcommand behind leading
-//! globals). Both real entries must route to the FOREIGN repo and leave the
-//! bound worktree non-sparse; an agent's own bare `sparse-checkout` must keep
+//! bare foreign-cwd entry must route to the FOREIGN repo and leave the bound
+//! worktree non-sparse; an agent's own bare `sparse-checkout` must keep
 //! operating on its bound worktree.
+//!
+//! The leading-global form `git -C <target> sparse-checkout ...` stays
+//! FAIL-CLOSED (unrecognized behind leading globals): `sparse-checkout` is
+//! deliberately outside `is_mutating_local`, so a recognized `-C` would
+//! survive `strip_target_overrides` and redirect the write to ANY non-foreign
+//! target too — a bound agent could sparse the canonical SOURCE repo from its
+//! own worktree (#2950 primary review, compiled-shim A/B). Denying the `-C`
+//! form closes that while keeping the incident-shape (bare foreign-cwd) fix.
 
 #![cfg(unix)]
 #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -224,12 +230,13 @@ fn foreign_cwd_sparse_checkout_routes_to_foreign_repo() {
 }
 
 /// The leading-global shape: cwd = the agent's own bound worktree, the target
-/// travels via `-C <foreign>`. Pre-fix this was denied outright
-/// (`sparse-checkout` unrecognized behind leading globals — fail-closed
-/// unknown-global guard). It must be a recognized policy path that routes to
-/// the foreign repo.
+/// travels via `-C <foreign>`. This must stay FAIL-CLOSED (the unknown-global
+/// deny): with cwd = the bound worktree, `cwd_is_foreign_repo` is false, the
+/// action stays `ChdirPass`, and the surviving `-C` would carry the write to
+/// the caller's target — the same mechanism reaches the canonical source repo
+/// (see the negative control below), so the whole `-C` form is denied.
 #[test]
-fn leading_dash_c_sparse_checkout_routes_to_foreign_repo() {
+fn leading_dash_c_sparse_checkout_stays_fail_closed() {
     let home = fixture_home("dashc");
     let (_src, wt) = bound_agent_fixture(&home);
     let foreign = foreign_repo(&home, "dashc");
@@ -247,14 +254,62 @@ fn leading_dash_c_sparse_checkout_routes_to_foreign_repo() {
         ],
     );
     assert!(
-        out.status.success(),
-        "-C <foreign> sparse-checkout must be a recognized policy path: {}",
+        !out.status.success(),
+        "-C <foreign> sparse-checkout must fail closed (unknown behind leading globals)"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unrecognized subcommand"),
+        "deny must come from the unknown-global guard, not an incidental failure: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let flist = sparse_state(&foreign).expect("foreign repo must be sparse after the set");
     assert!(
-        flist.contains("plugins/fake-plugin"),
-        "foreign repo must carry the cone pattern: {flist:?}"
+        sparse_state(&foreign).is_err(),
+        "foreign repo must stay non-sparse — the denied command must not run"
+    );
+    assert!(
+        sparse_state(&wt).is_err(),
+        "bound worktree must stay non-sparse"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Negative control (#2950 primary review blocker): a bound agent in its own
+/// worktree must NOT be able to sparse the canonical SOURCE repo via
+/// `-C <source-repo>`. With cwd = the bound worktree the foreign-cwd guard
+/// never fires (canonical shares the worktree's commondir → non-foreign), so
+/// the only thing standing between this argv and a silent write to the shared
+/// source repository is the fail-closed unknown-global deny.
+#[test]
+fn dash_c_canonical_sparse_checkout_denied_source_stays_clean() {
+    let home = fixture_home("canon");
+    let (src, wt) = bound_agent_fixture(&home);
+
+    let out = run_shim(
+        &wt,
+        &home,
+        "agent-a",
+        &[
+            "-C",
+            src.to_str().unwrap(),
+            "sparse-checkout",
+            "set",
+            "plugins/fake-plugin",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "-C <source-repo> sparse-checkout must be denied: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unrecognized subcommand"),
+        "deny must come from the unknown-global guard, not an incidental failure: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        sparse_state(&src).is_err(),
+        "canonical source repo must stay non-sparse — this is the shared-repo \
+         harm class the shim exists to prevent"
     );
     assert!(
         sparse_state(&wt).is_err(),

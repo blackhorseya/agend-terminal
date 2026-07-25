@@ -2347,9 +2347,9 @@ fn foreign_passthrough_action_matrix_1463() {
 // redirected into the caller's bound worktree, writes `core.sparseCheckout`
 // plus cone patterns into `config.worktree`, and silently EMPTIES the agent's
 // working tree while `git status` keeps reporting clean (four fleet
-// incidents, pattern `plugins/grafana-mcp`). Real-entry routing (bare AND
-// leading `-C`) is covered by tests/sparse_checkout_routing.rs through the
-// compiled shim.
+// incidents, pattern `plugins/grafana-mcp`). Real-entry behavior (bare
+// foreign-cwd routes to the foreign repo; leading `-C` fails closed) is
+// covered by tests/sparse_checkout_routing.rs through the compiled shim.
 #[test]
 fn foreign_sparse_checkout_passthrough_matrix() {
     use Action::*;
@@ -3929,6 +3929,22 @@ fn known_subcommands_mirror_classify_arms_27() {
     assert!(
         unrecognized(&action),
         "unhandled `gc` behind -C must fail closed, got {action:?}"
+    );
+    // `sparse-checkout` is DELIBERATELY not in the allowlist: it is outside
+    // `is_mutating_local`, so a recognized `-C` would survive
+    // `strip_target_overrides` and redirect the write to any non-foreign
+    // target — including the canonical source repo (#2950 primary review).
+    // This pin keeps the token out of the list.
+    let action = classify_argv(
+        &s(&["-C", "/x", "sparse-checkout", "set", "p"]),
+        &bound_binding("feat/x", "/tmp/.worktrees/dev"),
+        false,
+        false,
+        true,
+    );
+    assert!(
+        unrecognized(&action),
+        "`sparse-checkout` behind -C must fail closed, got {action:?}"
     );
     // …but BARE `git gc` (no leading global) is unchanged (Passthrough) — nothing hiding it.
     assert_eq!(
