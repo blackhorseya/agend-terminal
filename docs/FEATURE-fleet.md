@@ -195,6 +195,13 @@ anti-stall / decision-timeout notification. These are agent / recipient **names*
 (fleet topology), so they live here rather than in env vars. Every field is
 optional; an omitted block (or field) uses its built-in default.
 
+**Ghost-inbox guard**: every watchdog recipient — explicitly configured or
+built-in default — must name an entry in the `instances:` map. A recipient
+without an instance is skipped at emit time (warned once per process):
+enqueueing to it would grow `~/.agend/inbox/<name>.jsonl` forever with nobody
+to drain it. A missing or unparseable `fleet.yaml` skips the filter entirely
+(fail-open — no fleet, no restriction).
+
 ```yaml
 watchdog:
   # SINGLE-AGENT mode for the dev-vantage idle watchdog. When set, the
@@ -212,7 +219,6 @@ watchdog:
     - general
     - lead
   # Recipients for helper-staleness alerts. Default: [general, lead].
-  # Filtered against the instances: map (ghost-inbox guard).
   helper_staleness_recipients:
     - general
     - lead
