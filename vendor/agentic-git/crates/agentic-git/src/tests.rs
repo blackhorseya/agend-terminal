@@ -2339,6 +2339,56 @@ fn foreign_passthrough_action_matrix_1463() {
     );
 }
 
+// Sparse-pollution root fix: `sparse-checkout` in a FOREIGN repo must flip
+// ChdirPass → Passthrough. Pre-fix it falls to classify's `_` default arm
+// (bound → ChdirPass) and the converter has no sparse-checkout arm, so a
+// third-party tool's cwd-targeted `git sparse-checkout set plugins/<x>`
+// (Claude Code's plugin marketplace sync, cwd = the marketplace clone) is
+// redirected into the caller's bound worktree, writes `core.sparseCheckout`
+// plus cone patterns into `config.worktree`, and silently EMPTIES the agent's
+// working tree while `git status` keeps reporting clean (four fleet
+// incidents, pattern `plugins/grafana-mcp`). Real-entry behavior (bare
+// foreign-cwd routes to the foreign repo; leading `-C` fails closed) is
+// covered by tests/sparse_checkout_routing.rs through the compiled shim.
+#[test]
+fn foreign_sparse_checkout_passthrough_matrix() {
+    use Action::*;
+    let a = |toks: &[&str]| toks.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+    // The live incident shape: a sparse-checkout write with a foreign cwd.
+    assert_eq!(
+        apply_foreign_repo_passthrough(
+            ChdirPass("wt".into()),
+            "sparse-checkout",
+            &a(&["sparse-checkout", "set", "plugins/grafana-mcp"]),
+            true,
+        ),
+        Passthrough,
+        "foreign-cwd sparse-checkout must run against THAT repo, not be \
+         redirected into the bound worktree (sparse-pollution vector)"
+    );
+    // NOT foreign: unchanged ChdirPass — an agent's own sparse-checkout keeps
+    // operating on its bound worktree.
+    assert_eq!(
+        apply_foreign_repo_passthrough(
+            ChdirPass("wt".into()),
+            "sparse-checkout",
+            &a(&["sparse-checkout", "set", "plugins/x"]),
+            false,
+        ),
+        ChdirPass("wt".into())
+    );
+    // Non-ChdirPass inputs stay verbatim.
+    assert_eq!(
+        apply_foreign_repo_passthrough(
+            Deny("x".into()),
+            "sparse-checkout",
+            &a(&["sparse-checkout", "set", "p"]),
+            true,
+        ),
+        Deny("x".into())
+    );
+}
+
 // #2027 (§3.9): a ref-naming `branch`/`tag` in a FOREIGN repo must pass through
 // (run against THAT repo), never be ChdirPass'd into the worktree — the
 // worktree-redirect is the success-lie (silent no-op + exit 0 for a create; a
@@ -3879,6 +3929,22 @@ fn known_subcommands_mirror_classify_arms_27() {
     assert!(
         unrecognized(&action),
         "unhandled `gc` behind -C must fail closed, got {action:?}"
+    );
+    // `sparse-checkout` is DELIBERATELY not in the allowlist: it is outside
+    // `is_mutating_local`, so a recognized `-C` would survive
+    // `strip_target_overrides` and redirect the write to any non-foreign
+    // target — including the canonical source repo (#2950 primary review).
+    // This pin keeps the token out of the list.
+    let action = classify_argv(
+        &s(&["-C", "/x", "sparse-checkout", "set", "p"]),
+        &bound_binding("feat/x", "/tmp/.worktrees/dev"),
+        false,
+        false,
+        true,
+    );
+    assert!(
+        unrecognized(&action),
+        "`sparse-checkout` behind -C must fail closed, got {action:?}"
     );
     // …but BARE `git gc` (no leading global) is unchanged (Passthrough) — nothing hiding it.
     assert_eq!(

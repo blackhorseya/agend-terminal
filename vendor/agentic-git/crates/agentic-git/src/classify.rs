@@ -311,11 +311,30 @@ pub(crate) fn active_bypass_layer() -> &'static str {
     }
 }
 
-/// #1463 (A) + #2027: convert a bound-agent `ChdirPass` into `Passthrough` when
-/// cwd is a foreign repo AND the command is a local mutating one (#1463) or a
-/// ref-naming `branch`/`tag` (#2027). Pure so the matrix is unit-testable;
-/// everything else (push/checkout ChdirPass, Deny, already-Passthrough) is
-/// returned unchanged.
+/// #1463 (A) + #2027 + sparse-pollution fix: convert a bound-agent `ChdirPass`
+/// into `Passthrough` when cwd is a foreign repo AND the command is a local
+/// mutating one (#1463), a ref-naming `branch`/`tag` (#2027), or
+/// `sparse-checkout`. Pure so the matrix is unit-testable; everything else
+/// (push/checkout ChdirPass, Deny, already-Passthrough) is returned unchanged.
+///
+/// `sparse-checkout` rationale: it falls to classify's `_` default arm
+/// (bound → ChdirPass) yet mutates per-repo state on disk. In a FOREIGN repo
+/// it must run against THAT repo — otherwise a third-party tool's
+/// cwd-targeted invocation (Claude Code's plugin marketplace sync,
+/// `git sparse-checkout set plugins/<x>` with cwd = the marketplace clone) is
+/// redirected into the caller's bound worktree, writes `core.sparseCheckout`
+/// plus cone patterns into `config.worktree`, and silently EMPTIES the
+/// agent's working tree while `git status` keeps reporting clean (four fleet
+/// incidents, pattern `plugins/grafana-mcp`). Deliberately NOT added to
+/// `is_mutating_local`: that list also gates `strip_target_overrides`, and
+/// stripping `-C` from `git -C <dir> sparse-checkout` would break legit
+/// helpers (see the #1463 (B) rationale). The flip side (#2950 primary
+/// review): because the `-C` survives, `sparse-checkout` must also stay OUT
+/// of `KNOWN_SUBCOMMANDS` — behind a leading `-C` the cwd-based foreign guard
+/// here never fires, and the surviving `-C` would carry the write to any
+/// non-foreign target, canonical included. Only the bare (cwd-targeted) form
+/// is a policy path. Inline single-token check per the #2950 KISS review —
+/// no new predicate abstraction.
 pub(crate) fn apply_foreign_repo_passthrough(
     action: Action,
     subcmd: &str,
@@ -334,7 +353,10 @@ pub(crate) fn apply_foreign_repo_passthrough(
             action
         };
     }
-    if is_mutating_local(subcmd) || branch_tag_names_ref(subcmd, args) {
+    if is_mutating_local(subcmd)
+        || branch_tag_names_ref(subcmd, args)
+        || subcmd == "sparse-checkout"
+    {
         return Action::Passthrough;
     }
     action
@@ -750,6 +772,12 @@ pub(crate) fn classify(
 // Groups (in `classify` order): read-only (status..reflog); config/help/passthrough
 // (config..clone); push; mutating (commit..apply); checkout/switch/worktree;
 // flag-discriminated (restore/update-ref/symbolic-ref).
+// `sparse-checkout` is DELIBERATELY absent (#2950 primary review): it is
+// outside `is_mutating_local`, so recognizing it here would let the caller's
+// `-C` survive `strip_target_overrides` on a bound `ChdirPass` and redirect
+// the write to any non-foreign target — including the canonical source repo.
+// The `-C` form therefore fails closed; the foreign-cwd incident shape is
+// handled by `apply_foreign_repo_passthrough` on the bare form.
 pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "status",
     "log",
