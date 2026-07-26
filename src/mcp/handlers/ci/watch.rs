@@ -152,6 +152,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     let existing = std::fs::read_to_string(&watch_path)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
+    let requested_review_class = args["review_class"].as_str().filter(|s| !s.is_empty());
     // Re-arming an unwatch TOMBSTONE? Same predicate as `sweep.rs`
     // (`auto_arm_optout` + no subscribers), read from the PRE-EXISTING file —
     // before this call appends its subscriber or removes the optout below.
@@ -291,7 +292,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         watch["task_id"] = json!(tid);
     }
     // #972: persist review_class for §3.5 dual-review gate.
-    if let Some(rc) = args["review_class"].as_str().filter(|s| !s.is_empty()) {
+    if let Some(rc) = requested_review_class {
         watch["review_class"] = json!(rc);
     }
     // S1: persist the (validated, lowercased) exact-head pin. Its PRESENCE marks
@@ -339,6 +340,45 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
             "error": format!("watch file write failed: {e}"),
             "code": "watch_write_failed",
         });
+    }
+    // #3114: an explicit class can repair a persisted Unresolved PR gate even
+    // when CI already notified at this head. Reconcile the gate directly rather
+    // than clearing CI cursors, which would replay ci-pass/ci-ready messages.
+    // Run this on every explicit class so a partial prior failure is retryable.
+    if let Some(requested) = requested_review_class {
+        let requested = crate::daemon::pr_state::ReviewClass::parse_fail_closed(Some(requested));
+        if let Err(e) = crate::daemon::pr_state::with_pr_state(home, repo, branch, |state| {
+            let was_unresolved = matches!(
+                state.review_class,
+                crate::daemon::pr_state::ReviewClass::Unresolved
+            );
+            state.review_class =
+                crate::daemon::pr_state::reconcile_review_class(state.review_class, requested);
+            if was_unresolved
+                && !matches!(
+                    state.review_class,
+                    crate::daemon::pr_state::ReviewClass::Unresolved
+                )
+            {
+                state.diagnostic_emitted_for_sha = None;
+            }
+            if !matches!(
+                state.merge_state,
+                crate::daemon::pr_state::MergeState::Merged { .. }
+                    | crate::daemon::pr_state::MergeState::ClosedUnmerged { .. }
+            ) {
+                state.merge_state = if crate::daemon::pr_state::is_merge_ready(state) {
+                    crate::daemon::pr_state::MergeState::MergeReady
+                } else {
+                    crate::daemon::pr_state::MergeState::NotReady
+                };
+            }
+        }) {
+            return json!({
+                "error": format!("review class reconciliation failed: {e}"),
+                "code": "review_class_reconcile_failed",
+            });
+        }
     }
     // #813: on-watch-start mergeable check. Builds a default provider
     // for the repo (GitHub-only impl; GitLab/Bitbucket inherit the
