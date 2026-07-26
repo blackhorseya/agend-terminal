@@ -27,7 +27,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn real_git_path() -> PathBuf {
-    for cand in ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"] {
+    for cand in [
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+    ] {
         if Path::new(cand).exists() {
             return PathBuf::from(cand);
         }
@@ -129,7 +133,10 @@ fn bound_agent_fixture(home: &Path) -> (PathBuf, PathBuf) {
         ],
     );
     let wt = home.join("wt-a");
-    setup_git(&src, &["worktree", "add", wt.to_str().unwrap(), "-b", "feat/a"]);
+    setup_git(
+        &src,
+        &["worktree", "add", wt.to_str().unwrap(), "-b", "feat/a"],
+    );
     std::fs::write(
         wt.join(".agend-managed"),
         format!(
@@ -153,7 +160,15 @@ fn foreign_repo(home: &Path, tag: &str) -> PathBuf {
     setup_git(&f, &["add", "-A"]);
     setup_git(
         &f,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "init"],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "init",
+        ],
     );
     f
 }
@@ -329,18 +344,19 @@ fn own_worktree_sparse_checkout_still_targets_bound_worktree() {
     std::fs::write(src.join("plugins/fake-plugin/f.txt"), "x").unwrap();
     setup_git(
         &src,
+        &["-c", "user.name=t", "-c", "user.email=t@t", "add", "-A"],
+    );
+    setup_git(
+        &src,
         &[
             "-c",
             "user.name=t",
             "-c",
             "user.email=t@t",
-            "add",
-            "-A",
+            "commit",
+            "-m",
+            "cone",
         ],
-    );
-    setup_git(
-        &src,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-m", "cone"],
     );
 
     let out = run_shim(
