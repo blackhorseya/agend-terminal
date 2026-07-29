@@ -261,18 +261,18 @@ fn notification_only_valid_succeeds_and_idempotent() {
 
 // ── Production-seam tests for post_merge_receipt_and_watch ──
 
-/// Production seam: REAL TOPOLOGY — unbound orchestrator merges, developer
-/// is separately bound to the PR branch → receipt + watch armed for developer.
+/// Production seam: a named non-orchestrator merge authority merges while the
+/// developer is separately bound to the PR branch → receipt + watch armed.
 #[test]
-fn post_merge_orchestrator_merge_developer_bound_arms_watch() {
+fn post_merge_named_non_orchestrator_merge_developer_bound_arms_watch() {
     let home = tmp_home("post-merge-topology");
     let sha = "1".repeat(40);
     seed_fleet(&home, &["lead", "dev"]);
     let source_repo = make_source_repo(&home);
     seed_binding_with_source(&home, "dev", "t-merge", "fix/feature-x", &source_repo);
-    // Orchestrator (lead) has NO binding.
+    // Named merge authority (lead) has no binding and is not an orchestrator.
 
-    // Orchestrator calls merge → post_merge resolves developer from PR branch.
+    // Named authority calls merge → post_merge resolves developer from PR branch.
     let diag =
         super::merge::post_merge_receipt_and_watch(&home, REPO, &sha, 99, "fix/feature-x", "lead");
 
@@ -288,12 +288,58 @@ fn post_merge_orchestrator_merge_developer_bound_arms_watch() {
         diag["watch"], "armed",
         "watch must be armed for developer: {diag}"
     );
+    let watch_path =
+        home.join("ci-watches")
+            .join(crate::daemon::ci_watch::watch_filename_exact_head(
+                REPO, "main", &sha,
+            ));
+    let watch: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&watch_path).expect("post-merge watch must be persisted"),
+    )
+    .unwrap();
+    assert_eq!(watch["next_after_ci"], "lead");
+    assert!(watch["notification_only"].is_null());
+    assert_eq!(watch["task_id"], "t-merge");
+    assert_eq!(watch["target_head_sha"], sha);
+    assert!(crate::daemon::ci_watch::parse_subscribers(&watch).is_empty());
     let receipt = crate::merge_receipt::find(&home, REPO, &sha, "t-merge");
     assert!(receipt.is_some(), "receipt must be findable on disk");
     let r = receipt.unwrap();
     assert_eq!(r.task_assignee, "dev");
     assert_eq!(r.merge_authority, "lead");
     assert_eq!(r.pr_number, 99);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Production seam: an operator merge has no caller identity, but the task
+/// assignee remains the actionable post-CI handoff target.
+#[test]
+fn post_merge_operator_fallback_arms_assignee_handoff() {
+    let home = tmp_home("post-merge-operator-fallback");
+    let sha = "4".repeat(40);
+    seed_fleet(&home, &["dev"]);
+    let source_repo = make_source_repo(&home);
+    seed_binding_with_source(&home, "dev", "t-operator", "fix/operator-x", &source_repo);
+
+    let diag =
+        super::merge::post_merge_receipt_and_watch(&home, REPO, &sha, 103, "fix/operator-x", "");
+
+    assert_eq!(
+        diag["watch"], "armed",
+        "operator watch must be armed: {diag}"
+    );
+    let watch_path =
+        home.join("ci-watches")
+            .join(crate::daemon::ci_watch::watch_filename_exact_head(
+                REPO, "main", &sha,
+            ));
+    let watch: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&watch_path).expect("operator watch must be persisted"),
+    )
+    .unwrap();
+    assert_eq!(watch["next_after_ci"], "dev");
+    assert!(watch["notification_only"].is_null());
+    assert!(crate::daemon::ci_watch::parse_subscribers(&watch).is_empty());
     std::fs::remove_dir_all(&home).ok();
 }
 
