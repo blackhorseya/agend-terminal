@@ -237,6 +237,11 @@ fn txn_phase_order_and_worktree_existence() {
 fn txn_journal_persists_and_loads() {
     let home = tmp_home("txn-persist");
     let mangled = "agent-co-_src";
+    assert_eq!(
+        super::checkout_txn::journal_key(&home, mangled),
+        mangled,
+        "short legacy journal identities remain compatible"
+    );
     let mut j = sample_journal();
     j.advance(Phase::WorktreeAdded);
     j.save(&home, mangled).expect("save");
@@ -249,6 +254,195 @@ fn txn_journal_persists_and_loads() {
         Journal::load(&home, mangled).is_none(),
         "clear removes journal"
     );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[cfg(unix)]
+fn oversized_legacy_mangled(home: &Path) -> String {
+    let mut mangled = "agent-C_".to_string();
+    while super::checkout_txn::journal_path(home, &mangled)
+        .to_string_lossy()
+        .len()
+        <= 240
+    {
+        mangled.push_str("source_");
+    }
+    assert!(
+        mangled.len() < 255,
+        "legacy directory component must fit: {mangled}"
+    );
+    mangled
+}
+
+/// Long Windows-style source identities use a bounded durable directory key, while
+/// the journal remains readable/absent through the same save/load/clear lifecycle.
+#[test]
+fn txn_long_journal_identity_is_bounded_and_round_trips() {
+    let home = tmp_home("txn-long");
+    let mangled = format!("agent-C_{}", "source_".repeat(80));
+    let key = super::checkout_txn::journal_key(&home, &mangled);
+    assert_ne!(key, mangled, "oversized legacy identity must be bounded");
+    assert!(key.starts_with("journal-"), "bounded key is typed: {key}");
+    assert_eq!(
+        key.len(),
+        "journal-".len() + 43,
+        "bounded key is genuinely short"
+    );
+    let path = super::checkout_txn::journal_path(&home, &key);
+    assert!(
+        path.to_string_lossy().chars().count() < 240,
+        "bounded journal path must remain short: {}",
+        path.display()
+    );
+
+    let mut journal = sample_journal();
+    journal.advance(Phase::WorktreeAdded);
+    journal.save(&home, &key).expect("bounded journal saves");
+    let loaded = Journal::load(&home, &key).expect("bounded journal loads");
+    assert_eq!(loaded.nonce, journal.nonce);
+    Journal::clear(&home, &key);
+    assert!(Journal::load(&home, &key).is_none(), "clear leaves absent");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Pin the durable full-digest encoding against an independently derived vector.
+#[test]
+fn txn_journal_key_matches_sha256_base64url_vector() {
+    let home = tmp_home("txn-key-vector");
+    let mangled = format!("agent-C_{}", "source_".repeat(80));
+    assert_eq!(
+        super::checkout_txn::journal_key(&home, &mangled),
+        "journal-yPqPYt6MXKHcDOVFX3bn_0W8TzyiYLu8x6GFXdm3d2I"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The bounded key must fit a normal deep Windows CI home while retaining a
+/// collision-resistant identity for an oversized legacy worktree name.
+#[test]
+fn txn_long_journal_identity_fits_normal_deep_home() {
+    let base = tmp_home("txn-deep-normal");
+    let home = base.join("a".repeat(30)).join("b".repeat(30));
+    let mangled = format!("agent-C_{}", "source_".repeat(80));
+    let key = super::checkout_txn::journal_key(&home, &mangled);
+    assert_eq!(key.len(), "journal-".len() + 43);
+    assert_ne!(key, mangled);
+    assert!(
+        super::checkout_txn::journal_path(&home, &key)
+            .to_string_lossy()
+            .chars()
+            .count()
+            <= 240,
+        "bounded key must fit a normal deep home: {}",
+        super::checkout_txn::journal_path(&home, &key).display()
+    );
+    let journal = sample_journal();
+    journal
+        .save(&home, &key)
+        .expect("short bounded journal saves");
+    assert!(Journal::load(&home, &key).is_some());
+    Journal::clear(&home, &key);
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// Bounding the journal identity must not turn an existing unreadable record into
+/// Absent: recovery remains fail-closed for the same long identity.
+#[test]
+fn txn_long_journal_identity_unreadable_still_fails_closed() {
+    let home = tmp_home("txn-long-unread");
+    let mangled = format!("agent-C_{}", "source_".repeat(80));
+    let key = super::checkout_txn::journal_key(&home, &mangled);
+    std::fs::create_dir_all(super::checkout_txn::journal_path(&home, &key)).unwrap();
+    let r = recover_stale(&home, &key, &home.join("wt"), "/src", fixed_now(), || true);
+    assert!(
+        r.is_err(),
+        "bounded but unreadable journal must still fail closed: {r:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A deeply nested home can make even the bounded key exceed the safe path
+/// limit; resolution must fail closed rather than silently use an unsafe path.
+#[test]
+fn txn_deep_home_bounded_key_fails_closed() {
+    let base = tmp_home("txn-deep-home");
+    let home = base
+        .join("a".repeat(80))
+        .join("b".repeat(80))
+        .join("c".repeat(80));
+    let mangled = "agent";
+    let key = super::checkout_txn::journal_key(&home, mangled);
+    assert_ne!(key, mangled);
+    assert!(
+        super::checkout_txn::journal_path(&home, &key)
+            .to_string_lossy()
+            .chars()
+            .count()
+            > 240
+    );
+    let err = super::checkout_txn::resolve_journal_key(&home, mangled).unwrap_err();
+    assert!(err.contains("safe path limit"), "{err}");
+    std::fs::remove_dir_all(&base).ok();
+}
+
+/// A legacy directory and its bounded replacement cannot coexist: recovery must
+/// fail closed instead of choosing one journal authority.
+#[cfg(unix)]
+#[test]
+fn txn_long_legacy_and_bounded_collision_fails_closed() {
+    let home = tmp_home("txn-long-collision");
+    let mangled = oversized_legacy_mangled(&home);
+    let key = super::checkout_txn::journal_key(&home, &mangled);
+    std::fs::create_dir_all(super::checkout_txn::journal_path(&home, &mangled)).unwrap();
+    std::fs::create_dir_all(super::checkout_txn::journal_path(&home, &key)).unwrap();
+    let err = super::checkout_txn::resolve_journal_key(&home, &mangled).unwrap_err();
+    assert!(err.contains("both"), "collision must fail closed: {err}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A legacy identity that is not a directory is ambiguous storage, not an absent
+/// journal; resolution must fail closed before selecting the bounded key.
+#[cfg(unix)]
+#[test]
+fn txn_long_legacy_non_directory_fails_closed() {
+    let home = tmp_home("txn-long-nondir");
+    let mangled = oversized_legacy_mangled(&home);
+    std::fs::create_dir_all(super::checkout_txn::txn_root(&home)).unwrap();
+    std::fs::write(
+        super::checkout_txn::txn_root(&home).join(&mangled),
+        "not a journal directory",
+    )
+    .unwrap();
+    let err = super::checkout_txn::resolve_journal_key(&home, &mangled).unwrap_err();
+    assert!(
+        err.contains("not a directory"),
+        "non-directory must fail closed: {err}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A pre-existing oversized legacy directory is discovered and migrated rather
+/// than silently replaced by a fresh hash journal (Unix can still read this path;
+/// Windows uses the bounded-new-write path because the legacy path is too long).
+#[cfg(unix)]
+#[test]
+fn txn_long_legacy_journal_migrates_before_recovery() {
+    let home = tmp_home("txn-long-legacy");
+    let mangled = oversized_legacy_mangled(&home);
+    let legacy_path = super::checkout_txn::journal_path(&home, &mangled);
+    let mut journal = sample_journal();
+    journal.advance(Phase::WorktreeAdded);
+    journal.save(&home, &mangled).expect("legacy journal saves");
+    let key =
+        super::checkout_txn::resolve_journal_key(&home, &mangled).expect("legacy journal migrates");
+    assert_ne!(key, mangled);
+    assert!(
+        !legacy_path.parent().unwrap().exists(),
+        "legacy path migrated"
+    );
+    let loaded = Journal::load(&home, &key).expect("migrated journal remains readable");
+    assert_eq!(loaded.nonce, journal.nonce);
+    Journal::clear(&home, &key);
     std::fs::remove_dir_all(&home).ok();
 }
 

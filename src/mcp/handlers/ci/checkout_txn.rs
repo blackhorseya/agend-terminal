@@ -12,7 +12,8 @@
 //! - **Committed is the durable linearization point**: the caller returns
 //!   success ONLY after a `Committed` journal is durably written
 //!   ([`store::atomic_write`]); a write failure aborts into rollback.
-//! - The journal (keyed by the `<instance>-<source>` mangled name) and its
+//! - The journal (keyed by a bounded identity derived from the `<instance>-<source>`
+//!   mangled name) and its
 //!   provisioning lock (keyed by the NORMALIZED target PATH, so any consumer —
 //!   checkout/bind/release/GC — derives the same domain from the path alone) live
 //!   OUTSIDE the worktree in a daemon-owned area — so a `remove --force` of the
@@ -248,9 +249,127 @@ pub(crate) fn txn_root(home: &Path) -> PathBuf {
     home.join("checkout_txn")
 }
 
-/// Journal file for `mangled` (the `<instance>-<source>` worktree key).
-pub(crate) fn journal_path(home: &Path, mangled: &str) -> PathBuf {
-    txn_root(home).join(mangled).join("journal.json")
+/// Keep legacy human-readable journal directories while their full path is safely
+/// bounded. Oversized identities use a stable URL-safe base64 encoding of the
+/// full SHA-256 digest (43 characters) so a long Windows temp/home path cannot
+/// make the journal itself exceed filesystem limits while retaining the full
+/// collision-resistant identity.
+const LEGACY_JOURNAL_PATH_MAX: usize = 240;
+const JOURNAL_KEY_PREFIX: &str = "journal-";
+
+/// Resolve the durable directory key for a worktree's `<instance>-<source>` name.
+/// Existing short identities retain their legacy path for compatibility; only
+/// identities whose legacy journal path is too long move to the bounded key.
+pub(crate) fn journal_key(home: &Path, mangled: &str) -> String {
+    let legacy = txn_root(home).join(mangled).join("journal.json");
+    if journal_path_length(&legacy) <= LEGACY_JOURNAL_PATH_MAX {
+        return mangled.to_string();
+    }
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(mangled.as_bytes());
+    let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+    let mut encoded = String::with_capacity(43);
+    let mut buffer = 0u16;
+    let mut bits = 0u8;
+    for byte in digest {
+        buffer = (buffer << 8) | u16::from(byte);
+        bits += 8;
+        while bits >= 6 {
+            bits -= 6;
+            encoded.push(alphabet[((buffer >> bits) & 0x3f) as usize] as char);
+            buffer &= (1 << bits) - 1;
+        }
+    }
+    if bits != 0 {
+        encoded.push(alphabet[((buffer << (6 - bits)) & 0x3f) as usize] as char);
+    }
+    debug_assert_eq!(encoded.len(), 43);
+    format!("{JOURNAL_KEY_PREFIX}{encoded}")
+}
+
+/// Resolve and, when necessary, migrate an oversized legacy journal directory.
+/// This runs under the provisioning path lock: an existing legacy directory is
+/// never silently ignored in favor of a new hash key, and any discovery/migration
+/// uncertainty remains a fail-closed checkout error.
+pub(crate) fn resolve_journal_key(home: &Path, mangled: &str) -> Result<String, String> {
+    let key = journal_key(home, mangled);
+    if key == mangled {
+        return Ok(key);
+    }
+    if journal_path_length(&journal_path(home, &key)) > LEGACY_JOURNAL_PATH_MAX {
+        return Err("bounded checkout journal path exceeds the safe path limit".into());
+    }
+    let root = txn_root(home);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(key),
+        Err(e) => {
+            return Err(format!(
+                "checkout journal storage could not be inspected: {e}"
+            ))
+        }
+    };
+    let mut legacy_dir = None;
+    for entry in entries {
+        let entry =
+            entry.map_err(|e| format!("checkout journal storage could not be inspected: {e}"))?;
+        if entry.file_name().to_str() == Some(mangled) {
+            legacy_dir = Some(entry.path());
+            break;
+        }
+    }
+    let Some(legacy_dir) = legacy_dir else {
+        return Ok(key);
+    };
+    if !std::fs::symlink_metadata(&legacy_dir)
+        .map_err(|e| format!("legacy checkout journal could not be inspected: {e}"))?
+        .is_dir()
+    {
+        return Err("legacy checkout journal identity is not a directory".into());
+    }
+    let bounded_dir = root.join(&key);
+    match std::fs::symlink_metadata(&bounded_dir) {
+        Ok(_) => return Err("legacy and bounded checkout journals both exist".into()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            return Err(format!(
+                "bounded checkout journal could not be inspected: {e}"
+            ))
+        }
+    }
+    std::fs::rename(&legacy_dir, &bounded_dir)
+        .map_err(|e| format!("legacy checkout journal could not be migrated: {e}"))?;
+    Ok(key)
+}
+
+pub(crate) fn resolve_journal_key_response(
+    home: &Path,
+    mangled: &str,
+    branch: &str,
+) -> Result<String, serde_json::Value> {
+    resolve_journal_key(home, mangled).map_err(|e| {
+        serde_json::json!({
+            "error": super::checkout_helpers::redact_paths(&e),
+            "code": "stale_txn_rollback",
+            "branch": branch,
+        })
+    })
+}
+
+fn journal_path_length(path: &Path) -> usize {
+    #[cfg(windows)]
+    {
+        path.to_string_lossy().encode_utf16().count()
+    }
+    #[cfg(not(windows))]
+    {
+        path.to_string_lossy().len()
+    }
+}
+
+/// Journal file for a resolved durable directory key.
+pub(crate) fn journal_path(home: &Path, journal_key: &str) -> PathBuf {
+    txn_root(home).join(journal_key).join("journal.json")
 }
 
 /// #2755 R3 (root + independent review): QUARANTINE a corrupt journal instead of

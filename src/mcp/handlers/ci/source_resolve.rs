@@ -3,7 +3,7 @@
 //! at its file_size ceiling) so the security boundary is isolated + reviewable.
 //!
 //! A `source` is valid ONLY as:
-//!   1. an ABSOLUTE path (`/…`) or a `~`-relative home path, OR
+//!   1. an ABSOLUTE platform-native path or a `~`-relative home path, OR
 //!   2. a known AGENT NAME, resolved to that agent's `working_directory`
 //!      (the #1447 peer-workdir-by-name form).
 //!
@@ -34,7 +34,7 @@ pub(super) fn resolve_checkout_source_path(
     home: &Path,
     source: &str,
 ) -> Result<(String, PathBuf), Value> {
-    let source_path = if source.starts_with('/') || source.starts_with('~') {
+    let source_path = if Path::new(source).is_absolute() || source.starts_with('~') {
         source
             .strip_prefix("~/")
             .map(|rest| format!("{}/{rest}", crate::user_home_dir().display()))
@@ -65,10 +65,15 @@ pub(super) fn resolve_checkout_source_path(
     };
     // H2: validate source_path — reject path traversal and system paths. The
     // contracted error strings are preserved byte-for-byte (any matcher/test).
-    let source_canonical = match Path::new(&source_path).canonicalize() {
+    let source_canonical = match dunce::canonicalize(Path::new(&source_path)) {
         Ok(p) => p,
         Err(e) => return Err(json!({"error": format!("invalid source path: {e}")})),
     };
+    // Windows' filesystem canonicalizer returns `\\?\` verbatim paths. Keep
+    // all downstream checkout identities (worktree, lease, binding, journal)
+    // on the same non-verbatim spelling used by the validated canonical path.
+    #[cfg(windows)]
+    let source_path = source_canonical.display().to_string();
     if is_system_dir(&source_canonical) {
         return Err(system_dir_rejection());
     }
@@ -88,10 +93,23 @@ pub(super) fn resolve_checkout_source_path(
 
 /// The system-directory policy, applied to every path this module hands back.
 fn is_system_dir(p: &Path) -> bool {
-    p.starts_with("/etc")
+    if p.starts_with("/etc")
         || p.starts_with("/usr")
         || p.starts_with("/sys")
         || p.starts_with("/proc")
+    {
+        return true;
+    }
+    #[cfg(windows)]
+    {
+        let system_root = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("WINDIR"))
+            .and_then(|root| dunce::canonicalize(PathBuf::from(root)).ok());
+        if let Some(root) = system_root {
+            return p.starts_with(root);
+        }
+    }
+    false
 }
 
 /// The contracted rejection — error string preserved byte-for-byte (any matcher/test).
@@ -129,7 +147,7 @@ fn repo_common_dir(path: &Path) -> Option<PathBuf> {
     match out.lines().map(str::trim).collect::<Vec<_>>().as_slice() {
         // A bare repo has no working tree to admit, and its parent directory is
         // not a repo root — leave it to the existing downstream guards.
-        [common_dir, "false"] => std::fs::canonicalize(common_dir).ok(),
+        [common_dir, "false"] => dunce::canonicalize(common_dir).ok(),
         _ => None,
     }
 }
@@ -171,18 +189,14 @@ mod tests {
     /// to (pre-canonical string, canonical PathBuf) — the fix only rejects the
     /// non-absolute agent-name MISS, not absolute callers.
     ///
-    /// `#[cfg(unix)]`: the absolute arm is `/`-prefixed (Unix semantics); a Windows
-    /// drive path (`C:`-rooted) is not `/`-absolute, so the helper routes it through
-    /// the agent-name arm — the `/`-absolute path is a Unix-only contract. The input
-    /// is canonicalized FIRST so symlink resolution on CI (e.g. macOS `/var` →
-    /// `/private/var`) can't skew a literal-string comparison (cf. #2226/#2231
-    /// cross-platform test fragility — compare canonicalized forms, not raw strings).
-    #[cfg(unix)]
+    /// The input is canonicalized FIRST so symlink resolution on CI (e.g. macOS
+    /// `/var` → `/private/var`) can't skew a literal-string comparison (cf.
+    /// #2226/#2231 cross-platform test fragility — compare canonicalized forms,
+    /// not raw strings).
+    #[cfg(any(unix, windows))]
     #[test]
     fn absolute_existing_path_still_resolves_2158() {
-        let abs = std::env::temp_dir()
-            .canonicalize()
-            .expect("temp dir canonicalizes");
+        let abs = dunce::canonicalize(std::env::temp_dir()).expect("temp dir canonicalizes");
         let abs_str = abs.display().to_string();
         let (src_path, canonical) = resolve_checkout_source_path(&abs, &abs_str)
             .expect("absolute existing path must still resolve (legit arm preserved)");
@@ -193,6 +207,43 @@ mod tests {
             src_path, abs_str,
             "pre-canonical source string preserved for the caller"
         );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_absolute_source_has_non_verbatim_checkout_identity() {
+        let verbatim = std::fs::canonicalize(std::env::temp_dir())
+            .expect("temp dir canonicalizes with the Windows filesystem API");
+        assert!(
+            verbatim.to_string_lossy().starts_with(r"\\?\"),
+            "Windows regression input must exercise the verbatim form: {verbatim:?}"
+        );
+        let (source_path, canonical) =
+            resolve_checkout_source_path(&std::env::temp_dir(), &verbatim.display().to_string())
+                .expect("native absolute path must resolve");
+        assert!(!source_path.starts_with(r"\\?\"), "{source_path}");
+        assert!(
+            !canonical.to_string_lossy().starts_with(r"\\?\"),
+            "{canonical:?}"
+        );
+        assert!(
+            !source_path.contains('?'),
+            "invalid identity component: {source_path}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_system_root_is_rejected() {
+        let root = std::env::var_os("SystemRoot")
+            .or_else(|| std::env::var_os("WINDIR"))
+            .map(PathBuf::from)
+            .and_then(|path| dunce::canonicalize(path).ok())
+            .expect("Windows system root");
+        assert!(is_system_dir(&root));
+        let err = resolve_checkout_source_path(&std::env::temp_dir(), &root.display().to_string())
+            .expect_err("Windows system root must be rejected");
+        assert_eq!(err["error"], "source path rejected: system directory");
     }
 
     /// #2454 first slice: agent-name source resolution no longer needs an MCP-to-API
@@ -214,8 +265,12 @@ mod tests {
 
         let (source_path, canonical) =
             resolve_checkout_source_path(&home, "dev").expect("known agent name resolves");
+        let expected = dunce::canonicalize(&work).expect("canonical expected work");
+        #[cfg(windows)]
+        assert_eq!(source_path, expected.display().to_string());
+        #[cfg(not(windows))]
         assert_eq!(source_path, work.display().to_string());
-        assert_eq!(canonical, work.canonicalize().expect("canonical work"));
+        assert_eq!(canonical, expected);
 
         std::fs::remove_dir_all(&home).ok();
     }

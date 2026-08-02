@@ -169,12 +169,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     } else {
         None
     };
-    // #2755 INNER provisioning lock — acquired BEFORE the idempotent-reuse check
-    // and any provision so reuse AND fresh provision are both serialized on the
-    // worktree PATH (a reuse must not bypass the lock or the recursive submodule
-    // init). Declared AFTER `_lease_lock` ⇒ drops (releases) INNER-first. Journal +
-    // lock live OUTSIDE the worktree so a rollback `remove --force` can't delete
-    // the recovery record.
+    // #2755: serialize reuse and fresh provision on the target path; journal + lock
+    // remain outside the worktree so rollback cannot delete recovery state.
     let worktree_path_str = worktree_dir.display().to_string();
     let mangled = worktree_dir
         .file_name()
@@ -194,8 +190,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             })
         }
     };
-    // Revalidate the held lock maps to the EXACT target path before any side effect
-    // (fail-closed; the authority is the guard's normalized path).
+    // Revalidate the held lock against the exact target path before side effects.
     if !path_lock.guards(&worktree_dir) {
         return json!({
             "error": "provisioning lock identity does not match the target worktree path",
@@ -203,12 +198,17 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             "branch": branch,
         });
     }
+    let journal_key =
+        match super::checkout_txn::resolve_journal_key_response(home, &mangled, branch) {
+            Ok(key) => key,
+            Err(error) => return error,
+        };
     let txn_now = chrono::Utc::now();
     // Replay a journal left by a CRASHED prior provision of this path (removes a
     // stale worktree so a fresh add — or the reuse check below — sees clean state).
     if let Err(e) = super::checkout_txn::recover_stale(
         home,
-        &mangled,
+        &journal_key,
         &worktree_dir,
         &source_canonical.display().to_string(),
         txn_now,
@@ -323,7 +323,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         bind,
         txn_now.to_rfc3339(),
     );
-    if journal.save(home, &mangled).is_err() {
+    if journal.save(home, &journal_key).is_err() {
         return json!({
             "error": "could not persist checkout transaction journal",
             "code": "journal_write",
@@ -342,10 +342,10 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             // failure must roll it back or the durable record under-reports on-disk
             // state (a crash would then orphan it).
             journal.advance(super::checkout_txn::Phase::WorktreeAdded);
-            if journal.save(home, &mangled).is_err() {
+            if journal.save(home, &journal_key).is_err() {
                 let outcome = super::checkout_txn::rollback_failed(
                     home,
-                    &mangled,
+                    &journal_key,
                     &mut journal,
                     txn_now,
                     remove_worktree,
@@ -377,7 +377,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             {
                 let outcome = super::checkout_txn::rollback_failed(
                     home,
-                    &mangled,
+                    &journal_key,
                     &mut journal,
                     txn_now,
                     remove_worktree,
@@ -398,7 +398,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             if let Err(e) = sync_marker_contents(&marker_path) {
                 let outcome = super::checkout_txn::rollback_failed(
                     home,
-                    &mangled,
+                    &journal_key,
                     &mut journal,
                     txn_now,
                     remove_worktree,
@@ -417,7 +417,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             if let Err(e) = crate::store::fsync_parent_dir_checked(&marker_path) {
                 let outcome = super::checkout_txn::rollback_failed(
                     home,
-                    &mangled,
+                    &journal_key,
                     &mut journal,
                     txn_now,
                     remove_worktree,
@@ -435,10 +435,10 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 );
             }
             journal.advance(super::checkout_txn::Phase::MarkerDurable);
-            if journal.save(home, &mangled).is_err() {
+            if journal.save(home, &journal_key).is_err() {
                 let outcome = super::checkout_txn::rollback_failed(
                     home,
-                    &mangled,
+                    &journal_key,
                     &mut journal,
                     txn_now,
                     remove_worktree,
@@ -464,7 +464,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             if let Err(e) = crate::worktree::init_submodules_strict(&worktree_dir) {
                 let outcome = super::checkout_txn::rollback_failed(
                     home,
-                    &mangled,
+                    &journal_key,
                     &mut journal,
                     txn_now,
                     remove_worktree,
@@ -491,7 +491,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             if let Err(e) = crate::worktree::verify_submodules_at_gitlinks(&worktree_dir) {
                 let outcome = super::checkout_txn::rollback_failed(
                     home,
-                    &mangled,
+                    &journal_key,
                     &mut journal,
                     txn_now,
                     remove_worktree,
@@ -514,10 +514,10 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 return err;
             }
             journal.advance(super::checkout_txn::Phase::SubmodulesReady);
-            if journal.save(home, &mangled).is_err() {
+            if journal.save(home, &journal_key).is_err() {
                 let outcome = super::checkout_txn::rollback_failed(
                     home,
-                    &mangled,
+                    &journal_key,
                     &mut journal,
                     txn_now,
                     remove_worktree,
@@ -534,7 +534,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             if let Some(expected) = args["expected_head"].as_str() {
                 if let Some(err) = super::checkout_helpers::rollback_if_expected_head_drift(
                     home,
-                    &mangled,
+                    &journal_key,
                     &mut journal,
                     txn_now,
                     remove_worktree,
@@ -582,7 +582,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     // `remove --force`; bind_full failed ⇒ no binding to unbind).
                     let outcome = super::checkout_txn::rollback_failed(
                         home,
-                        &mangled,
+                        &journal_key,
                         &mut journal,
                         txn_now,
                         remove_worktree,
@@ -605,15 +605,13 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                         branch,
                     );
                 }
-                if checkout_purpose.is_none() {
-                    crate::binding::try_augment_review_lease(
-                        home,
-                        instance_name,
-                        task_id,
-                        branch,
-                        &source_canonical,
-                    );
-                }
+                crate::binding::try_augment_review_lease(
+                    home,
+                    instance_name,
+                    task_id,
+                    branch,
+                    &source_canonical,
+                );
                 bound_fingerprint =
                     match crate::binding::snapshot_guarded_binding(home, instance_name) {
                         Ok(crate::binding::GuardedBinding::Known { fingerprint, .. }) => {
@@ -625,7 +623,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                             // both binding + worktree in place for recovery.
                             let outcome = super::checkout_txn::rollback_failed(
                                 home,
-                                &mangled,
+                                &journal_key,
                                 &mut journal,
                                 txn_now,
                                 || false,
@@ -660,11 +658,11 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             // aborts into rollback (worktree + binding), never a half-visible
             // provision.
             journal.advance(super::checkout_txn::Phase::Committed);
-            if journal.save(home, &mangled).is_err() {
+            if journal.save(home, &journal_key).is_err() {
                 let fingerprint = bound_fingerprint.as_ref();
                 let outcome = super::checkout_txn::rollback_failed(
                     home,
-                    &mangled,
+                    &journal_key,
                     &mut journal,
                     txn_now,
                     || {
@@ -696,7 +694,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 );
             }
             // Committed durable ⇒ transaction resolved; drop the journal tombstone.
-            super::checkout_txn::Journal::clear(home, &mangled);
+            super::checkout_txn::Journal::clear(home, &journal_key);
             super::checkout_helpers::annotate_actual_head(
                 &mut resp,
                 args["expected_head"].as_str(),
@@ -711,7 +709,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 args["expected_head"].as_str().unwrap_or(""),
                 bind && auto_created_branch,
             );
-            super::checkout_txn::Journal::clear(home, &mangled);
+            super::checkout_txn::Journal::clear(home, &journal_key);
             let redacted = redact_paths(String::from_utf8_lossy(&o.stderr).trim());
             let mut err = json!({
                 "error": format!("git worktree add failed: {redacted}"),
@@ -732,7 +730,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 args["expected_head"].as_str().unwrap_or(""),
                 bind && auto_created_branch,
             );
-            super::checkout_txn::Journal::clear(home, &mangled);
+            super::checkout_txn::Journal::clear(home, &journal_key);
             let spawn_err = redact_paths(&e.to_string());
             let mut err = json!({
                 "error": format!("git worktree add spawn failed: {spawn_err}"),
