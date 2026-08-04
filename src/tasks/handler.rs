@@ -849,14 +849,19 @@ fn handle_done(
             )
         });
     }
-    if !force {
-        if let Err(reason) = super::assignee_completion_guard(home, &id, &caller, &record) {
-            return serde_json::json!({
-                "error": reason,
-                "code": "assignee_completion_blocked",
-            });
+    let completion_receipt = if force {
+        None
+    } else {
+        match super::assignee_completion_guard(home, &id, &caller, &record) {
+            Ok(receipt) => receipt,
+            Err(reason) => {
+                return serde_json::json!({
+                    "error": reason,
+                    "code": "assignee_completion_blocked",
+                })
+            }
         }
-    }
+    };
     // #1265: transition enforcement for done action.
     if !record
         .status
@@ -950,6 +955,7 @@ fn handle_done(
         }),
         Ok(inner) => match inner {
             Ok(Ok(_)) => {
+                super::settle_completion_receipt(home, &id, completion_receipt.as_ref());
                 // #789: task-completion is a workflow boundary —
                 // clean any empty `init` commits the backend has
                 // accumulated in the agent's bound worktree since
