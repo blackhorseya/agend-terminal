@@ -688,7 +688,9 @@ fn lexical_path_eq(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// Pure — testable without a real spawn. Lives under `$AGEND_HOME/backend-data`
 /// so the instance-delete teardown can GC it (see `full_delete_instance`).
 pub(crate) fn opencode_data_dir(home: &std::path::Path, instance: &str) -> PathBuf {
-    home.join("backend-data").join("opencode").join(instance)
+    home.join("backend-data")
+        .join("opencode")
+        .join(crate::transport::safe_component(instance))
 }
 
 /// #1519: the per-instance `XDG_DATA_HOME` to inject for an opencode spawn, or
@@ -704,6 +706,23 @@ fn per_instance_opencode_xdg(
         (Some(Backend::OpenCode), Some(h)) => Some(opencode_data_dir(h, instance)),
         _ => None,
     }
+}
+
+fn opencode_attach_command_args(
+    locator: &crate::transport::SessionLocator,
+    args: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let parsed = crate::transport::parse_opencode_model_args(args)?;
+    if let Some(model) = parsed.model.as_ref() {
+        anyhow::ensure!(
+            locator.model.as_ref() == Some(model),
+            "OpenCode session model does not match the parsed spawn argument"
+        );
+    }
+    Ok(crate::transport::opencode_attach_args(locator)?
+        .into_iter()
+        .chain(parsed.passthrough)
+        .collect())
 }
 
 /// #1519: canonical opencode `auth.json` to seed each per-instance data dir
@@ -768,9 +787,22 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         .cloned()
         .or_else(|| Backend::from_command(backend_command));
 
+    // Managed OpenCode instances are launched as clients of the durable
+    // NativeShared server/session prepared at the spawn chokepoint below.
+    // Preserve the old embedded-TUI command for unmanaged/ad-hoc spawns and
+    // for any instance that has no structured locator yet.
+    let opencode_locator = match (detected_backend.as_ref(), *home) {
+        (Some(Backend::OpenCode), Some(home)) => {
+            crate::transport::opencode_attach_locator(home, name)?
+        }
+        _ => None,
+    };
+
     // argv = preset (per spawn_mode) + caller args + backend spawn_flags.
     // Centralized here so callers don't double-apply preset args.
-    let enriched_args: Vec<String> = {
+    let enriched_args: Vec<String> = if let Some(locator) = opencode_locator.as_ref() {
+        opencode_attach_command_args(locator, args)?
+    } else {
         let preset = detected_backend
             .as_ref()
             .map(|b| b.preset_spawn_args(*spawn_mode))
@@ -976,6 +1008,17 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         cmd.env("XDG_DATA_HOME", &data_dir);
     }
 
+    if let Some(locator) = opencode_locator.as_ref() {
+        if let Some(username) = locator.username.as_deref() {
+            cmd.env("OPENCODE_SERVER_USERNAME", username);
+        }
+        if let Some(password) = locator.password.as_deref() {
+            // OpenCode attach reads this environment variable; keeping the
+            // secret out of argv also keeps it out of normal process listings.
+            cmd.env("OPENCODE_SERVER_PASSWORD", password);
+        }
+    }
+
     // #1956: disable opencode's interactive self-update prompt. opencode pops a
     // "A newer release is available. Would you like to update now?" modal on
     // startup/idle when a newer release exists — it hangs the ENTIRE pane (the
@@ -1012,10 +1055,12 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     // load-bearing flag-OFF safety, regression-pinned in `shadow::opencode` tests). An
     // alloc failure → skip injection (the agent spawns un-observed, never broken). The
     // injected port is registered so the observer supervisor knows where to subscribe.
-    if crate::daemon::shadow::opencode::should_inject(
-        detected_backend.as_ref(),
-        crate::daemon::shadow::enabled(),
-    ) {
+    if opencode_locator.is_none()
+        && crate::daemon::shadow::opencode::should_inject(
+            detected_backend.as_ref(),
+            crate::daemon::shadow::enabled(),
+        )
+    {
         if let Some(port) = crate::daemon::shadow::opencode::alloc_port() {
             cmd.arg("--port");
             cmd.arg(port.to_string());
@@ -1195,7 +1240,7 @@ pub(crate) fn spawn_agent_with_capture_home(
         name,
         backend: _,
         backend_command,
-        args: _,
+        args,
         spawn_mode: _,
         cols,
         rows,
@@ -1218,6 +1263,20 @@ pub(crate) fn spawn_agent_with_capture_home(
             anyhow::bail!(
                 "#1915: refusing to spawn '{name}' — instance is mid-delete (deleting-set chokepoint)"
             );
+        }
+    }
+
+    // OpenCode NativeShared owns the server/session handshake before the PTY
+    // exists. The resulting attach locator is then consumed by `build_command`,
+    // so the visible TUI and daemon prompt_async deliveries share one session.
+    // A declared OpenCode identity may intentionally use a wrapper command
+    // (the capability/model tests do this); only a real OpenCode command may
+    // be replaced by the attach subcommand and managed server lifecycle.
+    let is_opencode = Backend::from_command(backend_command)
+        .is_some_and(|backend| matches!(backend, Backend::OpenCode));
+    if is_opencode {
+        if let Some(home_path) = *home {
+            crate::transport::prepare_opencode_tui_session(home_path, name, *working_dir, args)?;
         }
     }
 

@@ -1,8 +1,10 @@
 use super::codex_app_server::CodexNativeShared;
 use super::envelope::{DeliveryEnvelope, DeliveryKind, SessionLocator};
 use super::legacy_pty::{LegacyPty, PtyInjector};
+use super::opencode_server::OpenCodeNativeShared;
 use super::{DeliveryReceipt, TransportMode};
 use crate::backend::Backend;
+use base64::Engine as _;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,10 +23,8 @@ pub(crate) fn backend_for_instance(home: &Path, instance: &str) -> Option<Backen
 
 pub(crate) fn mode_for_backend(backend: &Backend) -> TransportMode {
     match backend {
-        Backend::Codex => TransportMode::NativeShared,
-        // OpenCode and Claude are deliberately not implemented in this PR.
+        Backend::Codex | Backend::OpenCode => TransportMode::NativeShared,
         Backend::ClaudeCode
-        | Backend::OpenCode
         | Backend::Grok
         | Backend::KiroCli
         | Backend::Agy
@@ -70,7 +70,6 @@ fn session_path(home: &Path, instance: &str) -> PathBuf {
         .join(format!("{}.json", super::receipt::safe_component(instance)))
 }
 
-#[cfg(unix)]
 pub(crate) fn save_session_locator(
     home: &Path,
     instance: &str,
@@ -79,9 +78,55 @@ pub(crate) fn save_session_locator(
     let path = session_path(home, instance);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        }
     }
     let bytes = serde_json::to_vec_pretty(locator)?;
-    crate::store::atomic_write(&path, &bytes)
+    secure_atomic_write(&path, &bytes)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn secure_atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    use uuid::Uuid;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("session locator has no parent directory"))?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("locator.json");
+    let temp = parent.join(format!(".{file_name}.tmp-{}", Uuid::new_v4()));
+    let result = (|| -> anyhow::Result<()> {
+        let mut file = OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)?;
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        std::fs::set_permissions(&temp, std::fs::Permissions::from_mode(0o600))?;
+        std::fs::rename(&temp, path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        crate::store::fsync_parent_dir(path);
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
+}
+
+#[cfg(not(unix))]
+fn secure_atomic_write(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
+    crate::store::atomic_write(path, bytes)
 }
 
 pub(crate) fn load_session_locator(home: &Path, instance: &str) -> anyhow::Result<SessionLocator> {
@@ -107,6 +152,42 @@ fn default_codex_locator(home: &Path, instance: &str) -> SessionLocator {
     SessionLocator::codex(endpoint, thread_id)
 }
 
+fn default_opencode_locator(home: &Path, instance: &str) -> anyhow::Result<SessionLocator> {
+    let endpoint = match std::env::var("AGEND_OPENCODE_SERVER_URL") {
+        Ok(endpoint) => endpoint,
+        Err(_) => {
+            let listener = std::net::TcpListener::bind(("127.0.0.1", 0))?;
+            let port = listener.local_addr()?.port();
+            drop(listener);
+            format!("http://127.0.0.1:{port}")
+        }
+    };
+    let session_id = std::env::var("AGEND_OPENCODE_SESSION_ID").ok();
+    let username =
+        std::env::var("AGEND_OPENCODE_SERVER_USERNAME").unwrap_or_else(|_| "opencode".to_string());
+    let external = std::env::var("AGEND_OPENCODE_EXTERNAL").ok().as_deref() == Some("1");
+    let password = std::env::var("AGEND_OPENCODE_SERVER_PASSWORD")
+        .ok()
+        .or_else(|| {
+            if external {
+                return None;
+            }
+            let mut bytes = [0_u8; 32];
+            getrandom::fill(&mut bytes).expect("OS randomness is required for OpenCode auth");
+            Some(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+        });
+    let mut locator = SessionLocator::opencode(
+        endpoint,
+        session_id,
+        username,
+        password.clone().unwrap_or_default(),
+    );
+    locator.password = password;
+    locator.managed = !external;
+    let _ = (home, instance);
+    Ok(locator)
+}
+
 fn locator_for_instance(
     home: &Path,
     instance: &str,
@@ -121,9 +202,10 @@ fn locator_for_instance(
                 "NativeShared session locator is not a regular file: {}",
                 path.display()
             )),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(default_codex_locator(home, instance))
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match backend {
+                Some(Backend::OpenCode) => default_opencode_locator(home, instance),
+                _ => Ok(default_codex_locator(home, instance)),
+            },
             Err(error) => Err(anyhow::anyhow!(
                 "NativeShared session locator cannot be inspected at {}: {error}",
                 path.display()
@@ -138,7 +220,73 @@ fn locator_for_instance(
         endpoint: None,
         thread_id: None,
         session_id: None,
+        endpoint_url: None,
+        username: None,
+        password: None,
+        model: None,
+        event_cursor: None,
+        managed: false,
+        server_pid: None,
+        server_start_token: None,
     })
+}
+
+pub(crate) fn opencode_attach_locator(
+    home: &Path,
+    instance: &str,
+) -> anyhow::Result<Option<SessionLocator>> {
+    let path = session_path(home, instance);
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {
+            let locator = load_session_locator(home, instance)?;
+            if locator.backend == "opencode" {
+                Ok(Some(locator))
+            } else {
+                Ok(None)
+            }
+        }
+        Ok(_) => Err(anyhow::anyhow!(
+            "OpenCode session locator is not a regular file: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow::anyhow!(
+            "OpenCode session locator cannot be inspected at {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+pub(crate) fn opencode_attach_args(locator: &SessionLocator) -> anyhow::Result<Vec<String>> {
+    OpenCodeNativeShared::attach_args(locator)
+}
+
+pub(crate) fn prepare_opencode_tui_session(
+    home: &Path,
+    instance: &str,
+    working_dir: Option<&Path>,
+    args: &[String],
+) -> anyhow::Result<SessionLocator> {
+    let mut locator = locator_for_instance(
+        home,
+        instance,
+        Some(&Backend::OpenCode),
+        TransportMode::NativeShared,
+    )?;
+    if let Some(model) = parse_opencode_model_args(args)?.model {
+        locator.model = Some(model);
+    }
+    super::opencode_server::prepare_resident_tui(home, instance, locator, working_dir)
+}
+
+pub(crate) fn parse_opencode_model_args(
+    args: &[String],
+) -> anyhow::Result<crate::backend_model::ParsedModelArgs> {
+    Backend::OpenCode
+        .model_capability()
+        .ok_or_else(|| anyhow::anyhow!("OpenCode model capability is unavailable"))?
+        .parse(args)
+        .map_err(|error| anyhow::anyhow!("invalid OpenCode model argument: {error}"))
 }
 
 pub(crate) fn envelope_for_instance(
@@ -191,10 +339,16 @@ where
     let mode = mode_for_instance(home, instance);
     let envelope = envelope_for_instance(home, instance, body)?;
     match mode {
-        TransportMode::NativeShared => {
-            let mut adapter = CodexNativeShared::new(home, instance);
-            adapter.deliver_blocking(envelope)
-        }
+        TransportMode::NativeShared => match envelope.session.backend.as_str() {
+            "codex" => {
+                let mut adapter = CodexNativeShared::new(home, instance);
+                adapter.deliver_blocking(envelope)
+            }
+            "opencode" => super::opencode_server::deliver_resident(home, instance, envelope),
+            backend => Err(anyhow::anyhow!(
+                "NativeShared backend {backend:?} has no registered adapter"
+            )),
+        },
         TransportMode::LegacyPty => {
             let injector: PtyInjector = Arc::new(legacy_injector);
             let mut adapter = LegacyPty::new(home, instance, injector);
@@ -322,6 +476,66 @@ mod tests {
         });
         assert!(result.is_err());
         assert_eq!(pty_calls.load(Ordering::SeqCst), 0);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn opencode_model_arg_contract_matches_declared_backend_policy() {
+        assert_eq!(
+            parse_opencode_model_args(&["--model=anthropic/opus".to_string()])
+                .expect("long model")
+                .model,
+            Some("anthropic/opus".to_string())
+        );
+        assert_eq!(
+            parse_opencode_model_args(&["-m".to_string(), "openai/gpt-5".to_string()])
+                .expect("short model")
+                .model,
+            Some("openai/gpt-5".to_string())
+        );
+        assert!(parse_opencode_model_args(&["-m=openai/gpt-5".to_string()]).is_err());
+        assert!(parse_opencode_model_args(&["-mopenai/gpt-5".to_string()]).is_err());
+        assert!(parse_opencode_model_args(&[
+            "--model".to_string(),
+            "--".to_string(),
+            "payload".to_string(),
+        ])
+        .is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn session_locator_and_parent_are_private_before_secret_is_persisted() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-private-locator-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let locator = SessionLocator::opencode(
+            "http://127.0.0.1:4096".to_string(),
+            Some("session".to_string()),
+            "opencode".to_string(),
+            "secret".to_string(),
+        );
+        save_session_locator(&home, "agent", &locator).expect("save locator");
+        let path = session_path(&home, "agent");
+        assert_eq!(
+            std::fs::metadata(&path)
+                .expect("locator metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o600
+        );
+        assert_eq!(
+            std::fs::metadata(path.parent().expect("parent"))
+                .expect("parent metadata")
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
         let _ = std::fs::remove_dir_all(home);
     }
 }

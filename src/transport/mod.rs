@@ -7,18 +7,31 @@
 mod codex_app_server;
 mod envelope;
 mod legacy_pty;
+mod opencode_server;
 mod receipt;
 mod registry;
 
 pub(crate) use envelope::{DeliveryEnvelope, DeliveryKind, SessionLocator};
 pub(crate) use receipt::{
-    delivery_path_for_instance, remove_instance_delivery_state, DeliveryReceipt, DeliveryState,
-    ReceiptStore,
+    delivery_path_for_instance, safe_component, DeliveryReceipt, DeliveryState, ReceiptStore,
 };
 #[cfg(test)]
 pub(crate) use registry::mode_for_backend;
 
 pub(crate) use registry::{deliver_notification, record_delivery_drop};
+
+pub(crate) use registry::{
+    opencode_attach_args, opencode_attach_locator, parse_opencode_model_args,
+    prepare_opencode_tui_session,
+};
+
+pub(crate) fn remove_instance_delivery_state(
+    home: &std::path::Path,
+    instance: &str,
+) -> anyhow::Result<()> {
+    opencode_server::stop_instance_server(home, instance);
+    receipt::remove_instance_delivery_state(home, instance)
+}
 
 /// Explicit transport selected for a backend instance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -103,9 +116,12 @@ mod tests {
             mode_for_backend(&Backend::Codex),
             TransportMode::NativeShared
         );
+        assert_eq!(
+            mode_for_backend(&Backend::OpenCode),
+            TransportMode::NativeShared
+        );
         for backend in [
             Backend::ClaudeCode,
-            Backend::OpenCode,
             Backend::Grok,
             Backend::KiroCli,
             Backend::Agy,
