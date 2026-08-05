@@ -1,22 +1,23 @@
 //! AUDIT2-006: bounded delivery worker.
 //!
 //! The daemon's main tick / `run_core` loop emits events and, via the event bus
-//! subscribers, delivers notifications by injecting into agent PTYs and sending
-//! Telegram messages. Both are BLOCKING I/O: a Telegram network black-hole (no
-//! local request timeout) or a slow PTY readback would otherwise park the tick
-//! thread — stalling the hang-detection, recovery-dispatcher and crash handling
-//! that share that one thread.
+//! subscribers, delivers notifications by injecting into agent PTYs, using a
+//! structured backend protocol, and sending Telegram messages. All are
+//! BLOCKING I/O: a Telegram network black-hole (no local request timeout), a
+//! slow PTY readback, or a backend handshake/RPC wait would otherwise park the
+//! tick thread — stalling the hang-detection, recovery-dispatcher and crash
+//! handling that share that one thread.
 //!
-//! This module offloads ONLY the blocking *wake* effect (the physical PTY poke
-//! and the Telegram send) onto a single bounded background worker. Durable
-//! source-of-truth writes (inbox JSONL, `notification_queue`, schedule
-//! `run_history`) stay SYNCHRONOUS on the caller — a notification is a wakeup,
-//! not a commit barrier. `event_bus::emit`'s handled-count is unaffected: it is
-//! decided by the synchronous kind-match inside each subscriber, BEFORE any
-//! delivery is enqueued (see `event_bus.rs`).
+//! This module offloads the blocking delivery effect (physical PTY poke,
+//! structured backend delivery, and Telegram send) onto a single bounded
+//! background worker. Durable source-of-truth writes (inbox JSONL,
+//! `notification_queue`, schedule `run_history`) stay SYNCHRONOUS on the caller
+//! — a notification is a wakeup, not a commit barrier. `event_bus::emit`'s
+//! handled-count is unaffected: it is decided by the synchronous kind-match
+//! inside each subscriber, BEFORE any delivery is enqueued (see `event_bus.rs`).
 //!
-//! Backpressure: a bounded `sync_channel(QUEUE_CAP)`; [`enqueue_pty_wake`] /
-//! [`enqueue_telegram_send`] use `try_send` and NEVER block. On a full queue the
+//! Backpressure: a bounded `sync_channel(QUEUE_CAP)`; transport and Telegram
+//! enqueue functions use `try_send` and NEVER block. On a full queue the
 //! job is dropped and the caller is told (`Err(())`) so it can record the drop
 //! where it owns a durable status (cron → `drop_queue_full`; Telegram → evict the
 //! dedup claim so a later identical emit isn't suppressed for the whole TTL).
@@ -31,6 +32,8 @@
 //! line latency becomes real after the Telegram request timeout lands, split into
 //! lanes (one Telegram, one PTY) later — not now.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::OnceLock;
 
@@ -41,13 +44,13 @@ const QUEUE_CAP: usize = 256;
 
 /// A unit of blocking delivery work offloaded off the tick / main-loop thread.
 enum DeliveryJob {
-    /// Physical submit-aware PTY inject — the `inbox::notify::inject_with_submit`
-    /// primitive (an `api::call(INJECT)` loopback). The worker calls the `_direct`
-    /// primitive, NEVER the offload wrapper, so there is no recursive re-enqueue.
-    PtyWake {
-        home: std::path::PathBuf,
+    /// A selected transport delivery. LegacyPty performs its physical wake
+    /// directly from this worker; it never enqueues a second physical wake job.
+    TransportDelivery {
+        home: PathBuf,
         agent: String,
         notification: String,
+        epoch: u64,
     },
     /// A Telegram send whose dedup claim was already recorded on the caller
     /// thread (see `channel::telegram::notify`). On terminal send failure the
@@ -95,6 +98,50 @@ struct DeliveryWorker {
     tx: SyncSender<DeliveryJob>,
 }
 
+struct TransportCoordinator {
+    serial: parking_lot::Mutex<()>,
+    epochs: parking_lot::Mutex<HashMap<(PathBuf, String), u64>>,
+}
+
+fn transport_coordinator() -> &'static TransportCoordinator {
+    static COORDINATOR: OnceLock<TransportCoordinator> = OnceLock::new();
+    COORDINATOR.get_or_init(|| TransportCoordinator {
+        serial: parking_lot::Mutex::new(()),
+        epochs: parking_lot::Mutex::new(HashMap::new()),
+    })
+}
+
+fn transport_epoch(home: &Path, agent: &str) -> u64 {
+    let key = (home.to_path_buf(), agent.to_string());
+    let mut epochs = transport_coordinator().epochs.lock();
+    *epochs.entry(key).or_insert(0)
+}
+
+fn bump_transport_epoch(home: &Path, agent: &str) {
+    let key = (home.to_path_buf(), agent.to_string());
+    let mut epochs = transport_coordinator().epochs.lock();
+    let epoch = epochs.entry(key).or_insert(0);
+    *epoch = epoch.saturating_add(1);
+}
+
+pub(crate) struct TransportCleanupGuard {
+    _serial: parking_lot::MutexGuard<'static, ()>,
+    key: (PathBuf, String),
+}
+
+/// Invalidate queued transport work and hold the transport lane through
+/// teardown. The epoch bump at drop also invalidates jobs enqueued while the
+/// deletion guard was held, so a late worker dequeue cannot recreate receipts.
+pub(crate) fn begin_transport_cleanup(home: &Path, agent: &str) -> TransportCleanupGuard {
+    let coordinator = transport_coordinator();
+    let serial = coordinator.serial.lock();
+    bump_transport_epoch(home, agent);
+    TransportCleanupGuard {
+        _serial: serial,
+        key: (home.to_path_buf(), agent.to_string()),
+    }
+}
+
 fn global() -> &'static DeliveryWorker {
     static WORKER: OnceLock<DeliveryWorker> = OnceLock::new();
     WORKER.get_or_init(|| {
@@ -127,16 +174,43 @@ fn worker_loop(rx: Receiver<DeliveryJob>) {
 
 fn dispatch(job: DeliveryJob) {
     match job {
-        DeliveryJob::PtyWake {
+        DeliveryJob::TransportDelivery {
             home,
             agent,
             notification,
+            epoch,
         } => {
-            if let Err(e) =
-                crate::inbox::notify::inject_with_submit_direct(&home, &agent, &notification)
+            let _serial = transport_coordinator().serial.lock();
+            if crate::agent::deleting::is_deleting(&home, &agent)
+                || transport_epoch(&home, &agent) != epoch
             {
-                tracing::debug!(agent = %agent, error = %e, "delivery_worker: PTY wake inject failed");
+                #[cfg(test)]
+                test_support::note_transport_dispatch_complete(&home, &agent);
+                tracing::debug!(
+                    agent = %agent,
+                    "delivery_worker: discarded stale transport delivery during teardown"
+                );
+                return;
             }
+            let result = crate::transport::deliver_notification(
+                &home,
+                &agent,
+                &notification,
+                |home, agent, text| {
+                    #[cfg(test)]
+                    test_support::note_legacy_wake(agent);
+                    crate::inbox::notify::inject_with_submit_direct(home, agent, text)
+                },
+            );
+            if let Err(error) = result {
+                tracing::debug!(
+                    agent = %agent,
+                    error = %error,
+                    "delivery_worker: structured transport delivery failed"
+                );
+            }
+            #[cfg(test)]
+            test_support::note_transport_dispatch_complete(&home, &agent);
         }
         DeliveryJob::TelegramSend(job) => {
             crate::channel::telegram::notify::send_telegram_job(job);
@@ -193,19 +267,26 @@ fn dispatch(job: DeliveryJob) {
     }
 }
 
-/// Offload a physical submit-aware PTY wake. Returns `Err(())` when the bounded
-/// queue is full — the wake is dropped and the caller owns whether/how to record
-/// that (most notify callers discard the result; a WARN is emitted internally).
-pub(crate) fn enqueue_pty_wake(
-    home: &std::path::Path,
+/// Enqueue a complete backend transport delivery. The bounded queue is the
+/// caller-facing non-blocking boundary; structured handshakes and protocol
+/// waits happen only in [`dispatch`] on the worker thread.
+pub(crate) fn enqueue_transport_delivery(
+    home: &Path,
     agent: &str,
     notification: &str,
 ) -> Result<(), ()> {
-    try_enqueue(DeliveryJob::PtyWake {
+    try_enqueue(DeliveryJob::TransportDelivery {
         home: home.to_path_buf(),
         agent: agent.to_string(),
         notification: notification.to_string(),
+        epoch: transport_epoch(home, agent),
     })
+}
+
+impl Drop for TransportCleanupGuard {
+    fn drop(&mut self) {
+        bump_transport_epoch(&self.key.0, &self.key.1);
+    }
 }
 
 /// Offload a Telegram send whose dedup claim was already recorded on the caller
@@ -288,7 +369,19 @@ pub(crate) mod test_support {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     static FORCE_FULL: AtomicBool = AtomicBool::new(false);
+    static LEGACY_WAKE_COUNT: std::sync::atomic::AtomicUsize =
+        std::sync::atomic::AtomicUsize::new(0);
     static FF_LOCK: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+    static TRANSPORT_COMPLETIONS: std::sync::OnceLock<
+        parking_lot::Mutex<std::collections::HashMap<(std::path::PathBuf, String), usize>>,
+    > = std::sync::OnceLock::new();
+
+    fn transport_completions(
+    ) -> &'static parking_lot::Mutex<std::collections::HashMap<(std::path::PathBuf, String), usize>>
+    {
+        TRANSPORT_COMPLETIONS
+            .get_or_init(|| parking_lot::Mutex::new(std::collections::HashMap::new()))
+    }
 
     /// Force every `try_enqueue` to behave as if the bounded queue were full,
     /// WITHOUT actually filling 256 slots — lets callers unit-test the drop /
@@ -303,6 +396,35 @@ pub(crate) mod test_support {
     /// toggle→assert→reset window. Every force-full test MUST hold it.
     pub(crate) fn force_full_guard() -> parking_lot::MutexGuard<'static, ()> {
         FF_LOCK.lock()
+    }
+
+    pub(crate) fn note_legacy_wake(agent: &str) {
+        if agent == "legacy-agent" {
+            LEGACY_WAKE_COUNT.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    pub(crate) fn reset_legacy_wake_count() {
+        LEGACY_WAKE_COUNT.store(0, Ordering::SeqCst);
+    }
+
+    pub(crate) fn legacy_wake_count() -> usize {
+        LEGACY_WAKE_COUNT.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn note_transport_dispatch_complete(home: &std::path::Path, agent: &str) {
+        let key = (home.to_path_buf(), agent.to_string());
+        let mut completions = transport_completions().lock();
+        *completions.entry(key).or_default() += 1;
+    }
+
+    pub(crate) fn transport_dispatch_count(home: &std::path::Path, agent: &str) -> usize {
+        let key = (home.to_path_buf(), agent.to_string());
+        transport_completions()
+            .lock()
+            .get(&key)
+            .copied()
+            .unwrap_or(0)
     }
 
     pub(super) fn force_full() -> bool {
@@ -320,10 +442,10 @@ mod tests {
     #[test]
     fn enqueue_is_nonblocking_and_drops_when_full() {
         let _ff = test_support::force_full_guard();
-        // Healthy queue: a PTY wake enqueues without blocking.
+        // Healthy queue: a transport delivery enqueues without blocking.
         test_support::set_force_full(false);
         assert!(
-            enqueue_pty_wake(std::path::Path::new("/tmp/aw"), "agentA", "ping").is_ok(),
+            enqueue_transport_delivery(std::path::Path::new("/tmp/aw"), "agentA", "ping").is_ok(),
             "a non-full delivery queue must accept the wake without blocking"
         );
 
@@ -331,7 +453,7 @@ mod tests {
         // owns recording the drop. No block, no panic.
         test_support::set_force_full(true);
         assert!(
-            enqueue_pty_wake(std::path::Path::new("/tmp/aw"), "agentA", "ping").is_err(),
+            enqueue_transport_delivery(std::path::Path::new("/tmp/aw"), "agentA", "ping").is_err(),
             "AUDIT2-006: a full delivery queue must drop (Err), never block the tick thread"
         );
         test_support::set_force_full(false);
@@ -357,5 +479,164 @@ mod tests {
             "a full delivery queue must drop the page (Err), never block the monitor"
         );
         test_support::set_force_full(false);
+    }
+
+    /// A missing Codex endpoint must not make the caller wait for the
+    /// structured adapter's readiness timeout; only the worker may perform it.
+    #[test]
+    fn transport_delivery_enqueue_is_nonblocking_for_unavailable_codex() {
+        let _ff = test_support::force_full_guard();
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-worker-codex-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  codex-agent:\n    backend: codex\n",
+        )
+        .expect("fleet");
+        let started = std::time::Instant::now();
+        assert!(enqueue_transport_delivery(&home, "codex-agent", "ping").is_ok());
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(500),
+            "transport enqueue must not run Codex readiness on the caller thread"
+        );
+        // The daemon-lifetime worker may still be consuming this job; keep the
+        // unique home available until its best-effort read has finished.
+    }
+
+    #[test]
+    fn legacy_transport_delivery_executes_one_physical_wake_on_worker() {
+        let _ff = test_support::force_full_guard();
+        test_support::set_force_full(true);
+        test_support::reset_legacy_wake_count();
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-worker-legacy-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  legacy-agent:\n    backend: claude\n",
+        )
+        .expect("fleet");
+        dispatch(DeliveryJob::TransportDelivery {
+            home: home.clone(),
+            agent: "legacy-agent".to_string(),
+            notification: "one logical wake".to_string(),
+            epoch: transport_epoch(&home, "legacy-agent"),
+        });
+        assert_eq!(
+            test_support::legacy_wake_count(),
+            1,
+            "LegacyPty must make one physical wake on the existing worker lane"
+        );
+        test_support::set_force_full(false);
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn stale_transport_delivery_cannot_recreate_receipts_after_cleanup() {
+        let _ff = test_support::force_full_guard();
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-worker-teardown-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let agent = "legacy-agent";
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  legacy-agent:\n    backend: claude\n",
+        )
+        .expect("fleet");
+
+        let stale_epoch = transport_epoch(&home, agent);
+        let cleanup = begin_transport_cleanup(&home, agent);
+        assert!(try_enqueue(DeliveryJob::TransportDelivery {
+            home: home.clone(),
+            agent: agent.to_string(),
+            notification: "stale teardown wake".to_string(),
+            epoch: stale_epoch,
+        })
+        .is_ok());
+        drop(cleanup);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while test_support::transport_dispatch_count(&home, agent) == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            test_support::transport_dispatch_count(&home, agent),
+            1,
+            "the queued stale delivery must be processed by the worker before inspecting state"
+        );
+
+        let delivery_path = crate::transport::delivery_path_for_instance(&home, agent);
+        assert!(
+            !delivery_path.exists(),
+            "teardown must prevent stale worker delivery from recreating the receipt body"
+        );
+        assert!(
+            !delivery_path.with_extension("jsonl.lock").exists(),
+            "teardown must prevent stale worker delivery from recreating the receipt lock"
+        );
+        assert!(
+            !delivery_path.parent().is_some_and(std::path::Path::exists),
+            "teardown must leave no delivery directory after a stale worker delivery"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn delivery_enqueued_during_teardown_cannot_resurrect_receipts() {
+        let _ff = test_support::force_full_guard();
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-worker-teardown-window-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let agent = "legacy-agent";
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  legacy-agent:\n    backend: claude\n",
+        )
+        .expect("fleet");
+
+        let cleanup = begin_transport_cleanup(&home, agent);
+        assert!(enqueue_transport_delivery(&home, agent, "wake during teardown").is_ok());
+        crate::transport::remove_instance_delivery_state(&home, agent).expect("cleanup");
+        drop(cleanup);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while test_support::transport_dispatch_count(&home, agent) == 0
+            && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert_eq!(
+            test_support::transport_dispatch_count(&home, agent),
+            1,
+            "the delivery enqueued during teardown must be processed before inspecting state"
+        );
+
+        let delivery_path = crate::transport::delivery_path_for_instance(&home, agent);
+        assert!(
+            !delivery_path.exists(),
+            "a delivery enqueued during teardown must not resurrect the receipt body"
+        );
+        assert!(
+            !delivery_path.with_extension("jsonl.lock").exists(),
+            "a delivery enqueued during teardown must not resurrect the receipt lock"
+        );
+        assert!(
+            !delivery_path.parent().is_some_and(std::path::Path::exists),
+            "a delivery enqueued during teardown must leave no delivery directory"
+        );
+
+        let _ = std::fs::remove_dir_all(home);
     }
 }
