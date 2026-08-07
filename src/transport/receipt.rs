@@ -12,6 +12,8 @@ use uuid::Uuid;
 /// the latest receipt, while dropping superseded metadata records.
 const MAX_RECEIPT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_RETAINED_DELIVERIES: usize = 1024;
+const OPENCODE_MESSAGE_ID_PREFIX: &str = "msg_";
+const OPENCODE_MESSAGE_ID_NATIVE_SUFFIX_LEN: usize = 12 + 14;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) enum DeliveryState {
@@ -74,6 +76,21 @@ struct DurableRecord {
 #[derive(Debug, Clone)]
 pub(crate) struct ReceiptStore {
     path: PathBuf,
+}
+
+fn is_native_opencode_protocol_request_id(value: &str) -> bool {
+    let Some(suffix) = value.strip_prefix(OPENCODE_MESSAGE_ID_PREFIX) else {
+        return false;
+    };
+    let Some(timestamp) = suffix.get(..12) else {
+        return false;
+    };
+    let Some(random) = suffix.get(12..) else {
+        return false;
+    };
+    suffix.len() == OPENCODE_MESSAGE_ID_NATIVE_SUFFIX_LEN
+        && timestamp.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && random.bytes().all(|byte| byte.is_ascii_alphanumeric())
 }
 
 impl ReceiptStore {
@@ -165,6 +182,56 @@ impl ReceiptStore {
                 Some((envelope?, receipt))
             })
             .collect())
+    }
+
+    pub(crate) fn latest_opencode_protocol_request_id_for_session(
+        &self,
+        session_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let _lock = crate::store::acquire_file_lock(&self.lock_path())?;
+        restrict_permissions(&self.lock_path(), 0o600)?;
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        restrict_permissions(&self.path, 0o600)?;
+        let file = File::open(&self.path)?;
+        let records = BufReader::new(file)
+            .lines()
+            .map(|line| -> anyhow::Result<DurableRecord> { Ok(serde_json::from_str(&line?)?) })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        let sessions = records
+            .iter()
+            .filter_map(|record| {
+                record.envelope.as_ref().and_then(|envelope| {
+                    envelope
+                        .session
+                        .session_id
+                        .as_ref()
+                        .map(|session_id| (record.receipt.delivery_id, session_id.clone()))
+                })
+            })
+            .collect::<HashMap<_, _>>();
+        let mut latest = None;
+        for record in records {
+            let Some(request_id) = record.receipt.protocol_request_id.as_deref() else {
+                continue;
+            };
+            if sessions
+                .get(&record.receipt.delivery_id)
+                .map(String::as_str)
+                != Some(session_id)
+                || !is_native_opencode_protocol_request_id(request_id)
+            {
+                continue;
+            }
+            if latest
+                .as_deref()
+                .is_none_or(|current: &str| request_id > current)
+            {
+                latest = Some(request_id.to_string());
+            }
+        }
+        Ok(latest)
     }
 
     fn append(&self, record: DurableRecord) -> anyhow::Result<()> {
@@ -456,6 +523,177 @@ mod tests {
                 0o600
             );
         }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn protocol_request_id_survives_terminal_compaction_and_reload() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-receipt-protocol-id-{}",
+            Uuid::new_v4()
+        ));
+        let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+        let body_padding = "x".repeat(120_000);
+        for index in 0..40 {
+            let envelope = DeliveryEnvelope::new(
+                "agent",
+                SessionLocator::codex(PathBuf::from("/tmp/sock"), Some("thread".to_string())),
+                DeliveryKind::Prompt,
+                format!("filler-{index}-{body_padding}"),
+                None,
+            );
+            store.record_queued(&envelope).expect("filler queued");
+            store
+                .record(DeliveryReceipt::for_state(
+                    &envelope,
+                    DeliveryState::Completed,
+                ))
+                .expect("filler completed");
+        }
+
+        let target = DeliveryEnvelope::new(
+            "agent",
+            SessionLocator::opencode(
+                "http://127.0.0.1:4096".to_string(),
+                Some("thread".to_string()),
+                "opencode".to_string(),
+                "secret".to_string(),
+            ),
+            DeliveryKind::Prompt,
+            format!("target-{body_padding}"),
+            None,
+        );
+        let protocol_request_id = "msg_fdb5a96c3001auuSsUN6in29xP".to_string();
+        store.record_queued(&target).expect("target queued");
+        let mut accepted = DeliveryReceipt::for_state(&target, DeliveryState::ProtocolAccepted);
+        accepted.protocol_request_id = Some(protocol_request_id.clone());
+        store.record(accepted).expect("target accepted");
+        let mut completed = DeliveryReceipt::for_state(&target, DeliveryState::Completed);
+        completed.protocol_request_id = Some(protocol_request_id.clone());
+        store.record(completed).expect("target completed");
+
+        let tail = DeliveryEnvelope::new(
+            "agent",
+            SessionLocator::opencode(
+                "http://127.0.0.1:4096".to_string(),
+                Some("thread".to_string()),
+                "opencode".to_string(),
+                "secret".to_string(),
+            ),
+            DeliveryKind::Prompt,
+            format!("tail-{body_padding}"),
+            None,
+        );
+        store.record_queued(&tail).expect("tail queued");
+        store
+            .record(DeliveryReceipt::for_state(&tail, DeliveryState::Completed))
+            .expect("tail completed");
+
+        let reloaded = ReceiptStore::for_instance(&home, "agent").expect("reload store");
+        assert_eq!(
+            reloaded
+                .latest(target.delivery_id)
+                .expect("latest target")
+                .expect("target receipt")
+                .state,
+            DeliveryState::Completed
+        );
+        assert_eq!(
+            reloaded
+                .latest_opencode_protocol_request_id_for_session("thread")
+                .expect("latest protocol request id"),
+            Some(protocol_request_id)
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn opencode_seed_lookup_scopes_session_and_ignores_legacy_ids_after_reload() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-receipt-opencode-seed-{}",
+            Uuid::new_v4()
+        ));
+        let store = ReceiptStore::for_instance(&home, "agent").expect("store");
+        let body_padding = "x".repeat(120_000);
+        for index in 0..40 {
+            let envelope = DeliveryEnvelope::new(
+                "agent",
+                SessionLocator::opencode(
+                    "http://127.0.0.1:4096".to_string(),
+                    Some("session-a".to_string()),
+                    "opencode".to_string(),
+                    "secret".to_string(),
+                ),
+                DeliveryKind::Prompt,
+                format!("filler-{index}-{body_padding}"),
+                None,
+            );
+            store.record_queued(&envelope).expect("filler queued");
+            store
+                .record(DeliveryReceipt::for_state(
+                    &envelope,
+                    DeliveryState::Completed,
+                ))
+                .expect("filler completed");
+        }
+
+        let record_request = |session_id: &str, request_id: &str| {
+            let envelope = DeliveryEnvelope::new(
+                "agent",
+                SessionLocator::opencode(
+                    "http://127.0.0.1:4096".to_string(),
+                    Some(session_id.to_string()),
+                    "opencode".to_string(),
+                    "secret".to_string(),
+                ),
+                DeliveryKind::Prompt,
+                format!("request-{session_id}-{request_id}-{body_padding}"),
+                None,
+            );
+            store.record_queued(&envelope)?;
+            let mut receipt = DeliveryReceipt::for_state(&envelope, DeliveryState::Completed);
+            receipt.protocol_request_id = Some(request_id.to_string());
+            store.record(receipt)
+        };
+        let legacy = "msg_ffffffffffffffffffffffffffffffff";
+        let session_a_low = "msg_fdb5a96c3001auuSsUN6in29xP";
+        let session_a_high = "msg_fdb5a96c3002auuSsUN6in29xP";
+        let session_b_high = "msg_fdb5a96c4000auuSsUN6in29xP";
+        record_request("session-a", legacy).expect("legacy request");
+        record_request("session-a", session_a_low).expect("low request");
+        record_request("session-a", session_a_high).expect("high request");
+        record_request("session-b", session_b_high).expect("other-session request");
+
+        let tail = DeliveryEnvelope::new(
+            "agent",
+            SessionLocator::opencode(
+                "http://127.0.0.1:4096".to_string(),
+                Some("session-a".to_string()),
+                "opencode".to_string(),
+                "secret".to_string(),
+            ),
+            DeliveryKind::Prompt,
+            format!("tail-{body_padding}"),
+            None,
+        );
+        store.record_queued(&tail).expect("tail queued");
+        store
+            .record(DeliveryReceipt::for_state(&tail, DeliveryState::Completed))
+            .expect("tail completed");
+
+        let reloaded = ReceiptStore::for_instance(&home, "agent").expect("reload store");
+        assert_eq!(
+            reloaded
+                .latest_opencode_protocol_request_id_for_session("session-a")
+                .expect("session A seed"),
+            Some(session_a_high.to_string())
+        );
+        assert_eq!(
+            reloaded
+                .latest_opencode_protocol_request_id_for_session("session-b")
+                .expect("session B seed"),
+            Some(session_b_high.to_string())
+        );
         let _ = std::fs::remove_dir_all(home);
     }
 }
