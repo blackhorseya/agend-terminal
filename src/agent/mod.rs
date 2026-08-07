@@ -728,13 +728,19 @@ fn opencode_attach_command_args(
 fn codex_remote_command_args(
     locator: &crate::transport::SessionLocator,
     args: &[String],
+    spawn_mode: crate::backend::SpawnMode,
 ) -> anyhow::Result<Vec<String>> {
     let mut enriched = crate::transport::codex_attach_args(locator)?;
     enriched.extend([
         "-c".to_string(),
         "check_for_update_on_startup=false".to_string(),
-        "--dangerously-bypass-approvals-and-sandbox".to_string(),
     ]);
+    if spawn_mode == crate::backend::SpawnMode::Resume {
+        let thread_id = crate::transport::codex_thread_for_spawn(locator, spawn_mode)
+            .unwrap_or_else(|| "--last".to_string());
+        enriched.extend(["resume".to_string(), thread_id]);
+    }
+    enriched.push("--dangerously-bypass-approvals-and-sandbox".to_string());
     enriched.extend(args.iter().cloned());
     Ok(enriched)
 }
@@ -822,7 +828,7 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     let enriched_args: Vec<String> = if let Some(locator) = opencode_locator.as_ref() {
         opencode_attach_command_args(locator, args)?
     } else if let Some(locator) = codex_locator.as_ref() {
-        codex_remote_command_args(locator, args)?
+        codex_remote_command_args(locator, args, *spawn_mode)?
     } else {
         let preset = detected_backend
             .as_ref()
@@ -1262,7 +1268,7 @@ pub(crate) fn spawn_agent_with_capture_home(
         backend: _,
         backend_command,
         args,
-        spawn_mode: _,
+        spawn_mode,
         cols,
         rows,
         env: _,
@@ -1309,6 +1315,7 @@ pub(crate) fn spawn_agent_with_capture_home(
                 name,
                 backend_command,
                 *working_dir,
+                *spawn_mode,
             )?;
         }
     }
