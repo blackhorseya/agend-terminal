@@ -1,3 +1,4 @@
+use super::claude_channel;
 use super::codex_app_server::CodexNativeShared;
 use super::envelope::{DeliveryEnvelope, DeliveryKind, SessionLocator};
 use super::legacy_pty::{LegacyPty, PtyInjector};
@@ -24,20 +25,26 @@ pub(crate) fn backend_for_instance(home: &Path, instance: &str) -> Option<Backen
 pub(crate) fn mode_for_backend(backend: &Backend) -> TransportMode {
     match backend {
         Backend::Codex | Backend::OpenCode => TransportMode::NativeShared,
-        Backend::ClaudeCode
-        | Backend::Grok
-        | Backend::KiroCli
-        | Backend::Agy
-        | Backend::Shell
-        | Backend::Raw(_) => TransportMode::LegacyPty,
+        Backend::ClaudeCode => TransportMode::ChannelBridge,
+        Backend::Grok | Backend::KiroCli | Backend::Agy | Backend::Shell | Backend::Raw(_) => {
+            TransportMode::LegacyPty
+        }
     }
 }
 
 pub(crate) fn mode_for_instance(home: &Path, instance: &str) -> TransportMode {
+    let backend = backend_for_instance(home, instance);
+    if backend.as_ref() == Some(&Backend::ClaudeCode) {
+        return if claude_channel::legacy_pty_opt_in(home, instance) {
+            TransportMode::LegacyPty
+        } else {
+            TransportMode::ChannelBridge
+        };
+    }
     if persisted_native_shared_hint(home, instance) {
         return TransportMode::NativeShared;
     }
-    backend_for_instance(home, instance)
+    backend
         .as_ref()
         .map(mode_for_backend)
         .unwrap_or(TransportMode::LegacyPty)
@@ -68,6 +75,44 @@ fn session_path(home: &Path, instance: &str) -> PathBuf {
     home.join("transport")
         .join("sessions")
         .join(format!("{}.json", super::receipt::safe_component(instance)))
+}
+
+pub(crate) fn claude_attach_locator(
+    home: &Path,
+    instance: &str,
+) -> anyhow::Result<Option<SessionLocator>> {
+    let path = session_path(home, instance);
+    match std::fs::metadata(&path) {
+        Ok(metadata) if metadata.is_file() => {
+            let locator = load_session_locator(home, instance)?;
+            if locator.backend == "claude" {
+                Ok(Some(locator))
+            } else {
+                Err(anyhow::anyhow!(
+                    "Claude session locator belongs to backend {}",
+                    locator.backend
+                ))
+            }
+        }
+        Ok(_) => Err(anyhow::anyhow!(
+            "Claude session locator is not a regular file: {}",
+            path.display()
+        )),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(anyhow::anyhow!(
+            "Claude session locator cannot be inspected at {}: {error}",
+            path.display()
+        )),
+    }
+}
+
+pub(crate) fn remove_session_locator(home: &Path, instance: &str) -> anyhow::Result<()> {
+    let path = session_path(home, instance);
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 pub(crate) fn save_session_locator(
@@ -363,7 +408,11 @@ pub(crate) fn envelope_for_instance(
 ) -> anyhow::Result<DeliveryEnvelope> {
     let backend = backend_for_instance(home, instance);
     let mode = mode_for_instance(home, instance);
-    let locator = locator_for_instance(home, instance, backend.as_ref(), mode)?;
+    let locator = if mode == TransportMode::ChannelBridge {
+        super::claude_channel::prepare_claude_channel(home, instance)?
+    } else {
+        locator_for_instance(home, instance, backend.as_ref(), mode)?
+    };
     Ok(DeliveryEnvelope::new(
         instance,
         locator,
@@ -421,9 +470,17 @@ where
             let mut adapter = LegacyPty::new(home, instance, injector);
             adapter.deliver_blocking(envelope)
         }
-        TransportMode::ChannelBridge
-        | TransportMode::ManagedHeadless
-        | TransportMode::ManualRequired => Err(anyhow::anyhow!(
+        TransportMode::ChannelBridge => {
+            if envelope.session.backend == "claude" {
+                super::claude_channel::deliver_resident(home, instance, envelope)
+            } else {
+                Err(anyhow::anyhow!(
+                    "ChannelBridge backend {:?} has no registered adapter",
+                    envelope.session.backend
+                ))
+            }
+        }
+        TransportMode::ManagedHeadless | TransportMode::ManualRequired => Err(anyhow::anyhow!(
             "transport mode {mode:?} has no adapter in this implementation"
         )),
     }
