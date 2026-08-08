@@ -146,6 +146,11 @@ impl PostFlushSlot {
 pub struct AppRestartRequest {
     pub reply: crossbeam_channel::Sender<AppRestartVerdict>,
     pub flush_ack: crossbeam_channel::Receiver<()>,
+    /// The managed caller's stable fleet identity, resolved from the live
+    /// registry at API ingress. `None` is reserved for anonymous/operator
+    /// ingress; managed callers are resolved before the restart gate is
+    /// claimed.
+    pub requester_id: Option<crate::types::InstanceId>,
 }
 
 /// Injected sender (handler → TUI loop); bounded (capacity 1) at the composition root.

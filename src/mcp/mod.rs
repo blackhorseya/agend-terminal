@@ -16,6 +16,7 @@ mod per_tool_arg_invariant;
 
 use serde_json::Value;
 
+#[cfg(test)]
 pub(crate) fn execute_tool_with_runtime(
     tool_name: &str,
     args: &Value,
@@ -23,4 +24,20 @@ pub(crate) fn execute_tool_with_runtime(
     runtime: handlers::dispatch::RuntimeContext,
 ) -> Value {
     handlers::handle_tool_with_runtime(tool_name, args, instance_name, Some(runtime))
+}
+
+pub(crate) fn execute_tool_with_runtime_and_requester(
+    tool_name: &str,
+    args: &Value,
+    instance_name: &str,
+    runtime: handlers::dispatch::RuntimeContext,
+    requester_id: Option<crate::types::InstanceId>,
+) -> Value {
+    handlers::handle_tool_with_runtime_and_requester(
+        tool_name,
+        args,
+        instance_name,
+        Some(runtime),
+        requester_id,
+    )
 }
