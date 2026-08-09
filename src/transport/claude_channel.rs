@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender, SyncSender, TrySendError};
 use std::sync::{Arc, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use uuid::Uuid;
 
 pub(crate) const CHANNEL_SERVER_NAME: &str = "agend-claude-channel";
@@ -32,6 +32,7 @@ const BRIDGE_VERSION: &str = "0.1.0";
 const MAX_HEADERS: usize = 64 * 1024;
 const MAX_BODY: usize = 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
+const CHANNEL_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SSE_READ_TIMEOUT: Duration = Duration::from_secs(20);
 const HTTP_PATH: &str = "/webhook";
 
@@ -938,6 +939,47 @@ pub(crate) fn prepare_claude_channel(
     Ok(locator)
 }
 
+pub(crate) fn wait_for_ready_claude_channel(
+    home: &Path,
+    instance: &str,
+    timeout: Duration,
+) -> anyhow::Result<SessionLocator> {
+    wait_for_ready_claude_channel_until(home, instance, timeout)
+}
+
+fn wait_for_ready_claude_channel_until(
+    home: &Path,
+    instance: &str,
+    timeout: Duration,
+) -> anyhow::Result<SessionLocator> {
+    let started = Instant::now();
+    loop {
+        let last_error = match prepare_claude_channel(home, instance).and_then(|locator| {
+            let capability = health_probe(&locator)?;
+            if capability.ready {
+                Ok(locator)
+            } else {
+                Err(anyhow::anyhow!(
+                    "{}",
+                    capability.degraded_reason.unwrap_or_else(|| {
+                        "Claude ChannelBridge capability probe failed closed".to_string()
+                    })
+                ))
+            }
+        }) {
+            Ok(locator) => return Ok(locator),
+            Err(error) => error,
+        };
+        let remaining = timeout.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            anyhow::bail!(
+                "Claude ChannelBridge did not become ready within {timeout:?}: {last_error}"
+            );
+        }
+        thread::sleep(std::cmp::min(CHANNEL_READY_POLL_INTERVAL, remaining));
+    }
+}
+
 fn ensure_claude_bridge_owned(locator: &SessionLocator) -> anyhow::Result<()> {
     if locator.backend != "claude" {
         anyhow::bail!(
@@ -1609,6 +1651,24 @@ mod tests {
     }
 
     #[test]
+    fn channel_ready_wait_is_bounded_when_locator_never_publishes() {
+        let home = home("bounded-ready-wait");
+        let started = Instant::now();
+        let error =
+            wait_for_ready_claude_channel_until(&home, "claude-agent", Duration::from_millis(50))
+                .expect_err("missing locator must time out");
+        assert!(
+            error.to_string().contains("did not become ready within"),
+            "unexpected readiness error: {error:#}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "bounded readiness wait must not hang"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
     fn health_probe_rejects_mismatched_session_identity() {
         let listener = TcpListener::bind("127.0.0.1:0").expect("health listener");
         let port = listener.local_addr().expect("health address").port();
@@ -1670,7 +1730,8 @@ mod tests {
     }
 
     #[test]
-    fn registry_delivery_uses_channel_bridge_without_pty_fallback() {
+    fn registry_delivery_waits_for_delayed_channel_bridge_without_pty_fallback() {
+        let _delivery_hook_guard = super::super::registry::test_support::delivery_hook_guard();
         let home = home("registry-delivery");
         let listener = TcpListener::bind("127.0.0.1:0").expect("fake channel listener");
         listener
@@ -1678,7 +1739,9 @@ mod tests {
             .expect("nonblocking listener");
         let port = listener.local_addr().expect("listener address").port();
         let stop = Arc::new(AtomicBool::new(false));
+        let ready = Arc::new(AtomicBool::new(false));
         let thread_stop = Arc::clone(&stop);
+        let thread_ready = Arc::clone(&ready);
         let server = thread::spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
@@ -1691,10 +1754,13 @@ mod tests {
                             (
                                 "200 OK",
                                 json!({
-                                    "ready": true,
+                                    "ready": thread_ready.load(Ordering::Acquire),
                                     "session_id": "claude-registry-session",
                                     "backend_version": "2.1.89",
-                                    "capabilities": {"claude/channel": true, "tools": true}
+                                    "capabilities": {
+                                        "claude/channel": thread_ready.load(Ordering::Acquire),
+                                        "tools": thread_ready.load(Ordering::Acquire)
+                                    }
                                 })
                                 .to_string(),
                             )
@@ -1724,37 +1790,59 @@ mod tests {
         locator.managed = true;
         locator.server_pid = Some(std::process::id());
         locator.server_start_token = crate::process::process_start_token(std::process::id());
-        super::super::registry::save_session_locator(&home, "claude-agent", &locator)
-            .expect("locator");
         fs::write(
             crate::fleet::fleet_yaml_path(&home),
             "instances:\n  claude-agent:\n    backend: claude\n",
         )
         .expect("fleet");
+        let publisher_home = home.clone();
+        let publisher_locator = locator.clone();
+        let publisher_ready = Arc::clone(&ready);
+        let publisher = thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            super::super::registry::save_session_locator(
+                &publisher_home,
+                "claude-agent",
+                &publisher_locator,
+            )
+            .expect("delayed locator publication");
+            thread::sleep(Duration::from_millis(200));
+            publisher_ready.store(true, Ordering::Release);
+        });
         let legacy_called = Arc::new(AtomicBool::new(false));
         let legacy_called_by_closure = Arc::clone(&legacy_called);
-        let receipt = super::super::registry::deliver_notification(
+        let result = super::super::registry::wait_for_notification_readiness(
             &home,
             "claude-agent",
-            "registry delivery",
-            move |_, _, _| {
-                legacy_called_by_closure.store(true, Ordering::Release);
-                Ok(())
-            },
+            Duration::from_secs(1),
         )
-        .expect("ChannelBridge delivery");
-        assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
-        assert!(!legacy_called.load(Ordering::Acquire));
-        let stored = ReceiptStore::for_instance(&home, "claude-agent")
-            .expect("receipt store")
-            .latest(receipt.delivery_id)
-            .expect("receipt lookup")
-            .expect("stored receipt");
-        assert_eq!(stored.state, DeliveryState::ProtocolAccepted);
+        .and_then(|()| {
+            super::super::registry::deliver_notification(
+                &home,
+                "claude-agent",
+                "registry delivery",
+                move |_, _, _| {
+                    legacy_called_by_closure.store(true, Ordering::Release);
+                    Ok(())
+                },
+            )
+        });
+        publisher.join().expect("delayed publisher");
+        if let Ok(receipt) = &result {
+            assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
+            assert!(!legacy_called.load(Ordering::Acquire));
+            let stored = ReceiptStore::for_instance(&home, "claude-agent")
+                .expect("receipt store")
+                .latest(receipt.delivery_id)
+                .expect("receipt lookup")
+                .expect("stored receipt");
+            assert_eq!(stored.state, DeliveryState::ProtocolAccepted);
+        }
         stop_instance_state(&home, "claude-agent");
         stop.store(true, Ordering::Release);
         let _ = server.join();
         let _ = fs::remove_dir_all(home);
+        result.expect("ChannelBridge delivery must wait for delayed readiness");
     }
 
     #[test]
