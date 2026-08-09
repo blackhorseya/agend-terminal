@@ -452,6 +452,10 @@ pub(crate) fn deliver_notification<F>(
 where
     F: Fn(&Path, &str, &str) -> anyhow::Result<()> + Send + Sync + 'static,
 {
+    #[cfg(test)]
+    if let Some(result) = test_support::run_delivery_hook(home, instance, body) {
+        return result;
+    }
     let mode = mode_for_instance(home, instance);
     let envelope = envelope_for_instance(home, instance, body)?;
     match mode {
@@ -483,6 +487,54 @@ where
         TransportMode::ManagedHeadless | TransportMode::ManualRequired => Err(anyhow::anyhow!(
             "transport mode {mode:?} has no adapter in this implementation"
         )),
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::DeliveryReceipt;
+    use std::path::Path;
+    use std::sync::{Arc, OnceLock};
+
+    pub(crate) type DeliveryHook =
+        Arc<dyn Fn(&Path, &str, &str) -> Option<anyhow::Result<DeliveryReceipt>> + Send + Sync>;
+
+    static DELIVERY_HOOK: OnceLock<parking_lot::Mutex<Option<DeliveryHook>>> = OnceLock::new();
+    static DELIVERY_HOOK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    pub(crate) struct DeliveryHookGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    pub(crate) fn delivery_hook_guard() -> DeliveryHookGuard {
+        let lock = DELIVERY_HOOK_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        set_delivery_hook(None);
+        DeliveryHookGuard { _lock: lock }
+    }
+
+    fn hook() -> &'static parking_lot::Mutex<Option<DeliveryHook>> {
+        DELIVERY_HOOK.get_or_init(|| parking_lot::Mutex::new(None))
+    }
+
+    pub(crate) fn set_delivery_hook(next: Option<DeliveryHook>) {
+        *hook().lock() = next;
+    }
+
+    impl Drop for DeliveryHookGuard {
+        fn drop(&mut self) {
+            set_delivery_hook(None);
+        }
+    }
+
+    pub(crate) fn run_delivery_hook(
+        home: &Path,
+        instance: &str,
+        body: &str,
+    ) -> Option<anyhow::Result<DeliveryReceipt>> {
+        let delivery_hook = hook().lock().as_ref().cloned();
+        delivery_hook.and_then(|hook| hook(home, instance, body))
     }
 }
 

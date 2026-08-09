@@ -175,6 +175,9 @@ pub(crate) use inject_offload::{
     inject_target_physical, inject_with_target_gated_offload, InjectDispatch,
 };
 
+mod self_kick;
+use self_kick::{deliver_self_kick, SelfKickDelivery};
+
 /// Returns true if the env-var name is on the spawn-time deny-list.
 pub fn is_sensitive_env_key(key: &str) -> bool {
     SENSITIVE_ENV_KEYS
@@ -1293,6 +1296,26 @@ pub(crate) fn spawn_agent_with_capture_home(
         }
     }
 
+    // Fence normal queued deliveries across the whole generation transition.
+    // The lane is acquired after the delete precheck and before any structured
+    // session preparation, then released only after SpawnRollback commits (or
+    // during rollback on every error return).
+    let transport_generation_guard = (*home).map(|home_path| {
+        crate::daemon::delivery_worker::begin_transport_generation_transition(home_path, name)
+    });
+    // The delete mark may have been acquired after the precheck but before the
+    // keyed transport lane. Re-check after the lane admission so preparation
+    // cannot proceed concurrently with a teardown that is now serialized on
+    // the same generation key.
+    if let Some(home_path) = *home {
+        if deleting::is_deleting(home_path, name) {
+            drop(transport_generation_guard);
+            anyhow::bail!(
+                "#1915: refusing to spawn '{name}' — instance entered deletion after lane admission"
+            );
+        }
+    }
+
     // OpenCode NativeShared owns the server/session handshake before the PTY
     // exists. The resulting attach locator is then consumed by `build_command`,
     // so the visible TUI and daemon prompt_async deliveries share one session.
@@ -1596,6 +1619,7 @@ pub(crate) fn spawn_agent_with_capture_home(
 
     // Disarm the rollback guard — all ordered mutations succeeded.
     rollback.commit();
+    drop(transport_generation_guard);
 
     tracing::info!(agent = name, backend = backend_command, args = %config.args.join(" "), "spawned");
     Ok(instance_id)
@@ -1871,8 +1895,9 @@ fn spawn_instructions_bootstrap(
 /// fleet (the recurring "lead restarted and just sat there" failure). This polls
 /// the freshly-spawned session to Idle (so the inject isn't swallowed while the
 /// backend is still `Starting`) and injects a single `[AGEND-RESUME]`
-/// self-bootstrap first turn, armed for ≤1 re-delivery via the inject-delivery
-/// verifier. Authorized paths are the SPAWN handler when `restart_spawn_params`
+/// self-bootstrap first turn. Only the LegacyPty route arms the inject-delivery
+/// verifier for ≤1 re-delivery; structured routes are never armed. Authorized
+/// paths are the SPAWN handler when `restart_spawn_params`
 /// sets the independent `self_kick_on_ready` flag (fresh restart), and the
 /// Owned app successor for an exact committed app-reexec requester — the flag
 /// is NEVER derived from `SpawnMode::Fresh` (initial fleet spawns are Fresh too,
@@ -1881,6 +1906,7 @@ pub(crate) fn spawn_self_kick_bootstrap(
     registry: AgentRegistry,
     instance_id: crate::types::InstanceId,
     name: String,
+    home: std::path::PathBuf,
     timeout: std::time::Duration,
     registration_state: BootstrapRegistrationState,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -1899,17 +1925,18 @@ pub(crate) fn spawn_self_kick_bootstrap(
             shutdown.as_ref(),
             "self-kick",
         ) {
-            // force=true: we already waited for Idle; the submit key drives the turn.
-            match inject_with_target(&tgt, prompt.as_bytes()) {
-                Ok(()) => {
-                    // Re-delivery verification (≤1 redeliver, operator-visible if
-                    // undelivered) so a swallowed first turn can't silently strand
-                    // the restart. arm is a no-op for non-hook backends.
-                    crate::daemon::inject_delivery::arm(&name, &prompt);
+            match deliver_self_kick(&registry, &home, &tgt, &prompt) {
+                Ok(SelfKickDelivery::LegacyPty) => {
+                    // LegacyPty arms its verification while the self-kick
+                    // transport lane is still held; structured adapters remain
+                    // never-armed.
                     tracing::info!(agent = %name, "fresh-restart self-kick injected");
                 }
-                Err(e) => {
-                    tracing::warn!(agent = %name, error = %e, "fresh-restart self-kick inject failed");
+                Ok(SelfKickDelivery::ProtocolAccepted) => {
+                    tracing::info!(agent = %name, "fresh-restart self-kick accepted");
+                }
+                Err(error) => {
+                    tracing::warn!(agent = %name, error = %error, "fresh-restart self-kick delivery failed");
                 }
             }
         }
@@ -2979,6 +3006,9 @@ fn observe_post_submit_with(
 /// blocks every other registry operation for the entire duration.
 #[derive(Clone)]
 pub(crate) struct InjectTarget {
+    pub instance_id: crate::types::InstanceId,
+    pub name: String,
+    pub generation: crash_disposition::SpawnGeneration,
     pub pty_writer: PtyWriter,
     pub inject_prefix: String,
     pub submit_key: String,
@@ -2995,6 +3025,9 @@ pub(crate) struct InjectTarget {
 impl InjectTarget {
     pub fn from_handle(h: &AgentHandle) -> Self {
         Self {
+            instance_id: h.id,
+            name: h.name.to_string(),
+            generation: h.generation,
             pty_writer: Arc::clone(&h.pty_writer),
             inject_prefix: h.inject_prefix.clone(),
             submit_key: h.submit_key.clone(),
