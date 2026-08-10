@@ -268,6 +268,7 @@ fn fresh_restart_self_kick_structured_route_has_no_pty_fallback() {
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -395,6 +396,7 @@ fn self_kick_fixture(tag: &str) -> SelfKickFixture {
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -1129,6 +1131,7 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -1750,6 +1753,7 @@ fn write_to_agent_typed_uses_timeout() {
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),
         typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -2423,6 +2427,7 @@ fn inject_with_target_skips_deleted_agent_1146() {
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         deleted: Arc::clone(&deleted),
         core: readback_test_core(b""), // #1912: bulk path never reads it
     };
@@ -2455,6 +2460,7 @@ fn inject_offload_queues_then_drops_on_full() {
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         core: readback_test_core(b""),
     };
@@ -2508,6 +2514,7 @@ fn inject_offload_defers_without_touching_delivery_worker() {
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         core: readback_test_core(b""),
     };
@@ -2538,7 +2545,11 @@ fn inject_offload_defers_without_touching_delivery_worker() {
 /// the backend's echo of typed chars). Lets the readback helpers be tested without
 /// a live backend process.
 fn readback_test_core(feed: &[u8]) -> Arc<CoreMutex<AgentCore>> {
-    let mut vterm = VTerm::new(80, 24);
+    readback_test_core_with_size(80, 24, feed)
+}
+
+fn readback_test_core_with_size(cols: u16, rows: u16, feed: &[u8]) -> Arc<CoreMutex<AgentCore>> {
+    let mut vterm = VTerm::new(cols, rows);
     vterm.process(feed);
     Arc::new(CoreMutex::new(AgentCore {
         vterm,
@@ -2562,6 +2573,7 @@ fn readback_test_target(core: Arc<CoreMutex<AgentCore>>) -> InjectTarget {
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
         typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         core,
     }
@@ -2589,6 +2601,96 @@ fn readback_confirm_returns_true_when_line_rendered_1912() {
         &target,
         payload,
         std::time::Duration::from_secs(1),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
+fn readback_confirm_matches_only_cursor_anchored_soft_wrap_3175() {
+    let payload = "ABCDEFGHIJKLMNO123456789";
+    let core = readback_test_core_with_size(20, 6, format!("\u{203a} {payload}").as_bytes());
+    let target = readback_test_target(core);
+    assert!(readback_confirm_typed_with(
+        &target,
+        payload,
+        std::time::Duration::from_millis(40),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
+fn readback_confirm_rejects_sentinel_on_previous_hard_row_3175() {
+    let payload = "unique-previous-row-suffix";
+    let core = readback_test_core(format!("{payload}\r\n\u{203a} different draft").as_bytes());
+    let target = readback_test_target(core);
+    assert!(!readback_confirm_typed_with(
+        &target,
+        payload,
+        std::time::Duration::from_millis(40),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
+fn readback_confirm_never_joins_same_text_across_hard_rows_3175() {
+    let payload = "1234567890tail";
+    let core = readback_test_core_with_size(10, 4, b"1234567890\r\ntail");
+    let target = readback_test_target(core);
+    assert!(!readback_confirm_typed_with(
+        &target,
+        payload,
+        std::time::Duration::from_millis(40),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
+fn readback_confirm_rejects_sentinel_after_cursor_3175() {
+    let payload = "unique-after-cursor";
+    let core = readback_test_core(format!("\u{203a} {payload}\r\x1b[2C").as_bytes());
+    let target = readback_test_target(core);
+    assert!(!readback_confirm_typed_with(
+        &target,
+        payload,
+        std::time::Duration::from_millis(40),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
+fn readback_confirm_compares_tab_at_its_composer_display_width_3175() {
+    let payload = "tab\tcase";
+    let core = readback_test_core("\u{203a} tab case".as_bytes());
+    let target = readback_test_target(core);
+    assert!(readback_confirm_typed_with(
+        &target,
+        payload,
+        std::time::Duration::from_millis(40),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
+fn readback_confirm_preserves_wide_graphemes_3175() {
+    let payload = "wake-日本語-尾";
+    let core = readback_test_core_with_size(10, 4, format!("\u{203a} {payload}").as_bytes());
+    let target = readback_test_target(core);
+    assert!(readback_confirm_typed_with(
+        &target,
+        payload,
+        std::time::Duration::from_millis(40),
+        std::time::Duration::from_millis(5),
+    ));
+}
+
+#[test]
+fn readback_confirm_rejects_empty_or_whitespace_payload_3175() {
+    let core = readback_test_core("\u{203a} ".as_bytes());
+    let target = readback_test_target(core);
+    assert!(!readback_confirm_typed_with(
+        &target,
+        " \n\t ",
+        std::time::Duration::from_millis(40),
         std::time::Duration::from_millis(5),
     ));
 }
@@ -2671,8 +2773,56 @@ impl std::io::Write for RetryEchoWriter {
     }
 }
 
+struct ExactEchoWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    expected: Vec<u8>,
+    rendered: String,
+    core: Arc<CoreMutex<AgentCore>>,
+}
+
+impl std::io::Write for ExactEchoWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.bytes.lock().extend_from_slice(buf);
+        if buf == self.expected {
+            self.core.lock().vterm.process(self.rendered.as_bytes());
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct SubmitFailEchoWriter {
+    bytes: Arc<Mutex<Vec<u8>>>,
+    expected: Vec<u8>,
+    rendered: String,
+    core: Arc<CoreMutex<AgentCore>>,
+}
+
+impl std::io::Write for SubmitFailEchoWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        if buf == b"\r" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "submit write failed",
+            ));
+        }
+        self.bytes.lock().extend_from_slice(buf);
+        if buf == self.expected {
+            self.core.lock().vterm.process(self.rendered.as_bytes());
+        }
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 #[test]
-fn typed_inject_retries_unrendered_payload_then_submits_once_s1() {
+fn typed_inject_readback_miss_never_rewrites_or_submits_3175() {
     let payload = b"S1_AGY_DIALOG_RETRY";
     let core = readback_test_core("\u{203a} ".as_bytes());
     let bytes = Arc::new(Mutex::new(Vec::new()));
@@ -2691,21 +2841,149 @@ fn typed_inject_retries_unrendered_payload_then_submits_once_s1() {
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
         typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         core,
     };
 
-    inject_with_target(&target, payload).expect("second rendered attempt should submit");
+    assert!(
+        inject_with_target(&target, payload).is_err(),
+        "an unconfirmed first write must fail closed without a rewrite"
+    );
 
     assert_eq!(
         payload_writes.load(std::sync::atomic::Ordering::Relaxed),
-        2,
-        "a transient startup dialog should cause one bounded retry"
+        1,
+        "readback miss must never duplicate the payload in the composer"
     );
     assert_eq!(
         bytes.lock().iter().filter(|&&byte| byte == b'\r').count(),
-        1,
-        "the recovered payload must be submitted exactly once"
+        0,
+        "an unconfirmed payload must never be submitted"
+    );
+}
+
+#[test]
+fn typed_inject_normalizes_trailing_whitespace_before_write_3175() {
+    let payload = b"TRAILING_BOTH   \n";
+    let expected = b"TRAILING_BOTH";
+    let core = readback_test_core("\u{203a} ".as_bytes());
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(ExactEchoWriter {
+        bytes: Arc::clone(&bytes),
+        expected: expected.to_vec(),
+        rendered: "\r\x1b[2K\u{203a} TRAILING_BOTH".to_string(),
+        core: Arc::clone(&core),
+    })));
+    let target = InjectTarget {
+        instance_id: crate::types::InstanceId::default(),
+        name: "typed-trailing-whitespace-test".to_string(),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+        pty_writer: writer,
+        inject_prefix: String::new(),
+        submit_key: "\r".to_string(),
+        typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core,
+    };
+
+    inject_with_target(&target, payload)
+        .expect("typed payload and sentinel must share one trailing-whitespace normalization");
+    assert_eq!(
+        bytes.lock().as_slice(),
+        [expected.as_slice(), b"\r"].concat(),
+        "only the normalized payload may be written before one submit"
+    );
+}
+
+#[test]
+fn typed_inject_miss_latches_before_later_payload_can_append_3175() {
+    let core = readback_test_core("\u{203a} ".as_bytes());
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(ExactEchoWriter {
+        bytes: Arc::clone(&bytes),
+        expected: b"B".to_vec(),
+        rendered: "\r\x1b[2K\u{203a} AB".to_string(),
+        core: Arc::clone(&core),
+    })));
+    let target = InjectTarget {
+        instance_id: crate::types::InstanceId::default(),
+        name: "typed-contamination-latch-test".to_string(),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+        pty_writer: writer,
+        inject_prefix: String::new(),
+        submit_key: "\r".to_string(),
+        typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core,
+    };
+
+    assert!(inject_with_target(&target, b"A").is_err());
+    {
+        let core = target.core.lock();
+        assert_eq!(
+            core.health.current_reason.as_ref().map(ToString::to_string),
+            Some("typed_inject_contaminated".to_string()),
+            "a persistent typed-inject fence must be visible as a blocked reason"
+        );
+        assert!(
+            core.health
+                .current_note
+                .as_deref()
+                .is_some_and(|note| note.contains("restart")),
+            "the blocked reason must tell the operator how the process-scoped fence clears"
+        );
+    }
+    let after_first_miss = bytes.lock().clone();
+    assert!(
+        inject_with_target(&target, b"B").is_err(),
+        "a later payload must not append to or submit an unconfirmed draft"
+    );
+    assert_eq!(
+        *bytes.lock(),
+        after_first_miss,
+        "the contamination latch must reject before writing any later byte"
+    );
+}
+
+#[test]
+fn typed_inject_submit_error_latches_before_later_payload_3175() {
+    let core = readback_test_core("\u{203a} ".as_bytes());
+    let bytes = Arc::new(Mutex::new(Vec::new()));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(SubmitFailEchoWriter {
+        bytes: Arc::clone(&bytes),
+        expected: b"A".to_vec(),
+        rendered: "\r\x1b[2K\u{203a} A".to_string(),
+        core: Arc::clone(&core),
+    })));
+    let target = InjectTarget {
+        instance_id: crate::types::InstanceId::default(),
+        name: "typed-submit-error-latch-test".to_string(),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+        pty_writer: writer,
+        inject_prefix: String::new(),
+        submit_key: "\r".to_string(),
+        typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        core,
+    };
+
+    assert!(
+        inject_with_target(&target, b"A").is_err(),
+        "the confirmed draft must remain unsubmitted when the submit write fails"
+    );
+    let after_submit_error = bytes.lock().clone();
+    assert!(
+        inject_with_target(&target, b"B").is_err(),
+        "a later payload must not append to a draft whose submit write failed"
+    );
+    assert_eq!(
+        *bytes.lock(),
+        after_submit_error,
+        "the submit-error latch must reject before writing any later byte"
     );
 }
 
@@ -2725,6 +3003,7 @@ fn typed_inject_never_submits_or_succeeds_without_readback_s1() {
         inject_prefix: String::new(),
         submit_key: "\r".to_string(),
         typed_inject: true,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         core,
     };
@@ -2837,6 +3116,7 @@ fn pty_read_error_triggers_cleanup() {
             submit_key: "\r".to_string(),
             inject_prefix: String::new(),
             typed_inject: false,
+            typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             spawned_at: std::time::Instant::now(),
             spawned_at_epoch_ms: 0,
             spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -2960,6 +3240,7 @@ fn make_crash_exit_handle(deleted: bool) -> (AgentHandle, crate::types::Instance
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -3421,6 +3702,7 @@ fn mk_handle_1441(name: &str, id: crate::types::InstanceId) -> AgentHandle {
         submit_key: "\r".to_string(),
         inject_prefix: String::new(),
         typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
         spawned_at: std::time::Instant::now(),
         spawned_at_epoch_ms: 0,
         spawn_mode: crate::backend::SpawnMode::Fresh,
@@ -4605,6 +4887,7 @@ fn concurrent_inject_to_different_agents_never_interleaves_2620() {
             inject_prefix: String::new(),
             submit_key: "\r".to_string(),
             typed_inject: true,
+            typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             core,
         };

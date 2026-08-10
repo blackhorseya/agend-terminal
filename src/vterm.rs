@@ -11,6 +11,8 @@ use parking_lot::Mutex;
 use std::io::Write;
 use std::sync::Arc;
 
+mod cursor_anchor;
+
 /// Fallback cell for snapshot out-of-bounds (should never happen, but
 /// defense-in-depth against arithmetic bugs in snapshot indexing).
 static DEFAULT_CELL: std::sync::OnceLock<Cell> = std::sync::OnceLock::new();
