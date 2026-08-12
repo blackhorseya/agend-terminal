@@ -10,7 +10,7 @@ use super::{
     DeliveryState, ReceiptStore, SessionLocator, TransportCapability, TransportMode,
 };
 use base64::Engine as _;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -34,6 +34,10 @@ const MAX_BODY: usize = 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 const CHANNEL_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SSE_READ_TIMEOUT: Duration = Duration::from_secs(20);
+/// A fresh-restart self-kick must prove consumer admission promptly. This is
+/// deliberately a bounded ambiguity window, not a retry timer: accepted
+/// without an exact consumer ack is never resent automatically.
+const SELF_KICK_ACK_WINDOW: Duration = Duration::from_secs(30);
 const HTTP_PATH: &str = "/webhook";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -289,6 +293,155 @@ impl ChannelRuntime {
         self.inbound.lock().get(chat_id).copied()
     }
 
+    fn inbound_contains_delivery(&self, delivery_id: Uuid) -> bool {
+        self.inbound
+            .lock()
+            .values()
+            .any(|candidate| *candidate == delivery_id)
+    }
+
+    fn self_kick_receipt(
+        &self,
+        delivery_id: Uuid,
+    ) -> anyhow::Result<(ReceiptStore, DeliveryEnvelope, DeliveryReceipt)> {
+        if !self.inbound_contains_delivery(delivery_id) {
+            anyhow::bail!("self-kick delivery_id is unknown or stale")
+        }
+        let store = ReceiptStore::for_instance(&self.home, &self.instance)?;
+        let Some((envelope, receipt)) = store.delivery(delivery_id)? else {
+            anyhow::bail!("self-kick delivery_id has no durable receipt")
+        };
+        if !envelope.self_kick {
+            anyhow::bail!("delivery_id is not a fresh-restart self-kick")
+        }
+        if envelope.session.session_id.as_deref() != Some(self.session_id.as_str()) {
+            anyhow::bail!("self-kick delivery belongs to a different Claude session")
+        }
+        Ok((store, envelope, receipt))
+    }
+
+    /// Record the consumer's exact-id TurnStarted acknowledgement. The
+    /// compare-and-append receipt transition is intentionally separate from
+    /// `remember_reply`: it emits no reply event and no SSE notification.
+    fn acknowledge_self_kick(&self, delivery_id: Uuid) -> anyhow::Result<DeliveryReceipt> {
+        let (store, envelope, mut current) = self.self_kick_receipt(delivery_id)?;
+        if current.state == DeliveryState::TurnStarted {
+            return Ok(current);
+        }
+        if current.state.is_terminal() {
+            anyhow::bail!("self-kick delivery is no longer awaiting start acknowledgement")
+        }
+        if !matches!(
+            current.state,
+            DeliveryState::Queued | DeliveryState::ProtocolAccepted | DeliveryState::AckOverdue
+        ) {
+            anyhow::bail!("self-kick delivery is not awaiting start acknowledgement")
+        }
+
+        // The bridge can write the notification and receive the consumer's
+        // ack before the daemon-side post-202 receipt append. Preserve the
+        // truthful ProtocolAccepted state first when the durable row is still
+        // Queued, then advance it to TurnStarted.
+        if current.state == DeliveryState::Queued {
+            let mut accepted = current.clone();
+            accepted.state = DeliveryState::ProtocolAccepted;
+            accepted.protocol_request_id = Some(delivery_id.to_string());
+            accepted.backend_session_id = Some(self.session_id.clone());
+            accepted.backend_event = Some("webhook_accepted".to_string());
+            if store.record_if_latest_state(delivery_id, DeliveryState::Queued, accepted)? {
+                current = store
+                    .latest(delivery_id)?
+                    .ok_or_else(|| anyhow::anyhow!("self-kick receipt disappeared after accept"))?;
+            } else {
+                current = store.latest(delivery_id)?.ok_or_else(|| {
+                    anyhow::anyhow!("self-kick receipt disappeared during accept")
+                })?;
+            }
+        }
+
+        if current.state == DeliveryState::TurnStarted {
+            return Ok(current);
+        }
+        if !matches!(
+            current.state,
+            DeliveryState::ProtocolAccepted | DeliveryState::AckOverdue
+        ) {
+            anyhow::bail!("self-kick delivery is not protocol-accepted")
+        }
+        let mut started = DeliveryReceipt::for_state(&envelope, DeliveryState::TurnStarted);
+        started.protocol_request_id = current
+            .protocol_request_id
+            .or_else(|| Some(delivery_id.to_string()));
+        started.backend_session_id = Some(self.session_id.clone());
+        started.backend_event = Some("claude_channel_turn_started".to_string());
+        started.detail = Some("consumer acknowledged exact self-kick delivery_id".to_string());
+        let mut expected = current.state;
+        loop {
+            if store.record_if_latest_state(delivery_id, expected, started.clone())? {
+                return Ok(started);
+            }
+            let latest = store
+                .latest(delivery_id)?
+                .ok_or_else(|| anyhow::anyhow!("self-kick receipt disappeared during start ack"))?;
+            if latest.state == DeliveryState::TurnStarted {
+                return Ok(latest);
+            }
+            if !matches!(
+                latest.state,
+                DeliveryState::ProtocolAccepted | DeliveryState::AckOverdue
+            ) {
+                anyhow::bail!("self-kick start acknowledgement lost a receipt race")
+            }
+            expected = latest.state;
+        }
+    }
+
+    /// Complete a self-kick only after the successor has finished its bounded
+    /// recovery sequence. This is a local receipt transition: unlike `reply`,
+    /// it has no outward channel or SSE effect.
+    fn complete_self_kick(&self, delivery_id: Uuid) -> anyhow::Result<DeliveryReceipt> {
+        let (store, envelope, current) = self.self_kick_receipt(delivery_id)?;
+        if current.state == DeliveryState::Completed {
+            return Ok(current);
+        }
+        if current.state != DeliveryState::TurnStarted {
+            anyhow::bail!("self-kick completion requires a prior exact start acknowledgement")
+        }
+        let mut completed = DeliveryReceipt::for_state(&envelope, DeliveryState::Completed);
+        completed.protocol_request_id = current.protocol_request_id;
+        completed.backend_session_id = Some(self.session_id.clone());
+        completed.backend_event = Some("claude_channel_self_kick_completed".to_string());
+        completed.detail = Some("successor completed bounded restart recovery".to_string());
+        if store.record_if_latest_state(
+            delivery_id,
+            DeliveryState::TurnStarted,
+            completed.clone(),
+        )? {
+            Ok(completed)
+        } else {
+            let latest = store.latest(delivery_id)?.ok_or_else(|| {
+                anyhow::anyhow!("self-kick receipt disappeared during completion")
+            })?;
+            if latest.state == DeliveryState::Completed {
+                Ok(latest)
+            } else {
+                anyhow::bail!("self-kick completion lost a receipt race")
+            }
+        }
+    }
+
+    fn reject_self_kick_reply(&self, delivery_id: Uuid) -> anyhow::Result<()> {
+        let store = ReceiptStore::for_instance(&self.home, &self.instance)?;
+        if let Some((envelope, _)) = store.delivery(delivery_id)? {
+            if envelope.self_kick {
+                anyhow::bail!(
+                    "fresh-restart self-kick has no outward reply; use ack_complete after recovery"
+                )
+            }
+        }
+        Ok(())
+    }
+
     fn remember_reply(
         &self,
         delivery_id: Uuid,
@@ -426,7 +579,7 @@ fn mcp_initialize(message: &Value, runtime: &ChannelRuntime) -> Value {
                 "tools": {}
             },
             "serverInfo": {"name": CHANNEL_SERVER_NAME, "version": BRIDGE_VERSION},
-            "instructions": "Messages arrive as <channel source=\"agend-terminal\" chat_id=\"...\" delivery_id=\"...\">. Each delivery has a unique chat_id; reply with the reply tool using the same chat_id and delivery_id."
+            "instructions": "Messages arrive as <channel source=\"agend-terminal\" chat_id=\"...\" delivery_id=\"...\">. Each delivery has a unique chat_id; reply with the reply tool using the same chat_id and delivery_id. For [AGEND-RESUME], immediately call ack_start with the exact delivery_id from channel metadata before recovery, then call ack_complete only after the bounded recovery sequence; self-kick acknowledgements never send an outward reply."
         }
     })
 }
@@ -447,6 +600,31 @@ fn reply_tool_definition() -> Value {
     })
 }
 
+fn self_kick_ack_tool_definition(name: &str, description: &str) -> Value {
+    json!({
+        "name": name,
+        "description": description,
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "delivery_id": {"type":"string", "description":"Exact UUID from the [AGEND-RESUME] channel metadata"}
+            },
+            "required": ["delivery_id"]
+        }
+    })
+}
+
+fn self_kick_ack_response(id: Value, result: Value) -> Value {
+    json!({
+        "jsonrpc":"2.0",
+        "id": id,
+        "result": {
+            "content": [{"type":"text","text": result["text"]}],
+            "structuredContent": result
+        }
+    })
+}
+
 fn mcp_message(message: Value, runtime: &ChannelRuntime) -> Option<Value> {
     let method = message.get("method").and_then(Value::as_str)?;
     match method {
@@ -460,18 +638,21 @@ fn mcp_message(message: Value, runtime: &ChannelRuntime) -> Option<Value> {
         "tools/list" => Some(json!({
             "jsonrpc":"2.0",
             "id": message.get("id").cloned().unwrap_or(Value::Null),
-            "result": {"tools": [reply_tool_definition()]}
+            "result": {"tools": [
+                reply_tool_definition(),
+                self_kick_ack_tool_definition(
+                    "ack_start",
+                    "Acknowledge exact [AGEND-RESUME] consumer admission before any recovery action. This has no outward reply or SSE side effect."
+                ),
+                self_kick_ack_tool_definition(
+                    "ack_complete",
+                    "Mark exact [AGEND-RESUME] recovery complete after the bounded task-board/inbox/list-instances recovery sequence. This has no outward reply or SSE side effect."
+                )
+            ]}
         })),
         "tools/call" => {
             let id = message.get("id").cloned().unwrap_or(Value::Null);
             let name = message.pointer("/params/name").and_then(Value::as_str);
-            if name != Some("reply") {
-                return Some(json_rpc_error(
-                    id,
-                    -32601,
-                    "unknown Claude ChannelBridge tool",
-                ));
-            }
             let arguments = message
                 .pointer("/params/arguments")
                 .and_then(Value::as_object);
@@ -482,6 +663,37 @@ fn mcp_message(message: Value, runtime: &ChannelRuntime) -> Option<Value> {
                     "reply arguments must be an object",
                 ));
             };
+            if matches!(name, Some("ack_start" | "ack_complete")) {
+                let Some(delivery_id) = arguments.get("delivery_id").and_then(Value::as_str) else {
+                    return Some(json_rpc_error(id, -32602, "delivery_id is required"));
+                };
+                let Ok(delivery_id) = Uuid::parse_str(delivery_id) else {
+                    return Some(json_rpc_error(id, -32602, "delivery_id is invalid"));
+                };
+                let result = if name == Some("ack_start") {
+                    runtime.acknowledge_self_kick(delivery_id)
+                } else {
+                    runtime.complete_self_kick(delivery_id)
+                };
+                return Some(match result {
+                    Ok(receipt) => self_kick_ack_response(
+                        id,
+                        json!({
+                            "text": if name == Some("ack_start") { "turn_started" } else { "completed" },
+                            "delivery_id": receipt.delivery_id,
+                            "state": receipt.state,
+                        }),
+                    ),
+                    Err(error) => json_rpc_error(id, -32602, &error.to_string()),
+                });
+            }
+            if name != Some("reply") {
+                return Some(json_rpc_error(
+                    id,
+                    -32601,
+                    "unknown Claude ChannelBridge tool",
+                ));
+            }
             let Some(chat_id) = arguments.get("chat_id").and_then(Value::as_str) else {
                 return Some(json_rpc_error(id, -32602, "reply.chat_id is required"));
             };
@@ -508,6 +720,9 @@ fn mcp_message(message: Value, runtime: &ChannelRuntime) -> Option<Value> {
                     None => return Some(json_rpc_error(id, -32602, "reply.chat_id is unknown")),
                 },
             };
+            if let Err(error) = runtime.reject_self_kick_reply(delivery_id) {
+                return Some(json_rpc_error(id, -32602, &error.to_string()));
+            }
             match runtime.remember_reply(delivery_id, chat_id, text) {
                 Ok(event) => Some(json!({
                     "jsonrpc":"2.0",
@@ -731,16 +946,21 @@ fn handle_http(mut stream: TcpStream, runtime: Arc<ChannelRuntime>) -> anyhow::R
             )?;
             return Ok(());
         };
-        match runtime.reply_for(id) {
-            Some(event) => write_http_response(
+        let reply = runtime.reply_for(id);
+        let receipt = ReceiptStore::for_instance(&runtime.home, &runtime.instance)
+            .ok()
+            .and_then(|store| store.latest(id).ok().flatten());
+        if reply.is_some() || receipt.is_some() {
+            write_http_response(
                 &mut stream,
                 200,
                 "application/json",
-                &json_response(json!({"reply":event})),
-            )?,
-            None => {
-                write_http_response(&mut stream, 404, "application/json", br#"{"reply":null}"#)?
-            }
+                &json_response(
+                    json!({"reply":reply,"receipt":receipt,"state":receipt.as_ref().map(|r| r.state)}),
+                ),
+            )?;
+        } else {
+            write_http_response(&mut stream, 404, "application/json", br#"{"reply":null}"#)?;
         }
         return Ok(());
     }
@@ -869,6 +1089,72 @@ fn run_http_listener(listener: TcpListener, runtime: Arc<ChannelRuntime>, stop: 
             }
         }
     }
+}
+
+fn self_kick_ack_elapsed(recorded_at: &str, now: DateTime<Utc>) -> Option<Duration> {
+    let recorded = DateTime::parse_from_rfc3339(recorded_at)
+        .ok()?
+        .with_timezone(&Utc);
+    now.signed_duration_since(recorded).to_std().ok()
+}
+
+/// Reconcile accepted self-kicks from the durable receipt log. This scan is
+/// intentionally separate from Claude hook observations: elapsed time only
+/// creates a truthful nonterminal AckOverdue alert, never a TurnStarted proof
+/// or retry.
+fn self_kick_watchdog_pass_at(
+    home: &Path,
+    instance: &str,
+    now: DateTime<Utc>,
+) -> anyhow::Result<usize> {
+    let store = ReceiptStore::for_instance(home, instance)?;
+    let mut alerts = 0;
+    for (envelope, current) in store.pending_deliveries()? {
+        if !envelope.self_kick
+            || current.state != DeliveryState::ProtocolAccepted
+            || self_kick_ack_elapsed(&current.recorded_at, now)
+                .is_none_or(|elapsed| elapsed < SELF_KICK_ACK_WINDOW)
+        {
+            continue;
+        }
+        let mut overdue = current.clone();
+        overdue.state = DeliveryState::AckOverdue;
+        overdue.backend_event = Some("claude_channel_self_kick_ack_timeout".to_string());
+        overdue.detail = Some(format!(
+            "ProtocolAccepted but no exact consumer ack within {:?}; no automatic retry; inspect the agent and reconcile delivery {}",
+            SELF_KICK_ACK_WINDOW, envelope.delivery_id
+        ));
+        if !store.record_if_latest_state(
+            envelope.delivery_id,
+            DeliveryState::ProtocolAccepted,
+            overdue,
+        )? {
+            continue;
+        }
+        let alert = format!(
+            "[claude-self-kick] {} accepted delivery {} but received no exact consumer ack within {:?}; state=AckOverdue; no automatic retry — inspect the agent and reconcile manually",
+            instance, envelope.delivery_id, SELF_KICK_ACK_WINDOW
+        );
+        let channels = crate::channel::notify_all_escalation_channels(
+            instance,
+            crate::channel::NotifySeverity::Error,
+            &alert,
+            false,
+        );
+        tracing::warn!(agent = %instance, delivery_id = %envelope.delivery_id, "{alert}");
+        crate::event_log::log(
+            home,
+            "claude_self_kick_ack_overdue",
+            instance,
+            &format!("{alert} notified_channels={channels}"),
+        );
+        alerts += 1;
+    }
+    Ok(alerts)
+}
+
+pub(crate) fn self_kick_watchdog_pass(home: &Path, instance: &str) -> anyhow::Result<usize> {
+    self_kick_watchdog_pass_at(home, instance, Utc::now())
 }
 
 pub(crate) fn run_channel_server(home: &Path, instance: &str) -> anyhow::Result<()> {
@@ -1405,10 +1691,16 @@ pub(crate) fn deliver_resident(
     receipt.protocol_request_id = Some(envelope.delivery_id.to_string());
     receipt.backend_event = Some("webhook_accepted".to_string());
     if let Some(previous) = store.latest(envelope.delivery_id)? {
-        if previous.state.is_terminal() {
-            // Claude may call `reply` while the webhook handler is still
-            // writing its 202 response. Preserve that terminal receipt rather
-            // than appending a late ProtocolAccepted regression.
+        if previous.state.is_terminal()
+            || matches!(
+                previous.state,
+                DeliveryState::TurnStarted | DeliveryState::AckOverdue
+            )
+        {
+            // Claude may acknowledge (or complete) the self-kick while the
+            // daemon-side delivery worker is still writing its post-202
+            // receipt. Preserve every later state rather than appending a
+            // ProtocolAccepted regression.
             return Ok(previous);
         }
     }
@@ -1959,4 +2251,6 @@ mod tests {
         stop_instance_state(&home, "claude-agent");
         let _ = fs::remove_dir_all(home);
     }
+
+    mod self_kick_tests;
 }
