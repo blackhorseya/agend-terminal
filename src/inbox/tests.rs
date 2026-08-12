@@ -1,5 +1,5 @@
 use super::notify::route_notification;
-use super::storage::{inbox_path, inbox_path_for_id};
+use super::storage::{inbox_path, inbox_path_for_id, set_row_delivering_at_for_test};
 use super::*;
 use parking_lot::Mutex;
 use std::fs;
@@ -4503,13 +4503,12 @@ fn reclaim_renudge_classifier_runs_unlocked_not_under_inbox_lock() {
     );
 }
 
-// ── Session-reset settle (agend-customization#159) ──────────────────────
+// ── Session-reset requeue (#3228) ───────────────────────────────────────
 
-/// settle_delivering_for_session_reset transitions all DELIVERING rows to
-/// PROCESSED (stamps read_at) — the core invariant. After settle, those rows
-/// must NOT be re-delivered by drain() nor reverted by reclaim_stale_delivering().
+/// A fresh session reset requeues all DELIVERING rows, preserving them for the
+/// successor rather than claiming they were processed by the lost context.
 #[test]
-fn settle_transitions_delivering_to_processed() {
+fn settle_requeues_delivering_for_successor() {
     let home = tmp_home("settle-basic");
     let agent = "settle-agent";
 
@@ -4530,18 +4529,18 @@ fn settle_transitions_delivering_to_processed() {
     assert_eq!(drained.len(), 3, "all 3 should drain");
 
     // At this point all 3 are DELIVERING (delivering_at set, read_at None).
-    // Settle them as if this were a session-reset.
-    let settled = settle_delivering_for_session_reset(&home, agent);
-    assert_eq!(settled, 3, "all 3 delivering rows should be settled");
+    // Requeue them as if this were a session-reset.
+    let settled = requeue_delivering_for_session_reset(&home, agent);
+    assert_eq!(settled, 3, "all 3 delivering rows should be requeued");
 
-    // Verify: a subsequent drain returns nothing (all are now PROCESSED).
+    // Verify: a subsequent drain returns all 3 for the successor.
     let post_settle_drain = drain(&home, agent);
-    assert!(
-        post_settle_drain.is_empty(),
-        "no messages should be drainable after settle"
-    );
+    assert_eq!(post_settle_drain.len(), 3);
+    assert!(post_settle_drain.iter().all(|m| m.read_at.is_none()));
+    assert!(post_settle_drain.iter().all(|m| m.delivery_count == 2));
 
-    // Verify: reclaim does NOT revert them (they have read_at set now).
+    // The successor's drain is now in flight; the normal next-drain implicit
+    // ack closes that batch, and reclaim cannot resurrect it while fresh.
     reclaim_stale_delivering(&home);
     let post_reclaim_drain = drain(&home, agent);
     assert!(
@@ -4552,8 +4551,8 @@ fn settle_transitions_delivering_to_processed() {
     fs::remove_dir_all(&home).ok();
 }
 
-/// settle must NOT touch UNREAD rows — only DELIVERING rows are settled.
-/// Unread messages (never drained) must remain available for the new session.
+/// Requeue must NOT touch UNREAD rows — both the prior delivering row and the
+/// never-drained row remain available for the new session.
 #[test]
 fn settle_does_not_touch_unread() {
     let home = tmp_home("settle-unread");
@@ -4581,14 +4580,15 @@ fn settle_does_not_touch_unread() {
     )
     .unwrap();
 
-    // Settle: should only settle the 1 delivering row, not the unread one.
-    let settled = settle_delivering_for_session_reset(&home, agent);
-    assert_eq!(settled, 1, "only the delivering row should be settled");
+    // Requeue: should only requeue the 1 delivering row, not discard either.
+    let settled = requeue_delivering_for_session_reset(&home, agent);
+    assert_eq!(settled, 1, "only the delivering row should be requeued");
 
-    // The unread message should still be drainable.
+    // Both messages should be drainable; neither was silently dropped.
     let post = drain(&home, agent);
-    assert_eq!(post.len(), 1, "the unread message must survive settle");
-    assert_eq!(post[0].text, "unread msg");
+    assert_eq!(post.len(), 2, "both messages must survive reset");
+    assert!(post.iter().any(|m| m.text == "drained msg"));
+    assert!(post.iter().any(|m| m.text == "unread msg"));
 
     fs::remove_dir_all(&home).ok();
 }
@@ -4607,21 +4607,20 @@ fn settle_is_idempotent() {
     .unwrap();
     drain(&home, agent);
 
-    let first = settle_delivering_for_session_reset(&home, agent);
+    let first = requeue_delivering_for_session_reset(&home, agent);
     assert_eq!(first, 1);
 
-    // Second settle: already processed → 0 newly settled.
-    let second = settle_delivering_for_session_reset(&home, agent);
+    // Second reset: already requeued → 0 newly requeued.
+    let second = requeue_delivering_for_session_reset(&home, agent);
     assert_eq!(second, 0, "idempotent: no rows to settle on second call");
 
     fs::remove_dir_all(&home).ok();
 }
 
-/// #159 end-to-end: the reclaim-stale-delivering path must NOT re-page an
-/// agent whose delivering rows were settled by a session-reset. This is the
-/// specific scenario that caused stale re-injection.
+/// #3228 end-to-end: a stale delivering row is requeued by session reset and
+/// remains available to the successor instead of being processed.
 #[test]
-fn settled_rows_immune_to_reclaim_and_renudge() {
+fn reset_requeues_stale_delivering_row() {
     let home = tmp_home("settle-reclaim");
     let agent = "settle-reclaim-agent";
 
@@ -4646,19 +4645,16 @@ fn settled_rows_immune_to_reclaim_and_renudge() {
     )
     .unwrap();
 
-    // Settle it (session-reset path).
-    let settled = settle_delivering_for_session_reset(&home, agent);
-    assert_eq!(settled, 1, "the stale delivering row should be settled");
+    // Requeue it (session-reset path).
+    let settled = requeue_delivering_for_session_reset(&home, agent);
+    assert_eq!(settled, 1, "the stale delivering row should be requeued");
 
-    // Now run reclaim — it should find nothing to revert (read_at is set).
+    // Reclaim has nothing to do because reset already cleared delivering_at.
     reclaim_stale_delivering(&home);
 
-    // Verify the message is still PROCESSED (not reverted to unread).
+    // Verify the message is still available for the successor.
     let post = drain(&home, agent);
-    assert!(
-        post.is_empty(),
-        "settled row must not be reverted by reclaim → no drainable messages"
-    );
+    assert_eq!(post.len(), 1, "requeued row must remain drainable");
 
     fs::remove_dir_all(&home).ok();
 }
@@ -5082,6 +5078,165 @@ fn audit3_005_reclaim_stale_delivering_preserves_corrupt_line() {
         a3005_read(&home, "ag").contains("CORRUPT-005"),
         "reclaim_stale_delivering must PRESERVE the unparseable line"
     );
+    fs::remove_dir_all(&home).ok();
+}
+
+// ── Durable redelivery history (#3228) ─────────────────────────────────
+
+/// A quiet agent can outlive several reclaim TTLs without losing the fact that
+/// the row was delivered.  The response must expose that history while the
+/// stored message identity and canonical text remain unchanged.
+#[test]
+fn redelivery_history_survives_repeated_quiet_cycles_and_targeted_ack() {
+    let home = tmp_home("redelivery-history");
+    let agent = "redelivery-history-agent";
+    let id = "m-redelivery-history";
+    let original = msg()
+        .id(id)
+        .sender("lead")
+        .text("do not mutate this canonical text")
+        .kind("query")
+        .build();
+    enqueue(&home, agent, original.clone()).unwrap();
+
+    let first = drain(&home, agent);
+    assert_eq!(first.len(), 1);
+    let first_json = serde_json::to_value(&first[0]).unwrap();
+    assert_eq!(first_json["delivery_count"], 1);
+    let first_delivered_at = first_json["first_delivered_at"].clone();
+    assert!(first_delivered_at.is_string());
+    assert_eq!(first[0].id, original.id);
+    assert_eq!(first[0].text, original.text);
+
+    set_row_delivering_at_for_test(
+        &home,
+        agent,
+        id,
+        &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+    );
+    reclaim_stale_delivering(&home);
+    let second = drain(&home, agent);
+    assert_eq!(second.len(), 1);
+    let second_json = serde_json::to_value(&second[0]).unwrap();
+    assert_eq!(second_json["delivery_count"], 2);
+    assert_eq!(second_json["first_delivered_at"], first_delivered_at);
+    assert_eq!(second[0].id, original.id);
+    assert_eq!(second[0].text, original.text);
+    set_row_delivering_at_for_test(
+        &home,
+        agent,
+        id,
+        &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+    );
+    reclaim_stale_delivering(&home);
+    let third = drain(&home, agent);
+    assert_eq!(third.len(), 1);
+    assert_eq!(
+        serde_json::to_value(&third[0]).unwrap()["delivery_count"],
+        3
+    );
+
+    // The row is unread again after reclaim, but targeted ack may settle it
+    // because durable history proves it was delivered before.
+    set_row_delivering_at_for_test(
+        &home,
+        agent,
+        id,
+        &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+    );
+    reclaim_stale_delivering(&home);
+    assert_eq!(ack(&home, agent, Some(id)), 1);
+    assert!(drain(&home, agent).is_empty());
+
+    // A never-delivered targeted ack remains conservative and cannot silently
+    // discard the message.
+    let never = msg()
+        .id("m-never-delivered")
+        .sender("lead")
+        .text("must survive")
+        .kind("query")
+        .build();
+    enqueue(&home, agent, never).unwrap();
+    assert_eq!(ack(&home, agent, Some("m-never-delivered")), 0);
+    assert_eq!(drain(&home, agent).len(), 1);
+
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Reclaim history is metadata-only: attachments and the canonical message
+/// payload must be byte-for-byte equivalent across redelivery.
+#[test]
+fn redelivery_history_preserves_attachment_payload() {
+    use crate::channel::event::{Attachment, AttachmentKind};
+
+    let home = tmp_home("redelivery-attachment");
+    let agent = "redelivery-attachment-agent";
+    let original = msg()
+        .id("m-redelivery-attachment")
+        .sender("telegram:user")
+        .text("caption stays canonical")
+        .kind("query")
+        .attachments(vec![Attachment {
+            kind: AttachmentKind::Photo,
+            path: "/tmp/redelivery-photo.jpg".into(),
+            mime: Some("image/jpeg".into()),
+            caption: Some("a caption".into()),
+            size_bytes: Some(1234),
+            original_filename: Some("photo.jpg".into()),
+        }])
+        .build();
+    enqueue(&home, agent, original.clone()).unwrap();
+    let first = drain(&home, agent);
+    assert_eq!(first.len(), 1);
+    set_row_delivering_at_for_test(
+        &home,
+        agent,
+        original.id.as_deref().unwrap(),
+        &(chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339(),
+    );
+    reclaim_stale_delivering(&home);
+    let second = drain(&home, agent);
+    assert_eq!(second.len(), 1);
+    assert_eq!(second[0].id, original.id);
+    assert_eq!(second[0].text, original.text);
+    assert_eq!(
+        serde_json::to_value(&second[0].attachments).unwrap(),
+        serde_json::to_value(&original.attachments).unwrap()
+    );
+    assert_eq!(
+        serde_json::to_value(&second[0]).unwrap()["delivery_count"],
+        2
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Fresh reset is a context handoff, not an acknowledgement: unconfirmed
+/// delivering rows must be requeued for the successor session.
+#[test]
+fn fresh_reset_requeues_unconfirmed_delivering_rows() {
+    let home = tmp_home("fresh-reset-requeue");
+    let agent = "fresh-reset-requeue-agent";
+    enqueue(
+        &home,
+        agent,
+        msg()
+            .id("m-fresh-reset-requeue")
+            .sender("lead")
+            .text("survive reset")
+            .kind("query")
+            .build(),
+    )
+    .unwrap();
+    assert_eq!(drain(&home, agent).len(), 1);
+
+    assert_eq!(requeue_delivering_for_session_reset(&home, agent), 1);
+    let content = fs::read_to_string(inbox_path(&home, agent)).unwrap();
+    let persisted: serde_json::Value =
+        serde_json::from_str(content.lines().next().unwrap()).unwrap();
+    assert!(persisted["read_at"].is_null());
+    assert!(persisted["delivering_at"].is_null());
+    assert_eq!(persisted["delivery_count"], 1);
+    assert_eq!(drain(&home, agent).len(), 1);
     fs::remove_dir_all(&home).ok();
 }
 
