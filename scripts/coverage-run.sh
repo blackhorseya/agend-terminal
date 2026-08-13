@@ -3,12 +3,14 @@
 # `Run coverage` step in .github/workflows/ci.yml so its failure semantics are
 # testable (same pattern as fmt-owned.sh + test_fmt_owned.sh).
 #
-# SCOPE (decision d-20260812161748154106-7): diagnostics and failure semantics
-# ONLY. The corrupt-profraw writer is UNRESOLVED and nothing here claims to cure
-# it — this wrapper's job is to stop lying about what failed and to leave behind
-# enough evidence to finish that RCA.
+# SCOPE: diagnostics and failure semantics (decision
+# d-20260812161748154106-7), plus conservative containment of an unreadable
+# partial profile (decision d-20260813102525005763-1). The exact historical
+# signal owner remains unresolved; a SIGKILL racing LLVM's exit-time profile
+# write reproduces this artifact class locally, but the CI authority is not
+# established.
 #
-# Four properties, pinned by scripts/test_coverage_run.sh:
+# Five properties, pinned by scripts/test_coverage_run.sh:
 #   1. an observed `test … FAILED` outranks the corruption signature — a real
 #      failure is never retried and never relabelled a flake, and the producer's
 #      own exit code survives (previously the signature was checked first, so a
@@ -20,6 +22,8 @@
 #   4. corrupt/no-profile failure emits bounded, deterministic evidence, and
 #      a path the producer NAMED as corrupt is described regardless of where it
 #      sorts in the glob-ordered cap
+#   5. the production command passes through `failure-mode all`; contained
+#      corruption remains visible, while an all-unusable producer still fails
 #
 # Seams (all default to the production values):
 #   COVERAGE_PRODUCER     command that produces coverage        [cargo llvm-cov …]
@@ -32,7 +36,11 @@
 #   COVERAGE_DIAG_PROC_ROOT  /proc to consult for PID visibility          [/proc]
 set -o pipefail
 
-producer="${COVERAGE_PRODUCER:-cargo llvm-cov -p agend-terminal --tests --features tray --lcov --output-path coverage.lcov}"
+# `all` keeps every valid profile when one killed process leaves a partial raw
+# file. Missing counters can only lower measured coverage; real test failures
+# still make cargo-llvm-cov fail, and llvm-profdata still fails when every input
+# is unusable.
+producer="${COVERAGE_PRODUCER:-cargo llvm-cov -p agend-terminal --tests --features tray --failure-mode all --lcov --output-path coverage.lcov}"
 clean_cmd="${COVERAGE_CLEAN:-cargo llvm-cov clean --workspace}"
 profile_dir="${COVERAGE_PROFILE_DIR:-target/llvm-cov-target}"
 max_attempts="${COVERAGE_MAX_ATTEMPTS:-3}"
@@ -1071,6 +1079,15 @@ while :; do
     eval "$producer" 2>&1 | tee "$log"
     producer_rc="${PIPESTATUS[0]}"
     if [ "$producer_rc" -eq 0 ]; then
+        # `--failure-mode all` deliberately preserves usable profiles, but a
+        # contained partial must not disappear inside a successful 25k-line
+        # job log. Keep the same bounded evidence without entering retry or
+        # cleanup: this run produced a valid conservative report already.
+        contained_warnings="$(count_corruption_warnings)"
+        if [ "$contained_warnings" -gt 0 ]; then
+            emit_diagnostics "$attempt"
+            echo "::warning::coverage completed from valid profiles while the producer reported at least one unreadable profile; see the evidence block above"
+        fi
         exit 0
     fi
 
