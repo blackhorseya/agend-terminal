@@ -147,6 +147,36 @@ emit_deadline_diagnostics() {
                 printf 'deadline_outcome=%s\n' "$(diag_escape "$value")"
                 found=1
                 ;;
+            reason=*)
+                value="${line#reason=}"
+                printf 'deadline_reason=%s\n' "$(diag_escape "$value")"
+                found=1
+                ;;
+            elapsed_seconds=*)
+                value="${line#elapsed_seconds=}"
+                printf 'deadline_elapsed_seconds=%s\n' "$(diag_escape "$value")"
+                found=1
+                ;;
+            rescue=*)
+                value="${line#rescue=}"
+                printf 'deadline_rescue=%s\n' "$(diag_escape "$value")"
+                found=1
+                ;;
+            rescue_completion=*)
+                value="${line#rescue_completion=}"
+                printf 'deadline_rescue_completion=%s\n' "$(diag_escape "$value")"
+                found=1
+                ;;
+            soft_deadline_reached=*)
+                value="${line#soft_deadline_reached=}"
+                printf 'deadline_soft_deadline_reached=%s\n' "$(diag_escape "$value")"
+                found=1
+                ;;
+            hard_deadline_reached=*)
+                value="${line#hard_deadline_reached=}"
+                printf 'deadline_hard_deadline_reached=%s\n' "$(diag_escape "$value")"
+                found=1
+                ;;
             waited_seconds=*)
                 value="${line#waited_seconds=}"
                 printf 'deadline_waited_seconds=%s\n' "$(diag_escape "$value")"
@@ -758,14 +788,12 @@ PRODUCER
 # block truncated mid-print — strictly worse than a failure, and precisely the
 # unreadable failure this wrapper exists to remove.
 
-# Run the wrapper under a hard deadline. A test for a hang must not itself hang:
-# if the process is still alive at the deadline it is BLOCKED, and we release it
-# by OPENING each FIFO FOR WRITING — that completes the pending open-for-read, so
-# the wrapper finishes and no orphan is left behind. Safe precisely because we
-# only do it while a blocked reader is known to exist.
+# Run the wrapper under a soft deadline and a bounded hard stop. A test for a
+# hang must not itself hang. A FIFO writer probe is allowed to block in a child,
+# but the caller polls and kills that child after a bounded interval; the probe
+# is never a synchronous O_WRONLY operation in the deadline loop.
 # Process snapshots add measured observation overhead (~45ms per `ps` on CI);
-# that cost is diagnostic-only. The loop/deadline comparisons, FIFO rescue, and
-# kill semantics remain the same.
+# that cost is diagnostic-only and never replaces the deadline state machine.
 record_process_snapshot() {
     local output="$1" root_pid="$2" snapshot line
     if ! command -v ps >/dev/null 2>&1; then
@@ -805,19 +833,116 @@ record_process_snapshot() {
     )
 }
 
+deadline_publish_rescue_result() {
+    local result="$1" state="$2" temporary="${result}.tmp.$$"
+    printf '%s\n' "$state" >"$temporary" || return 1
+    mv -f "$temporary" "$result" 2>/dev/null || return 1
+}
+
+deadline_rescue_fifo() {
+    local fifo="$1" budget="${2:-1}" rescue_pid rescue_waited=0 rescue_rc
+    local result="${fifo}.rescue-result" worker_path="${fifo}.rescue-worker-pid"
+    # Bash 3.2/MSYS has no portable O_NONBLOCK shell redirection. Isolate the
+    # O_WRONLY open in a worker and bound that worker from the parent instead.
+    rm -f "$result" "${result}.tmp.$$" "$worker_path"
+    ( exec 3>"$fifo"; exec 3>&- ) 2>/dev/null &
+    rescue_pid=$!
+    printf '%s\n' "$rescue_pid" >"$worker_path"
+    while kill -0 "$rescue_pid" 2>/dev/null && [ "$rescue_waited" -lt "$budget" ]; do
+        sleep 1
+        rescue_waited=$((rescue_waited + 1))
+    done
+    if kill -0 "$rescue_pid" 2>/dev/null; then
+        kill -9 "$rescue_pid" 2>/dev/null
+        wait "$rescue_pid" 2>/dev/null || true
+        rm -f "$worker_path"
+        deadline_publish_rescue_result "$result" failed
+        return 1
+    fi
+    wait "$rescue_pid" 2>/dev/null
+    rescue_rc=$?
+    rm -f "$worker_path"
+    if [ "$rescue_rc" -eq 0 ] && \
+        deadline_publish_rescue_result "$result" released; then
+        return 0
+    fi
+    deadline_publish_rescue_result "$result" failed
+    return 1
+}
+
+deadline_kill_rescue_workers() {
+    local root="$1" path pid
+    for path in "$root/profiles"/*.rescue-worker-pid; do
+        [ -f "$path" ] || continue
+        IFS= read -r pid <"$path" || pid=""
+        case "$pid" in
+            '' | *[!0-9]*) ;;
+            *) [ "$pid" -gt 1 ] && kill -9 "$pid" 2>/dev/null || true ;;
+        esac
+        rm -f "$path"
+    done
+}
+
+deadline_collect_rescue_results() {
+    local root="$1" result state
+    for result in "$root/profiles"/*.rescue-result; do
+        [ -f "$result" ] || continue
+        IFS= read -r state <"$result" || state=failed
+        case "$state" in
+            released) rescue_released=1 ;;
+            failed) rescue_unreleased=1 ;;
+        esac
+    done
+}
+
+# Deadline fixtures may intentionally outlive the wrapper's hard stop. Keep
+# their known producer tree from becoming an orphan, and make that cleanup a
+# load-bearing assertion in every deadline control that creates these files.
+cleanup_deadline_producer() {
+    local sandbox="$1" path pid pids="" found=0 alive=0 waited=0
+    for path in "$sandbox/producer.pid" "$sandbox/producer-child.pid"; do
+        [ -f "$path" ] || continue
+        IFS= read -r pid <"$path" || pid=""
+        case "$pid" in
+            '' | *[!0-9]*) continue ;;
+            *) pids="$pids $pid"; found=1 ;;
+        esac
+    done
+    [ "$found" -eq 1 ] || return 1
+    for pid in $pids; do
+        [ "$pid" -gt 1 ] && kill -9 "$pid" 2>/dev/null || true
+    done
+    while [ "$waited" -lt 3 ]; do
+        alive=0
+        for pid in $pids; do
+            kill -0 "$pid" 2>/dev/null && alive=1
+        done
+        [ "$alive" -eq 0 ] && return 0
+        sleep 1
+        waited=$((waited + 1))
+    done
+    [ "$alive" -eq 0 ]
+}
+
 run_wrapper_with_deadline() {
     local sandbox="$1" secs="$2" contract="${FUNCNAME[1]:-unknown}"
-    local pid waited=0 blocked=0 hard_stop=0 wait_status=0 p
+    local pid waited=0 soft_expired=0 hard_stop=0 wait_status=0 p
+    local hard_deadline rescue_pid next_rescue_pids rescue_waited
+    local rescue_result_count started_epoch ended_epoch elapsed_seconds
+    local rescue_pids="" rescue_attempted=0 rescue_released=0 rescue_state=none
+    local rescue_unreleased=0 rescue_completion=not-attempted
+    local reason soft_pause_secs soft_deadline_reached=no hard_deadline_reached=no
     local status_path fifo_path process_path
     status_path="$(deadline_status_for "$contract")"
     fifo_path="$(deadline_fifos_for "$contract")"
     process_path="$(deadline_processes_for "$contract")"
     printf 'contract=%s\n' "$contract" >"$process_path"
+    started_epoch="$(date +%s 2>/dev/null || echo 0)"
     (
-        cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+            cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
             COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
             COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 \
-            "$wrapper" >"$sandbox/out" 2>&1
+            exec "$wrapper" >"$sandbox/out" 2>&1
     ) &
         pid=$!
     while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$secs" ]; do
@@ -825,33 +950,153 @@ run_wrapper_with_deadline() {
         sleep 1
         waited=$((waited + 1))
     done
-    while kill -0 "$pid" 2>/dev/null; do
-        blocked=1
-        record_process_snapshot "$process_path" "$pid"
+    if kill -0 "$pid" 2>/dev/null; then
+        soft_expired=1
+        soft_deadline_reached=yes
+        hard_deadline=$((secs * 4))
         for p in "$sandbox/profiles"/*; do
             [ -p "$p" ] || continue
-            ( exec 3>"$p"; exec 3>&- ) 2>/dev/null
+            rescue_attempted=1
+            rescue_state=attempted-unreleased
+            deadline_rescue_fifo "$p" 1 >/dev/null 2>&1 &
+            rescue_pids="$rescue_pids $!"
         done
-        sleep 1
-        waited=$((waited + 1))
-        if [ "$waited" -gt $((secs * 4)) ]; then
+        # This is a deterministic seam for the soft-vs-hard contract. It is
+        # test-only and bounded by the already selected hard-stop window.
+        case "${COVERAGE_TEST_DEADLINE_SOFT_PAUSE_SECS:-0}" in
+            '' | 0) ;;
+            *[!0-9]*) ;;
+            *)
+                soft_pause_secs="$COVERAGE_TEST_DEADLINE_SOFT_PAUSE_SECS"
+                [ "$soft_pause_secs" -le "$((hard_deadline - waited))" ] \
+                    || soft_pause_secs="$((hard_deadline - waited))"
+                if [ "$soft_pause_secs" -gt 0 ]; then
+                    sleep "$soft_pause_secs"
+                    waited=$((waited + soft_pause_secs))
+                fi
+                ;;
+        esac
+        while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$hard_deadline" ]; do
+            next_rescue_pids=""
+            for rescue_pid in $rescue_pids; do
+                if kill -0 "$rescue_pid" 2>/dev/null; then
+                    next_rescue_pids="$next_rescue_pids $rescue_pid"
+                else
+                    wait "$rescue_pid" 2>/dev/null
+                    deadline_collect_rescue_results "$sandbox"
+                fi
+            done
+            rescue_pids="$next_rescue_pids"
+            sleep 1
+            waited=$((waited + 1))
+        done
+        # Harvest probes that completed in the same interval as the wrapper.
+        next_rescue_pids=""
+        for rescue_pid in $rescue_pids; do
+            if kill -0 "$rescue_pid" 2>/dev/null; then
+                next_rescue_pids="$next_rescue_pids $rescue_pid"
+            else
+                wait "$rescue_pid" 2>/dev/null
+                deadline_collect_rescue_results "$sandbox"
+            fi
+        done
+        rescue_pids="$next_rescue_pids"
+        if kill -0 "$pid" 2>/dev/null; then
+            for rescue_pid in $rescue_pids; do
+                kill -9 "$rescue_pid" 2>/dev/null || true
+                wait "$rescue_pid" 2>/dev/null || true
+            done
             kill -9 "$pid" 2>/dev/null
             hard_stop=1
-            break
+            hard_deadline_reached=yes
+        else
+            # The wrapper completed before the hard stop. Rescue workers have
+            # their own one-second bound, so give them a bounded harvest
+            # window before deciding whether the release was positive.
+            rescue_waited=0
+            while [ -n "$rescue_pids" ] && [ "$rescue_waited" -lt 2 ]; do
+                next_rescue_pids=""
+                for rescue_pid in $rescue_pids; do
+                    if kill -0 "$rescue_pid" 2>/dev/null; then
+                        next_rescue_pids="$next_rescue_pids $rescue_pid"
+                    else
+                        wait "$rescue_pid" 2>/dev/null || true
+                        deadline_collect_rescue_results "$sandbox"
+                    fi
+                done
+                rescue_pids="$next_rescue_pids"
+                [ -n "$rescue_pids" ] || break
+                sleep 1
+                rescue_waited=$((rescue_waited + 1))
+            done
+            for rescue_pid in $rescue_pids; do
+                kill -9 "$rescue_pid" 2>/dev/null || true
+                wait "$rescue_pid" 2>/dev/null || true
+            done
         fi
-    done
+        # A rescue function can itself be killed while its isolated O_WRONLY
+        # worker is blocked. The worker pid sidecar lets this parent reap that
+        # descendant too, including deterministic synchronous-rescue mutants.
+        deadline_kill_rescue_workers "$sandbox"
+        deadline_collect_rescue_results "$sandbox"
+        rescue_result_count=0
+        for p in "$sandbox/profiles"/*.rescue-result; do
+            [ -f "$p" ] || continue
+            rescue_result_count=$((rescue_result_count + 1))
+        done
+        [ "$rescue_result_count" -ge "$rescue_attempted" ] \
+            || rescue_unreleased=1
+        if [ "$rescue_attempted" -eq 0 ]; then
+            rescue_completion=not-attempted
+        elif [ "$rescue_result_count" -ge "$rescue_attempted" ]; then
+            rescue_completion=bounded
+        else
+            rescue_completion=forced-stop
+        fi
+    fi
     wait "$pid" 2>/dev/null || wait_status=$?
     record_process_snapshot "$process_path" "$pid"
     find "$sandbox" -type p -print 2>/dev/null >"$fifo_path"
+    ended_epoch="$(date +%s 2>/dev/null || echo 0)"
+    case "$started_epoch:$ended_epoch" in
+        *[!0-9:]* | *:0) elapsed_seconds="$waited" ;;
+        *)
+            elapsed_seconds=$((ended_epoch - started_epoch))
+            [ "$elapsed_seconds" -ge 0 ] || elapsed_seconds="$waited"
+            ;;
+    esac
+    if [ "$hard_stop" -eq 1 ]; then
+        reason=hard_timeout
+    elif [ "$rescue_released" -eq 1 ]; then
+        reason=released_blockage
+    elif [ "$soft_expired" -eq 1 ]; then
+        reason=slow_success
+    else
+        reason=completed
+    fi
+    if [ "$rescue_unreleased" -eq 1 ]; then
+        [ "$rescue_released" -eq 1 ] && rescue_state=partial
+        [ "$rescue_released" -eq 0 ] && rescue_state=failed
+    elif [ "$rescue_released" -eq 1 ]; then
+        rescue_state=released
+    elif [ "$rescue_attempted" -eq 0 ]; then
+        rescue_state=none
+    fi
     {
         printf 'contract=%s\n' "$contract"
-        printf 'outcome=%s\n' "$([ "$blocked" -eq 1 ] && echo blocked || echo completed)"
+        printf 'outcome=%s\n' "$([ "$hard_stop" -eq 1 ] && echo timeout || echo completed)"
+        printf 'reason=%s\n' "$reason"
+        printf 'elapsed_seconds=%s\n' "$elapsed_seconds"
+        printf 'rescue=%s\n' "$rescue_state"
+        printf 'rescue_completion=%s\n' "$rescue_completion"
+        printf 'soft_deadline_reached=%s\n' "$soft_deadline_reached"
+        printf 'hard_deadline_reached=%s\n' "$hard_deadline_reached"
         printf 'waited_seconds=%s\n' "$waited"
         printf 'deadline_seconds=%s\n' "$secs"
         printf 'forced_stop=%s\n' "$([ "$hard_stop" -eq 1 ] && echo yes || echo no)"
         printf 'wait_status=%s\n' "$wait_status"
     } >"$status_path"
-    printf '%s' "$blocked"
+    printf '%s' "$hard_stop"
 }
 
 # `mkfifo` is absent or a no-op on some platforms; then the premise, not the
@@ -864,7 +1109,7 @@ fifos_unavailable() {
 }
 
 test_named_fifo_does_not_block_the_wrapper() {
-    local sandbox blocked out deadline_status bad=""
+    local sandbox forced_stop out deadline_status diagnostics bad=""
     sandbox="$(new_sandbox)"
     if fifos_unavailable "$sandbox"; then
         rm -rf "$sandbox"
@@ -876,16 +1121,21 @@ test_named_fifo_does_not_block_the_wrapper() {
 #!/usr/bin/env bash
 mkfifo "$COVERAGE_PROFILE_DIR/fifo-1-1_0.profraw"
 printf 'warning: %s/fifo-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+exec 4<"$COVERAGE_PROFILE_DIR/fifo-1-1_0.profraw"
+exec 4<&-
 echo "error: no profile can be merged"
 exit 1
 PRODUCER
     chmod +x "$sandbox/producer.sh"
-    blocked="$(run_wrapper_with_deadline "$sandbox" 5)"
+    run_wrapper_with_deadline "$sandbox" 5 >/dev/null
     out="$(cat "$sandbox/out" 2>/dev/null)"
     deadline_status="$(cat "$(deadline_status_for "${FUNCNAME[0]}")" 2>/dev/null)"
+    diagnostics="$(emit_failure_diagnostics "${FUNCNAME[0]}" \
+        "synthetic released blockage" "deadline control")"
+    forced_stop="$(echo "$deadline_status" | sed -n 's/^forced_stop=//p')"
     rm -f "$sandbox/profiles"/*.profraw 2>/dev/null
     rm -rf "$sandbox"
-    [ "$blocked" = "0" ] || bad="$bad blocked-on-open"
+    [ "$forced_stop" = "no" ] || bad="$bad hard-stop"
     # It must still finish the block it started — a truncated group is the CI
     # symptom that makes a hang worse than a failure.
     echo "$out" | grep -q '::endgroup::' || bad="$bad block-truncated"
@@ -893,6 +1143,14 @@ PRODUCER
     echo "$out" | grep -qE '^[[:space:]]*corrupt=fifo-1-1_0\.profraw' || bad="$bad not-described"
     echo "$out" | grep -q 'exists=not-a-regular-file' || bad="$bad not-labelled-non-regular"
     echo "$deadline_status" | grep -q '^outcome=completed$' || bad="$bad deadline-not-recorded"
+    echo "$deadline_status" | grep -q '^reason=released_blockage$' || bad="$bad reason-not-released"
+    echo "$deadline_status" | grep -q '^rescue=released$' || bad="$bad rescue-not-released"
+    echo "$deadline_status" | grep -q '^rescue_completion=bounded$' || bad="$bad rescue-not-bounded"
+    echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
+    echo "$deadline_status" | grep -q '^hard_deadline_reached=no$' || bad="$bad hard-reached"
+    echo "$diagnostics" | grep '^deadline_reason=released_blockage$' >/dev/null || bad="$bad diagnostic-reason"
+    echo "$diagnostics" | grep '^deadline_elapsed_seconds=[0-9][0-9]*$' >/dev/null || bad="$bad diagnostic-elapsed"
+    echo "$diagnostics" | grep '^deadline_rescue=released$' >/dev/null || bad="$bad diagnostic-rescue"
     if [ -n "$bad" ]; then
         report 1 "a producer-named FIFO does not block the wrapper" \
             "issues:$bad; got: $(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -1)"
@@ -904,7 +1162,7 @@ PRODUCER
 # The same hazard on the response file, whose NAME is producer-controlled by
 # glob: the count, the fragment listing and the membership read all open it.
 test_fifo_response_file_does_not_block_the_wrapper() {
-    local sandbox blocked out deadline_status bad=""
+    local sandbox forced_stop out deadline_status bad=""
     sandbox="$(new_sandbox)"
     if fifos_unavailable "$sandbox"; then
         rm -rf "$sandbox"
@@ -917,16 +1175,19 @@ test_fifo_response_file_does_not_block_the_wrapper() {
 printf 'partial' >"$COVERAGE_PROFILE_DIR/real-1-1_0.profraw"
 mkfifo "$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
 printf 'warning: %s/real-1-1_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+exec 4<"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+exec 4<&-
 echo "error: no profile can be merged"
 exit 1
 PRODUCER
     chmod +x "$sandbox/producer.sh"
-    blocked="$(run_wrapper_with_deadline "$sandbox" 5)"
+    run_wrapper_with_deadline "$sandbox" 5 >/dev/null
     out="$(cat "$sandbox/out" 2>/dev/null)"
     deadline_status="$(cat "$(deadline_status_for "${FUNCNAME[0]}")" 2>/dev/null)"
+    forced_stop="$(echo "$deadline_status" | sed -n 's/^forced_stop=//p')"
     rm -f "$sandbox/profiles"/* 2>/dev/null
     rm -rf "$sandbox"
-    [ "$blocked" = "0" ] || bad="$bad blocked-on-open"
+    [ "$forced_stop" = "no" ] || bad="$bad hard-stop"
     echo "$out" | grep -q '::endgroup::' || bad="$bad block-truncated"
     # The real profile alongside it must still be described.
     echo "$out" | grep -qE '^[[:space:]]*corrupt=real-1-1_0\.profraw' || bad="$bad real-path-lost"
@@ -935,6 +1196,240 @@ PRODUCER
         report 1 "a FIFO response file does not block the wrapper" "issues:$bad"
     else
         report 0 "a FIFO response file does not block the wrapper"
+    fi
+}
+
+# A wrapper that simply takes longer than the soft deadline is slow, not
+# blocked. The old helper reported this as blocked because it only sampled
+# liveness at the deadline.
+test_slow_success_is_not_classified_as_blocked() {
+    local sandbox deadline_status diagnostics elapsed bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+sleep 2
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    run_wrapper_with_deadline "$sandbox" 1 >/dev/null
+    deadline_status="$(cat "$(deadline_status_for "${FUNCNAME[0]}")" 2>/dev/null)"
+    diagnostics="$(emit_failure_diagnostics "${FUNCNAME[0]}" \
+        "synthetic slow success" "deadline control")"
+    elapsed="$(echo "$deadline_status" | sed -n 's/^elapsed_seconds=//p')"
+    rm -rf "$sandbox"
+    echo "$deadline_status" | grep -q '^outcome=completed$' || bad="$bad outcome"
+    echo "$deadline_status" | grep -q '^reason=slow_success$' || bad="$bad reason"
+    echo "$deadline_status" | grep -q '^forced_stop=no$' || bad="$bad forced-stop"
+    echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
+    echo "$deadline_status" | grep -q '^hard_deadline_reached=no$' || bad="$bad hard-reached"
+    echo "$diagnostics" | grep '^deadline_reason=slow_success$' >/dev/null || bad="$bad diagnostic-reason"
+    echo "$diagnostics" | grep '^deadline_elapsed_seconds=[0-9][0-9]*$' >/dev/null || bad="$bad diagnostic-elapsed"
+    echo "$diagnostics" | grep '^deadline_rescue=none$' >/dev/null || bad="$bad diagnostic-rescue"
+    case "$elapsed" in '' | *[!0-9]*) bad="$bad elapsed-invalid" ;; esac
+    [ "${elapsed:-0}" -ge 1 ] || bad="$bad elapsed-too-short"
+    if [ -n "$bad" ]; then
+        report 1 "a slow success is not classified as blocked" "issues:$bad"
+    else
+        report 0 "a slow success is not classified as blocked"
+    fi
+}
+
+# A readerless rescue can fail while the wrapper itself finishes after the
+# soft deadline. The failure must be explicit, but it must not turn ordinary
+# slow completion into a hard timeout.
+test_failed_rescue_is_distinct_from_slow_success() {
+    local sandbox deadline_status diagnostics elapsed bad=""
+    sandbox="$(new_sandbox)"
+    if fifos_unavailable "$sandbox"; then
+        rm -rf "$sandbox"
+        report_skip "a failed rescue is distinct from slow success" \
+            "this platform does not create FIFOs; premise unavailable"
+        return
+    fi
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+mkfifo "$COVERAGE_PROFILE_DIR/readerless-rescue.fifo"
+printf '%s\n' "$$" >"$COVERAGE_PROFILE_DIR/../producer.pid"
+sleep 2 &
+printf '%s\n' "$!" >"$COVERAGE_PROFILE_DIR/../producer-child.pid"
+wait
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    run_wrapper_with_deadline "$sandbox" 1 >/dev/null
+    deadline_status="$(cat "$(deadline_status_for "${FUNCNAME[0]}")" 2>/dev/null)"
+    diagnostics="$(emit_failure_diagnostics "${FUNCNAME[0]}" \
+        "synthetic failed rescue" "deadline control")"
+    elapsed="$(echo "$deadline_status" | sed -n 's/^elapsed_seconds=//p')"
+    cleanup_deadline_producer "$sandbox" \
+        || bad="$bad leftover-producer-process"
+    rm -rf "$sandbox"
+    echo "$deadline_status" | grep -q '^outcome=completed$' || bad="$bad outcome"
+    echo "$deadline_status" | grep -q '^reason=slow_success$' || bad="$bad reason"
+    echo "$deadline_status" | grep -q '^rescue=failed$' || bad="$bad rescue"
+    echo "$deadline_status" | grep -q '^rescue_completion=bounded$' || bad="$bad rescue-not-bounded"
+    echo "$deadline_status" | grep -q '^forced_stop=no$' || bad="$bad forced-stop"
+    echo "$diagnostics" | grep '^deadline_reason=slow_success$' >/dev/null || bad="$bad diagnostic-reason"
+    echo "$diagnostics" | grep '^deadline_rescue=failed$' >/dev/null || bad="$bad diagnostic-rescue"
+    echo "$diagnostics" | grep '^deadline_rescue_completion=bounded$' >/dev/null || bad="$bad diagnostic-completion"
+    case "$elapsed" in
+        '' | *[!0-9]*) bad="$bad elapsed-invalid" ;;
+        *) [ "$elapsed" -ge 1 ] && [ "$elapsed" -le 4 ] \
+            || bad="$bad elapsed($elapsed)" ;;
+    esac
+    if [ -n "$bad" ]; then
+        report 1 "a failed rescue is distinct from slow success" "issues:$bad"
+    else
+        report 0 "a failed rescue is distinct from slow success"
+    fi
+}
+
+# A second, unreferenced FIFO has no reader. Its rescue worker must be bounded
+# independently of the named FIFO that the wrapper can positively release.
+test_readerless_fifo_rescue_is_hard_bounded() {
+    local sandbox deadline_status diagnostics elapsed t0 t1
+    local result result_count=0 bad=""
+    sandbox="$(new_sandbox)"
+    if fifos_unavailable "$sandbox"; then
+        rm -rf "$sandbox"
+        report_skip "a readerless FIFO rescue is hard-bounded" \
+            "this platform does not create FIFOs; premise unavailable"
+        return
+    fi
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf '%s\n' "$$" >"$COVERAGE_PROFILE_DIR/../producer.pid"
+mkfifo "$COVERAGE_PROFILE_DIR/fifo-2-2_0.profraw"
+mkfifo "$COVERAGE_PROFILE_DIR/readerless-rescue.fifo"
+printf 'warning: %s/fifo-2-2_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+exec 4<"$COVERAGE_PROFILE_DIR/fifo-2-2_0.profraw"
+exec 4<&-
+sleep 30 &
+printf '%s\n' "$!" >"$COVERAGE_PROFILE_DIR/../producer-child.pid"
+wait
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    t0="$(date +%s)"
+    run_wrapper_with_deadline "$sandbox" 1 >/dev/null
+    t1="$(date +%s)"
+    deadline_status="$(cat "$(deadline_status_for "${FUNCNAME[0]}")" 2>/dev/null)"
+    diagnostics="$(emit_failure_diagnostics "${FUNCNAME[0]}" \
+        "synthetic readerless rescue" "deadline control")"
+    elapsed="$(echo "$deadline_status" | sed -n 's/^elapsed_seconds=//p')"
+    for result in "$sandbox/profiles"/*.rescue-result; do
+        [ -f "$result" ] || continue
+        result_count=$((result_count + 1))
+        grep -qE '^(released|failed)$' "$result" \
+            || bad="$bad non-terminal-result"
+    done
+    [ "$result_count" -eq 2 ] || bad="$bad result-count($result_count)"
+    cleanup_deadline_producer "$sandbox" \
+        || bad="$bad leftover-producer-process"
+    rm -f "$sandbox/profiles"/*.profraw "$sandbox/profiles"/*.fifo 2>/dev/null
+    rm -rf "$sandbox"
+    [ $((t1 - t0)) -le 10 ] || bad="$bad unbounded($((t1-t0))s)"
+    echo "$deadline_status" | grep -q '^outcome=timeout$' || bad="$bad outcome"
+    echo "$deadline_status" | grep -q '^reason=hard_timeout$' || bad="$bad reason"
+    echo "$deadline_status" | grep -q '^rescue=partial$' || bad="$bad rescue"
+    echo "$deadline_status" | grep -q '^rescue_completion=bounded$' || bad="$bad rescue-not-bounded"
+    echo "$deadline_status" | grep -q '^forced_stop=yes$' || bad="$bad forced-stop"
+    echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
+    echo "$deadline_status" | grep -q '^hard_deadline_reached=yes$' || bad="$bad hard-not-reached"
+    echo "$diagnostics" | grep '^deadline_reason=hard_timeout$' >/dev/null || bad="$bad diagnostic-reason"
+    echo "$diagnostics" | grep '^deadline_elapsed_seconds=[0-9][0-9]*$' >/dev/null || bad="$bad diagnostic-elapsed"
+    echo "$diagnostics" | grep '^deadline_rescue=partial$' >/dev/null || bad="$bad diagnostic-rescue"
+    case "$elapsed" in
+        '' | *[!0-9]*) bad="$bad elapsed-invalid" ;;
+        *) [ "$elapsed" -ge 4 ] && [ "$elapsed" -le 8 ] \
+            || bad="$bad elapsed($elapsed)" ;;
+    esac
+    if [ -n "$bad" ]; then
+        report 1 "a readerless FIFO rescue is hard-bounded" "issues:$bad"
+    else
+        report 0 "a readerless FIFO rescue is hard-bounded"
+    fi
+}
+
+# A process that never exits must reach the hard-stop path even when no FIFO
+# rescue is available.
+test_genuine_hard_timeout_is_recorded() {
+    local sandbox deadline_status diagnostics elapsed bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf '%s\n' "$$" >"$COVERAGE_PROFILE_DIR/../producer.pid"
+sleep 30 &
+printf '%s\n' "$!" >"$COVERAGE_PROFILE_DIR/../producer-child.pid"
+wait
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    run_wrapper_with_deadline "$sandbox" 1 >/dev/null
+    deadline_status="$(cat "$(deadline_status_for "${FUNCNAME[0]}")" 2>/dev/null)"
+    diagnostics="$(emit_failure_diagnostics "${FUNCNAME[0]}" \
+        "synthetic hard timeout" "deadline control")"
+    elapsed="$(echo "$deadline_status" | sed -n 's/^elapsed_seconds=//p')"
+    cleanup_deadline_producer "$sandbox" \
+        || bad="$bad leftover-producer-process"
+    rm -rf "$sandbox"
+    echo "$deadline_status" | grep -q '^outcome=timeout$' || bad="$bad outcome"
+    echo "$deadline_status" | grep -q '^reason=hard_timeout$' || bad="$bad reason"
+    echo "$deadline_status" | grep -q '^forced_stop=yes$' || bad="$bad forced-stop"
+    echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
+    echo "$deadline_status" | grep -q '^hard_deadline_reached=yes$' || bad="$bad hard-not-reached"
+    echo "$diagnostics" | grep '^deadline_reason=hard_timeout$' >/dev/null || bad="$bad diagnostic-reason"
+    echo "$diagnostics" | grep '^deadline_elapsed_seconds=[0-9][0-9]*$' >/dev/null || bad="$bad diagnostic-elapsed"
+    case "$elapsed" in
+        '' | *[!0-9]*) bad="$bad elapsed-invalid" ;;
+        *) [ "$elapsed" -ge 4 ] && [ "$elapsed" -le 8 ] \
+            || bad="$bad elapsed($elapsed)" ;;
+    esac
+    if [ -n "$bad" ]; then
+        report 1 "a genuine hard timeout is recorded" "issues:$bad"
+    else
+        report 0 "a genuine hard timeout is recorded"
+    fi
+}
+
+# Pause after the soft deadline, then prove the bounded hard deadline remains
+# the later state transition rather than being skipped or reclassified.
+test_soft_deadline_precedes_hard_deadline() {
+    local sandbox deadline_status diagnostics waited bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf '%s\n' "$$" >"$COVERAGE_PROFILE_DIR/../producer.pid"
+sleep 30 &
+printf '%s\n' "$!" >"$COVERAGE_PROFILE_DIR/../producer-child.pid"
+wait
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    COVERAGE_TEST_DEADLINE_SOFT_PAUSE_SECS=1 \
+        run_wrapper_with_deadline "$sandbox" 1 >/dev/null
+    deadline_status="$(cat "$(deadline_status_for "${FUNCNAME[0]}")" 2>/dev/null)"
+    diagnostics="$(emit_failure_diagnostics "${FUNCNAME[0]}" \
+        "synthetic ordered deadlines" "deadline control")"
+    waited="$(echo "$deadline_status" | sed -n 's/^waited_seconds=//p')"
+    cleanup_deadline_producer "$sandbox" \
+        || bad="$bad leftover-producer-process"
+    rm -rf "$sandbox"
+    echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft"
+    echo "$deadline_status" | grep -q '^hard_deadline_reached=yes$' || bad="$bad hard"
+    echo "$deadline_status" | grep -q '^reason=hard_timeout$' || bad="$bad reason"
+    echo "$deadline_status" | grep -q '^forced_stop=yes$' || bad="$bad forced-stop"
+    case "$waited" in
+        '' | *[!0-9]*) bad="$bad waited-invalid" ;;
+        *) [ "$waited" -ge 4 ] || bad="$bad hard-not-later" ;;
+    esac
+    echo "$diagnostics" | grep '^deadline_soft_deadline_reached=yes$' >/dev/null || bad="$bad diagnostic-soft"
+    echo "$diagnostics" | grep '^deadline_hard_deadline_reached=yes$' >/dev/null || bad="$bad diagnostic-hard"
+    if [ -n "$bad" ]; then
+        report 1 "the soft deadline precedes the hard deadline" "issues:$bad"
+    else
+        report 0 "the soft deadline precedes the hard deadline"
     fi
 }
 
@@ -3654,6 +4149,11 @@ test_proc_absence_is_never_reported_as_no
 test_isolation_fails_closed_when_its_commands_fail
 test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper
+test_slow_success_is_not_classified_as_blocked
+test_failed_rescue_is_distinct_from_slow_success
+test_readerless_fifo_rescue_is_hard_bounded
+test_genuine_hard_timeout_is_recorded
+test_soft_deadline_precedes_hard_deadline
 test_phrase_bearing_path_fragment_claims_no_count
 test_benign_raw_profile_prose_fabricates_no_record
 test_exact_raw_profile_messages_are_parsed
