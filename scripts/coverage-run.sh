@@ -28,6 +28,8 @@
 #   COVERAGE_MAX_ATTEMPTS total producer executions             [3]
 #   COVERAGE_LOG          per-attempt producer log              [cov-attempt.log]
 #   COVERAGE_DIAG_MAX_FILES  profraw files described on failure [10]
+#   COVERAGE_DIAG_GRACE_SECS post-cleanup grace before final inventory [2]
+#   COVERAGE_DIAG_PROC_ROOT  /proc to consult for PID visibility          [/proc]
 set -o pipefail
 
 producer="${COVERAGE_PRODUCER:-cargo llvm-cov -p agend-terminal --tests --features tray --lcov --output-path coverage.lcov}"
@@ -36,6 +38,15 @@ profile_dir="${COVERAGE_PROFILE_DIR:-target/llvm-cov-target}"
 max_attempts="${COVERAGE_MAX_ATTEMPTS:-3}"
 log="${COVERAGE_LOG:-cov-attempt.log}"
 diag_max_files="${COVERAGE_DIAG_MAX_FILES:-10}"
+# #3236: bounded post-cleanup grace before the final inventory (corrupt path only).
+diag_grace_secs="${COVERAGE_DIAG_GRACE_SECS:-2}"
+# Seam: the /proc to consult for PID visibility. Overridable so the hidepid and
+# restricted-namespace branches are testable off Linux.
+diag_proc_root="${COVERAGE_DIAG_PROC_ROOT:-/proc}"
+# Validated like the file cap, and HARD-BOUNDED. Unvalidated it leaked a raw
+# `sleep: invalid time interval` and an arbitrarily large value could re-time
+# the retry path — neither is acceptable for a diagnostics-only change.
+DIAG_GRACE_MAX_SECS=30
 
 # A genuine producer/test failure. Checked BEFORE the corruption signature:
 # corruption may accompany a real failure, and when it does the real failure is
@@ -99,6 +110,14 @@ esac
 # already far beyond any real profile count, so anything longer is a typo.
 if [ "${#diag_max_files}" -gt 6 ]; then
     diag_max_files=0
+fi
+case "$diag_grace_secs" in
+    '' | *[!0-9]*) diag_grace_secs=-1 ;;
+esac
+if [ "$diag_grace_secs" = "-1" ] || [ "${#diag_grace_secs}" -gt 3 ] \
+    || [ "$diag_grace_secs" -gt "$DIAG_GRACE_MAX_SECS" ]; then
+    echo "::warning::COVERAGE_DIAG_GRACE_SECS=$(escape_field "${COVERAGE_DIAG_GRACE_SECS-}") is not an integer in 0..$DIAG_GRACE_MAX_SECS; using 2"
+    diag_grace_secs=2
 fi
 if [ "$diag_max_files" -lt 1 ]; then
     echo "::warning::COVERAGE_DIAG_MAX_FILES=$(escape_field "${COVERAGE_DIAG_MAX_FILES-}") is not a positive integer; using 10"
@@ -243,11 +262,13 @@ resolve_in_profile_dir() {
 FACT_SIZE=""
 FACT_HEADER=""
 FACT_MTIME=""
+FACT_HEAD64=""
 read_pinned_facts() {
     local path="$1" tmp
     FACT_SIZE=n/a
     FACT_HEADER=n/a
     FACT_MTIME=unknown
+    FACT_HEAD64=n/a
     # ONLY REGULAR FILES ARE OPENED. Opening a FIFO for reading blocks until a
     # writer appears, so a producer-named `*.profraw` FIFO hung the wrapper
     # forever — in CI a silent step timeout with the evidence block truncated
@@ -294,6 +315,11 @@ read_pinned_facts() {
     exec 9<&-
     FACT_SIZE="$( { wc -c <"$tmp"; } 2>/dev/null | tr -d ' ')"
     FACT_HEADER="$( { od -An -tx1 -N8 <"$tmp"; } 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
+    # 64 bytes, from the SAME pinned copy — no second open. The magic alone was
+    # never the problem: it is valid LLVM raw magic, identical on healthy files.
+    # `-v`: without it od collapses repeated lines to `*`, silently truncating the
+    # very bytes this field exists to show.
+    FACT_HEAD64="$( { od -v -An -tx1 -N64 <"$tmp"; } 2>/dev/null | tr -s ' \n' ' ' | sed 's/^ //;s/ $//')"
     rm -f "$tmp"
     # `od` prints nothing at all for an empty file, so a 0-byte profile used to
     # report `header=` blank here while the survey reported `header=n/a` for the
@@ -394,6 +420,265 @@ file_mtime() {
     date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || echo unknown
 }
 
+
+# ── #3236 late-writer discriminator (DIAGNOSTICS ONLY) ──────────────────────
+# None of this changes the failure, the retry policy or the classification. It
+# answers one open question: is the writer of a named corrupt profile still
+# ALIVE when llvm-profdata runs? Run 31655194748 showed one module's profiles at
+# four different page-aligned sizes — the shape of files caught mid-growth — but
+# liveness at merge was never observed, so the hypothesis stayed unproven.
+
+# The `%p` field from `<name>-<pid>-<module>_<n>.profraw`; `unknown` otherwise.
+pid_token() {
+    printf '%s' "$1" | sed -nE 's/.*-([0-9]+)-[0-9]+_[0-9]+\.profraw$/\1/p' | grep . || printf 'unknown'
+}
+
+# POSIX liveness of a PID NUMBER — deliberately NOT called writer_alive. PIDs
+# are recycled, so a live number is not proof that THE writer still runs; it is
+# one correlate, to be read with `writer_start`/`writer_exe`. `kill -0` needs no
+# /proc, so this fact holds on Linux, macOS and Git Bash alike.
+# ONE boundary parse. Every PID consumer below reads ONLY this result, so a
+# non-canonical token can never reach a kill/ps//proc lookup. Guarding each
+# consumer separately was the wrong shape: it left `writer_start`/`writer_exe`
+# free to look up `007969` and name a real process while liveness said unknown.
+# Empty result == not a usable PID.
+canonical_pid() {
+    case "$1" in
+        # A leading zero is not canonical: `007` would be reinterpreted as PID 7,
+        # a DIFFERENT process. `0` is never a writer.
+        '' | *[!0-9]* | 0*) printf ''; return ;;
+    esac
+    # Digits alone are not enough — a token too large for a shell integer errors
+    # inside `[ … ]` and prints a raw shell diagnostic into the block.
+    [ "${#1}" -le 10 ] || { printf ''; return; }
+    printf '%s' "$1"
+}
+
+# Callers pass ONLY a canonical_pid result.
+#
+# TRI-STATE, truthfully. `kill -0` fails for BOTH "no such process" (ESRCH) and
+# "permission denied" (EPERM), so a bare failure is NOT proof of absence.
+#   yes     = existence proven
+#   no      = absence proven BY AN AUTHORITY THAT SEES ALL PROCESSES
+#   unknown = could not distinguish
+# Authority matters: MSYS `ps` lists only MSYS processes, so on Windows it can
+# not refute a native PID — measured, it reported PID 1 absent in CI.
+# Which authority, if any, can prove ABSENCE of an arbitrary PID on this host?
+# A NAMED SEAM, so Windows behaviour is testable from any platform.
+#   proc = /proc lists every process (Linux)
+#   ps   = `ps -p` lists every process (Darwin/BSD)
+#   none = no authority over the native PID space; absence is NOT knowable
+# Git Bash/MSYS is `none` even though it ships BOTH a /proc and a ps: each sees
+# only MSYS processes, so neither can refute a native Windows PID. Inferring
+# authority from `[ -d /proc ]` is exactly how PID 1 was twice declared absent
+# on Windows CI.
+pid_authority() {
+    case "${MSYSTEM:-}" in
+        ?*) printf 'none'; return ;;
+    esac
+    case "${OSTYPE:-}" in
+        msys* | cygwin* | win*) printf 'none'; return ;;
+    esac
+    case "$(uname -s 2>/dev/null)" in
+        Linux) printf 'proc' ;;
+        Darwin | *BSD) printf 'ps' ;;
+        *) printf 'none' ;;
+    esac
+}
+
+# Callers pass ONLY a canonical_pid result.
+#
+# TRI-STATE, truthfully. `kill -0` fails for BOTH ESRCH and EPERM, so a bare
+# failure is NOT proof of absence.
+#   yes     = existence proven
+#   no      = absence proven by an authority that sees EVERY process
+#   unknown = could not distinguish
+pid_liveness() {
+    [ -n "$1" ] || { printf 'unknown'; return; }
+    if kill -0 "$1" 2>/dev/null; then
+        printf 'yes'
+        return
+    fi
+    # The authority must actually ANSWER. A failed query proves nothing: `ps`
+    # exiting 127 because it is missing is not evidence that the process is
+    # gone, and neither is a /proc that is not mounted.
+    local rc
+    case "$(pid_authority)" in
+        proc)
+            # PRESENCE proves existence. ABSENCE proves nothing, ever.
+            # hidepid is OWNER-SENSITIVE: PID 1 can be visible merely because it
+            # shares our UID while a foreign target stays hidden, so no /proc
+            # entry — not `self`, not `1` — can serve as a visibility proxy.
+            # After `kill -0` has already failed, a missing entry is
+            # indistinguishable from an invisible one, so it is `unknown`.
+            if [ -d "$diag_proc_root/$1" ]; then
+                printf 'yes'
+            else
+                printf 'unknown'
+            fi
+            ;;
+        ps)
+            ps -p "$1" -o pid= >/dev/null 2>&1
+            rc=$?
+            case "$rc" in
+                0) printf 'yes' ;;
+                # POSIX `ps` exits 1 for "no matching process" — the only
+                # non-zero status that actually proves absence.
+                1) printf 'no' ;;
+                *) printf 'unknown' ;;
+            esac
+            ;;
+        *) printf 'unknown' ;;
+    esac
+}
+
+# Start time and EXECUTABLE IDENTITY, both best-effort and both platform-guarded.
+# Only the executable's BASENAME is emitted — never argv, never env — so the
+# block answers "which binary was this?" without carrying arbitrary content.
+writer_start() {
+    [ -n "$1" ] || { printf 'unavailable'; return; }
+    if [ -r "/proc/$1/stat" ]; then
+        # comm (field 2) is parenthesised and may contain spaces or ')', so
+        # counting fields from the start is wrong. Cut after the FINAL ')' and
+        # take the 20th remaining field (starttime is field 22 overall).
+        sed 's/.*) //' "/proc/$1/stat" 2>/dev/null | awk '{print $20}' | grep . && return
+    fi
+    ps -o lstart= -p "$1" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//' | grep . && return
+    printf 'unavailable'
+}
+
+writer_exe() {
+    local raw=""
+    [ -n "$1" ] || { printf 'unavailable'; return; }
+    if [ -r "/proc/$1/cmdline" ]; then
+        raw="$(tr '\0' '\n' <"/proc/$1/cmdline" 2>/dev/null | head -n 1)"
+    fi
+    [ -n "$raw" ] || raw="$(ps -o comm= -p "$1" 2>/dev/null | head -n 1)"
+    [ -n "$raw" ] || { printf 'unavailable'; return; }
+    raw="${raw##*/}"
+    printf '%s' "$(escape_field "${raw:0:64}")"
+}
+
+# One healthy peer of the SAME module, so an odd size can be read against its
+# own module rather than against unrelated ones. Non-regular objects are never
+# opened, per the FIFO rule.
+# Is this basename one the producer named corrupt?
+is_named_corrupt_base() {
+    local want="$1" b
+    while IFS= read -r b; do
+        [ -n "$b" ] || continue
+        [ "$b" = "$want" ] && return 0
+    done <<EOF
+$NAMED_CORRUPT_BASES
+EOF
+    return 1
+}
+
+emit_module_exemplar() {
+    local corrupt_base="$1" module="$2" f base
+    case "$module" in '' | unknown) printf '    exemplar=none\n'; return ;; esac
+    for f in "$profile_dir"/*-"$module"_*.profraw; do
+        [ -e "$f" ] || continue
+        base="${f##*/}"
+        [ "$base" = "$corrupt_base" ] && continue
+        is_named_corrupt_base "$base" && continue
+        # CONTAINMENT, then ONE SNAPSHOT — the same two steps the named route
+        # takes, not a second mechanism. `wc -c` plus `od` were two more opens
+        # of a producer-controlled name that `-f` had already followed, so a
+        # peer symlinked outside the profile directory was offered as this
+        # module's "healthy" exemplar and its first bytes printed.
+        #
+        # BASENAME, never "$f": resolve_in_profile_dir prepends $profile_dir_abs
+        # to any non-absolute candidate, and $profile_dir defaults to the
+        # RELATIVE `target/llvm-cov-target` — handing it the glob's own path
+        # would double the prefix and silently blind this field in exactly the
+        # configuration CI runs.
+        resolve_in_profile_dir "$base" || continue
+        # Any non-zero is a candidate we could not read as a healthy peer —
+        # escaping, non-regular, replaced mid-read, or our own scratch failing.
+        # An exemplar is an offer, so the honest move is to offer the next one.
+        read_pinned_facts "$RESOLVED_FINAL" || continue
+        printf '    exemplar=%s size_bytes=%s header=%s\n' \
+            "$(escape_field "$base")" "$FACT_SIZE" "$FACT_HEADER"
+        return
+    done
+    printf '    exemplar=none\n'
+}
+
+# PIDs named corrupt in THIS attempt, for the inventories below.
+NAMED_WRITER_PIDS=""
+# Basenames the producer NAMED corrupt this attempt. A named-corrupt file must
+# never be offered as another's "healthy" exemplar — that inverts the field's
+# entire purpose.
+NAMED_CORRUPT_BASES=""
+
+# A bounded inventory: how many profraw files remain, and how many named writers
+# are still alive. NOT a process table — that would be unbounded and would carry
+# arbitrary cmdlines.
+emit_inventory() {
+    local label="$1" files=0 live=0 f pid
+    for f in "$profile_dir"/*.profraw; do
+        # `-e` FOLLOWS the link, so a DANGLING symlink is false and used to
+        # vanish from this count. A count is the one field a reader trusts
+        # without checking, and an entry the producer created is present
+        # whether or not its target is. Widened, never followed: the entry is
+        # counted, nothing is opened.
+        [ -e "$f" ] || [ -L "$f" ] || continue
+        files=$((files + 1))
+    done
+    for pid in $NAMED_WRITER_PIDS; do
+        [ "$(pid_liveness "$pid")" = "yes" ] && live=$((live + 1))
+    done
+    printf '  inventory=%s profraw_files=%s live_writers=%s\n' "$label" "$files" "$live"
+}
+
+# Resolve the llvm-profdata that cargo-llvm-cov ACTUALLY uses. Plain
+# `llvm-profdata` is not on PATH in CI — the real one ships with the rustup
+# llvm-tools component beside the target libdir, which is why the first version
+# of this reported `unavailable` for a tool that had just run.
+resolve_llvm_profdata() {
+    local libdir cand
+    if [ -n "${LLVM_PROFDATA:-}" ]; then
+        printf '%s' "$LLVM_PROFDATA"
+        return
+    fi
+    libdir="$( { rustc --print target-libdir; } 2>/dev/null )"
+    if [ -n "$libdir" ]; then
+        cand="${libdir%/lib}/bin/llvm-profdata"
+        if [ -x "$cand" ]; then
+            printf '%s' "$cand"
+            return
+        fi
+    fi
+    command -v llvm-profdata 2>/dev/null || printf ''
+}
+
+# cargo-llvm-cov answers to both the direct binary and the cargo subcommand;
+# try both before concluding it is absent.
+resolve_cargo_llvm_cov_version() {
+    local v
+    v="$( { cargo-llvm-cov --version; } 2>/dev/null | head -n 1)"
+    [ -n "$v" ] || v="$( { cargo llvm-cov --version; } 2>/dev/null | head -n 1)"
+    printf '%s' "$v"
+}
+
+# Versions of the tools that actually ran, plus whether the two LLVM overrides
+# are set. PRESENCE ONLY — the values are paths and are deliberately not printed.
+emit_toolchain() {
+    local rustc_v cov_v pd_v pd_bin cov_present=unset pd_present=unset
+    [ -n "${LLVM_COV:-}" ] && cov_present="set"
+    [ -n "${LLVM_PROFDATA:-}" ] && pd_present="set"
+    rustc_v="$( { rustc --version; } 2>/dev/null | head -n 1)"
+    cov_v="$(resolve_cargo_llvm_cov_version)"
+    pd_bin="$(resolve_llvm_profdata)"
+    [ -n "$pd_bin" ] && pd_v="$( { "$pd_bin" --version; } 2>/dev/null | head -n 1 | tr -s ' ')"
+    printf '  toolchain rustc=%s cargo_llvm_cov=%s llvm_profdata=%s LLVM_COV=%s LLVM_PROFDATA=%s\n' \
+        "$(escape_field "${rustc_v:-unavailable}")" \
+        "$(escape_field "${cov_v:-unavailable}")" \
+        "$(escape_field "${pd_v:-unavailable}")" \
+        "$cov_present" "$pd_present"
+}
+
 # The `%m` module token from `<name>-<pid>-<module>_<n>.profraw`; `unknown` when
 # the name does not carry one.
 module_token() {
@@ -403,28 +688,90 @@ module_token() {
 # Membership is exact and by NORMALIZED FULL PATH: a same-named file in another
 # directory is a different member, and a substring test would call foo.profraw a
 # member because the list happens to hold otherfoo.profraw.
+#
+# TRI-STATE, because `no` is the strongest claim in this record and it needs an
+# authority. `yes` needs one matching entry. `no` needs the far stronger fact
+# that EVERY present list was read to its end — so a list we could not examine
+# (a directory or FIFO the producer's glob name landed on; a regular file whose
+# open failed) yields `unknown`, never `no`. The survey below discloses those
+# same lists as `lines=n/a`: emitting `in_response=no` beside `lines=n/a` made
+# one record assert absence and admit ignorance at the same time, and the
+# assertion was the false half. An empty glob is `unknown` too — no list to read
+# is not a list that excludes us, and it is indistinguishable from a profile
+# directory that could not be enumerated.
+#
+# This is the `ps` exit-127 rule and the `/proc`-absence rule at their fourth
+# site: a query that did not answer is not a `no`. Membership was the last field
+# in the record without a third state.
 response_contains_path() {
-    local want="$1" list entry
+    local want="$1" list entry examined=0 unexamined=0
     for list in "$profile_dir"/*-profraw-list; do
+        # An unmatched glob leaves the pattern itself, and neither test matches
+        # it. `-e` alone also dropped a DANGLING symlink — it follows the link,
+        # so a broken one was skipped before the refusal below could class it
+        # as unexamined. Widened so the entry reaches that refusal; the link is
+        # still never followed.
+        [ -e "$list" ] || [ -L "$list" ] || continue
+        # A SYMLINKED LIST IS REFUSED OUTRIGHT, in scope or not. The name is
+        # producer-controlled by glob, and cargo-llvm-cov writes this file with
+        # `fs::write` — a legitimate producer never presents a link here, so
+        # supporting one buys nothing and costs a resolved second path, which is
+        # the validate-one/open-another shape this script has already been bitten
+        # by. Judging the SHAPE needs no resolution at all.
+        #
+        # HONEST BOUND: this does not eliminate TOCTOU. `[ -L ]` and the open
+        # below are separate syscalls and nothing anchors the object between
+        # them; refusing outright removes the resolved detour and fails closed,
+        # nothing more. A HARD link to an outside file defeats this test and the
+        # resolving alternative alike — `-L` is false and the path genuinely is
+        # inside the directory — and that requires same-UID write access to the
+        # profile directory, which this block already declares out of scope.
+        if [ -L "$list" ]; then
+            unexamined=1
+            continue
+        fi
         # `-f`, not `-e`: a FIFO response file would block this read forever.
-        [ -f "$list" ] || continue
-        # `|| [ -n "$entry" ]` so a final entry without a trailing newline is
-        # still read.
-        while IFS= read -r entry || [ -n "$entry" ]; do
-            entry="$(clean_token "$entry")"
-            [ -n "$entry" ] || continue
-            resolve_in_profile_dir "$entry" || continue
-            # Compare the NAMED path: membership is about the path the response
-            # file refers to, not the target a link happens to point at.
-            if [ "$RESOLVED_NAMED" = "$want" ]; then
-                printf 'yes'
-                return 0
-            fi
-        # Grouped: an unreadable response file must not report its own path
-        # into the evidence block through the shell's redirection error.
-        done 2>/dev/null <"$list"
+        # Refusing to read it is exactly why membership cannot then be denied.
+        if [ ! -f "$list" ]; then
+            unexamined=1
+            continue
+        fi
+        # The open we TEST is the open we READ FROM. A separate `: <"$list"`
+        # probe would validate one open and consume another — the
+        # validate-one-path-open-another gap this script has already closed
+        # once. The loop's own status is that of its last body command, so `:`
+        # forces zero; a non-zero status here can then ONLY mean the redirection
+        # itself failed, which is the difference between a list that omits us
+        # and a list we never read.
+        #
+        # `2>/dev/null` BEFORE `<"$list"`: redirections apply left to right, so
+        # ordering them the other way lets a failed open print bash's own
+        # message — carrying the path, unframed — into the evidence block.
+        if { while IFS= read -r entry || [ -n "$entry" ]; do
+                 # `|| [ -n "$entry" ]` above so a final entry without a
+                 # trailing newline is still read.
+                 entry="$(clean_token "$entry")"
+                 [ -n "$entry" ] || continue
+                 resolve_in_profile_dir "$entry" || continue
+                 # Compare the NAMED path: membership is about the path the
+                 # response file refers to, not the target a link happens to
+                 # point at.
+                 if [ "$RESOLVED_NAMED" = "$want" ]; then
+                     printf 'yes'
+                     return 0
+                 fi
+             done
+             :; } 2>/dev/null <"$list"; then
+            examined=1
+        else
+            unexamined=1
+        fi
     done
-    printf 'no'
+    if [ "$unexamined" -eq 1 ] || [ "$examined" -eq 0 ]; then
+        printf 'unknown'
+    else
+        printf 'no'
+    fi
 }
 
 describe_named_corrupt() {
@@ -499,17 +846,36 @@ describe_named_corrupt() {
         size=n/a
         header=n/a
         mtime=n/a
-        in_response=no
+        # `unknown`, not `no`, and not by analogy — by the same defect: the
+        # membership walk SKIPS every entry that resolves outside the profile
+        # directory, so a response list may name this exact path while we
+        # deliberately ignore it. `no` claimed an exclusion that the comparison
+        # is structurally unable to establish for an out-of-scope path.
+        in_response=unknown
     fi
     # The module token is derived from the RAW basename, then the basename is
     # rendered: deriving it from the escaped form would read `\n` as characters.
     printf '  corrupt=%s exists=%s in_response=%s size_bytes=%s header=%s mtime=%s module=%s\n' \
         "$(escape_field "$base")" "$exists" "$in_response" "$size" "$header" "$mtime" \
         "$(module_token "$base")"
+    # Writer evidence on its own lines, so the corrupt= record above keeps the
+    # exact shape every prior contract test pins.
+    # Parse ONCE; an invalid token yields the coherent tuple
+    # (unknown, unavailable, unavailable) with ZERO process lookups.
+    local wpid cpid
+    wpid="$(pid_token "$base")"
+    cpid="$(canonical_pid "$wpid")"
+    NAMED_WRITER_PIDS="$NAMED_WRITER_PIDS $cpid"
+    printf '    writer_pid=%s pid_alive=%s writer_start=%s writer_exe=%s\n' \
+        "$(escape_field "$wpid")" "$(pid_liveness "$cpid")" \
+        "$(escape_field "$(writer_start "$cpid")")" "$(writer_exe "$cpid")"
+    printf '    head64=%s\n' "$FACT_HEAD64"
+    emit_module_exemplar "$base" "$(module_token "$base")"
 }
 
 emit_diagnostics() {
     local attempt="$1"
+    NAMED_WRITER_PIDS=""
     profile_dir_abs="$(resolve_profile_dir_abs)"
     echo "::group::coverage corruption evidence (attempt $attempt)"
     # `printf`, not `echo`, wherever an escaped field is emitted: the escaped
@@ -518,6 +884,18 @@ emit_diagnostics() {
     # off on all three CI platforms, so this is hardening rather than a fix for
     # anything reachable here; the invariant simply should not rest on it.
     printf 'profile_dir=%s\n' "$(escape_field "$profile_dir")"
+    emit_toolchain
+    # Collect every named-corrupt basename FIRST, so the exemplar search below
+    # can exclude all of them rather than only the file being described.
+    local ncb
+    while IFS= read -r ncb; do
+        [ -n "$ncb" ] || continue
+        ncb="$(clean_token "$ncb")"
+        NAMED_CORRUPT_BASES="$NAMED_CORRUPT_BASES
+${ncb##*/}"
+    done <<EOF
+$(named_corrupt_paths)
+EOF
     # (a) cap-exempt: every path the producer itself named, in the order named.
     local named=0 p
     while IFS= read -r p; do
@@ -544,7 +922,10 @@ EOF
         # pathname bytes from message bytes, and exact reconstruction is
         # impossible by decision — so this discloses THAT something was
         # unattributable, and claims nothing about how much.
-        echo "  corrupt=(unparseable) exists=unparseable in_response=no size_bytes=n/a header=n/a mtime=n/a module=unknown"
+        # `in_response=unknown`: there is no path here to look up. Membership was
+        # never queried, and a record that cannot even name its subject is the
+        # last place to assert that subject is absent from a list.
+        echo "  corrupt=(unparseable) exists=unparseable in_response=unknown size_bytes=n/a header=n/a mtime=n/a module=unknown"
     elif [ "$named" -eq 0 ]; then
         echo "  (producer named no corrupt profile path)"
     fi
@@ -564,11 +945,21 @@ EOF
     # fabricated fact, which is the rule the named route already follows.
     local list line count
     for list in "$profile_dir"/*-profraw-list; do
-        [ -e "$list" ] || continue
+        # Widened for the same reason as membership: a dangling list symlink is
+        # a present entry, and dropping it left the block silent about a file
+        # the producer created. It falls into the `lines=n/a` branch below,
+        # disclosed by name and never opened.
+        [ -e "$list" ] || [ -L "$list" ] || continue
         # The response file's NAME is producer-controlled by glob, so it can be
         # a FIFO too — and the count, the listing and the membership read all
         # open it. Disclosed, never read, never dropped.
-        if [ ! -f "$list" ]; then
+        #
+        # `-L` first, and for the same reason membership refuses it: a symlink
+        # under this name is not a shape any legitimate producer creates, and
+        # following one disclosed the CONTENT of a file outside the profile
+        # directory as `response_line=` records. The NAME is producer-controlled
+        # data this block already prints; the bytes behind a link are not ours.
+        if [ -L "$list" ] || [ ! -f "$list" ]; then
             printf 'response_file=%s lines=n/a\n' "$(escape_field "$list")"
             continue
         fi
@@ -590,31 +981,37 @@ EOF
             printf '  … more response lines not shown (cap=%s)\n' "$diag_max_files"
         fi
     done
-    local shown=0 f fsize fheader
+    local shown=0 f fbase fsize fheader
     for f in "$profile_dir"/*.profraw; do
-        [ -e "$f" ] || continue
+        # Widened, NOT turned into a refusal: an IN-SCOPE symlinked profile is
+        # legitimate here and is still read through. A dangling one simply
+        # reaches the containment-and-snapshot path below and fails there, so
+        # it is disclosed by name with n/a facts instead of disappearing.
+        [ -e "$f" ] || [ -L "$f" ] || continue
         if [ "$shown" -ge "$diag_max_files" ]; then
             echo "  … more profraw files not shown (cap=$diag_max_files)"
             break
         fi
-        # Same rule as the named route: never open a non-regular object.
-        if [ ! -f "$f" ]; then
-            fsize=""
+        fbase="${f##*/}"
+        # CONTAINMENT, then ONE SNAPSHOT, exactly as the named route does it.
+        # `-f` FOLLOWS a link, so `wc -c` and `od` used to read — and print the
+        # size and first bytes of — a file outside the profile directory that a
+        # producer had linked to under an in-directory name. The two reads were
+        # also two separate opens, so the size and the header could describe
+        # different objects; one pinned copy answers both.
+        # BASENAME for the same prefix-doubling reason as the exemplar above.
+        if resolve_in_profile_dir "$fbase" && read_pinned_facts "$RESOLVED_FINAL"; then
+            fsize="$FACT_SIZE"
+            fheader="$FACT_HEADER"
         else
-            fsize="$( { wc -c <"$f"; } 2>/dev/null | tr -d ' ')"
+            # Escaping, non-regular, replaced mid-read, or our own scratch
+            # failed. The NAME is still disclosed — never dropped — and no fact
+            # is invented for a read that did not happen.
+            fsize=n/a
+            fheader=n/a
         fi
-        case "$fsize" in
-            '' | *[!0-9]*)
-                fsize=n/a
-                fheader=n/a
-                ;;
-            *)
-                fheader="$( { od -An -tx1 -N8 <"$f"; } 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')"
-                [ -n "$fheader" ] || fheader=n/a
-                ;;
-        esac
         printf '  file=%s size_bytes=%s header=%s\n' \
-            "$(escape_field "$(basename "$f")")" "$fsize" "$fheader"
+            "$(escape_field "$fbase")" "$fsize" "$fheader"
         shown=$((shown + 1))
     done
     [ "$shown" -eq 0 ] && echo "  (no .profraw files present)"
@@ -697,6 +1094,9 @@ while :; do
     fi
 
     echo "::warning::coverage attempt $attempt hit llvm-cov profile corruption; isolating outputs and retrying"
+    # #3236 ownership timeline. Corrupt path ONLY — a passing run never reaches
+    # here, so neither the inventories nor the grace touch the success path.
+    emit_inventory pre-clean
     # (2) cleanup truthfully.
     if ! eval "$clean_cmd"; then
         # shellcheck disable=SC2016  # the backticks are literal message text,
@@ -705,6 +1105,11 @@ while :; do
             "$(escape_field "$clean_cmd")"
         exit 1
     fi
+    emit_inventory post-clean
+    # A short bounded grace, then look again: a writer that survives cleanup and
+    # is still alive here is the late writer the RCA is hunting.
+    sleep "$diag_grace_secs"
+    emit_inventory post-grace
     # (3) isolation, verified.
     isolate_attempt_outputs || exit 1
     attempt=$((attempt + 1))

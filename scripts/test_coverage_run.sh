@@ -1532,6 +1532,143 @@ test_membership_compares_full_paths_not_basenames() {
     fi
 }
 
+# ── Membership is TRI-STATE, and `no` is the claim that needs an authority ────
+# `no` asserts that every present response list was read to its end and none
+# named this path. A list that could not be examined establishes nothing, and
+# the survey below the record already discloses exactly those lists as
+# `lines=n/a` — so `in_response=no` printed beside `lines=n/a` was ONE record
+# making two contradictory claims, with `in_response` the half asserting absence
+# it never had the authority for. Same class as `ps` exit 127, `kill -0` EPERM
+# and an absent `/proc` entry: a query that did not answer is not a `no`.
+
+# Non-regular: the response file's NAME is producer-controlled by glob, so it can
+# land on a directory. `-f` correctly refuses to read it — and refusing to read
+# is precisely why membership cannot then be denied.
+test_membership_unknown_when_list_is_non_regular() {
+    local sandbox line
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/nonreg-1-2_0.profraw"
+    # A DIRECTORY, not a symlink or a FIFO: every platform can create one, so
+    # this contract RUNS where the symlink and mode-000 premises are unavailable
+    # (a property only exercised on Linux is a property Windows never guards).
+    mkdir "$sandbox/profiles/agend-terminal-profraw-list"
+    line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/nonreg-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'in_response=unknown'; then
+        report 0 "a non-regular response list is not evidence of non-membership"
+    else
+        report 1 "a non-regular response list is not evidence of non-membership" \
+            "got: $line"
+    fi
+}
+
+# The same hazard on the shape that also BLOCKS: a FIFO must stay unread, and an
+# unread list must stay unknown. Deadline-bounded, because a test for a
+# potentially blocking open must not itself be able to hang the suite.
+test_membership_unknown_when_list_is_a_fifo() {
+    local sandbox out line
+    sandbox="$(new_sandbox)"
+    if fifos_unavailable "$sandbox"; then
+        rm -rf "$sandbox"
+        report_skip "a FIFO response list is not evidence of non-membership" \
+            "this platform does not create FIFOs; premise unavailable"
+        return
+    fi
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/fifomem-1-2_0.profraw"
+mkfifo "$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+printf 'warning: %s/fifomem-1-2_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    run_wrapper_with_deadline "$sandbox" 5 >/dev/null
+    out="$(cat "$sandbox/out" 2>/dev/null)"
+    rm -f "$sandbox/profiles"/* 2>/dev/null
+    rm -rf "$sandbox"
+    line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=fifomem' | head -n 1)"
+    if echo "$line" | grep -q 'in_response=unknown'; then
+        report 0 "a FIFO response list is not evidence of non-membership"
+    else
+        report 1 "a FIFO response list is not evidence of non-membership" \
+            "got: $line"
+    fi
+}
+
+# The exhibit: the list NAMES this profile, so the truth is `yes`. Only the mode
+# stops the read. Reporting `no` here is not a conservative default — it is the
+# opposite of the fact, printed beside a `lines=n/a` that admits we never looked.
+test_membership_unknown_when_list_is_unreadable() {
+    local sandbox out line
+    sandbox="$(new_sandbox)"
+    if cannot_make_unreadable "$sandbox"; then
+        rm -rf "$sandbox"
+        report_skip "an unreadable response list is not evidence of non-membership" \
+            "this user can read a mode-000 file; premise unavailable"
+        return
+    fi
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/hidden-1-2_0.profraw"
+printf '%s/hidden-1-2_0.profraw\n' "$COVERAGE_PROFILE_DIR" \
+    >"$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+chmod 000 "$COVERAGE_PROFILE_DIR/agend-terminal-profraw-list"
+printf 'warning: %s/hidden-1-2_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
+    chmod -R u+rwX "$sandbox" 2>/dev/null
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'in_response=unknown'; then
+        report 0 "an unreadable response list is not evidence of non-membership"
+    else
+        report 1 "an unreadable response list is not evidence of non-membership" \
+            "got: $line"
+    fi
+}
+
+# No list at all is not a list that excludes us. It is also indistinguishable
+# from a directory we could not enumerate, which is the second reason `no` is
+# unavailable here.
+test_membership_unknown_when_no_response_list_exists() {
+    local sandbox line
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/nolist-1-2_0.profraw"
+    line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/nolist-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'in_response=unknown'; then
+        report 0 "an absent response list is not evidence of non-membership"
+    else
+        report 1 "an absent response list is not evidence of non-membership" \
+            "got: $line"
+    fi
+}
+
+# And the tri-state must not swallow the `no` it replaces: a list that WAS read
+# end to end, and does not name us, still says `no`. Two existing contracts pin
+# that (exact-not-substring, full-paths-not-basenames); this one pins that the
+# unknown-producing paths above did not simply disable `no` everywhere.
+test_membership_no_survives_a_fully_examined_list() {
+    local sandbox line
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/present-1-2_0.profraw"
+    printf '%s\n' "$sandbox/profiles/someone-else-9-9_0.profraw" \
+        >"$sandbox/profiles/agend-terminal-profraw-list"
+    line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/present-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    if echo "$line" | grep -q 'in_response=no'; then
+        report 0 "a fully examined list still yields no"
+    else
+        report 1 "a fully examined list still yields no" "got: $line"
+    fi
+}
+
 # A named path containing spaces must survive extraction intact.
 test_named_path_with_spaces_is_extracted() {
     local sandbox line
@@ -1586,6 +1723,297 @@ test_symlink_leaf_cannot_escape_containment() {
         report 0 "a symlinked leaf cannot escape containment"
     else
         report 1 "a symlinked leaf cannot escape containment" "got: $line"
+    fi
+}
+
+# ── Containment belongs to EVERY reader, not only the named leaf ─────────────
+# The named route resolves its leaf through resolve_in_profile_dir. Three other
+# readers glob a producer-controlled name inside the profile dir and then let
+# `-f`/`-e` FOLLOW a symlink, so a link planted under one of those names hands
+# the reader a file outside the directory — and the block discloses what it
+# found there: the response list by CONTENT (`response_line=`), the survey and
+# the exemplar by SIZE and FIRST BYTES. The name is producer-controlled data we
+# already print; the CONTENT of an outside file is not ours to disclose.
+
+# Same driver as drive_named, but echoes the WHOLE block: these contracts are
+# about what must not appear ANYWHERE in it, which one grepped line cannot show.
+drive_named_block() {
+    local profiles="$1" named="$2" sandbox
+    sandbox="$(dirname "$profiles")"
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+echo "warning: $named: invalid instrumentation profile data (file header is corrupt)"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    (cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)
+}
+
+test_symlinked_response_list_discloses_nothing_outside() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    printf 'OUTSIDE-SENTINEL-LIST\n' >"$sandbox/secret-list.txt"
+    printf 'partial' >"$sandbox/profiles/listlink-1-2_0.profraw"
+    ln -s "$sandbox/secret-list.txt" \
+        "$sandbox/profiles/agend-terminal-profraw-list" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/agend-terminal-profraw-list" ]; then
+        rm -rf "$sandbox"
+        report_skip "a symlinked response list discloses nothing from outside" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/listlink-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
+    echo "$out" | grep -q 'OUTSIDE-SENTINEL-LIST' && bad="$bad content-disclosed"
+    echo "$out" | grep -qE '^response_file=.*lines=n/a' || bad="$bad list-not-marked-unread"
+    echo "$line" | grep -q 'in_response=unknown' || bad="$bad membership-not-unknown"
+    if [ -n "$bad" ]; then
+        report 1 "a symlinked response list discloses nothing from outside" \
+            "issues:$bad; got: $line"
+    else
+        report 0 "a symlinked response list discloses nothing from outside"
+    fi
+}
+
+test_symlinked_survey_profile_discloses_no_outside_bytes() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    printf 'SECRETBYTES' >"$sandbox/secret.bin"
+    printf 'partial' >"$sandbox/profiles/real-1-2_0.profraw"
+    ln -s "$sandbox/secret.bin" "$sandbox/profiles/leak-9-9_0.profraw" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/leak-9-9_0.profraw" ]; then
+        rm -rf "$sandbox"
+        report_skip "the survey discloses no bytes from an escaping profile" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/real-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    # 'SECR' — the first bytes od would print for the outside file.
+    echo "$out" | grep -qi '53 45 43 52' && bad="$bad header-disclosed"
+    echo "$out" | grep -qE '^[[:space:]]*file=leak-9-9_0\.profraw size_bytes=n/a header=n/a' ||
+        bad="$bad not-marked-unread"
+    if [ -n "$bad" ]; then
+        report 1 "the survey discloses no bytes from an escaping profile" \
+            "issues:$bad; got: $(echo "$out" | grep -E 'file=leak' | head -1)"
+    else
+        report 0 "the survey discloses no bytes from an escaping profile"
+    fi
+}
+
+test_symlinked_exemplar_discloses_no_outside_bytes() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    printf 'EXEMPLARSECRET' >"$sandbox/secret.bin"
+    printf 'partial' >"$sandbox/profiles/victim-1-77_0.profraw"
+    ln -s "$sandbox/secret.bin" "$sandbox/profiles/peer-2-77_0.profraw" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/peer-2-77_0.profraw" ]; then
+        rm -rf "$sandbox"
+        report_skip "an escaping peer is never offered as an exemplar" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/victim-1-77_0.profraw")"
+    rm -rf "$sandbox"
+    line="$(echo "$out" | grep -E '^[[:space:]]*exemplar=' | head -n 1)"
+    # 'EXEM' — the first bytes od would print for the outside file.
+    echo "$out" | grep -qi '45 58 45 4d' && bad="$bad header-disclosed"
+    echo "$line" | grep -q 'exemplar=none' || bad="$bad escaping-peer-offered"
+    if [ -n "$bad" ]; then
+        report 1 "an escaping peer is never offered as an exemplar" \
+            "issues:$bad; got: $line"
+    else
+        report 0 "an escaping peer is never offered as an exemplar"
+    fi
+}
+
+# The over-blocking guard. Containment must reject what ESCAPES, not everything
+# that is a symlink: an in-scope link is a legitimate object this block has
+# always read, and a fix that silently blinds the survey and the exemplar would
+# pass every test above while destroying the diagnostic.
+test_in_scope_symlinks_are_still_read() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    printf 'REALBYTES' >"$sandbox/profiles/target-1-88_0.profraw"
+    ln -s "$sandbox/profiles/target-1-88_0.profraw" \
+        "$sandbox/profiles/alias-2-88_0.profraw" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/alias-2-88_0.profraw" ]; then
+        rm -rf "$sandbox"
+        report_skip "an in-scope symlink is still surveyed and still an exemplar" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    printf 'partial' >"$sandbox/profiles/victim-3-88_0.profraw"
+    out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/victim-3-88_0.profraw")"
+    rm -rf "$sandbox"
+    # 9 bytes, and the header od prints for 'REALBYTES'.
+    echo "$out" | grep -qE 'exemplar=alias-2-88_0\.profraw size_bytes=9 header=52 45 41 4c' ||
+        bad="$bad exemplar-blinded"
+    echo "$out" | grep -qE '^[[:space:]]*file=alias-2-88_0\.profraw size_bytes=9' ||
+        bad="$bad survey-blinded"
+    if [ -n "$bad" ]; then
+        report 1 "an in-scope symlink is still surveyed and still an exemplar" \
+            "issues:$bad; got: $(echo "$out" | grep -E 'exemplar=|file=alias' | head -2 | tr '\n' ' ')"
+    else
+        report 0 "an in-scope symlink is still surveyed and still an exemplar"
+    fi
+}
+
+# The list object is judged by SHAPE, not by where it resolves to. cargo-llvm-cov
+# writes the response file with `fs::write`, so a legitimate producer never
+# presents a symlink here: supporting one buys nothing and costs a resolved
+# second path, which is the validate-one/open-another shape this script has
+# already been bitten by. So even an IN-SCOPE symlinked list is refused — and a
+# refused list is unexamined, which under the tri-state is `unknown`, never `no`.
+# ── A DANGLING link is a present directory entry ─────────────────────────────
+# Every enumeration guard here was `[ -e "$x" ] || continue`, and `-e` FOLLOWS
+# the link — so a broken symlink is false and the entry vanished from the block
+# BEFORE any refusal or containment policy could describe it. Nothing escapes,
+# but producer-controlled evidence is silently dropped, and "disclosed, never
+# read, never dropped" is the contract this block is FOR. The guards are widened
+# to `[ -e "$x" ] || [ -L "$x" ] || continue` so the entry reaches the policy
+# that already exists at each site; none of them follows the link.
+#
+# The ENUMERATION guard is now uniform. The POLICIES behind it deliberately are
+# not, and these contracts are named for the intent so nobody "tidies" them into
+# one rule later:
+#   * the response LIST is never followed — refused by shape, disclosed by name;
+#   * the SURVEY names every entry, including ones it will not open;
+#   * the EXEMPLAR offers only a healthy peer, so a candidate it cannot read is
+#     skipped rather than named — an offer that discloses nothing drops nothing.
+# Note also what is NOT pinned: a dangling link's `exists=` on the named route
+# depends on where the target would have been (outside vs missing in-scope), so
+# these contracts pin the basename, the n/a facts and the absence of a read —
+# never one universal value for a field that legitimately differs.
+
+test_dangling_response_list_is_disclosed_not_dropped() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/dangle-1-2_0.profraw"
+    ln -s "$sandbox/never-created-list.txt" \
+        "$sandbox/profiles/agend-terminal-profraw-list" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/agend-terminal-profraw-list" ]; then
+        rm -rf "$sandbox"
+        report_skip "a dangling response list is disclosed by name and never followed" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/dangle-1-2_0.profraw")"
+    rm -rf "$sandbox"
+    line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
+    # The disclosure line is the part that was missing; membership already lands
+    # on `unknown` here, by the empty-glob rule rather than by refusal. Both are
+    # required after the fix, so both are pinned.
+    echo "$out" | grep -qE '^response_file=.*lines=n/a' || bad="$bad list-entry-dropped"
+    echo "$line" | grep -q 'in_response=unknown' || bad="$bad membership-not-unknown"
+    if [ -n "$bad" ]; then
+        report 1 "a dangling response list is disclosed by name and never followed" \
+            "issues:$bad; got: $(echo "$out" | grep -E '^response_file=' | head -1)"
+    else
+        report 0 "a dangling response list is disclosed by name and never followed"
+    fi
+}
+
+# BOTH dangling shapes, because they are not the same fact: one would have
+# pointed OUTSIDE the profile directory, the other at a MISSING IN-SCOPE target.
+# The survey's promise is identical for both — name it, open nothing, invent no
+# facts — and pinning both is what proves the property is not an accident of one.
+test_dangling_profraw_is_surveyed_not_dropped() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/real-6-6_0.profraw"
+    ln -s "$sandbox/never-created.bin" "$sandbox/profiles/gone-7-7_0.profraw" 2>/dev/null
+    ln -s "$sandbox/profiles/also-never-created.bin" \
+        "$sandbox/profiles/inly-8-7_0.profraw" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/gone-7-7_0.profraw" ] ||
+        [ ! -L "$sandbox/profiles/inly-8-7_0.profraw" ]; then
+        rm -rf "$sandbox"
+        report_skip "the survey names a dangling profile it will not open" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/real-6-6_0.profraw")"
+    rm -rf "$sandbox"
+    echo "$out" | grep -qE '^[[:space:]]*file=gone-7-7_0\.profraw size_bytes=n/a header=n/a' ||
+        bad="$bad outside-target-entry-dropped"
+    echo "$out" | grep -qE '^[[:space:]]*file=inly-8-7_0\.profraw size_bytes=n/a header=n/a' ||
+        bad="$bad in-scope-target-entry-dropped"
+    if [ -n "$bad" ]; then
+        report 1 "the survey names a dangling profile it will not open" \
+            "issues:$bad; got: $(echo "$out" | grep -E 'file=' | head -4 | tr '\n' ' ')"
+    else
+        report 0 "the survey names a dangling profile it will not open"
+    fi
+}
+
+# The inventory is a COUNT, so a dropped entry is not a missing line — it is a
+# wrong number, and a number is exactly what an RCA reader trusts without
+# checking. `profraw_files` undercounted every dangling entry.
+test_dangling_profraw_is_counted_in_the_inventory() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/counted-8-8_0.profraw"
+    ln -s "$sandbox/never-created.bin" "$sandbox/profiles/missing-9-9_0.profraw" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/missing-9-9_0.profraw" ]; then
+        rm -rf "$sandbox"
+        report_skip "the inventory counts an entry it never opens" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    # The inventories exist ONLY on the retry path — a single-attempt run never
+    # reaches them — so this contract needs two attempts, and a zero grace so a
+    # test about a count does not also wait out the late-writer window.
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+echo "warning: $sandbox/profiles/counted-8-8_0.profraw: invalid instrumentation profile data (file header is corrupt)"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=2 \
+        COVERAGE_DIAG_GRACE_SECS=0 "$wrapper" 2>&1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -qE 'inventory=[^ ]+ profraw_files=2' || bad="$bad undercounted"
+    if [ -n "$bad" ]; then
+        report 1 "the inventory counts an entry it never opens" \
+            "issues:$bad; got: $(echo "$out" | grep -E 'inventory=' | head -1)"
+    else
+        report 0 "the inventory counts an entry it never opens"
+    fi
+}
+
+test_in_scope_symlinked_response_list_is_refused_not_read() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/member-4-5_0.profraw"
+    printf '%s\n' "$sandbox/profiles/member-4-5_0.profraw" \
+        >"$sandbox/profiles/real-list"
+    ln -s "$sandbox/profiles/real-list" \
+        "$sandbox/profiles/agend-terminal-profraw-list" 2>/dev/null
+    if [ ! -L "$sandbox/profiles/agend-terminal-profraw-list" ]; then
+        rm -rf "$sandbox"
+        report_skip "an in-scope symlinked response list is refused, not read" \
+            "this platform does not create real symlinks; premise unavailable"
+        return
+    fi
+    out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/member-4-5_0.profraw")"
+    rm -rf "$sandbox"
+    line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
+    # It names the profile, so a reader that FOLLOWED it would answer `yes`.
+    # Refusing to read it is exactly why the answer must be `unknown` instead.
+    echo "$line" | grep -q 'in_response=unknown' || bad="$bad membership-not-unknown"
+    echo "$out" | grep -qE '^response_file=.*lines=n/a' || bad="$bad list-not-marked-unread"
+    if [ -n "$bad" ]; then
+        report 1 "an in-scope symlinked response list is refused, not read" \
+            "issues:$bad; got: $line"
+    else
+        report 0 "an in-scope symlinked response list is refused, not read"
     fi
 }
 
@@ -1726,6 +2154,857 @@ PRODUCER
     fi
 }
 
+# ── 48-54. Late-writer discriminator (#3236, d-…011320993265-24) ────────────
+# DIAGNOSTICS ONLY. These pin evidence, not a cure: nothing here may change the
+# failure, the retry policy or the classification. The open question they exist
+# to answer is whether the writer of a named corrupt profile is STILL ALIVE when
+# llvm-profdata runs.
+
+# Drive a corrupt run whose producer names $2 and optionally pre-creates files.
+drive_writer_case() {
+    local sandbox="$1" named="$2" attempts="${3:-1}"
+    (cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS="$attempts" \
+        "$wrapper" 2>&1)
+}
+
+# A profile whose writer is still running must be reported alive — the decisive
+# datum separating "late writer" from "died mid-merge".
+test_live_writer_is_reported_alive() {
+    local sandbox out live bad=""
+    sandbox="$(new_sandbox)"
+    # The TEST owns the live process, so its lifetime is deterministic; relying
+    # on a background job orphaned by the producer is not (measured: it does not
+    # survive the producer on this platform).
+    sleep 30 &
+    live=$!
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-$COV_LIVE_PID-777_0.profraw"
+printf 'warning: %s/agend-terminal-%s-777_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR" "$COV_LIVE_PID"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COV_LIVE_PID="$live" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    kill "$live" 2>/dev/null
+    wait "$live" 2>/dev/null
+    rm -rf "$sandbox"
+    echo "$out" | grep -q "writer_pid=$live" || bad="$bad pid-not-reported"
+    echo "$out" | grep -q 'pid_alive=yes' || bad="$bad not-alive"
+    if [ -n "$bad" ]; then
+        report 1 "a live writer is reported alive" "issues:$bad; got: $(echo "$out" | grep -o 'writer_[a-z]*=[^ ]*' | tr '\n' ' ')"
+    else
+        report 0 "a live writer is reported alive"
+    fi
+}
+
+# A writer that has exited must be reported dead, not alive.
+test_dead_writer_is_reported_dead() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+sh -c 'exit 0' & dead=$!; wait "$dead" 2>/dev/null
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-$dead-778_0.profraw"
+printf 'warning: %s/agend-terminal-%s-778_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR" "$dead"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'pid_alive=' || bad="$bad no-liveness-field"
+    echo "$out" | grep -q 'pid_alive=yes' && bad="$bad claims-alive"
+    if [ -n "$bad" ]; then
+        report 1 "an exited writer is not reported alive" "issues:$bad"
+    else
+        report 0 "an exited writer is not reported alive"
+    fi
+}
+
+# A name carrying no parseable pid must degrade, never error.
+test_unparseable_writer_pid_is_unknown() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    printf 'partial' >"$sandbox/profiles/nopid.profraw"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'warning: %s/nopid.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'writer_pid=unknown' || bad="$bad not-unknown"
+    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    if [ -n "$bad" ]; then
+        report 1 "an unparseable writer pid is reported unknown" "issues:$bad"
+    else
+        report 0 "an unparseable writer pid is reported unknown"
+    fi
+}
+
+# The ownership timeline: three bounded inventories around cleanup.
+test_three_inventories_bracket_cleanup() {
+    local sandbox out bad="" order
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4242-779_0.profraw"
+printf 'warning: %s/agend-terminal-4242-779_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 2)"
+    rm -rf "$sandbox"
+    order="$(echo "$out" | grep -o 'inventory=[a-z-]*' | tr '\n' ',')"
+    [ "$order" = "inventory=pre-clean,inventory=post-clean,inventory=post-grace," ] \
+        || bad="$bad wrong-order($order)"
+    echo "$out" | grep -q 'profraw_files=' || bad="$bad no-file-count"
+    echo "$out" | grep -q 'live_writers=' || bad="$bad no-live-count"
+    if [ -n "$bad" ]; then
+        report 1 "three inventories bracket cleanup" "issues:$bad"
+    else
+        report 0 "three inventories bracket cleanup"
+    fi
+}
+
+# The grace is diagnostic-only: a PASSING run must not pay it, and must emit no
+# inventory at all.
+test_grace_and_inventory_only_on_corrupt_path() {
+    local sandbox out bad="" t0 t1
+    sandbox="$(new_sandbox)"
+    printf '#!/usr/bin/env bash\nexit 0\n' >"$sandbox/producer.sh"
+    chmod +x "$sandbox/producer.sh"
+    t0=$(date +%s)
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    t1=$(date +%s)
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'inventory=' && bad="$bad inventory-on-success"
+    [ $((t1 - t0)) -le 1 ] || bad="$bad success-path-delayed($((t1-t0))s)"
+    if [ -n "$bad" ]; then
+        report 1 "grace and inventory are corrupt-path only" "issues:$bad"
+    else
+        report 0 "grace and inventory are corrupt-path only"
+    fi
+}
+
+# 64 bytes, not just the magic — and still one line for a newline-bearing name.
+test_first_64_bytes_are_captured() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+i=0; while [ "$i" -lt 80 ]; do printf 'A'; i=$((i+1)); done >"$COVERAGE_PROFILE_DIR/agend-terminal-4243-780_0.profraw"
+printf 'warning: %s/agend-terminal-4243-780_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    line="$(echo "$out" | grep -o 'head64=.*' | head -n 1)"
+    rm -rf "$sandbox"
+    [ -n "$line" ] || bad="$bad no-head64"
+    # 64 bytes of 0x41 => 64 "41" tokens.
+    [ "$(echo "$line" | grep -o '41' | wc -l | tr -d ' ')" = "64" ] || bad="$bad not-64-bytes"
+    if [ -n "$bad" ]; then
+        report 1 "the first 64 bytes are captured" "issues:$bad; got: ${line:0:60}"
+    else
+        report 0 "the first 64 bytes are captured"
+    fi
+}
+
+# Tool versions and LLVM_COV/LLVM_PROFDATA PRESENCE — never their values.
+test_toolchain_presence_without_values() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4244-781_0.profraw"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && LLVM_COV=/secret/path/llvm-cov COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    line="$(echo "$out" | grep -o 'toolchain .*' | head -n 1)"
+    rm -rf "$sandbox"
+    [ -n "$line" ] || bad="$bad no-toolchain-line"
+    echo "$line" | grep -q 'LLVM_COV=set' || bad="$bad presence-not-reported"
+    # The VALUE must never appear anywhere in the output.
+    echo "$out" | grep -q '/secret/path' && bad="$bad LEAKED-ENV-VALUE"
+    if [ -n "$bad" ]; then
+        report 1 "toolchain presence is reported without env values" "issues:$bad"
+    else
+        report 0 "toolchain presence is reported without env values"
+    fi
+}
+
+# A healthy exemplar of the SAME module settles whether an odd size is a module
+# property or a corruption signal — the hole left open by the run-31655194748
+# analysis.
+test_healthy_same_module_exemplar() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4245-782_0.profraw"
+printf 'healthy-exemplar-bytes' >"$COVERAGE_PROFILE_DIR/agend-terminal-9999-782_0.profraw"
+printf 'warning: %s/agend-terminal-4245-782_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'exemplar=agend-terminal-9999-782_0.profraw' || bad="$bad no-exemplar"
+    echo "$out" | grep -qE 'exemplar=[^ ]+ size_bytes=22' || bad="$bad no-exemplar-size"
+    if [ -n "$bad" ]; then
+        report 1 "a healthy same-module exemplar is emitted" "issues:$bad; got: $(echo "$out" | grep -o 'exemplar=.*' | head -1)"
+    else
+        report 0 "a healthy same-module exemplar is emitted"
+    fi
+}
+
+# No same-module peer -> say so explicitly rather than omit the field.
+test_missing_exemplar_is_explicit() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4246-783_0.profraw"
+printf 'warning: %s/agend-terminal-4246-783_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'exemplar=none' || bad="$bad not-explicit"
+    if [ -n "$bad" ]; then
+        report 1 "a missing exemplar is stated explicitly" "issues:$bad"
+    else
+        report 0 "a missing exemplar is stated explicitly"
+    fi
+}
+
+# ── 57-60. Blockers from the PR #3243 secondary review ──────────────────────
+
+# `kill -0 0` signals the CALLER'S PROCESS GROUP and always succeeds, so a
+# malformed pid token of 0 produced a FALSE pid_alive=yes — in the one field
+# the whole discriminator rests on.
+test_pid_zero_is_not_reported_alive() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-0-777_0.profraw"
+printf 'warning: %s/agend-terminal-0-777_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'pid_alive=yes' && bad="$bad false-alive-for-pid-0"
+    echo "$out" | grep -q 'writer_pid=' || bad="$bad no-pid-field"
+    if [ -n "$bad" ]; then
+        report 1 "pid 0 is never reported alive" "issues:$bad; got: $(echo "$out" | grep -o 'writer_[a-z]*=[^ ]*' | tr '\n' ' ')"
+    else
+        report 0 "pid 0 is never reported alive"
+    fi
+}
+
+# A file the producer itself named CORRUPT must never be offered as the healthy
+# exemplar for another corrupt file of the same module — that inverts the whole
+# point of the exemplar.
+test_exemplar_excludes_other_named_corrupt() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'aaa' >"$COVERAGE_PROFILE_DIR/agend-terminal-123-777_0.profraw"
+printf 'bbb' >"$COVERAGE_PROFILE_DIR/agend-terminal-124-777_0.profraw"
+printf 'warning: %s/agend-terminal-123-777_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+printf 'warning: %s/agend-terminal-124-777_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'exemplar=agend-terminal-123-777_0.profraw' && bad="$bad corrupt-123-as-exemplar"
+    echo "$out" | grep -q 'exemplar=agend-terminal-124-777_0.profraw' && bad="$bad corrupt-124-as-exemplar"
+    echo "$out" | grep -q 'exemplar=none' || bad="$bad should-be-none"
+    if [ -n "$bad" ]; then
+        report 1 "the exemplar excludes other named-corrupt files" "issues:$bad; got: $(echo "$out" | grep -o 'exemplar=[^ ]*' | tr '\n' ' ')"
+    else
+        report 0 "the exemplar excludes other named-corrupt files"
+    fi
+}
+
+# An invalid grace must not leak a raw `sleep:` error nor change the retry path.
+test_invalid_grace_is_validated() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4247-784_0.profraw"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COVERAGE_DIAG_GRACE_SECS=bogus COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=2 "$wrapper" 2>&1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -qi 'invalid time interval' && bad="$bad raw-sleep-error"
+    echo "$out" | grep -q 'inventory=post-grace' || bad="$bad grace-inventory-lost"
+    if [ -n "$bad" ]; then
+        report 1 "an invalid grace is validated, not passed to sleep" "issues:$bad"
+    else
+        report 0 "an invalid grace is validated, not passed to sleep"
+    fi
+}
+
+# A grace large enough to re-time the retry is not "bounded"; it must be capped.
+test_grace_is_hard_bounded() {
+    local sandbox out t0 t1 bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4248-785_0.profraw"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    t0=$(date +%s)
+    out="$(cd "$sandbox" && COVERAGE_DIAG_GRACE_SECS=45 COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=2 "$wrapper" 2>&1)"
+    t1=$(date +%s)
+    rm -rf "$sandbox"
+    # 45 is over the cap; a correct build spends ~2s here. Deliberately NOT a
+    # huge value: a test for an unbounded wait must not itself become one.
+    [ $((t1 - t0)) -le 35 ] || bad="$bad unbounded($((t1-t0))s)"
+    echo "$out" | grep -q 'inventory=post-grace' || bad="$bad grace-inventory-lost"
+    if [ -n "$bad" ]; then
+        report 1 "the grace is hard-bounded" "issues:$bad"
+    else
+        report 0 "the grace is hard-bounded"
+    fi
+}
+
+# A LIVE but UNRELATED pid must never be described as the writer: the field says
+# pid_alive, and executable/start are separate correlation evidence.
+test_unrelated_live_pid_is_not_claimed_as_writer() {
+    local sandbox out live bad=""
+    sandbox="$(new_sandbox)"
+    sleep 30 &
+    live=$!
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-$COV_LIVE_PID-790_0.profraw"
+printf 'warning: %s/agend-terminal-%s-790_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR" "$COV_LIVE_PID"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COV_LIVE_PID="$live" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    kill "$live" 2>/dev/null; wait "$live" 2>/dev/null
+    rm -rf "$sandbox"
+    # The claim must be about the PID, not about "the writer".
+    echo "$out" | grep -q 'pid_alive=yes' || bad="$bad no-pid-alive"
+    echo "$out" | grep -q 'writer_alive=' && bad="$bad claims-writer-alive"
+    if [ -n "$bad" ]; then
+        report 1 "a live pid is reported as pid_alive, not writer_alive" "issues:$bad"
+    else
+        report 0 "a live pid is reported as pid_alive, not writer_alive"
+    fi
+}
+
+# /proc/PID/stat comm is parenthesised and may contain spaces and ')'. Counting
+# fields from the start mis-parses starttime; the parse must cut after the FINAL
+# ')'. Exercised directly against a synthetic stat line.
+test_proc_stat_parse_survives_tricky_comm() {
+    local tmp got bad=""
+    tmp="$(mktemp "${TMPDIR:-/tmp}/statparse.XXXXXX")"
+    # comm = "(evil ) proc)" — spaces AND a ')'. starttime is field 22 overall,
+    # i.e. the 20th field after the final ')'.
+    printf '%s' "1234 (evil ) proc) S 1 1 1 0 -1 0 0 0 0 0 0 0 0 0 20 0 1 0 987654 0 0 0" >"$tmp"
+    got="$(sed 's/.*) //' "$tmp" | awk '{print $20}')"
+    rm -f "$tmp"
+    [ "$got" = "987654" ] || bad="$bad got($got)want(987654)"
+    if [ -n "$bad" ]; then
+        report 1 "/proc stat starttime parses past a tricky comm" "issues:$bad"
+    else
+        report 0 "/proc stat starttime parses past a tricky comm"
+    fi
+}
+
+# CI reported `llvm_profdata=unavailable` for a tool that had just run, because
+# plain `llvm-profdata` is not on PATH — the real one sits beside the rustup
+# target libdir. Discovery is pinned with shims so it cannot silently regress.
+test_llvm_profdata_discovery_via_rustc_libdir() {
+    local sandbox shim toolbin out bad=""
+    sandbox="$(new_sandbox)"
+    shim="$sandbox/shim"; toolbin="$sandbox/rustlib/host/bin"
+    mkdir -p "$shim" "$toolbin" "$sandbox/rustlib/host/lib"
+    printf '#!/usr/bin/env bash\nprintf "SHIMMED-PROFDATA 9.9\\n"\n' >"$toolbin/llvm-profdata"
+    chmod +x "$toolbin/llvm-profdata"
+    cat >"$shim/rustc" <<SHIM
+#!/usr/bin/env bash
+case "\$1" in
+  --print) printf '%s\n' "$sandbox/rustlib/host/lib" ;;
+  *) printf 'rustc 9.9.9 (shim)\n' ;;
+esac
+SHIM
+    chmod +x "$shim/rustc"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4249-786_0.profraw"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && PATH="$shim:$PATH" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'llvm_profdata=SHIMMED-PROFDATA 9.9' || bad="$bad not-discovered"
+    if [ -n "$bad" ]; then
+        report 1 "llvm-profdata is discovered beside the rustc target libdir" \
+            "issues:$bad; got: $(echo "$out" | grep -o 'llvm_profdata=[^ ]*' | head -1)"
+    else
+        report 0 "llvm-profdata is discovered beside the rustc target libdir"
+    fi
+}
+
+# When genuinely absent, say `unavailable` — never crash, never guess.
+test_absent_tools_degrade_to_unavailable() {
+    local sandbox shim out bad=""
+    sandbox="$(new_sandbox)"
+    shim="$sandbox/shim"; mkdir -p "$shim"
+    # A rustc that reports a libdir with no llvm-tools beside it.
+    # shellcheck disable=SC2016  # this is the shim's SOURCE; $1 must reach it unexpanded
+    printf '#!/usr/bin/env bash\ncase "$1" in --print) printf "%%s\\n" "/nonexistent/lib";; *) printf "rustc 9.9.9 (shim)\\n";; esac\n' >"$shim/rustc"
+    chmod +x "$shim/rustc"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4250-787_0.profraw"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && PATH="$shim:/usr/bin:/bin" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'llvm_profdata=unavailable' || bad="$bad not-unavailable"
+    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    if [ -n "$bad" ]; then
+        report 1 "absent tools degrade to unavailable" "issues:$bad"
+    else
+        report 0 "absent tools degrade to unavailable"
+    fi
+}
+
+# Digits alone are not enough: a producer-controlled basename can carry a
+# numeric PID too large for a shell integer, which passes a digits-only guard
+# and then errors inside `[ … -gt … ]` — a raw shell diagnostic in the block.
+# Same class as the diagnostic-cap range bug; pinned here so it cannot recur.
+test_oversized_pid_token_emits_no_raw_shell_error() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-99999999999999999999-777_0.profraw"
+printf 'warning: %s/agend-terminal-99999999999999999999-777_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$out" | grep -qi 'integer expression expected' && bad="$bad integer-error"
+    echo "$out" | grep -q 'pid_alive=unknown' || bad="$bad not-unknown"
+    if [ -n "$bad" ]; then
+        report 1 "an oversized pid token emits no raw shell error" \
+            "issues:$bad; got: $(echo "$out" | grep -E ': line [0-9]+:' | head -1)"
+    else
+        report 0 "an oversized pid token emits no raw shell error"
+    fi
+}
+
+# `kill -0` fails for BOTH ESRCH and EPERM, so a bare failure is not proof of
+# absence. PID 1 is alive and not ours: reporting `no` for it is a FALSE
+# refutation, and it contradicts writer_exe naming that very process.
+test_unsignalable_live_pid_is_not_reported_absent() {
+    local sandbox out line bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-1-791_0.profraw"
+printf 'warning: %s/agend-terminal-1-791_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    line="$(echo "$out" | grep -o 'pid_alive=[a-z]*' | head -n 1)"
+    rm -rf "$sandbox"
+    # PID 1 always exists; `no` would be a proven-false claim.
+    [ "$line" = "pid_alive=no" ] && bad="$bad false-absence-for-pid-1"
+    [ -n "$line" ] || bad="$bad no-field"
+    if [ -n "$bad" ]; then
+        report 1 "an unsignalable live pid is not reported absent" "issues:$bad; got: $line"
+    else
+        report 0 "an unsignalable live pid is not reported absent"
+    fi
+}
+
+# The block must never carry contradictory evidence: naming an executable while
+# asserting the pid is absent.
+test_no_contradictory_pid_evidence() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-1-792_0.profraw"
+printf 'warning: %s/agend-terminal-1-792_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    # If an executable was identified, absence cannot also be asserted.
+    if echo "$out" | grep -q 'pid_alive=no' \
+        && echo "$out" | grep -qE 'writer_exe=[^ ]+' \
+        && ! echo "$out" | grep -q 'writer_exe=unavailable'; then
+        bad="$bad names-exe-while-claiming-absent"
+    fi
+    if [ -n "$bad" ]; then
+        report 1 "pid evidence is never self-contradictory" \
+            "issues:$bad; got: $(echo "$out" | grep -o 'pid_alive=[a-z]*\|writer_exe=[^ ]*' | tr '\n' ' ')"
+    else
+        report 0 "pid evidence is never self-contradictory"
+    fi
+}
+
+# `007` must not be reinterpreted as PID 7 — a DIFFERENT process.
+test_leading_zero_pid_is_not_reinterpreted() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-007-793_0.profraw"
+printf 'warning: %s/agend-terminal-007-793_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'pid_alive=unknown' || bad="$bad not-unknown"
+    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    if [ -n "$bad" ]; then
+        report 1 "a leading-zero pid token is not reinterpreted" \
+            "issues:$bad; got: $(echo "$out" | grep -o 'pid_alive=[a-z]*' | head -1)"
+    else
+        report 0 "a leading-zero pid token is not reinterpreted"
+    fi
+}
+
+# A 10-digit token is at the accepted boundary: it must classify, not error.
+test_max_length_pid_token_classifies() {
+    local sandbox out bad=""
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4294967295-794_0.profraw"
+printf 'warning: %s/agend-terminal-4294967295-794_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(drive_writer_case "$sandbox" "" 1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -qE 'pid_alive=(yes|no|unknown)' || bad="$bad unclassified"
+    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    if [ -n "$bad" ]; then
+        report 1 "a max-length pid token classifies without error" "issues:$bad"
+    else
+        report 0 "a max-length pid token classifies without error"
+    fi
+}
+
+# SPY: an invalid PID token must perform ZERO process lookups and must yield a
+# COHERENT tuple. Guarding each consumer separately previously let
+# writer_start/writer_exe look up `007969` and name a real process while
+# liveness said unknown — contradictory evidence from one record.
+drive_pid_spy() {
+    local token="$1" sandbox shim out
+    sandbox="$(new_sandbox)"
+    shim="$sandbox/shim"
+    mkdir -p "$shim"
+    # A `ps` that records that it was called at all.
+    cat >"$shim/ps" <<SHIM
+#!/usr/bin/env bash
+printf 'called\n' >>"$sandbox/ps-called"
+exit 1
+SHIM
+    chmod +x "$shim/ps"
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+printf 'partial' >"\$COVERAGE_PROFILE_DIR/agend-terminal-$token-795_0.profraw"
+printf 'warning: %s/agend-terminal-$token-795_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "\$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && PATH="$shim:$PATH" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    local called="no"
+    [ -s "$sandbox/ps-called" ] && called="yes"
+    rm -rf "$sandbox"
+    printf '%s|%s' "$called" "$(echo "$out" | grep -o 'pid_alive=[a-z]*\|writer_start=[^ ]*\|writer_exe=[^ ]*' | tr '\n' ' ')"
+}
+
+test_invalid_pid_tokens_perform_no_lookup_and_stay_coherent() {
+    local token res called fields bad=""
+    # 0001 and 007 are the primary's exact repros; the whole TUPLE is
+    # asserted, not just pid_alive, because the contradiction lived in start/exe.
+    for token in 0 007 0001 007969 99999999999999999999; do
+        res="$(drive_pid_spy "$token")"
+        called="${res%%|*}"
+        fields="${res#*|}"
+        [ "$called" = "no" ] || bad="$bad [$token]ps-was-called"
+        case "$fields" in
+            *"pid_alive=unknown"*) ;;
+            *) bad="$bad [$token]not-unknown" ;;
+        esac
+        case "$fields" in
+            *"writer_start=unavailable"*) ;;
+            *) bad="$bad [$token]start-not-unavailable" ;;
+        esac
+        case "$fields" in
+            *"writer_exe=unavailable"*) ;;
+            *) bad="$bad [$token]exe-not-unavailable" ;;
+        esac
+    done
+    if [ -n "$bad" ]; then
+        report 1 "invalid pid tokens do no lookup and stay coherent" "issues:$bad"
+    else
+        report 0 "invalid pid tokens do no lookup and stay coherent"
+    fi
+}
+
+# The specific R3 repro: a LIVE pid encoded non-canonically must not be resolved
+# through the back door by start/exe.
+test_leading_zero_live_pid_is_not_resolved_by_exe() {
+    local sandbox out live bad=""
+    sandbox="$(new_sandbox)"
+    sleep 30 &
+    live=$!
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-0$COV_LIVE_PID-796_0.profraw"
+printf 'warning: %s/agend-terminal-0%s-796_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR" "$COV_LIVE_PID"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && COV_LIVE_PID="$live" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    kill "$live" 2>/dev/null; wait "$live" 2>/dev/null
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'pid_alive=unknown' || bad="$bad not-unknown"
+    echo "$out" | grep -q 'writer_exe=unavailable' || bad="$bad exe-resolved-anyway"
+    echo "$out" | grep -q 'writer_start=unavailable' || bad="$bad start-resolved-anyway"
+    if [ -n "$bad" ]; then
+        report 1 "a non-canonical live pid is not resolved by exe/start" \
+            "issues:$bad; got: $(echo "$out" | grep -o 'pid_alive=[a-z]*\|writer_exe=[^ ]*\|writer_start=[^ ]*' | tr '\n' ' ')"
+    else
+        report 0 "a non-canonical live pid is not resolved by exe/start"
+    fi
+}
+
+# Authority must be decided by PLATFORM, not inferred from a file. MSYS ships a
+# /proc listing only MSYS processes, so "/proc exists" wrongly implied Linux and
+# reported PID 1 absent on Windows CI — twice. A `uname` shim pins the rule on
+# any host: where we have no authority over the native PID space, absence is
+# NOT knowable and must degrade to unknown.
+test_absence_requires_platform_authority() {
+    local sandbox shim out bad="" plat
+    for plat in MINGW64_NT-10.0 CYGWIN_NT-10.0 SomethingUnknown; do
+        sandbox="$(new_sandbox)"
+        shim="$sandbox/shim"
+        mkdir -p "$shim"
+        printf '#!/usr/bin/env bash\nprintf "%%s\\n" "%s"\n' "$plat" >"$shim/uname"
+        chmod +x "$shim/uname"
+        cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-1-797_0.profraw"
+printf 'warning: %s/agend-terminal-1-797_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+        chmod +x "$sandbox/producer.sh"
+        out="$(cd "$sandbox" && PATH="$shim:$PATH" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+            COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+            COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+        rm -rf "$sandbox"
+        # PID 1 may be signallable (yes) or not (unknown) — but NEVER `no`,
+        # because this platform cannot prove absence.
+        echo "$out" | grep -q 'pid_alive=no' && bad="$bad [$plat]claims-absence-without-authority"
+    done
+    if [ -n "$bad" ]; then
+        report 1 "absence is only asserted with platform authority" "issues:$bad"
+    else
+        report 0 "absence is only asserted with platform authority"
+    fi
+}
+
+# The authority seam, exercised directly so Windows behaviour is testable here.
+# MSYS ships BOTH a /proc and a ps that see only MSYS processes, so it must
+# report `none` even where those exist.
+test_pid_authority_seam_classifies_platforms() {
+    local sandbox shim got bad="" fn
+    sandbox="$(new_sandbox)"
+    shim="$sandbox/shim"
+    mkdir -p "$shim"
+    # shellcheck disable=SC2016  # shim SOURCE: $FAKE_UNAME must reach it unexpanded
+    printf '#!/usr/bin/env bash\nprintf "%%s\\n" "$FAKE_UNAME"\n' >"$shim/uname"
+    chmod +x "$shim/uname"
+    # Extract the function rather than sourcing the wrapper: sourcing would run
+    # its main retry loop.
+    fn="$sandbox/fn.sh"
+    awk '/^pid_authority\(\) \{/,/^\}/' "$wrapper" >"$fn"
+    run_auth() {
+        # shellcheck disable=SC2016  # the sourced snippet must not expand here
+        env PATH="$shim:$PATH" FAKE_UNAME="$1" MSYSTEM="$2" OSTYPE="$3" \
+            bash -c '. "$1"; pid_authority' _ "$fn" 2>/dev/null
+    }
+    got="$(run_auth Linux MINGW64 '')";        [ "$got" = "none" ] || bad="$bad msystem($got)"
+    got="$(run_auth Linux '' msys)";           [ "$got" = "none" ] || bad="$bad ostype-msys($got)"
+    got="$(run_auth Linux '' '')";             [ "$got" = "proc" ] || bad="$bad linux($got)"
+    got="$(run_auth Darwin '' '')";            [ "$got" = "ps" ]   || bad="$bad darwin($got)"
+    got="$(run_auth MINGW64_NT-10.0 '' '')";   [ "$got" = "none" ] || bad="$bad mingw($got)"
+    rm -rf "$sandbox"
+    if [ -n "$bad" ]; then
+        report 1 "the pid authority seam classifies platforms" "issues:$bad"
+    else
+        report 0 "the pid authority seam classifies platforms"
+    fi
+}
+
+# FIFTH instance of the same principle: the authority must actually ANSWER. A
+# `ps` that exits 127 because it is missing proves nothing about the process,
+# yet a bare non-zero status was being read as proven absence.
+test_failed_authority_query_is_not_absence() {
+    local sandbox shim out bad=""
+    sandbox="$(new_sandbox)"
+    shim="$sandbox/shim"
+    mkdir -p "$shim"
+    # shellcheck disable=SC2016  # shim SOURCE, must not expand here
+    printf '#!/usr/bin/env bash\nprintf "Darwin\\n"\n' >"$shim/uname"
+    # A `ps` that cannot run at all. 127 is "command not found", not "absent".
+    printf '#!/usr/bin/env bash\nexit 127\n' >"$shim/ps"
+    chmod +x "$shim/uname" "$shim/ps"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4294967295-798_0.profraw"
+printf 'warning: %s/agend-terminal-4294967295-798_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out="$(cd "$sandbox" && PATH="$shim:$PATH" COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    rm -rf "$sandbox"
+    echo "$out" | grep -q 'pid_alive=no' && bad="$bad absence-from-failed-query"
+    echo "$out" | grep -q 'pid_alive=unknown' || bad="$bad not-unknown"
+    if [ -n "$bad" ]; then
+        report 1 "a failed authority query is not absence" \
+            "issues:$bad; got: $(echo "$out" | grep -o 'pid_alive=[a-z]*' | head -1)"
+    else
+        report 0 "a failed authority query is not absence"
+    fi
+}
+
+# SIXTH instance of the authority principle. `/proc/self` proves only that /proc
+# is MOUNTED, not that the namespace is fully VISIBLE: under hidepid, self
+# exists while other owners' PIDs are hidden, so a missing entry is
+# invisibility, not absence. PID 1's visibility is the usable proxy.
+drive_proc_visibility() {
+    local procroot="$1" sandbox shim out
+    sandbox="$(new_sandbox)"
+    shim="$sandbox/shim"
+    mkdir -p "$shim"
+    # shellcheck disable=SC2016  # shim SOURCE, must not expand here
+    printf '#!/usr/bin/env bash\nprintf "Linux\\n"\n' >"$shim/uname"
+    chmod +x "$shim/uname"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4294967294-799_0.profraw"
+printf 'warning: %s/agend-terminal-4294967294-799_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    # MSYSTEM/OSTYPE are checked BEFORE uname, so on Git Bash they would force
+    # authority=none and the shimmed uname would never be consulted. Clear them
+    # so this test exercises the proc branch on every platform — without that,
+    # it silently tested nothing on Windows and failed there.
+    out="$(cd "$sandbox" && PATH="$shim:$PATH" MSYSTEM="" OSTYPE="" \
+        COVERAGE_DIAG_PROC_ROOT="$procroot" \
+        COVERAGE_PRODUCER="$sandbox/producer.sh" COVERAGE_CLEAN="true" \
+        COVERAGE_PROFILE_DIR="$sandbox/profiles" COVERAGE_LOG="$sandbox/cov.log" \
+        COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
+    rm -rf "$sandbox"
+    printf '%s' "$(echo "$out" | grep -o 'pid_alive=[a-z]*' | head -1)"
+}
+
+test_proc_absence_is_never_reported_as_no() {
+    local base got bad=""
+    base="$(mktemp -d "${TMPDIR:-/tmp}/procvis.XXXXXX")"
+    # hidepid-like: /proc is mounted (self present) but PID 1 is hidden.
+    mkdir -p "$base/hidden/self"
+    got="$(drive_proc_visibility "$base/hidden")"
+    [ "$got" = "pid_alive=unknown" ] || bad="$bad hidepid-got($got)"
+    # PID 1 VISIBLE but target absent must still be `unknown`, never `no`:
+    # hidepid is owner-sensitive, so PID 1 may be visible only because it shares
+    # our UID while the foreign target stays hidden. No /proc entry is a valid
+    # visibility proxy.
+    mkdir -p "$base/open/self" "$base/open/1"
+    got="$(drive_proc_visibility "$base/open")"
+    [ "$got" = "pid_alive=unknown" ] || bad="$bad pid1-visible-target-absent-got($got)"
+    # Target present -> alive.
+    mkdir -p "$base/live/self" "$base/live/1" "$base/live/4294967294"
+    got="$(drive_proc_visibility "$base/live")"
+    [ "$got" = "pid_alive=yes" ] || bad="$bad live-got($got)"
+    rm -rf "$base"
+    if [ -n "$bad" ]; then
+        report 1 "/proc absence is never reported as no" "issues:$bad"
+    else
+        report 0 "/proc absence is never reported as no"
+    fi
+}
+
 test_real_failure_wins_over_corruption_signature
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
@@ -1737,9 +3016,22 @@ test_bare_relative_named_path_resolves
 test_benign_dots_in_filename_are_not_traversal
 test_response_entries_tolerate_crlf_and_no_final_newline
 test_membership_compares_full_paths_not_basenames
+test_membership_unknown_when_list_is_non_regular
+test_membership_unknown_when_list_is_a_fifo
+test_membership_unknown_when_list_is_unreadable
+test_membership_unknown_when_no_response_list_exists
+test_membership_no_survives_a_fully_examined_list
 test_named_path_with_spaces_is_extracted
 test_absolute_token_outside_profile_dir_is_out_of_scope
 test_symlink_leaf_cannot_escape_containment
+test_symlinked_response_list_discloses_nothing_outside
+test_symlinked_survey_profile_discloses_no_outside_bytes
+test_symlinked_exemplar_discloses_no_outside_bytes
+test_in_scope_symlinks_are_still_read
+test_in_scope_symlinked_response_list_is_refused_not_read
+test_dangling_response_list_is_disclosed_not_dropped
+test_dangling_profraw_is_surveyed_not_dropped
+test_dangling_profraw_is_counted_in_the_inventory
 test_absolute_missing_profile_dir_keeps_its_boundary
 test_relative_missing_profile_dir_under_symlinked_cwd
 test_in_scope_symlink_opens_the_validated_target
@@ -1749,6 +3041,34 @@ test_reads_are_pinned_against_post_validation_swap
 test_failed_pinned_read_is_not_reported_as_success
 test_temp_path_is_not_followed
 test_unparseable_named_path_is_disclosed
+test_live_writer_is_reported_alive
+test_dead_writer_is_reported_dead
+test_unparseable_writer_pid_is_unknown
+test_three_inventories_bracket_cleanup
+test_grace_and_inventory_only_on_corrupt_path
+test_first_64_bytes_are_captured
+test_toolchain_presence_without_values
+test_healthy_same_module_exemplar
+test_missing_exemplar_is_explicit
+test_pid_zero_is_not_reported_alive
+test_exemplar_excludes_other_named_corrupt
+test_invalid_grace_is_validated
+test_grace_is_hard_bounded
+test_unrelated_live_pid_is_not_claimed_as_writer
+test_proc_stat_parse_survives_tricky_comm
+test_llvm_profdata_discovery_via_rustc_libdir
+test_absent_tools_degrade_to_unavailable
+test_oversized_pid_token_emits_no_raw_shell_error
+test_unsignalable_live_pid_is_not_reported_absent
+test_no_contradictory_pid_evidence
+test_leading_zero_pid_is_not_reinterpreted
+test_max_length_pid_token_classifies
+test_invalid_pid_tokens_perform_no_lookup_and_stay_coherent
+test_leading_zero_live_pid_is_not_resolved_by_exe
+test_absence_requires_platform_authority
+test_pid_authority_seam_classifies_platforms
+test_failed_authority_query_is_not_absence
+test_proc_absence_is_never_reported_as_no
 test_isolation_fails_closed_when_its_commands_fail
 test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper
