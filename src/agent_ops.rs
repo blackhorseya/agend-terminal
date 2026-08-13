@@ -1268,6 +1268,10 @@ mod tests {
     /// without reaching an adapter or recreating receipt state.
     #[test]
     fn external_delete_fences_queued_transport_before_early_return() {
+        run_external_delete_fixture(true);
+    }
+
+    fn run_external_delete_fixture(send_outcome: bool) {
         use std::sync::atomic::{AtomicUsize, Ordering};
         use std::time::Duration;
 
@@ -1276,6 +1280,8 @@ mod tests {
         let _full_guard = crate::daemon::delivery_worker::test_support::force_full_guard();
         crate::daemon::delivery_worker::test_support::set_force_full(false);
         let _delivery_hook = crate::transport::test_support::delivery_hook_guard();
+        let _cleanup_release_tail_guard =
+            crate::daemon::delivery_worker::test_support::cleanup_release_tail_hook_guard();
         let adapter_calls = std::sync::Arc::new(AtomicUsize::new(0));
         let adapter_calls_hook = std::sync::Arc::clone(&adapter_calls);
         let expected_home = home.clone();
@@ -1318,6 +1324,20 @@ mod tests {
             std::sync::Arc::new(move |hook_home: &std::path::Path, hook_agent: &str| {
                 if hook_home == admission_home.as_path() && hook_agent == admission_agent {
                     std::thread::sleep(LANE_ADMISSION_DELAY);
+                }
+            }),
+        ));
+
+        // Deterministic treatment for the completion clock: the cleanup tail
+        // is a real post-lane release path, so delaying it here reproduces the
+        // Windows panic without relying on scheduler or filesystem load.
+        const CLEANUP_RELEASE_TAIL_DELAY: Duration = Duration::from_millis(1200);
+        let tail_home = home.clone();
+        let tail_agent = agent.clone();
+        crate::daemon::delivery_worker::test_support::set_cleanup_release_tail_hook(Some(
+            std::sync::Arc::new(move |hook_home, hook_agent| {
+                if hook_home == tail_home.as_path() && hook_agent == tail_agent {
+                    std::thread::sleep(CLEANUP_RELEASE_TAIL_DELAY);
                 }
             }),
         ));
@@ -1423,14 +1443,10 @@ mod tests {
                 externals: &delete_externals,
                 notifier: None,
             };
-            delete_tx
-                .send(delete_instance(
-                    &delete_home,
-                    &delete_agent,
-                    &context,
-                    false,
-                ))
-                .expect("delete outcome observer");
+            let outcome = delete_instance(&delete_home, &delete_agent, &context, false);
+            if send_outcome {
+                delete_tx.send(outcome).expect("delete outcome observer");
+            }
         });
 
         let marker_observation = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1452,12 +1468,23 @@ mod tests {
         lane_release_tx.send(()).expect("release lane");
         lane_holder.join().expect("lane holder");
 
-        assert_eq!(
-            delete_rx
-                .recv_timeout(Duration::from_secs(1))
-                .expect("external delete outcome"),
-            DeleteOutcome::External
-        );
+        if send_outcome {
+            assert_eq!(
+                delete_rx.recv().expect(
+                    "external delete outcome sender dropped before sending outcome (RecvError)",
+                ),
+                DeleteOutcome::External
+            );
+        } else {
+            let disconnected: std::sync::mpsc::RecvError = delete_rx.recv().expect_err(
+                "external delete outcome sender dropped before sending outcome (RecvError)",
+            );
+            assert_eq!(
+                format!("{disconnected:?}"),
+                "RecvError",
+                "external delete completion must fail with the named RecvError"
+            );
+        }
         delete_thread.join().expect("delete thread");
 
         let dispatch_deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -1492,6 +1519,13 @@ mod tests {
             "external delete must remove the external registry entry"
         );
         std::fs::remove_dir_all(home).ok();
+    }
+
+    /// The real external-delete thread can disconnect before reporting its
+    /// outcome; the fixture's own completion receiver must surface RecvError.
+    #[test]
+    fn external_delete_completion_disconnect_control() {
+        run_external_delete_fixture(false);
     }
 
     #[test]
