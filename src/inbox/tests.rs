@@ -2,6 +2,7 @@ use super::notify::route_notification;
 use super::storage::{inbox_path, inbox_path_for_id, set_row_delivering_at_for_test};
 use super::*;
 use parking_lot::Mutex;
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
@@ -49,6 +50,107 @@ fn tmp_home_starts_clean_when_suffix_is_reused() {
 
 fn make_msg(from: &str, text: &str) -> InboxMessage {
     msg().sender(from).text(text).build()
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ConcurrentEnqueueDiagnostics {
+    physical_rows: usize,
+    parseable_rows: usize,
+    malformed_rows: usize,
+    distinct_ids: usize,
+    duplicate_ids: usize,
+    missing_ids: usize,
+    unread_rows: usize,
+    delivering_rows: usize,
+    processed_rows: usize,
+    invalid_state_rows: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum ConcurrentEnqueueFailureClass {
+    AppendSideCorruption,
+    AppendSideAbsence,
+    AppendSideIdentityAnomaly,
+    DrainRewriteCorruption,
+    DrainRewriteIdentityAnomaly,
+    DrainRewriteLoss,
+    DrainStateOmission,
+    SnapshotUnavailable,
+    Unclassified,
+}
+
+fn classify_concurrent_enqueue_rows(raw: &str) -> ConcurrentEnqueueDiagnostics {
+    let mut diagnostics = ConcurrentEnqueueDiagnostics::default();
+    let mut ids = HashSet::new();
+
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        diagnostics.physical_rows += 1;
+        let Ok(message) = serde_json::from_str::<InboxMessage>(line) else {
+            diagnostics.malformed_rows += 1;
+            continue;
+        };
+
+        diagnostics.parseable_rows += 1;
+        match message.id {
+            Some(id) => {
+                if !ids.insert(id) {
+                    diagnostics.duplicate_ids += 1;
+                }
+            }
+            None => diagnostics.missing_ids += 1,
+        }
+
+        match (message.read_at.is_some(), message.delivering_at.is_some()) {
+            (false, false) => diagnostics.unread_rows += 1,
+            (false, true) => diagnostics.delivering_rows += 1,
+            (true, false) => diagnostics.processed_rows += 1,
+            (true, true) => diagnostics.invalid_state_rows += 1,
+        }
+    }
+
+    diagnostics.distinct_ids = ids.len();
+    diagnostics
+}
+
+fn read_concurrent_enqueue_diagnostics(
+    path: &Path,
+) -> std::io::Result<ConcurrentEnqueueDiagnostics> {
+    let raw = fs::read(path)?;
+    Ok(classify_concurrent_enqueue_rows(&String::from_utf8_lossy(
+        &raw,
+    )))
+}
+
+fn classify_concurrent_enqueue_failure(
+    pre_drain: Option<&ConcurrentEnqueueDiagnostics>,
+    post_drain: Option<&ConcurrentEnqueueDiagnostics>,
+    drained_rows: usize,
+) -> ConcurrentEnqueueFailureClass {
+    let Some(pre_drain) = pre_drain else {
+        return ConcurrentEnqueueFailureClass::SnapshotUnavailable;
+    };
+    let Some(post_drain) = post_drain else {
+        return ConcurrentEnqueueFailureClass::SnapshotUnavailable;
+    };
+    let pre_identity_anomalies = pre_drain.duplicate_ids + pre_drain.missing_ids;
+    let post_identity_anomalies = post_drain.duplicate_ids + post_drain.missing_ids;
+    if pre_drain.malformed_rows > 0 && post_drain.malformed_rows <= pre_drain.malformed_rows {
+        ConcurrentEnqueueFailureClass::AppendSideCorruption
+    } else if post_drain.malformed_rows > pre_drain.malformed_rows {
+        ConcurrentEnqueueFailureClass::DrainRewriteCorruption
+    } else if pre_identity_anomalies > 0 && post_identity_anomalies <= pre_identity_anomalies {
+        ConcurrentEnqueueFailureClass::AppendSideIdentityAnomaly
+    } else if post_identity_anomalies > pre_identity_anomalies {
+        ConcurrentEnqueueFailureClass::DrainRewriteIdentityAnomaly
+    } else if pre_drain.physical_rows < 20 {
+        ConcurrentEnqueueFailureClass::AppendSideAbsence
+    } else if post_drain.physical_rows < 20 {
+        ConcurrentEnqueueFailureClass::DrainRewriteLoss
+    } else if drained_rows < 20 {
+        ConcurrentEnqueueFailureClass::DrainStateOmission
+    } else {
+        ConcurrentEnqueueFailureClass::Unclassified
+    }
 }
 
 struct TestMsgBuilder(InboxMessage);
@@ -2401,15 +2503,167 @@ fn test_enqueue_concurrent_same_agent() {
         h.join().expect("thread should not panic");
     }
 
+    let path = inbox_path_resolved(&home, "agent1");
+    let pre_drain = read_concurrent_enqueue_diagnostics(&path).unwrap_or_else(|error| {
+        panic!("pre-drain snapshot failed for {}: {error}", path.display())
+    });
     let msgs = drain(&home, "agent1");
-    assert_eq!(
-        msgs.len(),
-        20,
-        "all 20 concurrent enqueues must survive, got {}",
-        msgs.len()
-    );
+    if msgs.len() != 20 {
+        let (post_drain, post_drain_read_error) = match read_concurrent_enqueue_diagnostics(&path) {
+            Ok(diagnostics) => (Some(diagnostics), None),
+            Err(error) => (None, Some(error.to_string())),
+        };
+        let failure_class =
+            classify_concurrent_enqueue_failure(Some(&pre_drain), post_drain.as_ref(), msgs.len());
+        panic!(
+            "all 20 concurrent enqueues must survive, got {}; path={}; failure_class={failure_class:?}; pre-drain diagnostics={pre_drain:#?}; post-drain diagnostics={post_drain:#?}; post-drain read error={post_drain_read_error:?}",
+            msgs.len(),
+            path.display(),
+        );
+    }
 
     fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn concurrent_enqueue_classifier_counts_row_states_and_ids() {
+    let unread = serde_json::to_string(&msg().sender("unread").id("m-1").build()).unwrap();
+    let mut delivering = msg().sender("delivering").id("m-1").build();
+    delivering.delivering_at = Some("2025-01-01T00:00:00Z".to_string());
+    let delivering = serde_json::to_string(&delivering).unwrap();
+    let mut processed = msg().sender("processed").id("m-2").build();
+    processed.read_at = Some("2025-01-01T00:00:00Z".to_string());
+    let processed = serde_json::to_string(&processed).unwrap();
+    let mut invalid = msg().sender("invalid").id("m-3").build();
+    invalid.read_at = Some("2025-01-01T00:00:00Z".to_string());
+    invalid.delivering_at = Some("2025-01-01T00:00:00Z".to_string());
+    let invalid = serde_json::to_string(&invalid).unwrap();
+    let missing_id = serde_json::to_string(&msg().sender("missing-id").build()).unwrap();
+    let raw =
+        format!("{unread}\n{delivering}\n{processed}\n{invalid}\n{missing_id}\n{{not-json}}\n");
+
+    assert_eq!(
+        classify_concurrent_enqueue_rows(&raw),
+        ConcurrentEnqueueDiagnostics {
+            physical_rows: 6,
+            parseable_rows: 5,
+            malformed_rows: 1,
+            distinct_ids: 3,
+            duplicate_ids: 1,
+            missing_ids: 1,
+            unread_rows: 2,
+            delivering_rows: 1,
+            processed_rows: 1,
+            invalid_state_rows: 1,
+        }
+    );
+
+    let invalid_utf8 = String::from_utf8_lossy(b"{not-json\xff}\n");
+    assert_eq!(
+        classify_concurrent_enqueue_rows(&invalid_utf8),
+        ConcurrentEnqueueDiagnostics {
+            physical_rows: 1,
+            malformed_rows: 1,
+            ..Default::default()
+        }
+    );
+}
+
+#[test]
+fn concurrent_enqueue_failure_classification_decision_table() {
+    let counts = |physical_rows| ConcurrentEnqueueDiagnostics {
+        physical_rows,
+        ..Default::default()
+    };
+
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&counts(19)), 19),
+        ConcurrentEnqueueFailureClass::DrainRewriteLoss
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(19)), Some(&counts(19)), 19),
+        ConcurrentEnqueueFailureClass::AppendSideAbsence
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&counts(20)), 19),
+        ConcurrentEnqueueFailureClass::DrainStateOmission
+    );
+
+    let malformed = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 19,
+        malformed_rows: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&malformed), Some(&malformed), 19),
+        ConcurrentEnqueueFailureClass::AppendSideCorruption
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&malformed), 19),
+        ConcurrentEnqueueFailureClass::DrainRewriteCorruption
+    );
+    let more_malformed = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 18,
+        malformed_rows: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&malformed), Some(&more_malformed), 18),
+        ConcurrentEnqueueFailureClass::DrainRewriteCorruption
+    );
+
+    let duplicate = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 20,
+        distinct_ids: 19,
+        duplicate_ids: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&duplicate), Some(&duplicate), 19),
+        ConcurrentEnqueueFailureClass::AppendSideIdentityAnomaly
+    );
+
+    let missing = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 20,
+        distinct_ids: 19,
+        missing_ids: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&missing), Some(&missing), 19),
+        ConcurrentEnqueueFailureClass::AppendSideIdentityAnomaly
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&duplicate), 19),
+        ConcurrentEnqueueFailureClass::DrainRewriteIdentityAnomaly
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), Some(&missing), 19),
+        ConcurrentEnqueueFailureClass::DrainRewriteIdentityAnomaly
+    );
+    let more_duplicate = ConcurrentEnqueueDiagnostics {
+        physical_rows: 20,
+        parseable_rows: 20,
+        distinct_ids: 18,
+        duplicate_ids: 2,
+        ..Default::default()
+    };
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&duplicate), Some(&more_duplicate), 18),
+        ConcurrentEnqueueFailureClass::DrainRewriteIdentityAnomaly
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(None, Some(&counts(20)), 19),
+        ConcurrentEnqueueFailureClass::SnapshotUnavailable
+    );
+    assert_eq!(
+        classify_concurrent_enqueue_failure(Some(&counts(20)), None, 19),
+        ConcurrentEnqueueFailureClass::SnapshotUnavailable
+    );
 }
 
 #[test]
