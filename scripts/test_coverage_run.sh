@@ -17,6 +17,73 @@ pass=0
 fail=0
 skip=0
 
+# #3247: every contract run gets one private temporary root. It is removed on
+# success and retained on failure so the failure block can point at the exact
+# run state without widening any production wrapper behavior.
+run_tmpdir_parent="${TMPDIR:-/tmp}"
+run_tmpdir="$(mktemp -d "$run_tmpdir_parent/cov-contract-run.XXXXXX")" || {
+    echo "FAIL  could not create isolated contract TMPDIR" >&2
+    exit 1
+}
+export TMPDIR="$run_tmpdir"
+diag_root="$run_tmpdir/diagnostics"
+mkdir -p "$diag_root"
+diag_item_cap=8
+
+diag_contract_key() {
+    local key="$1"
+    key="${key//[^[:alnum:]_.-]/_}"
+    printf '%s' "$key"
+}
+
+deadline_status_for() {
+    printf '%s/deadline-status.%s\n' "$diag_root" "$(diag_contract_key "$1")"
+}
+
+deadline_fifos_for() {
+    printf '%s/deadline-fifos.%s\n' "$diag_root" "$(diag_contract_key "$1")"
+}
+
+deadline_processes_for() {
+    printf '%s/deadline-processes.%s\n' "$diag_root" "$(diag_contract_key "$1")"
+}
+
+deadline_sidecar_matches() {
+    local contract="$1" status_path first_line=""
+    status_path="$(deadline_status_for "$contract")"
+    [ -f "$status_path" ] || return 1
+    IFS= read -r first_line <"$status_path" || true
+    [ "$first_line" = "contract=$contract" ]
+}
+
+process_sidecar_matches() {
+    local contract="$1" process_path first_line=""
+    process_path="$(deadline_processes_for "$contract")"
+    [ -f "$process_path" ] || return 1
+    IFS= read -r first_line <"$process_path" || true
+    [ "$first_line" = "contract=$contract" ]
+}
+
+# Process diagnostics are authoritative only when the sidecar contains a
+# descendant row with the fields emitted by the snapshot query. A sidecar
+# marker alone is not evidence that this platform can identify processes.
+process_sidecar_has_authority() {
+    local contract="$1" process_path
+    process_path="$(deadline_processes_for "$contract")"
+    process_sidecar_matches "$contract" || return 1
+    grep -qE '^scope=run-descendant[[:space:]]+[0-9]+[[:space:]]+[0-9]+[[:space:]]+[^[:space:]]+[[:space:]]' \
+        "$process_path" 2>/dev/null
+}
+
+cleanup_run_tmpdir() {
+    if [ "$fail" -eq 0 ]; then
+        rm -rf "$run_tmpdir"
+    else
+        echo "coverage failure diagnostics preserved at $diag_root"
+    fi
+}
+trap cleanup_run_tmpdir EXIT
+
 # A property this platform cannot exercise is SKIPPED, never silently passed:
 # a green count that includes an unverifiable property is a false green.
 report_skip() {
@@ -33,6 +100,7 @@ report() {
     else
         echo "FAIL  $label"
         [ -n "$detail" ] && echo "      $detail"
+        emit_failure_diagnostics "${FUNCNAME[1]:-unknown}" "$label" "$detail"
         fail=$((fail + 1))
     fi
 }
@@ -41,7 +109,163 @@ new_sandbox() {
     local dir
     dir="$(mktemp -d "${TMPDIR:-/tmp}/cov-run-test.XXXXXX")"
     mkdir -p "$dir/profiles"
+    printf '%s\n' "$dir" >"$diag_root/last_sandbox"
+    printf 'sandbox=%s\n' "$dir" >>"$diag_root/sandboxes"
     echo "$dir"
+}
+
+# Keep failure fields one-line and bounded. The exact bytes are less important
+# than preserving enough readable identity to correlate a failed contract with
+# its run state without letting a hostile path or command flood CI output.
+diag_escape() {
+    local s="$1"
+    s="${s//\\/\\\\}"
+    s="${s//$'\n'/\\n}"
+    s="${s//$'\r'/\\r}"
+    s="${s//$'\t'/\\t}"
+    case "$s" in
+        *[[:cntrl:]]*) s="$(printf '%s' "$s" | LC_ALL=C sed 's/[[:cntrl:]]/\\?/g')" ;;
+    esac
+    if [ "${#s}" -gt 240 ]; then
+        s="${s:0:237}..."
+    fi
+    printf '%s' "$s"
+}
+
+emit_deadline_diagnostics() {
+    local contract="$1" line value found=0 status_path
+    status_path="$(deadline_status_for "$contract")"
+    if ! deadline_sidecar_matches "$contract"; then
+        echo "deadline_outcome=not-recorded"
+        return
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ "$line" = "contract=$contract" ] && continue
+        case "$line" in
+            outcome=*)
+                value="${line#outcome=}"
+                printf 'deadline_outcome=%s\n' "$(diag_escape "$value")"
+                found=1
+                ;;
+            waited_seconds=*)
+                value="${line#waited_seconds=}"
+                printf 'deadline_waited_seconds=%s\n' "$(diag_escape "$value")"
+                found=1
+                ;;
+            deadline_seconds=*)
+                value="${line#deadline_seconds=}"
+                printf 'deadline_seconds=%s\n' "$(diag_escape "$value")"
+                found=1
+                ;;
+            forced_stop=*)
+                value="${line#forced_stop=}"
+                printf 'deadline_forced_stop=%s\n' "$(diag_escape "$value")"
+                found=1
+                ;;
+            wait_status=*)
+                value="${line#wait_status=}"
+                printf 'deadline_wait_status=%s\n' "$(diag_escape "$value")"
+                found=1
+                ;;
+        esac
+    done <"$status_path"
+    [ "$found" -eq 1 ] || echo "deadline_outcome=unreadable"
+}
+
+emit_fifo_diagnostics() {
+    local contract="$1" path count=0 found=0 deadline_found=0
+    if ! command -v find >/dev/null 2>&1; then
+        echo "fifo_state=unavailable"
+        return
+    fi
+    if deadline_sidecar_matches "$contract" && [ -f "$(deadline_fifos_for "$contract")" ]; then
+        while IFS= read -r path || [ -n "$path" ]; do
+            [ -n "$path" ] || continue
+            deadline_found=1
+            if [ "$count" -ge "$diag_item_cap" ]; then
+                continue
+            fi
+            printf 'fifo_snapshot=%s\n' "$(diag_escape "$path")"
+            count=$((count + 1))
+        done <"$(deadline_fifos_for "$contract")"
+        if [ "$deadline_found" -eq 1 ]; then
+            echo "deadline_fifo_state=present"
+        else
+            echo "deadline_fifo_state=none"
+        fi
+    else
+        echo "deadline_fifo_state=not-recorded"
+    fi
+    while IFS= read -r path || [ -n "$path" ]; do
+        [ -n "$path" ] || continue
+        found=1
+        if [ "$count" -ge "$diag_item_cap" ]; then
+            continue
+        fi
+        printf 'fifo=%s\n' "$(diag_escape "$path")"
+        count=$((count + 1))
+    done <<EOF
+$(find "$run_tmpdir" -type p -print 2>/dev/null)
+EOF
+    if [ "$found" -eq 0 ]; then
+        echo "fifo_state=none"
+    elif [ "$count" -lt "$diag_item_cap" ]; then
+        echo "fifo_state=present"
+    else
+        echo "fifo_state=present-capped"
+    fi
+}
+
+emit_process_diagnostics() {
+    local contract="$1" line count=0 found=0 process_path
+    process_path="$(deadline_processes_for "$contract")"
+    if ! process_sidecar_matches "$contract"; then
+        echo "process_state=not-recorded"
+        return
+    fi
+    if grep -q '^process_query=unavailable$' "$process_path" 2>/dev/null; then
+        echo "process_state=unavailable"
+        return
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        [ "$line" = "contract=$contract" ] && continue
+        found=1
+        if [ "$count" -ge "$diag_item_cap" ]; then
+            continue
+        fi
+        printf 'process=%s\n' "$(diag_escape "$line")"
+        count=$((count + 1))
+    done <"$process_path"
+    if [ "$found" -eq 0 ]; then
+        echo "process_state=none"
+    elif [ "$count" -lt "$diag_item_cap" ]; then
+        echo "process_state=present"
+    else
+        echo "process_state=present-capped"
+    fi
+}
+
+emit_failure_diagnostics() {
+    local contract="$1" assertion="$2" detail="$3" sandbox="" sandbox_state=not-recorded
+    if [ -f "$diag_root/last_sandbox" ]; then
+        sandbox="$(tail -n 1 "$diag_root/last_sandbox" 2>/dev/null)"
+        if [ -d "$sandbox" ]; then
+            sandbox_state=present
+        else
+            sandbox_state=deleted-before-report
+        fi
+    fi
+    echo "::group::coverage contract failure diagnostics"
+    printf 'contract=%s\n' "$(diag_escape "$contract")"
+    printf 'assertion=%s\n' "$(diag_escape "$assertion")"
+    printf 'assertion_detail=%s\n' "$(diag_escape "$detail")"
+    printf 'run_tmpdir=%s\n' "$(diag_escape "$run_tmpdir")"
+    printf 'sandbox=%s state=%s\n' "$(diag_escape "${sandbox:-not-recorded}")" "$sandbox_state"
+    emit_deadline_diagnostics "$contract"
+    emit_fifo_diagnostics "$contract"
+    emit_process_diagnostics "$contract"
+    echo "::endgroup::"
 }
 
 # ── 0. Conservative partial-profile containment ────────────────────────────
@@ -539,21 +763,71 @@ PRODUCER
 # by OPENING each FIFO FOR WRITING — that completes the pending open-for-read, so
 # the wrapper finishes and no orphan is left behind. Safe precisely because we
 # only do it while a blocked reader is known to exist.
+# Process snapshots add measured observation overhead (~45ms per `ps` on CI);
+# that cost is diagnostic-only. The loop/deadline comparisons, FIFO rescue, and
+# kill semantics remain the same.
+record_process_snapshot() {
+    local output="$1" root_pid="$2" snapshot line
+    if ! command -v ps >/dev/null 2>&1; then
+        printf 'process_query=unavailable\n' >>"$output"
+        return
+    fi
+    if ! snapshot="$(ps -axo pid=,ppid=,stat=,command= 2>/dev/null)"; then
+        printf 'process_query=unavailable\n' >>"$output"
+        return
+    fi
+    while IFS= read -r line || [ -n "$line" ]; do
+        [ -n "$line" ] || continue
+        line="scope=run-descendant $line"
+        if ! grep -Fqx -- "$line" "$output" 2>/dev/null; then
+            printf '%s\n' "$line" >>"$output"
+        fi
+    done < <(
+        printf '%s\n' "$snapshot" | awk -v root="$root_pid" '
+            $1 !~ /^[0-9]+$/ { next }
+            { rows[$1] = $0; parents[$1] = $2 }
+            END {
+                if (!(root in rows)) exit
+                keep[root] = 1
+                changed = 1
+                while (changed) {
+                    changed = 0
+                    for (pid in rows) {
+                        if (!(pid in keep) && (parents[pid] in keep)) {
+                            keep[pid] = 1
+                            changed = 1
+                        }
+                    }
+                }
+                for (pid in keep) print rows[pid]
+            }
+        '
+    )
+}
+
 run_wrapper_with_deadline() {
-    local sandbox="$1" secs="$2" pid waited=0 blocked=0 p
+    local sandbox="$1" secs="$2" contract="${FUNCNAME[1]:-unknown}"
+    local pid waited=0 blocked=0 hard_stop=0 wait_status=0 p
+    local status_path fifo_path process_path
+    status_path="$(deadline_status_for "$contract")"
+    fifo_path="$(deadline_fifos_for "$contract")"
+    process_path="$(deadline_processes_for "$contract")"
+    printf 'contract=%s\n' "$contract" >"$process_path"
     (
         cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
             COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
             COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 \
             "$wrapper" >"$sandbox/out" 2>&1
     ) &
-    pid=$!
+        pid=$!
     while kill -0 "$pid" 2>/dev/null && [ "$waited" -lt "$secs" ]; do
+        record_process_snapshot "$process_path" "$pid"
         sleep 1
         waited=$((waited + 1))
     done
     while kill -0 "$pid" 2>/dev/null; do
         blocked=1
+        record_process_snapshot "$process_path" "$pid"
         for p in "$sandbox/profiles"/*; do
             [ -p "$p" ] || continue
             ( exec 3>"$p"; exec 3>&- ) 2>/dev/null
@@ -562,10 +836,21 @@ run_wrapper_with_deadline() {
         waited=$((waited + 1))
         if [ "$waited" -gt $((secs * 4)) ]; then
             kill -9 "$pid" 2>/dev/null
+            hard_stop=1
             break
         fi
     done
-    wait "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null || wait_status=$?
+    record_process_snapshot "$process_path" "$pid"
+    find "$sandbox" -type p -print 2>/dev/null >"$fifo_path"
+    {
+        printf 'contract=%s\n' "$contract"
+        printf 'outcome=%s\n' "$([ "$blocked" -eq 1 ] && echo blocked || echo completed)"
+        printf 'waited_seconds=%s\n' "$waited"
+        printf 'deadline_seconds=%s\n' "$secs"
+        printf 'forced_stop=%s\n' "$([ "$hard_stop" -eq 1 ] && echo yes || echo no)"
+        printf 'wait_status=%s\n' "$wait_status"
+    } >"$status_path"
     printf '%s' "$blocked"
 }
 
@@ -579,7 +864,7 @@ fifos_unavailable() {
 }
 
 test_named_fifo_does_not_block_the_wrapper() {
-    local sandbox blocked out bad=""
+    local sandbox blocked out deadline_status bad=""
     sandbox="$(new_sandbox)"
     if fifos_unavailable "$sandbox"; then
         rm -rf "$sandbox"
@@ -597,6 +882,7 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     blocked="$(run_wrapper_with_deadline "$sandbox" 5)"
     out="$(cat "$sandbox/out" 2>/dev/null)"
+    deadline_status="$(cat "$(deadline_status_for "${FUNCNAME[0]}")" 2>/dev/null)"
     rm -f "$sandbox/profiles"/*.profraw 2>/dev/null
     rm -rf "$sandbox"
     [ "$blocked" = "0" ] || bad="$bad blocked-on-open"
@@ -606,6 +892,7 @@ PRODUCER
     # And describe the object honestly rather than claiming bytes it never read.
     echo "$out" | grep -qE '^[[:space:]]*corrupt=fifo-1-1_0\.profraw' || bad="$bad not-described"
     echo "$out" | grep -q 'exists=not-a-regular-file' || bad="$bad not-labelled-non-regular"
+    echo "$deadline_status" | grep -q '^outcome=completed$' || bad="$bad deadline-not-recorded"
     if [ -n "$bad" ]; then
         report 1 "a producer-named FIFO does not block the wrapper" \
             "issues:$bad; got: $(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -1)"
@@ -617,7 +904,7 @@ PRODUCER
 # The same hazard on the response file, whose NAME is producer-controlled by
 # glob: the count, the fragment listing and the membership read all open it.
 test_fifo_response_file_does_not_block_the_wrapper() {
-    local sandbox blocked out bad=""
+    local sandbox blocked out deadline_status bad=""
     sandbox="$(new_sandbox)"
     if fifos_unavailable "$sandbox"; then
         rm -rf "$sandbox"
@@ -636,12 +923,14 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     blocked="$(run_wrapper_with_deadline "$sandbox" 5)"
     out="$(cat "$sandbox/out" 2>/dev/null)"
+    deadline_status="$(cat "$(deadline_status_for "${FUNCNAME[0]}")" 2>/dev/null)"
     rm -f "$sandbox/profiles"/* 2>/dev/null
     rm -rf "$sandbox"
     [ "$blocked" = "0" ] || bad="$bad blocked-on-open"
     echo "$out" | grep -q '::endgroup::' || bad="$bad block-truncated"
     # The real profile alongside it must still be described.
     echo "$out" | grep -qE '^[[:space:]]*corrupt=real-1-1_0\.profraw' || bad="$bad real-path-lost"
+    echo "$deadline_status" | grep -q '^outcome=completed$' || bad="$bad deadline-not-recorded"
     if [ -n "$bad" ]; then
         report 1 "a FIFO response file does not block the wrapper" "issues:$bad"
     else
@@ -1488,6 +1777,209 @@ PRODUCER
             "issues:$bad; block: $(echo "$block" | grep -E ': line [0-9]+:' | head -1)"
     else
         report 0 "an unmatched warning count emits no raw shell error"
+    fi
+}
+
+# A deadline sidecar from another contract is not evidence for this failure.
+# The key and the embedded contract marker must agree before either status or
+# FIFO snapshots are attributed to the current assertion.
+test_stale_deadline_sidecar_is_not_attributed() {
+    local stale_contract="foreign-deadline-contract" failure bad="" status_path fifo_path
+    local stale_status stale_fifos legacy_status legacy_fifos foreign_root foreign_fifos path i=1
+    foreign_root="$(mktemp -d "${run_tmpdir_parent}/cov-stale-sidecar.XXXXXX")"
+    foreign_fifos="$foreign_root/fifos.list"
+    if fifos_unavailable "$foreign_root"; then
+        rm -rf "$foreign_root"
+        report_skip "a stale deadline sidecar is not attributed" \
+            "this platform does not create FIFOs; premise unavailable"
+        return
+    fi
+    : >"$foreign_fifos"
+    while [ "$i" -le 12 ]; do
+        path="$foreign_root/foreign-$i.fifo"
+        mkfifo "$path"
+        printf '%s\n' "$path" >>"$foreign_fifos"
+        i=$((i + 1))
+    done
+    stale_status="$(deadline_status_for "$stale_contract")"
+    stale_fifos="$(deadline_fifos_for "$stale_contract")"
+    legacy_status="$diag_root/deadline-status"
+    legacy_fifos="$diag_root/deadline-fifos"
+    status_path="$(deadline_status_for "${FUNCNAME[0]}")"
+    fifo_path="$(deadline_fifos_for "${FUNCNAME[0]}")"
+    printf 'contract=%s\noutcome=completed\nwaited_seconds=1\ndeadline_seconds=5\nwait_status=1\n' \
+        "$stale_contract" >"$stale_status"
+    printf '%s\n' "$foreign_root"/foreign-*.fifo >"$stale_fifos"
+    cp "$stale_status" "$legacy_status"
+    cp "$stale_fifos" "$legacy_fifos"
+    cp "$stale_status" "$status_path"
+    cp "$stale_fifos" "$fifo_path"
+    failure="$(report 1 "stale sidecar is not attributed" "sidecar=foreign")"
+    echo "$failure" | grep -q '^deadline_outcome=not-recorded$' \
+        || bad="$bad stale-deadline-was-attributed"
+    echo "$failure" | grep -qE '^deadline_(waited_seconds|seconds|wait_status)=' \
+        && bad="$bad stale-deadline-fields-leaked"
+    echo "$failure" | grep -q '^deadline_fifo_state=not-recorded$' \
+        || bad="$bad stale-fifo-state-not-recorded-missing"
+    echo "$failure" | grep -q 'foreign-' \
+        && bad="$bad foreign-fifo-path-leaked"
+    echo "$failure" | grep -q '^fifo_state=none$' \
+        || bad="$bad foreign-fifo-state-not-none"
+    rm -f "$status_path" "$fifo_path" "$stale_status" "$stale_fifos" \
+        "$legacy_status" "$legacy_fifos"
+    rm -rf "$foreign_root"
+    if [ -n "$bad" ]; then
+        report 1 "a stale deadline sidecar is not attributed" "issues:$bad"
+    else
+        report 0 "a stale deadline sidecar is not attributed"
+    fi
+}
+
+# An unavailable process query must select the explicit SKIP path in the
+# process-authority integration test, never the green/pass path. The
+# integration test itself emits the SKIP so the platform summary remains
+# truthful without manufacturing a skip on platforms where the capability is
+# available.
+test_process_authority_unavailable_is_not_passed() {
+    local contract="${FUNCNAME[0]}" process_path state bad=""
+    process_path="$(deadline_processes_for "$contract")"
+    printf 'contract=%s\nprocess_query=unavailable\n' "$contract" >"$process_path"
+    if process_sidecar_has_authority "$contract"; then
+        bad="authority-reported-available"
+    fi
+    state="$(emit_process_diagnostics "$contract")"
+    echo "$state" | grep -q '^process_state=unavailable$' \
+        || bad="$bad unavailable-state-not-classified"
+    rm -f "$process_path"
+    if [ -n "$bad" ]; then
+        report 1 "unavailable process authority is not treated as pass" \
+            "issues:$bad"
+    else
+        report 0 "unavailable process authority is not treated as pass"
+    fi
+}
+
+# `ps -axo pid=,ppid=,stat=,command=` right-aligns numeric fields. Keep the
+# padding in this fixture so authority detection accepts the real shape rather
+# than only the single-space shape produced by a hand-written fixture.
+test_process_authority_accepts_ps_padded_fields() {
+    local contract="${FUNCNAME[0]}" process_path bad=""
+    process_path="$(deadline_processes_for "$contract")"
+    printf 'contract=%s\nscope=run-descendant     123      45 S    /bin/sh\n' \
+        "$contract" >"$process_path"
+    process_sidecar_has_authority "$contract" \
+        || bad="padded-ps-row-rejected"
+    rm -f "$process_path"
+    if [ -n "$bad" ]; then
+        report 1 "padded ps fields retain process authority" "issues:$bad"
+    else
+        report 0 "padded ps fields retain process authority"
+    fi
+}
+
+# A foreign suite may use the same historical command names. Seed this test's
+# process sidecar through the deadline helper first, then prove every emitted
+# process row carries the helper's descendant scope. Restoring the old global
+# ps regex makes this exact control fail because it also emits the foreign row.
+test_foreign_process_is_not_reported_as_run_process() {
+    local sandbox foreign_root foreign_pid owned_pid failure process_rows row pid bad=""
+    sandbox="$(new_sandbox)"
+    foreign_root="$(mktemp -d "${run_tmpdir_parent}/cov-foreign-suite.XXXXXX")"
+    printf '#!/usr/bin/env bash\nsleep 30\n' >"$foreign_root/cov-run-test-foreign.sh"
+    chmod +x "$foreign_root/cov-run-test-foreign.sh"
+    "$foreign_root/cov-run-test-foreign.sh" &
+    foreign_pid=$!
+    cat >"$sandbox/producer.sh" <<PRODUCER
+#!/usr/bin/env bash
+sleep 30 >/dev/null 2>&1 &
+printf '%s\n' "\$!" >"$sandbox/owned-child.pid"
+sleep 3
+echo "error: no profile can be merged"
+exit 1
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    run_wrapper_with_deadline "$sandbox" 5 >/dev/null
+    if ! process_sidecar_has_authority "${FUNCNAME[0]}"; then
+        owned_pid="$(cat "$sandbox/owned-child.pid" 2>/dev/null)"
+        [ -n "$owned_pid" ] && kill "$owned_pid" 2>/dev/null || true
+        [ -n "$owned_pid" ] && wait "$owned_pid" 2>/dev/null || true
+        kill "$foreign_pid" 2>/dev/null || true
+        wait "$foreign_pid" 2>/dev/null || true
+        rm -rf "$sandbox" "$foreign_root"
+        report_skip "a foreign process is not run evidence" \
+            "process authority unavailable"
+        return
+    fi
+    owned_pid="$(cat "$sandbox/owned-child.pid" 2>/dev/null)"
+    failure="$(report 1 "foreign process is not run evidence" "process=foreign")"
+    [ -n "$owned_pid" ] && kill "$owned_pid" 2>/dev/null || true
+    [ -n "$owned_pid" ] && wait "$owned_pid" 2>/dev/null || true
+    kill "$foreign_pid" 2>/dev/null || true
+    wait "$foreign_pid" 2>/dev/null || true
+    rm -rf "$sandbox"
+    rm -rf "$foreign_root"
+    echo "$failure" | grep -qE '^process_state=present(-capped)?$' \
+        || bad="$bad process-state-present-missing"
+    process_rows="$(echo "$failure" | grep '^process=' || true)"
+    [ -n "$process_rows" ] || bad="$bad process-sidecar-empty"
+    while IFS= read -r row || [ -n "$row" ]; do
+        [ -n "$row" ] || continue
+        case "$row" in
+            process=scope=run-descendant\ *)
+                pid="${row#process=scope=run-descendant }"
+                pid="${pid%% *}"
+                [ "$pid" = "$foreign_pid" ] && bad="$bad foreign-pid-$pid-leaked"
+                ;;
+            *) bad="$bad unscoped-process-row" ;;
+        esac
+    done <<<"$process_rows"
+    echo "$process_rows" | grep -q 'foreign-' && bad="$bad foreign-path-leaked"
+    if [ -n "$bad" ]; then
+        report 1 "a foreign process is not run evidence" "issues:$bad"
+    else
+        report 0 "a foreign process is not run evidence"
+    fi
+}
+
+# #3247 deterministic RED control. The historical suite failure was
+# unidentified because a failed contract reported only the aggregate label.
+# This control requires the failure-only block to retain the exact contract and
+# assertion context while staying bounded; the existing baseline has no such
+# block, so it must fail before the diagnostics implementation lands.
+test_failure_diagnostics_are_bounded_and_failure_only() {
+    local sandbox failure deleted_failure success bad="" lines fifo_created=0
+    sandbox="$(new_sandbox)"
+    if mkfifo "$sandbox/diagnostic.fifo" 2>/dev/null; then
+        fifo_created=1
+    fi
+    failure="$(report 1 "synthetic failure assertion" "actual=Disconnected expected=Empty")"
+    success="$(report 0 "synthetic success assertion")"
+    lines="$(printf '%s\n' "$failure" | wc -l | tr -d ' ')"
+    echo "$failure" | grep -q '::group::coverage contract failure diagnostics' \
+        || bad="$bad missing-failure-block"
+    echo "$failure" | grep -q 'contract=test_failure_diagnostics_are_bounded_and_failure_only' \
+        || bad="$bad missing-contract"
+    echo "$failure" | grep -q 'assertion=synthetic failure assertion' \
+        || bad="$bad missing-assertion"
+    echo "$failure" | grep -q 'run_tmpdir=' || bad="$bad missing-run-tmpdir"
+    echo "$failure" | grep -q 'sandbox=' || bad="$bad missing-sandbox"
+    echo "$failure" | grep -q 'deadline_outcome=' \
+        || bad="$bad missing-deadline-outcome"
+    echo "$failure" | grep -q 'fifo_state=' || bad="$bad missing-fifo-state"
+    echo "$failure" | grep -q 'process_state=' || bad="$bad missing-process-state"
+    if [ "$fifo_created" -eq 1 ]; then
+        echo "$failure" | grep -q '^fifo=' || bad="$bad missing-fifo-entry"
+    fi
+    [ "$lines" -le 80 ] || bad="$bad unbounded-lines-$lines"
+    echo "$success" | grep -q '::group::' && bad="$bad success-emitted-diagnostics"
+    rm -rf "$sandbox"
+    deleted_failure="$(report 1 "deleted sandbox state is explicit" "sandbox=deleted")"
+    echo "$deleted_failure" | grep -q 'state=deleted-before-report' \
+        || bad="$bad deleted-sandbox-not-explicit"
+    if [ -n "$bad" ]; then
+        report 1 "failure diagnostics preserve bounded contract context" "issues:$bad"
+    else
+        report 0 "failure diagnostics preserve bounded contract context"
     fi
 }
 
@@ -3183,6 +3675,11 @@ test_response_file_name_cannot_forge_records
 test_profile_dir_field_cannot_forge_records
 test_missing_named_path_emits_no_raw_shell_error
 test_unmatched_warning_count_emits_no_raw_shell_error
+test_stale_deadline_sidecar_is_not_attributed
+test_process_authority_unavailable_is_not_passed
+test_process_authority_accepts_ps_padded_fields
+test_foreign_process_is_not_reported_as_run_process
+test_failure_diagnostics_are_bounded_and_failure_only
 
 echo
 echo "coverage-run contract: $pass passed, $fail failed, $skip skipped"
