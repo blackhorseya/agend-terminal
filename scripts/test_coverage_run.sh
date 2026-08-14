@@ -12,6 +12,15 @@ set -uo pipefail
 
 script_dir="$(cd "$(dirname "$0")" && pwd)"
 wrapper="$script_dir/coverage-run.sh"
+# A leading `set` anchor intentionally ignores comments. The first branch
+# catches any clustered short option containing `e` (for example `-eu` or
+# `-euo`), while the second preserves the long-form errexit spelling. Keep
+# `set -o pipefail` outside both branches: pipefail is required by the wrapper.
+errexit_guard_pattern='^[[:space:]]*set[[:space:]]+-[[:alpha:]]*e[[:alpha:]]*([[:space:]]|$)|^[[:space:]]*set[[:space:]]+-o[[:space:]]+errexit([[:space:]]|$)'
+
+errexit_enabled_in() {
+    grep -qE "$errexit_guard_pattern" "$1"
+}
 
 pass=0
 fail=0
@@ -424,6 +433,151 @@ PRODUCER
         report 0 "real failure wins over the corruption signature"
     fi
     rm -rf "$sandbox"
+}
+
+# A successful producer is not a successful wrapper run when tee cannot open
+# the per-attempt log. The producer output remains visible on stdout, but the
+# missing log makes classification and diagnostics untrustworthy.
+test_sink_failure_after_success_is_truthful() {
+    local sandbox out rc
+    sandbox="$(new_sandbox)"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER='printf producer-ok' \
+        COVERAGE_LOG="$sandbox/missing/cov.log" COVERAGE_MAX_ATTEMPTS=1 \
+        "$wrapper" 2>&1)"
+    rc=$?
+
+    if [ "$rc" -eq 0 ]; then
+        report 1 "tee sink failure cannot become success" \
+            "wrapper exited 0 despite an unwritable log: $out"
+    elif ! echo "$out" | grep -qi 'log sink'; then
+        report 1 "tee sink failure cannot become success" \
+            "no framed log-sink failure: $out"
+    else
+        report 0 "tee sink failure cannot become success"
+    fi
+    rm -rf "$sandbox"
+}
+
+# If both sides fail, preserve the producer's exit code but short-circuit all
+# log-dependent classification. A failed log must not turn a real failure into
+# an unclassified producer error or enter corruption retry logic.
+test_sink_failure_preserves_producer_failure_without_classification() {
+    local sandbox out rc
+    sandbox="$(new_sandbox)"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER='printf "test foo::bar ... FAILED\\n"; exit 101' \
+        COVERAGE_LOG="$sandbox/missing/cov.log" COVERAGE_MAX_ATTEMPTS=1 \
+        "$wrapper" 2>&1)"
+    rc=$?
+
+    if [ "$rc" -ne 101 ]; then
+        report 1 "tee sink failure preserves producer exit" \
+            "wrapper exited $rc, producer exited 101: $out"
+    elif ! echo "$out" | grep -qi 'log sink'; then
+        report 1 "tee sink failure preserves producer exit" \
+            "no framed log-sink failure: $out"
+    elif echo "$out" | grep -qiE 'unclassified|grep:'; then
+        report 1 "tee sink failure skips log classification" \
+            "log-dependent diagnostic leaked: $out"
+    elif echo "$out" | grep -qiE 'coverage attempt .*retrying|llvm-cov profile corruption'; then
+        report 1 "tee sink failure skips retry classification" \
+            "sink failure entered retry/classification path: $out"
+    else
+        report 0 "tee sink failure preserves producer failure without classification"
+    fi
+    rm -rf "$sandbox"
+}
+
+# The same sink contract must hold when the producer emits enough output to
+# exercise pipe buffering. This drives the real wrapper entry point rather than
+# testing a helper or a synthetic pipeline.
+test_large_output_sink_failure_is_truthful() {
+    local sandbox out out_file rc
+    sandbox="$(new_sandbox)"
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+i=0
+while [ "$i" -lt 10000 ]; do
+    printf 'coverage-line-%s\n' "$i"
+    i=$((i + 1))
+done
+PRODUCER
+    chmod +x "$sandbox/producer.sh"
+    out_file="$sandbox/out"
+    (cd "$sandbox" && COVERAGE_PRODUCER="$sandbox/producer.sh" \
+        COVERAGE_LOG="$sandbox/missing/cov.log" COVERAGE_MAX_ATTEMPTS=1 \
+        "$wrapper" >"$out_file" 2>&1)
+    rc=$?
+    out="$(sed -n '1,20p' "$out_file")"
+
+    if [ "$rc" -eq 0 ]; then
+        report 1 "large-output tee sink failure cannot become success" \
+            "wrapper exited 0; output head: $out"
+    elif ! grep -qi 'log sink' "$out_file"; then
+        report 1 "large-output tee sink failure cannot become success" \
+            "no framed log-sink failure; output head: $out"
+    else
+        report 0 "large-output tee sink failure cannot become success"
+    fi
+    rm -rf "$sandbox"
+}
+
+# Healthy tee remains the control: a clean producer with a writable log keeps
+# the existing success contract.
+test_writable_log_success_remains_success() {
+    local sandbox out rc
+    sandbox="$(new_sandbox)"
+    out="$(cd "$sandbox" && COVERAGE_PRODUCER='printf clean-success' \
+        COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 \
+        "$wrapper" 2>&1)"
+    rc=$?
+
+    if [ "$rc" -ne 0 ]; then
+        report 1 "writable log clean success remains success" \
+            "wrapper exited $rc: $out"
+    else
+        report 0 "writable log clean success remains success"
+    fi
+    rm -rf "$sandbox"
+}
+
+# The producer pipeline is intentionally classified after it fails; errexit
+# would bypass the real-failure, diagnostics, and retry contracts.
+test_set_e_is_not_enabled() {
+    if errexit_enabled_in "$wrapper"; then
+        report 1 "coverage wrapper does not enable set -e" \
+            "errexit would terminate before PIPESTATUS classification"
+    else
+        report 0 "coverage wrapper does not enable set -e"
+    fi
+}
+
+test_set_e_guard_handles_clustered_options() {
+    local fixture="$run_tmpdir/errexit-guard.fixture" bad=""
+
+    for option in 'set -eu' 'set -euo pipefail' 'set -ex'; do
+        printf '%s\n' "$option" >"$fixture"
+        if ! errexit_enabled_in "$fixture"; then
+            bad="$bad missing-$option"
+        fi
+    done
+
+    printf '%s\n' 'set -o pipefail' >"$fixture"
+    if errexit_enabled_in "$fixture"; then
+        bad="$bad pipefail-rejected"
+    fi
+
+    printf '%s\n' '# set -e' >"$fixture"
+    if errexit_enabled_in "$fixture"; then
+        bad="$bad comment-rejected"
+    fi
+
+    rm -f "$fixture"
+    if [ -n "$bad" ]; then
+        report 1 "errexit guard catches clustered options without overmatching" \
+            "issues:$bad"
+    else
+        report 0 "errexit guard catches clustered options without overmatching"
+    fi
 }
 
 # ── 2. Cleanup truthfulness ──────────────────────────────────────────────────
@@ -4083,6 +4237,12 @@ test_proc_absence_is_never_reported_as_no() {
 test_default_producer_contains_partial_profiles
 test_contained_corruption_is_visible_and_all_bad_still_fails
 test_real_failure_wins_over_corruption_signature
+test_sink_failure_after_success_is_truthful
+test_sink_failure_preserves_producer_failure_without_classification
+test_large_output_sink_failure_is_truthful
+test_writable_log_success_remains_success
+test_set_e_is_not_enabled
+test_set_e_guard_handles_clustered_options
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
 test_corrupt_failure_emits_bounded_diagnostics
