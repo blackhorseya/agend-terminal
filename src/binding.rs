@@ -29,6 +29,8 @@ pub(crate) use unbind::{unbind_with_permit, BindingRemoval};
 mod unbind_compat;
 #[allow(unused_imports)]
 pub use unbind_compat::unbind;
+#[cfg(test)]
+mod reaper_notify_tests;
 static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::new();
 
 /// #1990: parse a `binding.json` body, rejecting one a NEWER daemon wrote
