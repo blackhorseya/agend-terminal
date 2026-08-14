@@ -15,6 +15,49 @@
 
 use std::path::Path;
 
+/// R1 (PR #1 review, reviewer-caught): attempt the actual `binding.json`
+/// removal and only claim it happened — via the `tracing::info!` line AND
+/// the revoked-instance notification — when it truly did. The pre-existing
+/// `let _ = std::fs::remove_file(...)` this replaces swallowed the error and
+/// proceeded unconditionally: on a permission/IO failure it logged "removed"
+/// and told the recipient to `bind_self` recover a binding that was still on
+/// disk — an actionable-but-false notice, worse than the silent failure this
+/// PR set out to fix. A removal failure is instead surfaced via
+/// `tracing::warn!` so an unremovable orphan binding is a known state, not a
+/// swallowed one.
+///
+/// Lives here (not inline in `reconcile_orphans`) purely to keep
+/// `binding.rs` under the 2500-LOC anti-monolith ceiling — `binding_index()`
+/// / `index_key()` are private to `binding.rs` but visible here as this is a
+/// child module.
+pub(crate) fn remove_and_notify(
+    home: &Path,
+    agent_name: &str,
+    binding_path: &Path,
+    v: &serde_json::Value,
+) {
+    match std::fs::remove_file(binding_path) {
+        Ok(()) => {
+            if let Ok(mut map) = super::binding_index().write() {
+                map.remove(&super::index_key(home, agent_name));
+            }
+            tracing::info!(
+                path = %binding_path.display(),
+                "removed orphan binding (>24h old, heartbeat stale)"
+            );
+            notify_binding_reaped(home, agent_name, v);
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %binding_path.display(),
+                error = %e,
+                "reconcile_orphans: failed to remove orphan binding.json — \
+                 binding still bound, no notification sent"
+            );
+        }
+    }
+}
+
 /// Notify the revoked instance AND its team orchestrator (when one resolves
 /// and differs from the instance itself) that `reconcile_orphans` deleted
 /// their binding. `binding` is the already-parsed `binding.json` body — the
@@ -43,7 +86,7 @@ use std::path::Path;
 ///
 /// Best-effort: a failed enqueue (e.g. readonly disk) is logged and does NOT
 /// roll back the binding removal that already happened.
-pub(crate) fn notify_binding_reaped(home: &Path, agent_name: &str, binding: &serde_json::Value) {
+fn notify_binding_reaped(home: &Path, agent_name: &str, binding: &serde_json::Value) {
     let task_id = binding["task_id"].as_str().unwrap_or("");
     let branch = binding["branch"].as_str().unwrap_or("");
     let worktree = binding["worktree"].as_str().unwrap_or("");

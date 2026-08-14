@@ -878,15 +878,12 @@ pub fn reconcile_orphans(home: &Path) {
                                         // Heartbeat within 1h — agent still active, skip
                                         continue;
                                     }
-                                    let _ = std::fs::remove_file(&binding_path);
-                                    if let Ok(mut map) = binding_index().write() {
-                                        map.remove(&index_key(home, agent_name));
-                                    }
-                                    tracing::info!(
-                                        path = %binding_path.display(),
-                                        "removed orphan binding (>24h old, heartbeat stale)"
+                                    reaper_notify::remove_and_notify(
+                                        home,
+                                        agent_name,
+                                        &binding_path,
+                                        &v,
                                     );
-                                    reaper_notify::notify_binding_reaped(home, agent_name, &v);
                                 }
                             }
                         }
