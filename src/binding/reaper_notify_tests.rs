@@ -61,7 +61,9 @@ fn write_binding(
 }
 
 fn binding_path(home: &Path, agent: &str) -> std::path::PathBuf {
-    crate::paths::runtime_dir(home).join(agent).join("binding.json")
+    crate::paths::runtime_dir(home)
+        .join(agent)
+        .join("binding.json")
 }
 
 /// heartbeat_pair is a process-global registry keyed by name ALONE (no

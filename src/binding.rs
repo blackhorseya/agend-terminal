@@ -29,7 +29,9 @@ pub(crate) use unbind::{unbind_with_permit, BindingRemoval};
 mod unbind_compat;
 #[allow(unused_imports)]
 pub use unbind_compat::unbind;
+mod reaper_notify;
 #[cfg(test)]
+#[allow(clippy::unwrap_used)]
 mod reaper_notify_tests;
 static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::new();
 
@@ -884,6 +886,7 @@ pub fn reconcile_orphans(home: &Path) {
                                         path = %binding_path.display(),
                                         "removed orphan binding (>24h old, heartbeat stale)"
                                     );
+                                    reaper_notify::notify_binding_reaped(home, agent_name, &v);
                                 }
                             }
                         }
