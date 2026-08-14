@@ -25,6 +25,30 @@ pub(crate) struct UsageNotifyRecord {
     /// When we notified (rfc3339 UTC) — anchors the unlock deadline + the
     /// null-unlock fallback cooldown.
     notified_at: String,
+    /// Durable current-episode marker. Legacy records predate this field and
+    /// are treated as active so a restart in the same live episode remains
+    /// deduplicated.
+    #[serde(default = "default_episode_active")]
+    active: bool,
+    /// Monotonic identity for same-agent episodes. Recovery advances it rather
+    /// than deleting the notice ledger, so a new null-unlock episode is not
+    /// confused with the prior 24-hour timestamp window.
+    #[serde(default)]
+    episode_nonce: u64,
+}
+
+fn default_episode_active() -> bool {
+    true
+}
+
+/// Reclaim-facing interpretation of a persisted usage-limit record. Inactive
+/// is distinct from unknown so a recovered episode cannot select the long
+/// missing-reset fallback and get reclaimed before a new episode is recorded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UsageLimitRemaining {
+    Inactive,
+    Known(Duration),
+    Unknown,
 }
 
 pub(crate) fn usage_limit_notify_path(home: &std::path::Path) -> std::path::PathBuf {
@@ -82,28 +106,41 @@ pub(crate) fn unlock_deadline(
 }
 
 /// #2127 Phase 1: time until `name`'s usage-limit window unlocks, per the
-/// persisted notify record. `None` when there is no record, no parseable
-/// `unlock_at`, or an unparseable `notified_at` — the reclaim caller then falls
-/// back to a conservative long default (a missing reset time is treated as a long
-/// block). A past deadline clamps to `Duration::ZERO`. Lock-free read; reuses the
-/// same record + `unlock_deadline` math as the notify-suppression path so the two
-/// agree on what "this window" means.
+/// persisted notify record. `Inactive` means recovery closed the prior episode
+/// and is deliberately non-reclaimable until a current episode is durably
+/// recorded. `Unknown` means there is no record, no parseable `unlock_at`, or an
+/// unparseable `notified_at`; the reclaim caller then falls back to a
+/// conservative long default (a missing reset time is treated as a long block).
+/// A past deadline clamps to `Duration::ZERO`. Lock-free read; reuses the same
+/// record + `unlock_deadline` math as the notify-suppression path so the two agree
+/// on what "this window" means.
 pub(crate) fn usage_limit_remaining(
     home: &std::path::Path,
     name: &str,
     now: chrono::DateTime<chrono::Utc>,
-) -> Option<std::time::Duration> {
+) -> UsageLimitRemaining {
     let map: std::collections::HashMap<String, UsageNotifyRecord> =
         std::fs::read_to_string(usage_limit_notify_path(home))
             .ok()
-            .and_then(|c| serde_json::from_str(&c).ok())?;
-    let rec = map.get(name)?;
-    let unlock_at = rec.unlock_at.as_deref()?;
-    let notified_at = chrono::DateTime::parse_from_rfc3339(&rec.notified_at)
-        .ok()?
-        .with_timezone(&chrono::Utc);
-    let deadline = unlock_deadline(unlock_at, notified_at)?;
-    Some(
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or_default();
+    let Some(rec) = map.get(name) else {
+        return UsageLimitRemaining::Unknown;
+    };
+    if !rec.active {
+        return UsageLimitRemaining::Inactive;
+    }
+    let Some(unlock_at) = rec.unlock_at.as_deref() else {
+        return UsageLimitRemaining::Unknown;
+    };
+    let Ok(notified_at) = chrono::DateTime::parse_from_rfc3339(&rec.notified_at) else {
+        return UsageLimitRemaining::Unknown;
+    };
+    let notified_at = notified_at.with_timezone(&chrono::Utc);
+    let Some(deadline) = unlock_deadline(unlock_at, notified_at) else {
+        return UsageLimitRemaining::Unknown;
+    };
+    UsageLimitRemaining::Known(
         (deadline - now)
             .to_std()
             .unwrap_or(std::time::Duration::ZERO),
@@ -127,6 +164,9 @@ pub(crate) fn usage_limit_notify_suppressed(
     let Some(rec) = map.get(name) else {
         return false;
     };
+    if !rec.active {
+        return false;
+    }
     let Ok(notified_at) = chrono::DateTime::parse_from_rfc3339(&rec.notified_at) else {
         return false;
     };
@@ -158,16 +198,75 @@ pub(crate) fn record_usage_limit_notified(
     name: &str,
     unlock_at: Option<&str>,
     now: chrono::DateTime<chrono::Utc>,
-) {
-    let record = UsageNotifyRecord {
-        unlock_at: unlock_at.map(String::from),
-        notified_at: now.to_rfc3339(),
-    };
-    let _ = crate::store::with_json_state_or_create(
+) -> bool {
+    match crate::store::with_json_state_or_create(
         &usage_limit_notify_path(home),
         std::collections::HashMap::<String, UsageNotifyRecord>::new,
         |map| {
-            map.insert(name.to_string(), record);
+            let episode_nonce = map.get(name).map_or(0, |record| record.episode_nonce);
+            map.insert(
+                name.to_string(),
+                UsageNotifyRecord {
+                    unlock_at: unlock_at.map(String::from),
+                    notified_at: now.to_rfc3339(),
+                    active: true,
+                    episode_nonce,
+                },
+            );
         },
-    );
+    ) {
+        Ok(()) => true,
+        Err(error) => {
+            tracing::error!(%error, agent = %name, "usage_limit notify ledger write failed");
+            false
+        }
+    }
+}
+
+/// Mark the current usage-limit episode recovered without deleting its notice
+/// history. The live state snapshot is the authority for deciding recovery;
+/// this ledger mutation only advances the durable episode boundary used by
+/// repeat-notice suppression.
+pub(crate) fn mark_usage_limit_recovered(home: &std::path::Path, name: &str) -> bool {
+    let path = usage_limit_notify_path(home);
+    if !path.exists() {
+        return true;
+    }
+    match crate::store::with_json_state::<std::collections::HashMap<String, UsageNotifyRecord>, _, _>(
+        &path,
+        |map| {
+            if let Some(record) = map.get_mut(name) {
+                if record.active {
+                    record.active = false;
+                    record.episode_nonce = record.episode_nonce.saturating_add(1);
+                }
+            }
+        },
+    ) {
+        Ok(_) => true,
+        Err(error) => {
+            tracing::error!(%error, agent = %name, "usage_limit recovery marker write failed");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn legacy_record_defaults_to_active_episode() {
+        let legacy = serde_json::json!({
+            "unlock_at": "15:00",
+            "notified_at": "2026-06-09T14:00:00+00:00"
+        });
+        let record: UsageNotifyRecord =
+            serde_json::from_value(legacy).expect("legacy usage-limit record parses");
+        assert!(record.active, "legacy records remain in the open episode");
+        assert_eq!(
+            record.episode_nonce, 0,
+            "legacy records start with the key-only episode identity"
+        );
+    }
 }
