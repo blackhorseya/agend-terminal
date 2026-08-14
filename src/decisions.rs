@@ -2,7 +2,54 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+const DEFAULT_LIST_LIMIT: usize = 100;
+const MAX_LIST_LIMIT: usize = 500;
+const DEFAULT_SCAN_BUDGET: usize = 500;
+const MAX_SCAN_BUDGET: usize = 5_000;
+const MAX_BATCH_CANDIDATES: usize = 100;
+const BATCH_CONFIRM_TTL_SECS: i64 = 15 * 60;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct DecisionCursor {
+    version: u8,
+    namespace: String,
+    physical_filename: String,
+    parsed_id: Option<String>,
+    consistency: String,
+    snapshot_digest: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BatchCandidateSnapshot {
+    id: String,
+    physical_filename: String,
+    content_digest: String,
+}
+
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct BatchSourceSnapshot {
+    physical_filename: String,
+    content_digest: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct BatchConfirmation {
+    schema_version: u8,
+    actor: String,
+    created_at: String,
+    audit_reason: String,
+    policy_digest: String,
+    source_digest: String,
+    preview_digest: String,
+    #[serde(default)]
+    candidate_cap: usize,
+    #[serde(default)]
+    candidates_capped: bool,
+    sources: Vec<BatchSourceSnapshot>,
+    candidates: Vec<BatchCandidateSnapshot>,
+}
 
 /// #1990: on-disk schema version for a decision record (per-file store, so this
 /// follows the per-record `task_progress` pattern — a module const + an explicit
@@ -437,6 +484,169 @@ pub fn count_pending(home: &Path) -> PendingDecisionCounts {
     counts
 }
 
+fn cursor_encode(cursor: &DecisionCursor) -> anyhow::Result<String> {
+    use base64::Engine as _;
+    let bytes = serde_json::to_vec(cursor)?;
+    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes))
+}
+
+fn cursor_decode(raw: &str) -> anyhow::Result<DecisionCursor> {
+    use base64::Engine as _;
+    let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(raw)?;
+    let cursor: DecisionCursor = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(cursor.version == 1, "unsupported cursor version");
+    Ok(cursor)
+}
+
+fn decision_source_dir(home: &Path, namespace: &str) -> Option<PathBuf> {
+    match namespace {
+        "live" => Some(decisions_dir(home)),
+        "audit_history" => Some(decisions_dir(home).join(".archive")),
+        _ => None,
+    }
+}
+
+fn sorted_json_paths(dir: &Path) -> anyhow::Result<Vec<PathBuf>> {
+    if !dir.exists() {
+        return Ok(Vec::new());
+    }
+    let mut paths = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("json") {
+            anyhow::ensure!(
+                entry.file_type()?.is_file(),
+                "non-regular JSON source '{}'",
+                path.display()
+            );
+            paths.push(path);
+        }
+    }
+    // Decision IDs are timestamp-prefixed, so descending physical filename
+    // order preserves the historical newest-first default without parsing the
+    // whole store before returning the first bounded page.
+    paths.sort_by(|a, b| b.file_name().cmp(&a.file_name()));
+    Ok(paths)
+}
+
+fn batch_sources_with_archived_candidates(
+    dir: &Path,
+    archive: &Path,
+    confirmation: &BatchConfirmation,
+) -> anyhow::Result<Vec<BatchSourceSnapshot>> {
+    let mut names = sorted_json_paths(dir)?
+        .into_iter()
+        .filter_map(|path| path.file_name()?.to_str().map(String::from))
+        .collect::<Vec<_>>();
+    for candidate in &confirmation.candidates {
+        if dir.join(&candidate.physical_filename).exists() {
+            continue;
+        }
+        let archived = archive.join(&candidate.physical_filename);
+        if let Ok(metadata) = std::fs::symlink_metadata(&archived) {
+            anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "non-regular archived JSON source '{}'",
+                archived.display()
+            );
+            names.push(candidate.physical_filename.clone());
+        }
+    }
+    names.sort_by(|left, right| right.cmp(left));
+    names.dedup();
+    names
+        .into_iter()
+        .take(confirmation.sources.len())
+        .map(|physical_filename| {
+            let live = dir.join(&physical_filename);
+            let path = if live.exists() {
+                live
+            } else {
+                archive.join(&physical_filename)
+            };
+            let metadata = std::fs::symlink_metadata(&path)?;
+            anyhow::ensure!(
+                metadata.file_type().is_file(),
+                "non-regular JSON source '{}'",
+                path.display()
+            );
+            let raw = std::fs::read(&path)?;
+            Ok(BatchSourceSnapshot {
+                physical_filename,
+                content_digest: crate::daemon::utils::sha256_hex(&raw),
+            })
+        })
+        .collect()
+}
+
+fn archive_would_orphan_question(decision: &Decision) -> bool {
+    decision.status == Some(DecisionStatus::Pending)
+        || (decision.needs_answer
+            && !matches!(
+                decision.status,
+                Some(DecisionStatus::Answered | DecisionStatus::Expired)
+            ))
+}
+
+fn source_digest(paths: &[PathBuf]) -> String {
+    let mut bytes = Vec::new();
+    for path in paths {
+        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
+            bytes.extend_from_slice(name.as_bytes());
+            bytes.push(0);
+        }
+    }
+    crate::daemon::utils::sha256_hex(&bytes)
+}
+
+fn parse_bound(
+    value: &Value,
+    key: &str,
+) -> Result<Option<chrono::DateTime<chrono::FixedOffset>>, Value> {
+    let Some(raw) = value[key].as_str() else {
+        return Ok(None);
+    };
+    chrono::DateTime::parse_from_rfc3339(raw).map(Some).map_err(
+        |e| serde_json::json!({"error": format!("invalid '{key}' RFC3339 timestamp: {e}")}),
+    )
+}
+
+fn decision_matches(
+    decision: &Decision,
+    include_archived: bool,
+    filter_tags: &[String],
+    author: Option<&str>,
+    status: Option<&str>,
+    since: Option<chrono::DateTime<chrono::FixedOffset>>,
+    until: Option<chrono::DateTime<chrono::FixedOffset>>,
+) -> bool {
+    if !include_archived && decision.archived {
+        return false;
+    }
+    if !filter_tags.is_empty() && !filter_tags.iter().any(|tag| decision.tags.contains(tag)) {
+        return false;
+    }
+    if author.is_some_and(|wanted| decision.author != wanted) {
+        return false;
+    }
+    let actual_status = decision.status.map(|value| match value {
+        DecisionStatus::Pending => "pending",
+        DecisionStatus::Answered => "answered",
+        DecisionStatus::Expired => "expired",
+    });
+    if status.is_some_and(|wanted| actual_status != Some(wanted)) {
+        return false;
+    }
+    let Ok(created) = chrono::DateTime::parse_from_rfc3339(&decision.created_at) else {
+        return false;
+    };
+    if since.is_some_and(|bound| created < bound) || until.is_some_and(|bound| created > bound) {
+        return false;
+    }
+    true
+}
+
 pub fn list(home: &Path, args: &Value) -> Value {
     let include_archived = args["include_archived"].as_bool().unwrap_or(false);
     let filter_tags: Vec<String> = args["tags"]
@@ -447,15 +657,727 @@ pub fn list(home: &Path, args: &Value) -> Value {
                 .collect()
         })
         .unwrap_or_default();
+    let namespace = args["view"].as_str().unwrap_or("live");
+    let Some(dir) = decision_source_dir(home, namespace) else {
+        return serde_json::json!({"error": "'view' must be 'live' or 'audit_history'"});
+    };
+    let consistency = args["consistency"].as_str().unwrap_or("live");
+    if !matches!(consistency, "live" | "snapshot") {
+        return serde_json::json!({"error": "'consistency' must be 'live' or 'snapshot'"});
+    }
+    let limit = args["limit"]
+        .as_u64()
+        .unwrap_or(DEFAULT_LIST_LIMIT as u64)
+        .clamp(1, MAX_LIST_LIMIT as u64) as usize;
+    let scan_budget = args["scan_budget"]
+        .as_u64()
+        .unwrap_or(DEFAULT_SCAN_BUDGET as u64)
+        .clamp(1, MAX_SCAN_BUDGET as u64) as usize;
+    let since = match parse_bound(args, "since") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let until = match parse_bound(args, "until") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let status = args["status"].as_str();
+    if status.is_some_and(|value| !matches!(value, "pending" | "answered" | "expired")) {
+        return serde_json::json!({"error": "'status' must be pending, answered, or expired"});
+    }
 
-    let all = load_all(home);
-    let filtered: Vec<_> = all
+    let paths = match sorted_json_paths(&dir) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return serde_json::json!({"error": format!("decision source is unreadable: {error}")})
+        }
+    };
+    let digest = source_digest(&paths);
+    let cursor = match args["cursor"].as_str() {
+        Some(raw) => match cursor_decode(raw) {
+            Ok(cursor) => Some(cursor),
+            Err(e) => return serde_json::json!({"error": format!("invalid cursor: {e}")}),
+        },
+        None => None,
+    };
+    if let Some(cursor) = &cursor {
+        if cursor.namespace != namespace || cursor.consistency != consistency {
+            return serde_json::json!({"error": "cursor namespace/consistency does not match this query"});
+        }
+        if consistency == "snapshot" && cursor.snapshot_digest.as_deref() != Some(&digest) {
+            return serde_json::json!({"error": "snapshot changed; restart pagination without the cursor"});
+        }
+        if let Some(path) = paths.iter().find(|path| {
+            path.file_name().and_then(|value| value.to_str()) == Some(&cursor.physical_filename)
+        }) {
+            let current_id = std::fs::read(path)
+                .ok()
+                .and_then(|raw| serde_json::from_slice::<Decision>(&raw).ok())
+                .map(|decision| decision.id);
+            if cursor.parsed_id.is_some() && current_id != cursor.parsed_id {
+                return serde_json::json!({
+                    "error": "cursor physical record identity changed; restart pagination"
+                });
+            }
+        }
+    }
+
+    let start = cursor
+        .as_ref()
+        .map(|cursor| {
+            paths.partition_point(|path| {
+                path.file_name()
+                    .and_then(|value| value.to_str())
+                    .is_some_and(|filename| filename >= cursor.physical_filename.as_str())
+            })
+        })
+        .unwrap_or(0);
+    let mut decisions = Vec::new();
+    let mut errors = Vec::new();
+    let mut scanned = 0usize;
+    let mut index = start;
+    let mut last_cursor = None;
+    while index < paths.len() && scanned < scan_budget && decisions.len() < limit {
+        let path = &paths[index];
+        index += 1;
+        scanned += 1;
+        let filename = path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let mut parsed_id = None;
+        match std::fs::read_to_string(path)
+            .map_err(anyhow::Error::from)
+            .and_then(|raw| serde_json::from_str::<Decision>(&raw).map_err(anyhow::Error::from))
+        {
+            Ok(decision) if decision.schema_version <= SCHEMA_VERSION => {
+                parsed_id = Some(decision.id.clone());
+                if decision_matches(
+                    &decision,
+                    namespace == "audit_history" || include_archived,
+                    &filter_tags,
+                    args["author"].as_str(),
+                    status,
+                    since,
+                    until,
+                ) {
+                    decisions.push(decision);
+                }
+            }
+            Ok(decision) => errors.push(serde_json::json!({
+                "physical_filename": filename,
+                "code": "newer_schema",
+                "schema_version": decision.schema_version,
+            })),
+            Err(error) => errors.push(serde_json::json!({
+                "physical_filename": filename,
+                "code": "unreadable_or_malformed",
+                "error": error.to_string(),
+            })),
+        }
+        last_cursor = Some(DecisionCursor {
+            version: 1,
+            namespace: namespace.to_string(),
+            physical_filename: filename,
+            parsed_id,
+            consistency: consistency.to_string(),
+            snapshot_digest: (consistency == "snapshot").then(|| digest.clone()),
+        });
+    }
+    let has_more = index < paths.len();
+    let next_cursor = has_more
+        .then(|| {
+            last_cursor
+                .as_ref()
+                .and_then(|cursor| cursor_encode(cursor).ok())
+        })
+        .flatten();
+    serde_json::json!({
+        "decisions": decisions,
+        "source": namespace,
+        "consistency": consistency,
+        "snapshot_scope": (consistency == "snapshot").then_some("directory_membership; record contents are read live per page"),
+        "scanned": scanned,
+        "scan_budget": scan_budget,
+        "limit": limit,
+        "scan_exhausted": scanned == scan_budget && has_more,
+        "next_cursor": next_cursor,
+        "errors": errors,
+    })
+}
+
+fn protected_policy(home: &Path) -> anyhow::Result<(Vec<String>, String)> {
+    let path = crate::fleet::fleet_yaml_path(home);
+    if !path.exists() {
+        return Ok((Vec::new(), crate::daemon::utils::sha256_hex(b"absent")));
+    }
+    let raw = std::fs::read(&path)?;
+    let doc: serde_yaml_ng::Value = serde_yaml_ng::from_slice(&raw)?;
+    let protected = doc
+        .get("retention")
+        .and_then(|retention| retention.get("protected_decision_tags"))
+        .map(|value| {
+            value
+                .as_sequence()
+                .ok_or_else(|| anyhow::anyhow!("retention.protected_decision_tags must be a list"))
+        })
+        .transpose()?
         .into_iter()
-        .filter(|d| include_archived || !d.archived)
-        .filter(|d| filter_tags.is_empty() || filter_tags.iter().any(|t| d.tags.contains(t)))
-        .collect();
+        .flatten()
+        .map(|value| {
+            value
+                .as_str()
+                .map(String::from)
+                .ok_or_else(|| anyhow::anyhow!("protected decision tags must be strings"))
+        })
+        .collect::<anyhow::Result<Vec<_>>>()?;
+    Ok((protected, crate::daemon::utils::sha256_hex(&raw)))
+}
 
-    serde_json::json!({"decisions": filtered})
+fn confirmation_dir(home: &Path) -> PathBuf {
+    decisions_dir(home).join(".batch-confirmations")
+}
+
+fn confirmation_path(home: &Path, token: &str) -> Option<PathBuf> {
+    if token.len() == 36
+        && token
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    {
+        Some(confirmation_dir(home).join(format!("{token}.json")))
+    } else {
+        None
+    }
+}
+
+fn reap_expired_confirmations(home: &Path) {
+    let Ok(entries) = std::fs::read_dir(confirmation_dir(home)) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_regular_json = entry.file_type().is_ok_and(|kind| kind.is_file())
+            && path.extension().and_then(|value| value.to_str()) == Some("json");
+        if !is_regular_json {
+            continue;
+        }
+        let age = std::fs::read(&path)
+            .ok()
+            .and_then(|raw| serde_json::from_slice::<BatchConfirmation>(&raw).ok())
+            .and_then(|confirmation| {
+                chrono::DateTime::parse_from_rfc3339(&confirmation.created_at).ok()
+            })
+            .map(|created| {
+                chrono::Utc::now()
+                    .signed_duration_since(created)
+                    .num_seconds()
+            });
+        if age.is_none_or(|age| !(0..=BATCH_CONFIRM_TTL_SECS).contains(&age)) {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+fn durable_batch_audit_exists(home: &Path, token: &str, id: &str) -> bool {
+    (0..=5).any(|generation| {
+        let path = if generation == 0 {
+            home.join("event-log.jsonl")
+        } else {
+            home.join(format!("event-log.jsonl.{generation}"))
+        };
+        std::fs::read_to_string(path).is_ok_and(|raw| {
+            raw.lines().any(|line| {
+                let Ok(event) = serde_json::from_str::<serde_json::Value>(line) else {
+                    return false;
+                };
+                if event["kind"] != "decision_batch_archived" {
+                    return false;
+                }
+                let Some(detail) = event["detail"].as_str() else {
+                    return false;
+                };
+                serde_json::from_str::<serde_json::Value>(detail).is_ok_and(|detail| {
+                    detail["id"].as_str() == Some(id) && detail["token"].as_str() == Some(token)
+                })
+            })
+        })
+    })
+}
+
+fn batch_audit_detail(
+    candidate: &BatchCandidateSnapshot,
+    token: &str,
+    confirmation: &BatchConfirmation,
+    audit_reason: &str,
+) -> String {
+    serde_json::json!({
+        "id": candidate.id,
+        "token": token,
+        "preview_digest": confirmation.preview_digest,
+        "source_digest": confirmation.source_digest,
+        "policy_digest": confirmation.policy_digest,
+        "audit_reason": audit_reason,
+    })
+    .to_string()
+}
+
+fn write_batch_audit(
+    home: &Path,
+    caller: &str,
+    candidate: &BatchCandidateSnapshot,
+    token: &str,
+    confirmation: &BatchConfirmation,
+    audit_reason: &str,
+) -> anyhow::Result<()> {
+    crate::event_log::try_log(
+        home,
+        "decision_batch_archived",
+        caller,
+        &batch_audit_detail(candidate, token, confirmation, audit_reason),
+    )
+}
+
+fn read_stable_regular_file(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let before = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        before.file_type().is_file(),
+        "non-regular file '{}'",
+        path.display()
+    );
+    let raw = std::fs::read(path)?;
+    let after = std::fs::symlink_metadata(path)?;
+    anyhow::ensure!(
+        after.file_type().is_file(),
+        "non-regular file '{}'",
+        path.display()
+    );
+    anyhow::ensure!(
+        same_file_identity(&before, &after),
+        "file identity changed for '{}'",
+        path.display()
+    );
+    Ok(raw)
+}
+
+#[cfg(unix)]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_file_identity(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+        && left.created().ok() == right.created().ok()
+}
+
+fn selected_for_batch(
+    decision: &Decision,
+    args: &Value,
+    since: Option<chrono::DateTime<chrono::FixedOffset>>,
+    until: chrono::DateTime<chrono::FixedOffset>,
+) -> bool {
+    let tags = args["tags"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .collect::<Vec<_>>();
+    if !tags.is_empty()
+        && !tags
+            .iter()
+            .any(|tag| decision.tags.iter().any(|actual| actual == tag))
+    {
+        return false;
+    }
+    if args["author"]
+        .as_str()
+        .is_some_and(|author| decision.author != author)
+    {
+        return false;
+    }
+    let actual_status = decision.status.map(|value| match value {
+        DecisionStatus::Pending => "pending",
+        DecisionStatus::Answered => "answered",
+        DecisionStatus::Expired => "expired",
+    });
+    if args["status"]
+        .as_str()
+        .is_some_and(|wanted| actual_status != Some(wanted))
+    {
+        return false;
+    }
+    chrono::DateTime::parse_from_rfc3339(&decision.created_at)
+        .is_ok_and(|created| since.is_none_or(|lower| created >= lower) && created <= until)
+}
+
+pub fn archive_batch(home: &Path, caller: &str, args: &Value) -> Value {
+    if caller.trim().is_empty() {
+        return serde_json::json!({"error": "archive_batch requires an authenticated caller"});
+    }
+    let apply = args["apply"].as_bool().unwrap_or(false);
+    let audit_reason = args["audit_reason"].as_str().unwrap_or("").trim();
+    if audit_reason.is_empty() {
+        return serde_json::json!({"error": "archive_batch requires non-empty 'audit_reason'"});
+    }
+    if apply {
+        return archive_batch_apply(home, caller, args, audit_reason);
+    }
+    archive_batch_preview(home, caller, args, audit_reason)
+}
+
+fn archive_batch_preview(home: &Path, caller: &str, args: &Value, audit_reason: &str) -> Value {
+    reap_expired_confirmations(home);
+    if let Some(status) = args["status"].as_str() {
+        if !matches!(status, "pending" | "answered" | "expired") {
+            return serde_json::json!({"error": format!("invalid status filter '{status}'")});
+        }
+    }
+    let until = match parse_bound(args, "until") {
+        Ok(Some(value)) => value,
+        Ok(None) => return serde_json::json!({"error": "archive_batch dry-run requires 'until'"}),
+        Err(error) => return error,
+    };
+    let since = match parse_bound(args, "since") {
+        Ok(value) => value,
+        Err(error) => return error,
+    };
+    let (protected, policy_digest) = match protected_policy(home) {
+        Ok(value) => value,
+        Err(error) => {
+            return serde_json::json!({
+                "error": format!("protected decision policy is unreadable; refusing batch archive: {error}")
+            })
+        }
+    };
+    let scan_budget = args["scan_budget"]
+        .as_u64()
+        .unwrap_or(DEFAULT_SCAN_BUDGET as u64)
+        .clamp(1, MAX_SCAN_BUDGET as u64) as usize;
+    let paths = match sorted_json_paths(&decisions_dir(home)) {
+        Ok(paths) => paths,
+        Err(error) => {
+            return serde_json::json!({"error": format!("decision source is unreadable; refusing batch archive: {error}")})
+        }
+    };
+    let mut scanned = 0usize;
+    let mut source_material = Vec::new();
+    let mut sources = Vec::new();
+    let mut candidates = Vec::new();
+    let mut protected_ids = Vec::new();
+    let mut candidates_capped = false;
+    for path in paths.iter().take(scan_budget) {
+        scanned += 1;
+        let filename = path
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default()
+            .to_string();
+        let raw = match std::fs::read(path) {
+            Ok(raw) => raw,
+            Err(error) => {
+                return serde_json::json!({"error": format!("cannot read {filename}; refusing batch archive: {error}")})
+            }
+        };
+        let content_digest = crate::daemon::utils::sha256_hex(&raw);
+        source_material.extend_from_slice(filename.as_bytes());
+        source_material.push(0);
+        source_material.extend_from_slice(content_digest.as_bytes());
+        source_material.push(0);
+        sources.push(BatchSourceSnapshot {
+            physical_filename: filename.clone(),
+            content_digest: content_digest.clone(),
+        });
+        let decision: Decision = match serde_json::from_slice(&raw) {
+            Ok(decision) => decision,
+            Err(error) => {
+                return serde_json::json!({"error": format!("malformed {filename}; refusing batch archive: {error}")})
+            }
+        };
+        if decision.schema_version > SCHEMA_VERSION {
+            return serde_json::json!({
+                "error": format!("{filename} uses newer schema {}; refusing batch archive", decision.schema_version)
+            });
+        }
+        if decision.archived || !selected_for_batch(&decision, args, since, until) {
+            continue;
+        }
+        if archive_would_orphan_question(&decision) {
+            return serde_json::json!({
+                "error": format!("unresolved question '{}' matched; refusing batch archive", decision.id)
+            });
+        }
+        if !can_mutate_decision(home, caller, &decision) {
+            return serde_json::json!({
+                "error": format!("decision '{}' owned by '{}'; caller '{caller}' not authorized", decision.id, decision.author)
+            });
+        }
+        if decision.tags.iter().any(|tag| protected.contains(tag)) {
+            protected_ids.push(decision.id);
+            continue;
+        }
+        if candidates.len() == MAX_BATCH_CANDIDATES {
+            candidates_capped = true;
+            break;
+        }
+        candidates.push(BatchCandidateSnapshot {
+            id: decision.id,
+            physical_filename: filename,
+            content_digest,
+        });
+    }
+    let ids = candidates
+        .iter()
+        .map(|candidate| candidate.id.as_str())
+        .collect::<Vec<_>>();
+    let preview_digest = crate::daemon::utils::sha256_hex(ids.join("\0").as_bytes());
+    let source_digest = crate::daemon::utils::sha256_hex(&source_material);
+    let token = uuid::Uuid::new_v4().to_string();
+    let confirmation = BatchConfirmation {
+        schema_version: 1,
+        actor: caller.to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        audit_reason: audit_reason.to_string(),
+        policy_digest: policy_digest.clone(),
+        source_digest: source_digest.clone(),
+        preview_digest: preview_digest.clone(),
+        candidate_cap: MAX_BATCH_CANDIDATES,
+        candidates_capped,
+        sources,
+        candidates,
+    };
+    let dir = confirmation_dir(home);
+    if let Err(error) = std::fs::create_dir_all(&dir).and_then(|_| {
+        crate::store::save_atomic(&dir.join(format!("{token}.json")), &confirmation)
+            .map_err(std::io::Error::other)
+    }) {
+        return serde_json::json!({"error": format!("persist confirmation failed: {error}")});
+    }
+    serde_json::json!({
+        "apply": false,
+        "candidate_ids": confirmation.candidates.iter().map(|candidate| &candidate.id).collect::<Vec<_>>(),
+        "candidate_count": confirmation.candidates.len(),
+        "candidate_cap": confirmation.candidate_cap,
+        "candidates_capped": confirmation.candidates_capped,
+        "protected_ids": protected_ids,
+        "scanned": scanned,
+        "scan_budget": scan_budget,
+        "scan_exhausted": scanned == scan_budget && scanned < paths.len(),
+        "confirm_token": token,
+        "preview_digest": preview_digest,
+        "policy_digest": policy_digest,
+        "source_digest": source_digest,
+    })
+}
+
+fn archive_batch_apply(home: &Path, caller: &str, args: &Value, audit_reason: &str) -> Value {
+    let Some(token) = args["confirm_token"].as_str() else {
+        return serde_json::json!({"error": "apply=true requires 'confirm_token'"});
+    };
+    let Some(path) = confirmation_path(home, token) else {
+        return serde_json::json!({"error": "invalid confirm_token"});
+    };
+    let mut confirmation: BatchConfirmation = match std::fs::read(&path)
+        .map_err(anyhow::Error::from)
+        .and_then(|raw| serde_json::from_slice(&raw).map_err(anyhow::Error::from))
+    {
+        Ok(value) => value,
+        Err(error) => {
+            return serde_json::json!({"error": format!("confirmation unavailable: {error}")})
+        }
+    };
+    if confirmation.schema_version != 1
+        || confirmation.actor != caller
+        || confirmation.audit_reason != audit_reason
+    {
+        return serde_json::json!({"error": "confirmation actor/audit binding mismatch"});
+    }
+    let confirmation_age = chrono::DateTime::parse_from_rfc3339(&confirmation.created_at)
+        .map(|created| {
+            chrono::Utc::now()
+                .signed_duration_since(created)
+                .num_seconds()
+        })
+        .unwrap_or(BATCH_CONFIRM_TTL_SECS + 1);
+    if !(0..=BATCH_CONFIRM_TTL_SECS).contains(&confirmation_age) {
+        return serde_json::json!({"error": "confirmation expired; run dry-run again"});
+    }
+    let mut confirm_ids = args["confirm_ids"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str().map(String::from))
+        .collect::<Vec<_>>();
+    confirm_ids.sort();
+    confirm_ids.dedup();
+    let mut expected_ids = confirmation
+        .candidates
+        .iter()
+        .map(|candidate| candidate.id.clone())
+        .collect::<Vec<_>>();
+    expected_ids.sort();
+    if confirm_ids != expected_ids {
+        return serde_json::json!({"error": "confirm_ids must exactly match the dry-run preview"});
+    }
+    let (protected, policy_digest) = match protected_policy(home) {
+        Ok(value) => value,
+        Err(error) => {
+            return serde_json::json!({"error": format!("protected policy revalidation failed: {error}")})
+        }
+    };
+    if policy_digest != confirmation.policy_digest {
+        return serde_json::json!({"error": "protected decision policy changed; run dry-run again"});
+    }
+    let dir = decisions_dir(home);
+    let archive = dir.join(".archive");
+    let all_already_archived = confirmation.candidates.iter().all(|candidate| {
+        read_stable_regular_file(&archive.join(&candidate.physical_filename))
+            .ok()
+            .is_some_and(|raw| crate::daemon::utils::sha256_hex(&raw) == candidate.content_digest)
+            && std::fs::symlink_metadata(dir.join(&candidate.physical_filename))
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+    });
+    if !all_already_archived {
+        let current_sources = match batch_sources_with_archived_candidates(
+            &dir,
+            &archive,
+            &confirmation,
+        ) {
+            Ok(sources) => sources,
+            Err(error) => {
+                return serde_json::json!({"error": format!("decision source revalidation failed: {error}")})
+            }
+        };
+        if current_sources != confirmation.sources {
+            return serde_json::json!({"error": "decision source snapshot changed; run dry-run again"});
+        }
+    }
+    if let Err(error) = std::fs::create_dir_all(&archive) {
+        return serde_json::json!({"error": format!("create archive directory failed: {error}")});
+    }
+    let _sentinel = match crate::store::acquire_file_lock(&dir.join(".archive.lock")) {
+        Ok(lock) => lock,
+        Err(error) => {
+            return serde_json::json!({"error": format!("archive sentinel lock failed: {error}")})
+        }
+    };
+    let mut ordered = std::mem::take(&mut confirmation.candidates);
+    ordered.sort_by(|left, right| left.id.cmp(&right.id));
+    let mut outcomes = Vec::new();
+    let mut partial = false;
+    for candidate in ordered {
+        let outcome = with_decision_lock(home, &candidate.id, || {
+            let src = dir.join(&candidate.physical_filename);
+            let dst = archive.join(&candidate.physical_filename);
+            let src_metadata = match std::fs::symlink_metadata(&src) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    if read_stable_regular_file(&dst).ok().is_some_and(|raw| {
+                        crate::daemon::utils::sha256_hex(&raw) == candidate.content_digest
+                    }) {
+                        if durable_batch_audit_exists(home, token, &candidate.id) {
+                            return serde_json::json!({"id": candidate.id, "outcome": "already_archived", "audit_durable": true});
+                        }
+                        return match write_batch_audit(
+                            home,
+                            caller,
+                            &candidate,
+                            token,
+                            &confirmation,
+                            audit_reason,
+                        ) {
+                            Ok(()) => {
+                                serde_json::json!({"id": candidate.id, "outcome": "audit_repaired", "audit_durable": true})
+                            }
+                            Err(error) => {
+                                serde_json::json!({"id": candidate.id, "outcome": "archived_audit_failed", "error": error.to_string(), "audit_durable": false})
+                            }
+                        };
+                    }
+                    return serde_json::json!({"id": candidate.id, "outcome": "source_missing", "audit_durable": false});
+                }
+                Err(error) => {
+                    return serde_json::json!({"id": candidate.id, "outcome": "source_metadata_failed", "error": error.to_string(), "audit_durable": false})
+                }
+            };
+            if !src_metadata.file_type().is_file() {
+                return serde_json::json!({"id": candidate.id, "outcome": "revalidation_refused", "error": "source is not a regular file", "audit_durable": false});
+            }
+            match std::fs::symlink_metadata(&dst) {
+                Ok(_) => {
+                    return serde_json::json!({"id": candidate.id, "outcome": "archive_collision", "audit_durable": false});
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return serde_json::json!({"id": candidate.id, "outcome": "archive_metadata_failed", "error": error.to_string(), "audit_durable": false})
+                }
+            }
+            let raw = match read_stable_regular_file(&src) {
+                Ok(raw) => raw,
+                Err(error) => {
+                    return serde_json::json!({"id": candidate.id, "outcome": "read_failed", "error": error.to_string(), "audit_durable": false})
+                }
+            };
+            if crate::daemon::utils::sha256_hex(&raw) != candidate.content_digest {
+                return serde_json::json!({"id": candidate.id, "outcome": "content_changed", "audit_durable": false});
+            }
+            let decision: Decision = match serde_json::from_slice(&raw) {
+                Ok(decision) => decision,
+                Err(error) => {
+                    return serde_json::json!({"id": candidate.id, "outcome": "malformed", "error": error.to_string(), "audit_durable": false})
+                }
+            };
+            if decision.schema_version > SCHEMA_VERSION
+                || archive_would_orphan_question(&decision)
+                || decision.tags.iter().any(|tag| protected.contains(tag))
+                || !can_mutate_decision(home, caller, &decision)
+            {
+                return serde_json::json!({"id": candidate.id, "outcome": "revalidation_refused", "audit_durable": false});
+            }
+            let final_metadata = match std::fs::symlink_metadata(&src) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    return serde_json::json!({"id": candidate.id, "outcome": "source_metadata_failed", "error": error.to_string(), "audit_durable": false})
+                }
+            };
+            if !final_metadata.file_type().is_file()
+                || !same_file_identity(&src_metadata, &final_metadata)
+            {
+                return serde_json::json!({"id": candidate.id, "outcome": "revalidation_refused", "error": "source identity changed", "audit_durable": false});
+            }
+            if let Err(error) = std::fs::rename(&src, &dst) {
+                return serde_json::json!({"id": candidate.id, "outcome": "archive_failed", "error": error.to_string(), "audit_durable": false});
+            }
+            match write_batch_audit(home, caller, &candidate, token, &confirmation, audit_reason) {
+                Ok(()) => {
+                    serde_json::json!({"id": candidate.id, "outcome": "archived", "audit_durable": true})
+                }
+                Err(error) => {
+                    serde_json::json!({"id": candidate.id, "outcome": "archived_audit_failed", "error": error.to_string(), "audit_durable": false})
+                }
+            }
+        });
+        let value = match outcome {
+            Ok(value) => value,
+            Err(error) => {
+                serde_json::json!({"id": candidate.id, "outcome": "lock_failed", "error": error.to_string(), "audit_durable": false})
+            }
+        };
+        partial |= !value["audit_durable"].as_bool().unwrap_or(false);
+        outcomes.push(value);
+    }
+    serde_json::json!({
+        "apply": true,
+        "partial": partial,
+        "outcomes": outcomes,
+        "preview_digest": confirmation.preview_digest,
+        "candidate_cap": confirmation.candidate_cap,
+        "candidates_capped": confirmation.candidates_capped,
+        "source_digest": confirmation.source_digest,
+        "policy_digest": confirmation.policy_digest,
+    })
 }
 
 pub fn update(home: &Path, caller: &str, args: &Value) -> Value {
@@ -675,987 +1597,6 @@ pub(crate) fn auto_answer_timeout(home: &Path, id: &str) -> Option<(String, Stri
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn tmp_home(name: &str) -> std::path::PathBuf {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "agend-decisions-test-{}-{}-{}",
-            std::process::id(),
-            name,
-            id
-        ));
-        std::fs::create_dir_all(dir.join("decisions")).ok();
-        dir
-    }
-
-    #[test]
-    fn test_post_and_list() {
-        let home = tmp_home("post_and_list");
-        let result = post(
-            &home,
-            "test-agent",
-            &serde_json::json!({
-                "title": "Test Decision", "content": "We use Rust", "scope": "fleet"
-            }),
-        );
-        assert!(result["id"].as_str().is_some());
-        assert_eq!(result["status"], "posted");
-
-        let listed = list(&home, &serde_json::json!({}));
-        let decisions = listed["decisions"].as_array().expect("array");
-        assert_eq!(decisions.len(), 1);
-        assert_eq!(decisions[0]["title"], "Test Decision");
-        assert_eq!(decisions[0]["author"], "test-agent");
-
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn test_update_and_archive() {
-        let home = tmp_home("update_archive");
-        let result = post(
-            &home,
-            "a",
-            &serde_json::json!({"title": "D1", "content": "v1"}),
-        );
-        let id = result["id"].as_str().expect("id");
-
-        let upd = update(&home, "a", &serde_json::json!({"id": id, "content": "v2"}));
-        assert_eq!(upd["status"], "updated");
-
-        let listed = list(&home, &serde_json::json!({}));
-        assert_eq!(listed["decisions"][0]["content"], "v2");
-
-        // Archive
-        update(&home, "a", &serde_json::json!({"id": id, "archive": true}));
-        let listed = list(&home, &serde_json::json!({}));
-        assert!(listed["decisions"].as_array().expect("arr").is_empty());
-
-        // Include archived
-        let listed = list(&home, &serde_json::json!({"include_archived": true}));
-        assert_eq!(listed["decisions"].as_array().expect("arr").len(), 1);
-
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn test_update_nonexistent() {
-        let home = tmp_home("update_nonexistent");
-        let result = update(&home, "anyone", &serde_json::json!({"id": "no-such-id"}));
-        assert!(result["error"].as_str().is_some());
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn test_supersede_archives_old() {
-        let home = tmp_home("supersede");
-        let old = post(
-            &home,
-            "a",
-            &serde_json::json!({"title": "old", "content": "v1"}),
-        );
-        let old_id = old["id"].as_str().expect("id").to_string();
-        // New decision supersedes the old one.
-        let new = post(
-            &home,
-            "a",
-            &serde_json::json!({"title": "new", "content": "v2", "supersedes": old_id}),
-        );
-        assert_eq!(new["status"], "posted");
-
-        // Old must now be archived.
-        let listed = list(&home, &serde_json::json!({"include_archived": true}));
-        let arr = listed["decisions"].as_array().expect("arr");
-        let old_rec = arr
-            .iter()
-            .find(|d| d["id"].as_str() == Some(&old_id))
-            .expect("old decision present");
-        assert_eq!(old_rec["archived"], true);
-
-        // Default list (non-archived) excludes it.
-        let active = list(&home, &serde_json::json!({}));
-        let active_ids: Vec<_> = active["decisions"]
-            .as_array()
-            .expect("arr")
-            .iter()
-            .map(|d| d["id"].as_str().unwrap_or(""))
-            .collect();
-        assert!(!active_ids.contains(&old_id.as_str()));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn test_concurrent_updates_no_loss() {
-        // Load-modify-save without a lock would let the two updates race:
-        // both read the same starting record, each flips a different
-        // field, whichever writes last silently drops the other's change.
-        // Per-decision flock must serialize them so both writes land.
-        let home = tmp_home("concurrent");
-        let posted = post(
-            &home,
-            "a",
-            &serde_json::json!({"title": "T", "content": "c0", "tags": []}),
-        );
-        let id = posted["id"].as_str().expect("id").to_string();
-
-        let home_arc = std::sync::Arc::new(home.clone());
-        let id_arc = std::sync::Arc::new(id.clone());
-
-        let h1 = {
-            let h = home_arc.clone();
-            let i = id_arc.clone();
-            std::thread::spawn(move || {
-                for _ in 0..20 {
-                    update(
-                        &h,
-                        "a",
-                        &serde_json::json!({"id": (*i).clone(), "content": "from_thread_1"}),
-                    );
-                }
-            })
-        };
-        let h2 = {
-            let h = home_arc.clone();
-            let i = id_arc.clone();
-            std::thread::spawn(move || {
-                for _ in 0..20 {
-                    update(
-                        &h,
-                        "a",
-                        &serde_json::json!({"id": (*i).clone(), "tags": ["from_thread_2"]}),
-                    );
-                }
-            })
-        };
-        h1.join().expect("t1");
-        h2.join().expect("t2");
-
-        // Final state: last-writer-wins on each field is expected, but the
-        // *file* must be valid JSON (no interleaved bytes) and must still
-        // deserialize as a Decision. Without the lock, atomic_write guards
-        // the write but load_all-based update would re-serialize the
-        // *entire list*, losing fields written between load and save.
-        let listed = list(&home, &serde_json::json!({"include_archived": true}));
-        let decisions = listed["decisions"].as_array().expect("arr");
-        assert_eq!(decisions.len(), 1, "decision must still exist intact");
-        let d = &decisions[0];
-        // Final state: updated_at must be populated (both threads always
-        // update it), tags/content are whichever thread wrote last.
-        assert!(d["updated_at"].as_str().is_some());
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    // ─── Sprint 21 Phase 2 D1: cascade auth gate (can_mutate_decision) ───
-    //
-    // Closes the cascade attack chain headline (Sprint 20 Track D MCP audit
-    // C1 + Sprint 20.5 Track 6 cross-validation): without this gate a
-    // prompt-injected agent could silently archive operator strategic
-    // decisions. Mirror the `tasks::can_mutate_task` ownership pattern
-    // (Sprint 20 Track D Praise replicate identification).
-
-    fn make_test_decision(author: &str) -> Decision {
-        Decision {
-            id: "d-test".into(),
-            title: "T".into(),
-            content: "c".into(),
-            scope: "fleet".into(),
-            author: author.into(),
-            tags: vec![],
-            ttl_days: None,
-            created_at: "2026-04-27T00:00:00Z".into(),
-            updated_at: "2026-04-27T00:00:00Z".into(),
-            archived: false,
-            supersedes: None,
-            working_directory: None,
-            schema_version: SCHEMA_VERSION,
-            needs_answer: false,
-            status: None,
-            options: vec![],
-            allow_free_text: false,
-            answer: None,
-            answered_by: None,
-            answered_at: None,
-            timeout_secs: None,
-            timeout_default: None,
-        }
-    }
-
-    #[test]
-    fn can_mutate_decision_owner_pass() {
-        let home = tmp_home("can_mutate_owner");
-        let decision = make_test_decision("dev-lead");
-        assert!(can_mutate_decision(&home, "dev-lead", &decision));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn can_mutate_decision_non_owner_reject() {
-        let home = tmp_home("can_mutate_reject");
-        let decision = make_test_decision("dev-lead");
-        // No teams configured → no orchestrator override path → caller
-        // mismatch must reject.
-        assert!(!can_mutate_decision(&home, "dev-impl-1", &decision));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn can_mutate_decision_string_compare_no_numeric_coerce() {
-        // Operator-known-pitfall (Telegram alert): caller string vs numeric
-        // user_id. Decision.author is `String` (e.g. "dev-impl-1"); the
-        // gate compares strings, never parses an int. Verify that an
-        // alphabetically-similar but non-equal caller does NOT pass, and
-        // that numeric-suffixed names compare verbatim.
-        let home = tmp_home("can_mutate_string_compare");
-        let decision = make_test_decision("dev-impl-1");
-        // Exact string match — passes.
-        assert!(can_mutate_decision(&home, "dev-impl-1", &decision));
-        // Suffix mismatch — rejects (no int coerce to "1 == 1").
-        assert!(!can_mutate_decision(&home, "dev-impl-2", &decision));
-        // Bare numeric caller — rejects (would only "match" under int coerce
-        // path, which we explicitly do not have).
-        assert!(!can_mutate_decision(&home, "1", &decision));
-        // Substring of author — rejects (no prefix-match path).
-        assert!(!can_mutate_decision(&home, "dev-impl", &decision));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn update_decision_non_owner_returns_authz_error() {
-        let home = tmp_home("update_non_owner");
-        let posted = post(
-            &home,
-            "dev-lead",
-            &serde_json::json!({"title": "Strategic", "content": "c"}),
-        );
-        let id = posted["id"].as_str().expect("id");
-
-        // dev-impl-1 (not the author, no orchestrator override) attempts to
-        // archive — must be rejected with descriptive error.
-        let result = update(
-            &home,
-            "dev-impl-1",
-            &serde_json::json!({"id": id, "archive": true}),
-        );
-        let err = result["error"].as_str().expect("error string");
-        assert!(
-            err.contains("not authorized"),
-            "expected authz rejection, got: {err}"
-        );
-        assert!(
-            err.contains("dev-lead"),
-            "error must surface decision.author for diagnostics, got: {err}"
-        );
-        assert!(
-            err.contains("dev-impl-1"),
-            "error must surface caller for diagnostics, got: {err}"
-        );
-
-        // Verify the decision was NOT mutated despite the attempt.
-        let listed = list(&home, &serde_json::json!({}));
-        let arr = listed["decisions"].as_array().expect("arr");
-        assert_eq!(arr.len(), 1, "decision still active (not archived)");
-        assert_eq!(arr[0]["archived"], false);
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn update_decision_owner_succeeds() {
-        let home = tmp_home("update_owner");
-        let posted = post(
-            &home,
-            "dev-lead",
-            &serde_json::json!({"title": "T", "content": "v1"}),
-        );
-        let id = posted["id"].as_str().expect("id");
-
-        let result = update(
-            &home,
-            "dev-lead",
-            &serde_json::json!({"id": id, "content": "v2"}),
-        );
-        assert_eq!(result["status"], "updated");
-
-        let listed = list(&home, &serde_json::json!({}));
-        assert_eq!(listed["decisions"][0]["content"], "v2");
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #1990 additive: a pre-#1990 decision file (no `schema_version`) must still
-    /// load (the field defaults to 0 ≤ current).
-    #[test]
-    fn old_decision_without_schema_version_is_listed() {
-        let home = tmp_home("dec_oldver");
-        let dir = decisions_dir(&home);
-        std::fs::create_dir_all(&dir).ok();
-        std::fs::write(
-            dir.join("d-old.json"),
-            r#"{"id":"d-old","title":"T","content":"c","scope":"fleet","author":"a","tags":[],"ttl_days":null,"created_at":"2026-04-27T00:00:00Z","updated_at":"2026-04-27T00:00:00Z","archived":false,"supersedes":null,"working_directory":null}"#,
-        )
-        .expect("write old fixture");
-        assert!(
-            list_all(&home).iter().any(|d| d.id == "d-old"),
-            "a pre-#1990 decision (no schema_version) must still load"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #1990 fail-closed: a decision a newer daemon wrote (schema_version > current)
-    /// is skipped on read and refused for update — never silently downgraded.
-    #[test]
-    fn future_schema_version_decision_skipped_and_update_refused() {
-        let home = tmp_home("dec_futurever");
-        let dir = decisions_dir(&home);
-        std::fs::create_dir_all(&dir).ok();
-        std::fs::write(
-            dir.join("d-future.json"),
-            r#"{"id":"d-future","title":"T","content":"c","scope":"fleet","author":"a","tags":[],"ttl_days":null,"created_at":"2026-04-27T00:00:00Z","updated_at":"2026-04-27T00:00:00Z","archived":false,"supersedes":null,"working_directory":null,"schema_version":999}"#,
-        )
-        .expect("write future fixture");
-        assert!(
-            list_all(&home).iter().all(|d| d.id != "d-future"),
-            "a future-schema decision must be skipped, not listed"
-        );
-        let resp = update(
-            &home,
-            "a",
-            &serde_json::json!({"id":"d-future","content":"x"}),
-        );
-        assert!(
-            resp.get("error").is_some(),
-            "updating a future-schema decision must be refused: {resp}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    // ─── #2305 async decision board: pending questions + answer ───
-
-    fn post_question(home: &Path, args: serde_json::Value) -> String {
-        let r = post(home, "lead", &args);
-        r["id"].as_str().expect("question id").to_string()
-    }
-
-    /// Active pending questions — delegates to the prod `list_pending` (added in
-    /// PR2 now that the answer overlay calls it).
-    fn pending_questions(home: &Path) -> Vec<Decision> {
-        list_pending(home)
-    }
-
-    #[test]
-    fn pre_2305_decision_loads_as_plain_non_question() {
-        // A pre-#2305 record (none of the new fields) must load with needs_answer
-        // false / status None — i.e. behave exactly as a plain scope decision.
-        let home = tmp_home("dec_pre2305");
-        let dir = decisions_dir(&home);
-        std::fs::create_dir_all(&dir).ok();
-        std::fs::write(
-            dir.join("d-plain.json"),
-            r#"{"id":"d-plain","title":"T","content":"c","scope":"fleet","author":"a","tags":[],"ttl_days":null,"created_at":"2026-04-27T00:00:00Z","updated_at":"2026-04-27T00:00:00Z","archived":false,"supersedes":null,"working_directory":null,"schema_version":1}"#,
-        )
-        .expect("write pre-2305 fixture");
-        let all = list_all(&home);
-        let d = all.iter().find(|d| d.id == "d-plain").expect("loads");
-        assert!(!d.needs_answer, "pre-2305 record is not a question");
-        assert_eq!(d.status, None);
-        assert!(d.options.is_empty() && d.answer.is_none());
-        assert!(
-            pending_questions(&home).is_empty(),
-            "a plain decision must not appear as pending"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn post_question_appears_pending_then_answered() {
-        let home = tmp_home("dec_q_lifecycle");
-        let id = post_question(
-            &home,
-            serde_json::json!({
-                "title": "Deploy now?", "content": "ship v2?",
-                "needs_answer": true,
-                "options": [{"label": "yes", "recommended": true}, "no"],
-            }),
-        );
-        // Pending until answered.
-        let pending = pending_questions(&home);
-        assert_eq!(pending.len(), 1);
-        assert_eq!(pending[0].id, id);
-        assert_eq!(pending[0].status, Some(DecisionStatus::Pending));
-        assert!(
-            pending[0].options[0].recommended,
-            "recommended-first preserved"
-        );
-        assert!(
-            !pending[0].options[1].recommended,
-            "bare-string option = not recommended"
-        );
-
-        // Answer with a valid option.
-        let r = answer(
-            &home,
-            "operator",
-            &serde_json::json!({"id": id, "answer": "yes"}),
-        );
-        assert_eq!(r["status"], "answered");
-        assert_eq!(r["author"], "lead", "answer surfaces author for notify");
-
-        // No longer pending; fields recorded.
-        assert!(pending_questions(&home).is_empty());
-        let all = list_all(&home);
-        let d = all.iter().find(|d| d.id == id).expect("present");
-        assert_eq!(d.status, Some(DecisionStatus::Answered));
-        assert_eq!(d.answer.as_deref(), Some("yes"));
-        assert_eq!(d.answered_by.as_deref(), Some("operator"));
-        assert!(d.answered_at.is_some());
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn answer_rejects_non_option_when_free_text_disallowed() {
-        let home = tmp_home("dec_q_optonly");
-        let id = post_question(
-            &home,
-            serde_json::json!({
-                "title": "Q", "content": "?", "needs_answer": true,
-                "options": ["a", "b"], "allow_free_text": false,
-            }),
-        );
-        let bad = answer(
-            &home,
-            "operator",
-            &serde_json::json!({"id": id, "answer": "zzz"}),
-        );
-        assert!(
-            bad.get("error").is_some(),
-            "off-option answer must be refused: {bad}"
-        );
-        // Still pending (not consumed by the rejected attempt).
-        assert_eq!(pending_questions(&home).len(), 1);
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn answer_allows_free_text_when_enabled() {
-        let home = tmp_home("dec_q_freetext");
-        let id = post_question(
-            &home,
-            serde_json::json!({
-                "title": "Q", "content": "?", "needs_answer": true,
-                "options": ["a"], "allow_free_text": true,
-            }),
-        );
-        let r = answer(
-            &home,
-            "operator",
-            &serde_json::json!({"id": id, "answer": "something custom"}),
-        );
-        assert_eq!(r["status"], "answered");
-        let d = list_all(&home)
-            .into_iter()
-            .find(|d| d.id == id)
-            .expect("present");
-        assert_eq!(d.answer.as_deref(), Some("something custom"));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn answer_refuses_author_self_answer_2305() {
-        // r2 hardening: the question's own author must not self-answer (would
-        // bypass the operator). A different caller (the operator) still can.
-        let home = tmp_home("dec_q_self_answer");
-        let id = post_question(
-            &home,
-            serde_json::json!({"title": "Q", "content": "?", "needs_answer": true, "allow_free_text": true}),
-        );
-        // post_question authors as "lead" — lead answering its own question is refused.
-        let r = answer(&home, "lead", &serde_json::json!({"id": id, "answer": "x"}));
-        assert!(
-            r.get("error")
-                .is_some_and(|e| e.as_str().unwrap_or("").contains("cannot answer its own")),
-            "author self-answer must be refused: {r}"
-        );
-        assert_eq!(
-            pending_questions(&home).len(),
-            1,
-            "still pending after refused self-answer"
-        );
-        // The operator (different identity) answers fine.
-        assert_eq!(
-            answer(
-                &home,
-                "operator",
-                &serde_json::json!({"id": id, "answer": "x"})
-            )["status"],
-            "answered"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn answer_refuses_non_question_and_already_answered() {
-        let home = tmp_home("dec_q_guards");
-        // Plain decision (not a question) → refused.
-        let plain = post(
-            &home,
-            "lead",
-            &serde_json::json!({"title": "T", "content": "c"}),
-        );
-        let pid = plain["id"].as_str().expect("id");
-        assert!(answer(
-            &home,
-            "operator",
-            &serde_json::json!({"id": pid, "answer": "x"})
-        )
-        .get("error")
-        .is_some());
-
-        // Question → answer once OK, second answer refused (not Pending).
-        let id = post_question(
-            &home,
-            serde_json::json!({"title": "Q", "content": "?", "needs_answer": true, "allow_free_text": true}),
-        );
-        assert_eq!(
-            answer(
-                &home,
-                "operator",
-                &serde_json::json!({"id": id, "answer": "first"})
-            )["status"],
-            "answered"
-        );
-        let second = answer(
-            &home,
-            "operator",
-            &serde_json::json!({"id": id, "answer": "second"}),
-        );
-        assert!(
-            second.get("error").is_some(),
-            "re-answer must be refused: {second}"
-        );
-        // The first answer stands.
-        let d = list_all(&home)
-            .into_iter()
-            .find(|d| d.id == id)
-            .expect("present");
-        assert_eq!(d.answer.as_deref(), Some("first"));
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn concurrent_answers_exactly_one_wins() {
-        // Two threads answer the same pending question; the per-decision flock
-        // serializes read→validate→write, so the second sees Answered (not
-        // Pending) and is refused. Exactly one answer is recorded.
-        let home = tmp_home("dec_q_concurrent");
-        let id = post_question(
-            &home,
-            serde_json::json!({"title": "Q", "content": "?", "needs_answer": true, "allow_free_text": true}),
-        );
-        let home_arc = std::sync::Arc::new(home.clone());
-        let id_arc = std::sync::Arc::new(id.clone());
-        let mk = |ans: &'static str| {
-            let h = home_arc.clone();
-            let i = id_arc.clone();
-            std::thread::spawn(move || {
-                answer(
-                    &h,
-                    "operator",
-                    &serde_json::json!({"id": (*i).clone(), "answer": ans}),
-                )
-            })
-        };
-        // Spawn BOTH, then join — they contend on the same per-decision flock.
-        let (t1, t2) = (mk("A"), mk("B"));
-        let r1 = t1.join().expect("t1");
-        let r2 = t2.join().expect("t2");
-        let successes = [&r1, &r2]
-            .iter()
-            .filter(|r| r["status"] == "answered")
-            .count();
-        assert_eq!(successes, 1, "exactly one answer must win: {r1} | {r2}");
-        assert!(
-            pending_questions(&home).is_empty(),
-            "question is answered, not pending"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    // ── #2524 P2b / #2313 — count_pending badge helper ──
-
-    // #3031: `count_pending` memoizes on the decisions-dir mtime in a single
-    // process-global slot, so concurrent `count_pending` calls from other tests
-    // would evict the entry mid-test and make the cache-reuse assertion flaky.
-    // Every `count_pending` caller in the suite shares this serial group (the
-    // two #2313 tests below included) — they are the complete set.
-    use serial_test::serial;
-
-    #[test]
-    #[serial(decisions_count_cache)]
-    fn count_pending_buckets_by_author_2313() {
-        let home = tmp_home("count-pending-buckets-2313");
-        post(
-            &home,
-            "alice",
-            &serde_json::json!({"title": "Q1", "content": "?", "needs_answer": true}),
-        );
-        post(
-            &home,
-            "alice",
-            &serde_json::json!({"title": "Q2", "content": "?", "needs_answer": true}),
-        );
-        post(
-            &home,
-            "bob",
-            &serde_json::json!({"title": "Q3", "content": "?", "needs_answer": true}),
-        );
-        // Plain scope record (not a question) — must not count toward the badge.
-        post(
-            &home,
-            "carol",
-            &serde_json::json!({"title": "note", "content": "fyi"}),
-        );
-
-        let counts = count_pending(&home);
-        assert_eq!(counts.total, 3, "3 pending questions across alice+bob");
-        assert_eq!(counts.by_author.get("alice"), Some(&2));
-        assert_eq!(counts.by_author.get("bob"), Some(&1));
-        assert_eq!(
-            counts.by_author.get("carol"),
-            None,
-            "a plain scope record must not appear in the badge tally"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    #[serial(decisions_count_cache)]
-    fn count_pending_excludes_answered_2313() {
-        let home = tmp_home("count-pending-answered-2313");
-        let created = post(
-            &home,
-            "alice",
-            &serde_json::json!({
-                "title": "Q", "content": "?", "needs_answer": true, "allow_free_text": true
-            }),
-        );
-        let id = created["id"].as_str().expect("id").to_string();
-        answer(
-            &home,
-            "operator",
-            &serde_json::json!({"id": id, "answer": "yes"}),
-        );
-
-        let counts = count_pending(&home);
-        assert_eq!(
-            counts.total, 0,
-            "answered question must drop out of the tally"
-        );
-        assert!(counts.by_author.is_empty());
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    // ── #3031 — count_pending memoization keyed by decisions-dir mtime ──
-
-    /// Two `count_pending` calls over a directory whose mtime has not moved must
-    /// run exactly one underlying scan.
-    ///
-    /// Observed black-box, with no counter or production instrumentation: the
-    /// decision file is rewritten IN PLACE (`fs::write`), deliberately bypassing
-    /// `store::atomic_write`. A plain overwrite moves the FILE's mtime but not
-    /// the DIRECTORY's, so a second scan would see the edit and report a
-    /// different tally. Reporting the first call's tally is therefore only
-    /// possible if the second call did not scan at all.
-    ///
-    /// This pins cache reuse only. It is not writer support: mutating a decision
-    /// outside `atomic_write` is unsupported, and the stale read below is the
-    /// accepted consequence of that, not a behaviour callers may rely on.
-    #[test]
-    #[serial(decisions_count_cache)]
-    fn count_pending_reuses_load_when_directory_unchanged_3031() {
-        let home = tmp_home("count-pending-cache-reuse-3031");
-        let created = post(
-            &home,
-            "alice",
-            &serde_json::json!({"title": "Q1", "content": "?", "needs_answer": true}),
-        );
-        post(
-            &home,
-            "alice",
-            &serde_json::json!({"title": "Q2", "content": "?", "needs_answer": true}),
-        );
-        let id = created["id"].as_str().expect("id").to_string();
-
-        let first = count_pending(&home);
-        assert_eq!(first.total, 2, "precondition: two pending questions");
-
-        let path = decision_path(&home, &id);
-        let dir_mtime_before = std::fs::metadata(decisions_dir(&home))
-            .and_then(|m| m.modified())
-            .expect("decisions dir mtime");
-        let raw = std::fs::read_to_string(&path).expect("read decision");
-        let mut doc: serde_json::Value = serde_json::from_str(&raw).expect("parse decision");
-        doc["archived"] = serde_json::Value::Bool(true);
-        std::fs::write(&path, serde_json::to_string(&doc).expect("serialize"))
-            .expect("in-place write");
-        let dir_mtime_after = std::fs::metadata(decisions_dir(&home))
-            .and_then(|m| m.modified())
-            .expect("decisions dir mtime");
-        assert_eq!(
-            dir_mtime_before, dir_mtime_after,
-            "test precondition: an in-place file rewrite must not move the directory mtime"
-        );
-
-        let second = count_pending(&home);
-        assert_eq!(
-            second.total, 2,
-            "unchanged directory mtime must reuse the first scan's counts \
-             (a re-scan would see the in-place edit and report 1)"
-        );
-
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// A canonical decision write (`post` → `save` → `store::atomic_write`, i.e.
-    /// temp file in the same directory + `rename`) moves the directory mtime and
-    /// must invalidate the memoized tally. Guards the cache against serving
-    /// stale counts on the real mutation path; passes with or without the cache.
-    #[test]
-    #[serial(decisions_count_cache)]
-    fn count_pending_refreshes_after_atomic_mutation_3031() {
-        let home = tmp_home("count-pending-cache-refresh-3031");
-        post(
-            &home,
-            "alice",
-            &serde_json::json!({"title": "Q1", "content": "?", "needs_answer": true}),
-        );
-        post(
-            &home,
-            "alice",
-            &serde_json::json!({"title": "Q2", "content": "?", "needs_answer": true}),
-        );
-
-        let first = count_pending(&home);
-        assert_eq!(first.total, 2, "precondition: two pending questions");
-        let dir_mtime_before = std::fs::metadata(decisions_dir(&home))
-            .and_then(|m| m.modified())
-            .expect("decisions dir mtime");
-
-        post(
-            &home,
-            "bob",
-            &serde_json::json!({"title": "Q3", "content": "?", "needs_answer": true}),
-        );
-
-        let dir_mtime_after = std::fs::metadata(decisions_dir(&home))
-            .and_then(|m| m.modified())
-            .expect("decisions dir mtime");
-        assert_ne!(
-            dir_mtime_before, dir_mtime_after,
-            "test precondition: an atomic decision write must move the directory \
-             mtime (if this fires, the filesystem's mtime granularity is too \
-             coarse to distinguish the two writes, not a cache defect)"
-        );
-
-        let second = count_pending(&home);
-        assert_eq!(
-            second.total, 3,
-            "atomic decision write must refresh the memoized counts"
-        );
-        assert_eq!(second.by_author.get("bob"), Some(&1));
-
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// When the decisions directory has no readable metadata (it does not exist
-    /// yet), the memoization is bypassed entirely: the call still reports a real
-    /// tally, and nothing is stored that could shadow a later valid directory.
-    #[test]
-    #[serial(decisions_count_cache)]
-    fn count_pending_bypasses_cache_when_metadata_unreadable_3031() {
-        let missing = std::env::temp_dir().join(format!(
-            "agend-decisions-missing-{}-3031",
-            std::process::id()
-        ));
-        std::fs::remove_dir_all(&missing).ok();
-
-        let counts = count_pending(&missing);
-        assert_eq!(counts.total, 0, "absent decisions dir tallies zero");
-        assert!(counts.by_author.is_empty());
-
-        let home = tmp_home("count-pending-bypass-3031");
-        post(
-            &home,
-            "alice",
-            &serde_json::json!({"title": "Q", "content": "?", "needs_answer": true}),
-        );
-        let counts = count_pending(&home);
-        assert_eq!(
-            counts.total, 1,
-            "a valid directory must not be shadowed by the earlier metadata failure"
-        );
-
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    // ── #2524 P2c / #2313 — timeout+default validation + auto_answer_timeout ──
-
-    #[test]
-    fn post_timeout_secs_without_needs_answer_rejected_2313() {
-        let home = tmp_home("timeout-needs-answer-2313");
-        let result = post(
-            &home,
-            "lead",
-            &serde_json::json!({"title": "x", "content": "?", "timeout_secs": 60}),
-        );
-        assert!(
-            result["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("needs_answer"),
-            "timeout_secs without needs_answer must error: {result}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn post_timeout_secs_without_default_or_recommended_rejected_2313() {
-        let home = tmp_home("timeout-no-default-2313");
-        let result = post(
-            &home,
-            "lead",
-            &serde_json::json!({
-                "title": "x", "content": "?", "needs_answer": true, "timeout_secs": 60
-            }),
-        );
-        assert!(
-            result["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("timeout_default"),
-            "timeout_secs without a resolvable default must error: {result}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn post_timeout_secs_derives_default_from_recommended_option_2313() {
-        let home = tmp_home("timeout-derives-default-2313");
-        let result = post(
-            &home,
-            "lead",
-            &serde_json::json!({
-                "title": "x", "content": "?", "needs_answer": true, "timeout_secs": 60,
-                "options": [{"label": "proceed", "recommended": true}, {"label": "abort"}]
-            }),
-        );
-        assert_eq!(result["status"], "posted", "post must succeed: {result}");
-        let id = result["id"].as_str().expect("id").to_string();
-        let listed = list(&home, &serde_json::json!({}));
-        let decisions = listed["decisions"].as_array().expect("array");
-        let d = decisions.iter().find(|d| d["id"] == id).expect("found");
-        assert_eq!(d["timeout_secs"], 60);
-        assert_eq!(d["timeout_default"], "proceed");
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn post_timeout_secs_accepts_explicit_default_without_recommended_2313() {
-        let home = tmp_home("timeout-explicit-default-2313");
-        let result = post(
-            &home,
-            "lead",
-            &serde_json::json!({
-                "title": "x", "content": "?", "needs_answer": true, "timeout_secs": 60,
-                "timeout_default": "proceed"
-            }),
-        );
-        assert_eq!(result["status"], "posted", "post must succeed: {result}");
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn auto_answer_timeout_answers_pending_decision_2313() {
-        let home = tmp_home("auto-answer-2313");
-        let created = post(
-            &home,
-            "lead",
-            &serde_json::json!({
-                "title": "x", "content": "?", "needs_answer": true, "timeout_secs": 60,
-                "timeout_default": "proceed-with-lean"
-            }),
-        );
-        let id = created["id"].as_str().expect("id").to_string();
-
-        let result = auto_answer_timeout(&home, &id);
-        let (author, title) = result.expect("must auto-answer a pending timeout decision");
-        assert_eq!(author, "lead");
-        assert_eq!(title, "x");
-
-        let listed = list(&home, &serde_json::json!({}));
-        let decisions = listed["decisions"].as_array().expect("array");
-        let d = decisions.iter().find(|d| d["id"] == id).expect("found");
-        assert_eq!(d["answer"], "proceed-with-lean");
-        assert_eq!(d["answered_by"], "timeout-default");
-        assert_eq!(d["status"], "answered");
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn auto_answer_timeout_is_idempotent_2313() {
-        let home = tmp_home("auto-answer-idempotent-2313");
-        let created = post(
-            &home,
-            "lead",
-            &serde_json::json!({
-                "title": "x", "content": "?", "needs_answer": true, "timeout_secs": 60,
-                "timeout_default": "proceed"
-            }),
-        );
-        let id = created["id"].as_str().expect("id").to_string();
-
-        let first = auto_answer_timeout(&home, &id);
-        assert!(first.is_some(), "first call must answer: {first:?}");
-        let second = auto_answer_timeout(&home, &id);
-        assert!(
-            second.is_none(),
-            "already-answered decision must not be re-answered: {second:?}"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn auto_answer_timeout_none_for_operator_answered_decision_2313() {
-        let home = tmp_home("auto-answer-operator-beat-2313");
-        let created = post(
-            &home,
-            "lead",
-            &serde_json::json!({
-                "title": "x", "content": "?", "needs_answer": true, "timeout_secs": 60,
-                "timeout_default": "proceed", "allow_free_text": true
-            }),
-        );
-        let id = created["id"].as_str().expect("id").to_string();
-        // Operator answers first (the race the timeout tracker must lose to).
-        answer(
-            &home,
-            "operator",
-            &serde_json::json!({"id": id, "answer": "operator-choice"}),
-        );
-
-        let result = auto_answer_timeout(&home, &id);
-        assert!(
-            result.is_none(),
-            "must not clobber an already-operator-answered decision: {result:?}"
-        );
-        let listed = list(&home, &serde_json::json!({}));
-        let decisions = listed["decisions"].as_array().expect("array");
-        let d = decisions.iter().find(|d| d["id"] == id).expect("found");
-        assert_eq!(
-            d["answer"], "operator-choice",
-            "operator's answer must survive"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-}
+#[allow(clippy::unwrap_used)]
+#[path = "decisions_tests.rs"]
+mod tests;
