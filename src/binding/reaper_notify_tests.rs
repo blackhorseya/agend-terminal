@@ -253,3 +253,64 @@ fn reconcile_orphans_teamless_notifies_only_self_no_general_fallback_case4() {
 
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// Case 5 (R1 regression, reviewer-caught on PR #1): if the actual
+/// `binding.json` removal FAILS, `reconcile_orphans` must NOT send an
+/// "already revoked" notification — the binding is still bound on disk, so
+/// the notification would be actionable-but-false (tells the recipient to
+/// `bind_self` recover something that was never released). The failure
+/// itself must be surfaced (`tracing::warn!`), not silently swallowed.
+///
+/// `#[cfg(unix)]`: sabotages removal by stripping write permission on the
+/// binding's parent directory (unlinking a file requires write permission on
+/// its containing directory, not on the file itself) — the SAME technique
+/// already established in
+/// `worktree_cleanup::tests::remove_failure_upserts_hygiene_task_v1`. Not
+/// portable to Windows (no equivalent single-call sabotage there); the 4
+/// black-box cases above plus this codebase's existing Unix-only precedent
+/// for the identical fault-injection shape give this path real coverage on
+/// 2 of CI's 3 platforms without inventing a new, less-trusted fixture
+/// technique for Windows.
+#[cfg(unix)]
+#[test]
+#[tracing_test::traced_test]
+fn reconcile_orphans_skips_notify_when_remove_fails_case5_r1() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let home = tmp_home("case5");
+    let agent = "worker-89366-26-case5";
+    write_binding(
+        &home,
+        agent,
+        "t-fixture-5",
+        "feat/sabotaged",
+        "/wt/worker5",
+        chrono::Utc::now() - chrono::Duration::hours(25),
+    );
+    set_heartbeat_stale_over_1h(agent);
+
+    let agent_dir = crate::paths::runtime_dir(&home).join(agent);
+    // Sabotage: strip write permission so binding.json cannot be unlinked.
+    std::fs::set_permissions(&agent_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+
+    crate::binding::reconcile_orphans(&home);
+
+    // Restore before any assertion that could panic, so cleanup always runs.
+    std::fs::set_permissions(&agent_dir, std::fs::Permissions::from_mode(0o755)).ok();
+
+    assert!(
+        binding_path(&home, agent).exists(),
+        "sabotage must hold: the unremovable binding.json survives"
+    );
+    assert!(
+        crate::inbox::storage::drain(&home, agent).is_empty(),
+        "a failed removal must NOT produce an 'already revoked' notification \
+         (the binding is still bound — that notice would be false)"
+    );
+    assert!(
+        logs_contain("failed to remove"),
+        "a failed removal must be surfaced via tracing::warn!, not silently swallowed"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
