@@ -28,8 +28,38 @@ impl Drop for TestReadonlyGuard {
 fn tmp_home(suffix: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("agend-inbox-{}-{}", suffix, std::process::id()));
     fs::remove_dir_all(&dir).ok();
-    fs::create_dir_all(&dir).ok();
+    // #3245: fail closed. Ignoring this returned a path to a directory that did
+    // not exist, so the test failed later somewhere unrelated — or passed for
+    // the wrong reason.
+    fs::create_dir_all(&dir).unwrap_or_else(|e| {
+        panic!(
+            "inbox fixture home {} could not be created: {e}",
+            dir.display()
+        )
+    });
     dir
+}
+
+/// #3245: a fixture that cannot be built must fail AT the fixture, named.
+/// Ignoring `create_dir_all` returns a path to a directory that does not exist,
+/// so the test then fails somewhere unrelated — or passes for the wrong reason.
+#[test]
+fn tmp_home_fails_closed_when_the_directory_cannot_be_created() {
+    // Derive the path THROUGH the helper instead of re-spelling its shape: a
+    // second `agend-inbox-` literal here is itself a prefix-overlap offender,
+    // and baselining it would defeat the ratchet this PR introduces.
+    let blocker = tmp_home("failclosed-3245");
+    fs::remove_dir_all(&blocker).unwrap();
+    fs::write(&blocker, b"not a directory").unwrap();
+
+    let attempt = std::panic::catch_unwind(|| tmp_home("failclosed-3245"));
+    fs::remove_file(&blocker).ok();
+
+    assert!(
+        attempt.is_err(),
+        "tmp_home returned a path whose directory could not be created; \
+         fixture construction must fail closed"
+    );
 }
 
 #[test]
