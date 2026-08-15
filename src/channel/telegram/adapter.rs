@@ -9,7 +9,9 @@ use crate::channel::telegram::send::{
     needs_separate_text, resolve_caption, send_media, send_with_topic, send_with_topic_capturing_id,
 };
 use crate::channel::telegram::state::{block_on_value, lock_state, TelegramState};
-use crate::channel::telegram::topic_registry::{create_topic_for_instance, delete_topic};
+use crate::channel::telegram::topic_registry::{
+    create_topic_for_instance, delete_topic, DeleteTopicOutcome,
+};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use teloxide::prelude::*;
@@ -25,6 +27,27 @@ impl TelegramBindingPayload {
     pub(super) fn into_binding(self) -> crate::channel::BindingRef {
         let tag = format!("TG#{}", self.topic_id);
         crate::channel::BindingRef::new("telegram", Some(tag), self)
+    }
+}
+
+fn delete_topic_outcome_to_result(outcome: DeleteTopicOutcome) -> anyhow::Result<()> {
+    match outcome {
+        DeleteTopicOutcome::Deleted | DeleteTopicOutcome::AlreadyGone => Ok(()),
+        DeleteTopicOutcome::PermissionDenied => {
+            anyhow::bail!("telegram topic delete refused: bot lacks can_manage_topics")
+        }
+        DeleteTopicOutcome::ApiError(error) => {
+            anyhow::bail!("telegram topic delete failed: {error}")
+        }
+        DeleteTopicOutcome::ChannelUnavailable => {
+            anyhow::bail!("telegram topic delete failed: channel unavailable")
+        }
+        // #3232: chat side is settled but the durable row survived. Reporting
+        // Ok here would hand a caller a success while leaving the live-name
+        // mapping a later instance can inherit.
+        DeleteTopicOutcome::RegistryPersistFailed(error) => {
+            anyhow::bail!("telegram topic deleted but registry row persisted: {error}")
+        }
     }
 }
 
@@ -275,8 +298,7 @@ impl crate::channel::Channel for TelegramChannel {
             .downcast::<TelegramBindingPayload>()
             .ok_or_else(|| anyhow::anyhow!("non-telegram binding passed to remove_binding"))?;
         let home = lock_state(&self.state).home.clone();
-        delete_topic(&home, payload.topic_id);
-        Ok(())
+        delete_topic_outcome_to_result(delete_topic(&home, payload.topic_id))
     }
 
     fn has_binding(&self, instance: &str) -> bool {
@@ -572,6 +594,26 @@ mod tests {
         };
         let err = channel.delete(&msg_ref).expect_err("must Err");
         assert!(err.to_string().contains("bot not initialized"));
+    }
+
+    #[test]
+    fn remove_binding_outcome_propagates_delete_failure_3232() {
+        assert!(delete_topic_outcome_to_result(DeleteTopicOutcome::Deleted).is_ok());
+        assert!(delete_topic_outcome_to_result(DeleteTopicOutcome::AlreadyGone).is_ok());
+        assert!(delete_topic_outcome_to_result(DeleteTopicOutcome::PermissionDenied).is_err());
+        assert!(delete_topic_outcome_to_result(DeleteTopicOutcome::ChannelUnavailable).is_err());
+        assert!(
+            delete_topic_outcome_to_result(DeleteTopicOutcome::ApiError("boom".into())).is_err()
+        );
+        // #3232: chat side settled, durable row survived — the adapter must not
+        // hand back Ok, or the caller records a clean teardown while the
+        // live-name mapping is still inheritable.
+        assert!(
+            delete_topic_outcome_to_result(DeleteTopicOutcome::RegistryPersistFailed(
+                "row persisted".into()
+            ))
+            .is_err()
+        );
     }
 
     #[test]

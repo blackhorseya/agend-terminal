@@ -11,6 +11,7 @@ use super::state::block_on_value;
 /// See [`init_from_config`] orphan-cleanup filter and fleet-binding
 /// resolution.
 pub(crate) const FLEET_BINDING_SENTINEL: &str = "__fleet__";
+const ORPHANED_TOPIC_PREFIX: &str = "__orphaned__:";
 
 pub(crate) fn topic_registry_path(home: &Path) -> PathBuf {
     home.join("topics.json")
@@ -59,15 +60,42 @@ pub(crate) fn register_topic(
     Ok(())
 }
 
-pub(crate) fn unregister_topic(home: &Path, topic_id: i32) {
+/// Remove a topic's durable row, and PROVE it is gone.
+///
+/// #3232: the write result used to be discarded (`let _ = …`). That let
+/// [`delete_topic`] report `Deleted`/`AlreadyGone` — a success — while the row
+/// survived under the live instance name, which is exactly the #2550 reuse
+/// landmine reached through a success path instead of a failure one. The result
+/// is propagated, and absence is re-read rather than assumed: a write that
+/// returns Ok but leaves the row behind is indistinguishable, to every caller
+/// downstream, from one that silently failed.
+pub(crate) fn unregister_topic(home: &Path, topic_id: i32) -> anyhow::Result<()> {
     // #1886 C1: same locked-RMW discipline as register_topic.
-    let _ = crate::store::with_json_state_or_create::<HashMap<String, String>, _, _, _>(
+    crate::store::with_json_state_or_create::<HashMap<String, String>, _, _, _>(
         &topic_registry_path(home),
         HashMap::new,
         |reg| {
             reg.remove(&topic_id.to_string());
         },
-    );
+    )?;
+    if load_topic_registry(home).contains_key(&topic_id) {
+        anyhow::bail!("topics.json still maps topic {topic_id} after unregister");
+    }
+    Ok(())
+}
+
+/// Preserve a failed-delete recovery handle without allowing a later instance
+/// with the same name to reuse the old topic mapping (#3232 / #2550).
+pub(crate) fn mark_topic_orphaned(
+    home: &Path,
+    topic_id: i32,
+    instance_name: &str,
+) -> anyhow::Result<()> {
+    register_topic(
+        home,
+        topic_id,
+        &format!("{ORPHANED_TOPIC_PREFIX}{instance_name}"),
+    )
 }
 
 /// Reverse-lookup a topic_id for an instance from `topics.json`.
@@ -87,13 +115,23 @@ pub fn create_topic_for_instance(home: &std::path::Path, instance_name: &str) ->
     // still means what the mapping claims — the Bot API has no read-only
     // "does this forum topic still exist" call (only state-changing
     // edit/close/reopen/delete/unpin methods), so a clean, side-effect-free
-    // verification isn't available. `full_delete_instance` unregisters this
-    // mapping unconditionally on delete (regardless of whether the Telegram-
-    // side delete itself succeeded), which closes the main way a stale
-    // mapping used to survive to be reused here. The remaining exposure is
-    // narrow: the Telegram-side topic vanishing unilaterally (not through our
-    // own delete path) or the daemon crashing mid-teardown before reaching
-    // the unregister step above — accepted residual risk, not guarded here.
+    // verification isn't available.
+    //
+    // #3232 CORRECTION: `full_delete_instance` no longer unregisters
+    // unconditionally. It removes the durable row only when the topic is known
+    // absent chat-side (`Deleted` / `AlreadyGone`); on a failed delete it
+    // REWRITES the row under the reserved `__orphaned__:` prefix. That keeps the
+    // only recovery handle the Bot API leaves us — there is no forum-topic
+    // enumeration, so a removed row means a permanently invisible orphan — while
+    // still closing the reuse path this comment is about: the tombstoned name is
+    // `__orphaned__:<name>`, which is never equal to `<name>`, so the
+    // `lookup_topic_for_instance` match below cannot return it and a later
+    // same-name instance cannot inherit it.
+    //
+    // The remaining exposure is unchanged and narrow: the Telegram-side topic
+    // vanishing unilaterally (not through our own delete path), or the daemon
+    // crashing mid-teardown before either the unregister or the tombstone lands
+    // — accepted residual risk, not guarded here.
     if let Some(tid) = lookup_topic_for_instance(home, instance_name) {
         tracing::info!(instance = %instance_name, topic_id = tid, "reusing existing topic");
         return Some(tid);
@@ -235,6 +273,9 @@ pub enum DeleteTopicOutcome {
     /// Topic was deleted successfully on chat side + unregistered
     /// from `topics.json`.
     Deleted,
+    /// Telegram reports TOPIC_ID_INVALID: the topic is already absent, so the
+    /// durable registry entry was removed and the delete is success-equivalent.
+    AlreadyGone,
     /// Bot lacks `can_manage_topics` permission. Topic remains in
     /// chat AND in `topics.json` (operator must manually delete via
     /// Telegram UI OR fix bot permissions then retry).
@@ -248,6 +289,17 @@ pub enum DeleteTopicOutcome {
     /// or bot token missing). Topic remains in registry; no chat-
     /// side attempt was made.
     ChannelUnavailable,
+    /// #3232: the chat side is settled (deleted, or already absent) but the
+    /// durable `topics.json` row could NOT be removed. This is deliberately not
+    /// folded into `Deleted`: the row still maps the live instance name, so a
+    /// later same-name instance would inherit the topic through
+    /// `create_topic_for_instance`'s reuse-if-found check. Callers must treat it
+    /// as a failure even though nothing is wrong chat-side.
+    RegistryPersistFailed(String),
+}
+
+fn is_topic_already_gone_error(error: &str) -> bool {
+    error.to_ascii_lowercase().contains("topic_id_invalid")
 }
 
 /// Delete a forum topic.
@@ -296,12 +348,34 @@ pub fn delete_topic(home: &std::path::Path, topic_id: i32) -> DeleteTopicOutcome
     });
     match result {
         Ok(_) => {
-            unregister_topic(home, topic_id);
+            if let Err(persist) = unregister_topic(home, topic_id) {
+                tracing::error!(
+                    topic_id,
+                    error = %persist,
+                    "delete_topic: topic deleted chat-side but the registry row persisted"
+                );
+                return DeleteTopicOutcome::RegistryPersistFailed(persist.to_string());
+            }
             tracing::info!(topic_id, "delete_topic: deleted topic + unregistered");
             DeleteTopicOutcome::Deleted
         }
         Err(e) => {
             let err_str = e.to_string();
+            if is_topic_already_gone_error(&err_str) {
+                if let Err(persist) = unregister_topic(home, topic_id) {
+                    tracing::error!(
+                        topic_id,
+                        error = %persist,
+                        "delete_topic: topic already absent but the registry row persisted"
+                    );
+                    return DeleteTopicOutcome::RegistryPersistFailed(persist.to_string());
+                }
+                tracing::info!(
+                    topic_id,
+                    "delete_topic: topic already absent + unregistered"
+                );
+                return DeleteTopicOutcome::AlreadyGone;
+            }
             tracing::error!(
                 topic_id,
                 error = %err_str,
@@ -379,10 +453,46 @@ mod tests {
         let reg = load_topic_registry(&home);
         assert_eq!(reg.get(&1).map(String::as_str), Some("alpha"));
         assert_eq!(reg.get(&2).map(String::as_str), Some("beta"));
-        unregister_topic(&home, 1);
+        unregister_topic(&home, 1).unwrap();
         let reg = load_topic_registry(&home);
         assert_eq!(reg.get(&1), None);
         assert_eq!(reg.get(&2).map(String::as_str), Some("beta"));
+    }
+
+    /// #3232: a forced atomic-write failure must make `unregister_topic` fail
+    /// LOUDLY. This is the single propagation that keeps `delete_topic` from
+    /// returning `Deleted`/`AlreadyGone` while the row survives — the discarded
+    /// result used to turn a persistence failure into a reported success, with
+    /// the live-name mapping still there for the next same-name instance.
+    #[test]
+    fn unregister_topic_fails_closed_when_registry_unwritable_3232() {
+        let home = tmp_home("unregister-unwritable-3232");
+        // A directory where the registry file belongs: the locked
+        // read-modify-write cannot complete.
+        std::fs::create_dir_all(topic_registry_path(&home)).unwrap();
+        let result = unregister_topic(&home, 42);
+        assert!(
+            result.is_err(),
+            "an unwritable registry must surface, never report a clean removal"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The same failure, seen through `delete_topic`'s contract: whatever the
+    /// chat side reported, a surviving row may not be dressed up as success.
+    /// Driven at the outcome level because the chat-side call needs a live bot.
+    #[test]
+    fn registry_persist_failure_is_not_a_success_outcome_3232() {
+        let deleted = DeleteTopicOutcome::Deleted;
+        let persisted = DeleteTopicOutcome::RegistryPersistFailed("boom".into());
+        assert_ne!(
+            deleted, persisted,
+            "a persistence failure must not compare equal to a clean delete"
+        );
+        assert!(
+            matches!(persisted, DeleteTopicOutcome::RegistryPersistFailed(ref e) if e == "boom"),
+            "the persistence error must be carried for the operator"
+        );
     }
 
     #[test]
@@ -514,7 +624,7 @@ mod tests {
         let reg = load_topic_registry(&home);
         assert_eq!(reg.get(&100), Some(&"alice".to_string()));
         assert_eq!(reg.get(&200), Some(&"bob".to_string()));
-        unregister_topic(&home, 100);
+        unregister_topic(&home, 100).unwrap();
         let reg = load_topic_registry(&home);
         assert!(!reg.contains_key(&100));
         assert_eq!(reg.get(&200), Some(&"bob".to_string()));
@@ -555,6 +665,17 @@ mod tests {
         let home = tmp_home("delete-topic-home-scope");
         delete_topic(&home, 999_999);
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn topic_id_invalid_is_terminal_already_gone_3232() {
+        assert!(is_topic_already_gone_error("Bad Request: TOPIC_ID_INVALID"));
+        assert!(is_topic_already_gone_error(
+            "Telegram API error: topic_id_invalid"
+        ));
+        assert!(!is_topic_already_gone_error(
+            "Too Many Requests: retry after 10"
+        ));
     }
 
     #[test]

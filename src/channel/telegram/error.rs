@@ -25,12 +25,17 @@ pub(crate) fn is_topic_deleted_error(err: &anyhow::Error) -> bool {
 /// maps stale until the next state-aware send or process restart — acceptable
 /// because the MCP `delete_instance` handler's disk mutation (fleet.yaml
 /// removal + `cleanup_working_dir`) is the source of truth.
+/// Returns whether the durable `topics.json` row is PROVABLY gone. #3232: the
+/// in-memory teardown below always runs, but the caller must not report a
+/// completed self-heal when the row survived — that row still maps the live
+/// instance name, so the next same-name instance inherits the dead topic.
+#[must_use]
 pub(crate) fn cleanup_deleted_topic(
     home: &Path,
     instance_name: &str,
     tid: i32,
     state: Option<&Arc<Mutex<TelegramState>>>,
-) {
+) -> bool {
     if let Some(state) = state {
         let mut s = lock_state(state);
         s.topic_to_instance.remove(&tid);
@@ -47,7 +52,18 @@ pub(crate) fn cleanup_deleted_topic(
     // Strip the stale topic-id entry from the local registry. Safe to call
     // even if the topic was already unregistered (HashMap::remove is a no-op
     // on missing keys).
-    unregister_topic(home, tid);
+    match unregister_topic(home, tid) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                instance = %instance_name,
+                topic_id = tid,
+                error = %e,
+                "stale topic row could not be removed — a later same-name instance could inherit it"
+            );
+            false
+        }
+    }
 }
 
 /// Cleanup path for a deleted `fleet_binding` topic. Unlike
@@ -59,12 +75,32 @@ pub(crate) fn cleanup_deleted_topic(
 /// Only clears `fleet_binding_topic_id` when it still points at `tid`
 /// (defensive — avoids clobbering a fresh binding if a stale error
 /// somehow arrives after re-resolution).
-pub(crate) fn cleanup_fleet_binding(home: &Path, state: &Arc<Mutex<TelegramState>>, tid: i32) {
-    unregister_topic(home, tid);
+/// Returns whether the durable `__fleet__` row is PROVABLY gone. The in-memory
+/// binding is cleared either way — this process must stop writing to a dead
+/// thread — but a surviving row is reused on the next daemon restart, so the
+/// caller may not call that a completed self-heal (#3232).
+#[must_use]
+pub(crate) fn cleanup_fleet_binding(
+    home: &Path,
+    state: &Arc<Mutex<TelegramState>>,
+    tid: i32,
+) -> bool {
+    let cleared = match unregister_topic(home, tid) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::warn!(
+                topic_id = tid,
+                error = %e,
+                "fleet-binding row could not be removed — the next restart would reuse the dead thread"
+            );
+            false
+        }
+    };
     let mut s = lock_state(state);
     if s.fleet_binding_topic_id == Some(tid) {
         s.fleet_binding_topic_id = None;
     }
+    cleared
 }
 
 /// Classify a fleet-binding send error and run [`cleanup_fleet_binding`]
@@ -91,8 +127,10 @@ pub(crate) fn handle_fleet_send_failure(
         topic_id = tid,
         "fleet send hit topic_deleted — clearing binding + unregistering sentinel"
     );
-    cleanup_fleet_binding(home, state, tid);
-    true
+    // #3232: "handled" means the self-heal COMPLETED. A surviving durable row
+    // leaves the stale `__fleet__` mapping for the next restart to reuse, so
+    // the outer send-failure log must not be silenced.
+    cleanup_fleet_binding(home, state, tid)
 }
 
 /// Classify a send error and run topic-delete cleanup if it matches.
@@ -116,8 +154,10 @@ pub(crate) fn handle_send_failure(
         topic_id = tid,
         "send hit topic_deleted — cleaning up"
     );
-    cleanup_deleted_topic(home, instance_name, tid, state);
-    true
+    // #3232: same rule as the fleet path — an unremovable row means cleanup did
+    // not complete, and reporting `handled` would hide exactly the residue that
+    // lets a later same-name instance inherit this topic.
+    cleanup_deleted_topic(home, instance_name, tid, state)
 }
 
 /// Classify a Telegram send error as "the bound chat was migrated to a
@@ -204,7 +244,12 @@ pub(crate) fn invalidate_and_recreate_topic(
         stale_topic_id = stale_tid,
         "invalidating stale topic and recreating"
     );
-    unregister_topic(home, stale_tid);
+    if let Err(e) = unregister_topic(home, stale_tid) {
+        // The reuse check below matches on NAME, so a surviving row would be
+        // handed straight back as "the existing topic" — refuse instead.
+        tracing::error!(stale_topic_id = stale_tid, error = %e, "stale topic row persisted; refusing to recreate");
+        return None;
+    }
     create_topic_for_instance(home, instance_name)
 }
 
@@ -217,7 +262,8 @@ mod tests {
 
     use crate::channel::telegram::state::TelegramState;
     use crate::channel::telegram::topic_registry::{
-        load_topic_registry, register_topic, save_topic_registry, FLEET_BINDING_SENTINEL,
+        load_topic_registry, register_topic, save_topic_registry, topic_registry_path,
+        FLEET_BINDING_SENTINEL,
     };
 
     fn tmp_home(name: &str) -> PathBuf {
@@ -287,7 +333,7 @@ mod tests {
             None,
         )));
 
-        cleanup_deleted_topic(&home, "agent1", 42, Some(&state));
+        assert!(cleanup_deleted_topic(&home, "agent1", 42, Some(&state)));
 
         let s = state.lock();
         assert!(!s.topic_to_instance.contains_key(&42));
@@ -305,7 +351,7 @@ mod tests {
         reg.insert(100, "alive".to_string());
         save_topic_registry(&home, &reg).unwrap();
 
-        cleanup_deleted_topic(&home, "ghost", 99, None);
+        assert!(cleanup_deleted_topic(&home, "ghost", 99, None));
 
         let after = load_topic_registry(&home);
         assert!(!after.contains_key(&99));
@@ -576,6 +622,119 @@ instances:
             reg_after.get(&42),
             Some(&FLEET_BINDING_SENTINEL.to_string())
         );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    // ── #3232 — a surviving durable row is not a completed self-heal ──────
+    //
+    // Both handlers report `handled`, which the renderer uses to SILENCE the
+    // outer "send failed" log. `store::fail_next_atomic_write_for_test` forces
+    // the one `topics.json` write inside `unregister_topic` to fail, so the
+    // residue is real rather than simulated: the row is still on disk, still
+    // mapping the name the next instance would look up. Each test then repeats
+    // the same call unarmed as a negative control, proving the `false` came
+    // from the write failure and not from the fixture's shape.
+
+    #[test]
+    fn handle_send_failure_is_unhandled_when_the_row_survives_3232() {
+        let home = tmp_home("send-failure-residue");
+        let mut reg = HashMap::new();
+        reg.insert(42, "agent1".to_string());
+        reg.insert(100, "alive".to_string());
+        save_topic_registry(&home, &reg).unwrap();
+        let mut topic_map = HashMap::new();
+        topic_map.insert("agent1".to_string(), 42);
+        let mut submit_keys = HashMap::new();
+        submit_keys.insert("agent1".to_string(), "\r".to_string());
+        let state = Arc::new(Mutex::new(TelegramState::new(
+            "tok",
+            -1,
+            topic_map,
+            home.clone(),
+            submit_keys,
+            None,
+        )));
+        let err = anyhow::anyhow!("Bad Request: message thread not found");
+
+        crate::store::fail_next_atomic_write_for_test(&topic_registry_path(&home));
+        assert!(
+            !handle_send_failure(&err, &home, "agent1", Some(42), Some(&state)),
+            "an unremovable topics.json row must not be reported as handled"
+        );
+
+        let after = load_topic_registry(&home);
+        assert_eq!(
+            after.get(&42),
+            Some(&"agent1".to_string()),
+            "the residue is real: the row still maps the live name a later \
+             same-name instance would inherit"
+        );
+        assert_eq!(after.get(&100), Some(&"alive".to_string()));
+        {
+            // In-memory teardown runs either way — this process must stop
+            // routing to the dead topic even when the durable row survives.
+            let s = lock_state(&state);
+            assert!(!s.topic_to_instance.contains_key(&42));
+            assert!(!s.instance_to_topic.contains_key("agent1"));
+            assert!(!s.submit_keys.contains_key("agent1"));
+        }
+
+        // Negative control: same call, no forced failure.
+        assert!(
+            handle_send_failure(&err, &home, "agent1", Some(42), Some(&state)),
+            "a removable row is a completed self-heal"
+        );
+        let healed = load_topic_registry(&home);
+        assert!(!healed.contains_key(&42));
+        assert_eq!(healed.get(&100), Some(&"alive".to_string()));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn handle_fleet_send_failure_is_unhandled_when_the_sentinel_row_survives_3232() {
+        let home = tmp_home("fleet-failure-residue");
+        let mut reg = HashMap::new();
+        reg.insert(42, FLEET_BINDING_SENTINEL.to_string());
+        reg.insert(100, "at-dev-1".to_string());
+        save_topic_registry(&home, &reg).unwrap();
+        let state = Arc::new(Mutex::new(TelegramState::new(
+            "tok",
+            -12345,
+            HashMap::new(),
+            home.clone(),
+            HashMap::new(),
+            None,
+        )));
+        {
+            let mut s = lock_state(&state);
+            s.fleet_binding_topic_id = Some(42);
+        }
+        let err = anyhow::anyhow!("Bad Request: message thread not found");
+
+        crate::store::fail_next_atomic_write_for_test(&topic_registry_path(&home));
+        assert!(
+            !handle_fleet_send_failure(&err, &home, &state, 42),
+            "an unremovable __fleet__ row must not be reported as handled"
+        );
+
+        assert_eq!(
+            load_topic_registry(&home).get(&42),
+            Some(&FLEET_BINDING_SENTINEL.to_string()),
+            "the residue is real: the next daemon restart would resolve this \
+             row and write to the dead thread"
+        );
+        // The in-memory binding is cleared regardless, so this process stops
+        // emitting into the deleted topic.
+        assert_eq!(lock_state(&state).fleet_binding_topic_id, None);
+
+        // Negative control: same call, no forced failure.
+        assert!(
+            handle_fleet_send_failure(&err, &home, &state, 42),
+            "a removable sentinel row is a completed self-heal"
+        );
+        let healed = load_topic_registry(&home);
+        assert!(!healed.values().any(|v| v == FLEET_BINDING_SENTINEL));
+        assert_eq!(healed.get(&100), Some(&"at-dev-1".to_string()));
         std::fs::remove_dir_all(&home).ok();
     }
 }

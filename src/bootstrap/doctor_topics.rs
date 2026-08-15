@@ -354,7 +354,7 @@ pub fn execute_cleanup(home: &Path, report: &TopicReport) -> Vec<CleanupAction> 
                 }
                 use crate::channel::telegram::topic_registry::{delete_topic, DeleteTopicOutcome};
                 match delete_topic(home, entry.topic_id) {
-                    DeleteTopicOutcome::Deleted => {
+                    DeleteTopicOutcome::Deleted | DeleteTopicOutcome::AlreadyGone => {
                         actions.push(CleanupAction::DeletedFromChatAndRegistry {
                             topic_id: entry.topic_id,
                             instance_name: entry.instance_name.clone(),
@@ -378,6 +378,17 @@ pub fn execute_cleanup(home: &Path, report: &TopicReport) -> Vec<CleanupAction> 
                             topic_id: entry.topic_id,
                             instance_name: entry.instance_name.clone(),
                             error: "channel unavailable".to_string(),
+                        });
+                    }
+                    // #3232: the topic is gone chat-side but topics.json still
+                    // carries the row, so this is NOT DeletedFromChatAndRegistry
+                    // — reporting it as a completed cleanup would tell an
+                    // operator the reusable mapping is gone when it is not.
+                    DeleteTopicOutcome::RegistryPersistFailed(e) => {
+                        actions.push(CleanupAction::SkippedApiError {
+                            topic_id: entry.topic_id,
+                            instance_name: entry.instance_name.clone(),
+                            error: format!("registry row persisted: {e}"),
                         });
                     }
                 }
@@ -425,6 +436,61 @@ mod tests {
             }
         }
         std::fs::write(crate::fleet::fleet_yaml_path(home), yaml).unwrap();
+    }
+
+    /// #3232: a failed Telegram delete retains the row as
+    /// `__orphaned__:<name>`. Doctor must classify that as an ORPHAN, because
+    /// orphan is the class `execute_cleanup` retries — a tombstone that landed
+    /// in any other class would be a recovery handle nothing ever picks up, and
+    /// the Bot API has no forum-topic enumeration to rediscover it with.
+    #[test]
+    fn classify_orphan_tombstone_is_an_orphan_3232() {
+        let home = tmp_home("orphan-tombstone");
+        write_registry(&home, &[(77, "__orphaned__:doomed")]);
+        // `doomed` is gone from fleet.yaml — that is what made it a tombstone.
+        write_fleet(&home, &[("alpha", Some(42))]);
+        let report = classify(&home);
+        let entry = report
+            .entries
+            .iter()
+            .find(|e| e.topic_id == 77)
+            .expect("tombstone row must be classified, not dropped");
+        assert_eq!(
+            entry.class,
+            TopicClass::Orphan,
+            "a failed-delete tombstone must be reapable: {entry:?}"
+        );
+        assert_eq!(entry.instance_name, "__orphaned__:doomed");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    /// The tombstone must not be rescued by a LATER instance reclaiming the
+    /// original name: `__orphaned__:doomed` is not `doomed`, so re-creating
+    /// `doomed` leaves the tombstone an orphan rather than silently marking it
+    /// live and inheriting the old topic (the #2550 identity confusion).
+    #[test]
+    fn orphan_tombstone_stays_orphan_when_name_is_reused_3232() {
+        let home = tmp_home("orphan-tombstone-reuse");
+        write_registry(&home, &[(77, "__orphaned__:doomed"), (78, "doomed")]);
+        write_fleet(&home, &[("doomed", Some(78))]);
+        let report = classify(&home);
+        let tombstone = report
+            .entries
+            .iter()
+            .find(|e| e.topic_id == 77)
+            .expect("tombstone row must be classified");
+        let live = report
+            .entries
+            .iter()
+            .find(|e| e.topic_id == 78)
+            .expect("the new same-name instance must be classified");
+        assert_eq!(
+            tombstone.class,
+            TopicClass::Orphan,
+            "reusing the name must not resurrect the tombstone: {tombstone:?}"
+        );
+        assert_eq!(live.class, TopicClass::Live);
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]

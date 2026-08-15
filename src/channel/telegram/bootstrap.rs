@@ -18,6 +18,22 @@ pub fn attach_registry(state: &Arc<Mutex<TelegramState>>, registry: AgentRegistr
     s.registry = Some(registry);
 }
 
+/// Is this `topics.json` row an orphan the boot sweep should re-delete?
+///
+/// #3232: extracted from the sweep loop so the rule can be pinned directly.
+/// Two rows are exempt and neither is an instance: `topic_id == 1` is the
+/// forum's General topic, and [`FLEET_BINDING_SENTINEL`] pins the fleet
+/// binding across restarts. Everything else whose name is not a live
+/// `fleet.yaml` instance is an orphan — including a `__orphaned__:<name>`
+/// tombstone, which is exactly how a failed delete gets retried.
+pub(crate) fn is_sweepable_orphan(
+    topic_id: i32,
+    instance_name: &str,
+    is_live_instance: bool,
+) -> bool {
+    topic_id != 1 && instance_name != FLEET_BINDING_SENTINEL && !is_live_instance
+}
+
 /// Initialize Telegram from fleet config.
 pub fn init_from_config(
     config: &crate::fleet::FleetConfig,
@@ -103,11 +119,18 @@ pub fn init_from_config(
         .unwrap_or_default();
 
     // Clean up orphaned topics
+    //
+    // #3232: extracted so the selection rule is testable on the production
+    // predicate rather than on a copy of it. The `__orphaned__:` tombstone a
+    // failed delete leaves behind is deliberately NOT special-cased here — it is
+    // not a fleet.yaml instance name, so it falls into the ordinary orphan arm
+    // and the delete is retried on every boot, which is the whole point of
+    // retaining the row.
     let mut reg = load_topic_registry(home);
     let instance_names: std::collections::HashSet<&String> = config.instances.keys().collect();
     let mut orphan_count = 0;
     for (tid, inst_name) in reg.clone() {
-        if tid != 1 && inst_name != FLEET_BINDING_SENTINEL && !instance_names.contains(&inst_name) {
+        if is_sweepable_orphan(tid, &inst_name, instance_names.contains(&inst_name)) {
             tracing::info!(topic_id = tid, instance = %inst_name, "orphaned topic, deleting");
             delete_topic(home, tid);
             orphan_count += 1;
@@ -251,6 +274,37 @@ pub(super) fn resolve_fleet_binding(
 mod tests {
     use super::*;
     use crate::fleet::FleetConfig;
+
+    /// #3232: the boot sweep is the retry path for a failed topic delete. The
+    /// `__orphaned__:<name>` tombstone `full_delete_instance` leaves behind must
+    /// therefore be SELECTED here — it is not a fleet.yaml instance, so it takes
+    /// the ordinary orphan arm and the delete is attempted again on every boot.
+    /// If this stopped selecting the tombstone, the retained row would become
+    /// permanent litter instead of a recovery handle, and the Bot API offers no
+    /// enumeration to find it another way.
+    #[test]
+    fn boot_sweep_selects_orphan_tombstones_3232() {
+        assert!(
+            is_sweepable_orphan(77, "__orphaned__:doomed", false),
+            "a failed-delete tombstone must be retried by the boot sweep"
+        );
+        assert!(
+            is_sweepable_orphan(77, "retired", false),
+            "an ordinary retired instance stays sweepable"
+        );
+        assert!(
+            !is_sweepable_orphan(77, "alive", true),
+            "a live fleet.yaml instance must never be swept"
+        );
+        assert!(
+            !is_sweepable_orphan(77, FLEET_BINDING_SENTINEL, false),
+            "the fleet-binding sentinel is not an instance and must survive"
+        );
+        assert!(
+            !is_sweepable_orphan(1, "anything", false),
+            "topic_id 1 is the forum General topic, never ours to delete"
+        );
+    }
 
     /// #2005 left the symmetric fallback in `creds.rs` only; this site kept a
     /// legacy-ward literal, so a fleet pinning `bot_token_env: AGEND_BOT_TOKEN`
