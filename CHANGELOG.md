@@ -7,6 +7,15 @@ Format based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); projec
 
 ## [Unreleased]
 
+## [0.12.1] — 2026-08-16
+
+### Fixed
+
+- **Validated review receipts finalize their exact tasks** — an already-validated
+  exact-head review receipt is now authoritative for task completion even when
+  independent review-binding repair or release remains fail-closed. Ordinary
+  reports now preserve completion-guard refusal reasons (#3277).
+
 ## [0.12.0] — 2026-08-15
 
 112 commits since 0.11.3. This release makes restart recovery a structured,
@@ -808,7 +817,8 @@ Substantial work has landed on `main` since `0.3.0`. Highlights, grouped by area
 
 ---
 
-[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.12.0...HEAD
+[Unreleased]: https://github.com/suzuke/agend-terminal/compare/v0.12.1...HEAD
+[0.12.1]: https://github.com/suzuke/agend-terminal/compare/v0.12.0...v0.12.1
 [0.12.0]: https://github.com/suzuke/agend-terminal/compare/v0.11.3...v0.12.0
 [0.11.3]: https://github.com/suzuke/agend-terminal/compare/v0.11.2...v0.11.3
 [0.11.2]: https://github.com/suzuke/agend-terminal/compare/v0.11.1...v0.11.2
