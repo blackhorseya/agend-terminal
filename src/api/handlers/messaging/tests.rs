@@ -2824,7 +2824,12 @@ fn sidecar_present(home: &std::path::Path, task_id: &str) -> bool {
         .any(|d| d.correlation_id.as_deref() == Some(task_id))
 }
 
-fn t127_verdict(verdict_text: &str, task_id: &str, corr: &str) -> crate::inbox::InboxMessage {
+fn t127_verdict(
+    verdict_text: &str,
+    task_id: &str,
+    corr: &str,
+    reviewer: &str,
+) -> crate::inbox::InboxMessage {
     let verdict = if verdict_text.starts_with("VERIFIED") {
         crate::review_receipt::ReviewVerdict::Verified
     } else if verdict_text.starts_with("REJECTED") {
@@ -2843,7 +2848,7 @@ fn t127_verdict(verdict_text: &str, task_id: &str, corr: &str) -> crate::inbox::
             evidence_digest: "a".repeat(64),
             assignment_id: uuid::Uuid::new_v4(),
             reviewer_instance_id: crate::types::InstanceId::new(),
-            reviewer_name: "reviewer".into(),
+            reviewer_name: reviewer.into(),
             repo: "owner/repo".into(),
             pr_number: 1,
             branch: "feat/x".into(),
@@ -2883,7 +2888,7 @@ fn verdict_dual1_taskid_verified_closes_task_and_clears_sidecar_t127() {
     bridge_verdict_to_review_task(
         &home,
         reviewer,
-        &t127_verdict("VERIFIED looks good", "t-rev-1", "t-rev-1"),
+        &t127_verdict("VERIFIED looks good", "t-rev-1", "t-rev-1", reviewer),
     );
 
     assert_eq!(
@@ -2894,6 +2899,72 @@ fn verdict_dual1_taskid_verified_closes_task_and_clears_sidecar_t127() {
     assert!(
         !sidecar_present(&home, "t-rev-1"),
         "the dispatch sidecar must be cleared"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn validated_review_bridge_rejects_reporter_identity_mismatch() {
+    let home = tmp_home("validated-review-reporter-mismatch");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    seed_review_task(&home, "t-reviewer-mismatch", "reviewer-b");
+    record_review_dispatch(&home, "lead", "reviewer-b", "t-reviewer-mismatch");
+
+    bridge_verdict_to_review_task(
+        &home,
+        "reviewer-b",
+        &t127_verdict(
+            "VERIFIED spoofed reporter",
+            "t-reviewer-mismatch",
+            "t-reviewer-mismatch",
+            "reviewer-a",
+        ),
+    );
+
+    assert_eq!(
+        task_status_of(&home, "t-reviewer-mismatch"),
+        Some(crate::task_events::TaskStatus::Claimed),
+        "a reporter other than the validated reviewer must not close the task"
+    );
+    assert!(
+        sidecar_present(&home, "t-reviewer-mismatch"),
+        "a reporter identity mismatch must not resolve the validated review dispatch"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn production_validated_review_bridge_rejects_reporter_identity_mismatch() {
+    let home = tmp_home("production-validated-review-reporter-mismatch");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    seed_review_task(&home, "t-production-reviewer-mismatch", "reviewer-b");
+    record_review_dispatch(
+        &home,
+        "lead",
+        "reviewer-b",
+        "t-production-reviewer-mismatch",
+    );
+    let msg = t127_verdict(
+        "VERIFIED spoofed production reporter",
+        "t-production-reviewer-mismatch",
+        "t-production-reviewer-mismatch",
+        "reviewer-a",
+    );
+    let request = api_params_to_send_request(&json!({
+        "from": "reviewer-b",
+        "target": "lead",
+        "kind": "report",
+        "correlation_id": "t-production-reviewer-mismatch",
+    }));
+
+    crate::agent_ops::messaging::track_dispatch(&home, &request, "reviewer-b", "lead", &msg);
+
+    assert_eq!(
+        task_status_of(&home, "t-production-reviewer-mismatch"),
+        Some(crate::task_events::TaskStatus::Claimed),
+        "production bridge must reject a reporter other than the validated reviewer"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -2912,7 +2983,12 @@ fn verdict_dual2_repobranch_verified_bridges_via_reverse_lookup_t127() {
     bridge_verdict_to_review_task(
         &home,
         reviewer,
-        &t127_verdict("VERIFIED diff clean", "t-rev-2", "owner/repo@feat/x"),
+        &t127_verdict(
+            "VERIFIED diff clean",
+            "t-rev-2",
+            "owner/repo@feat/x",
+            reviewer,
+        ),
     );
 
     assert_eq!(
@@ -2941,7 +3017,12 @@ fn verdict_rejected_clears_sidecar_but_keeps_task_open_t127() {
     bridge_verdict_to_review_task(
         &home,
         reviewer,
-        &t127_verdict("REJECTED found a bug", "t-rev-3", "owner/repo@feat/x"),
+        &t127_verdict(
+            "REJECTED found a bug",
+            "t-rev-3",
+            "owner/repo@feat/x",
+            reviewer,
+        ),
     );
 
     assert!(
@@ -3084,7 +3165,12 @@ fn verified_disposable_review_receipt_closes_exact_task_when_review_branch_diffe
             }),
         )
         .unwrap();
-        let msg = t127_verdict(verdict, "t-disposable-review", "owner/repo@feat/subject");
+        let msg = t127_verdict(
+            verdict,
+            "t-disposable-review",
+            "owner/repo@feat/subject",
+            "reviewer",
+        );
         let params = json!({
             "from": "reviewer",
             "target": "lead",
@@ -3099,6 +3185,67 @@ fn verified_disposable_review_receipt_closes_exact_task_when_review_branch_diffe
         );
         std::fs::remove_dir_all(&home).ok();
     }
+}
+
+#[test]
+fn validated_review_receipt_closes_task_when_binding_repair_refuses() {
+    fn git(repo: &std::path::Path, args: &[&str]) {
+        let output = std::process::Command::new("git")
+            .args(args)
+            .current_dir(repo)
+            .output()
+            .expect("git command");
+        assert!(output.status.success(), "git {:?} failed", args);
+    }
+
+    let home = tmp_home("validated-review-binding-repair-refusal");
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).unwrap();
+    let repo = home.join("review-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-b", "main"]);
+    git(&repo, &["config", "user.email", "test@example.invalid"]);
+    git(&repo, &["config", "user.name", "test"]);
+    std::fs::write(repo.join("README"), "fixture\n").unwrap();
+    git(&repo, &["add", "README"]);
+    git(&repo, &["commit", "-m", "fixture"]);
+
+    seed_review_task(&home, "t-current-review", "reviewer");
+    crate::binding::bind_full(
+        &home,
+        "reviewer",
+        "t-stale-review",
+        "review/pr-1",
+        &repo,
+        &repo,
+        false,
+    )
+    .unwrap();
+
+    bridge_verdict_to_review_task(
+        &home,
+        "reviewer",
+        &t127_verdict(
+            "VERIFIED exact receipt remains authoritative",
+            "t-current-review",
+            "owner/repo@feat/subject",
+            "reviewer",
+        ),
+    );
+
+    assert_eq!(
+        task_status_of(&home, "t-current-review"),
+        Some(crate::task_events::TaskStatus::Done),
+        "binding repair refusal must not invalidate an already-validated exact receipt"
+    );
+    assert_eq!(
+        crate::binding::read(&home, "reviewer")
+            .and_then(|binding| binding["task_id"].as_str().map(str::to_owned))
+            .as_deref(),
+        Some("t-stale-review"),
+        "binding repair remains independently fail-closed"
+    );
+    std::fs::remove_dir_all(&home).ok();
 }
 
 /// F1 real-entry (spike t-…19288-1): a terminal correlated report driven through

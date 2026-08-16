@@ -113,15 +113,16 @@ fn bridge_verdict_to_review_task(
         return;
     };
     let summary = receipt.summary();
+    if summary.reviewer_name != reporter {
+        return;
+    }
     let task_id = &summary.task_id;
     let _ = crate::daemon::dispatch_idle::mark_resolved(home, task_id, reporter);
     if matches!(
         summary.verdict,
         crate::review_receipt::ReviewVerdict::Verified
     ) {
-        if crate::binding::retarget_disposable_review_binding_for_receipt(home, summary).is_err() {
-            return;
-        }
+        let _ = crate::binding::retarget_disposable_review_binding_for_receipt(home, summary);
         let _ = crate::tasks::auto_close::auto_close_on_validated_review(
             home, task_id, reporter, &msg.text,
         );
