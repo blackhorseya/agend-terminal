@@ -389,12 +389,14 @@ test_default_producer_contains_partial_profiles() {
     cat >"$sandbox/bin/cargo" <<'CARGO'
 #!/usr/bin/env bash
 printf '%s\n' "$@" >"$COV_TEST_ARGS"
+printf '%s' "${NEXTEST_PROFILE:-}" >"$COV_TEST_PROFILE"
 exit 0
 CARGO
     chmod +x "$sandbox/bin/cargo"
 
     out="$(cd "$sandbox" && PATH="$sandbox/bin:$PATH" \
         COV_TEST_ARGS="$sandbox/args" \
+        COV_TEST_PROFILE="$sandbox/profile" \
         COVERAGE_PROFILE_DIR="$sandbox/profiles" \
         COVERAGE_LOG="$sandbox/cov.log" \
         "$wrapper" 2>&1)"
@@ -403,11 +405,58 @@ CARGO
 
     if [ "$rc" -ne 0 ]; then
         report 1 "default producer uses llvm-profdata failure-mode all" "wrapper exited $rc: $out"
-    elif ! awk 'previous == "--failure-mode" && $0 == "all" { found = 1 }
-        { previous = $0 } END { exit !found }' "$sandbox/args"; then
-        report 1 "default producer uses llvm-profdata failure-mode all" "cargo args: $args"
+    elif ! awk 'previous == "--failure-mode" && $0 == "all" { failure_mode = 1 }
+        $0 == "--profile" { ambiguous_profile = 1 }
+        $0 == "nextest" { nextest = 1 }
+        $0 == "--tests" { legacy_tests = 1 }
+        { previous = $0 }
+        END { exit !(failure_mode && nextest && !ambiguous_profile && !legacy_tests) }' "$sandbox/args" ||
+        [ "$(cat "$sandbox/profile")" != "ci" ]; then
+        report 1 "default producer selects nextest isolation and llvm-profdata failure-mode all" \
+            "cargo args: $args; NEXTEST_PROFILE=$(cat "$sandbox/profile")"
     else
-        report 0 "default producer uses llvm-profdata failure-mode all"
+        report 0 "default producer selects nextest isolation and llvm-profdata failure-mode all"
+    fi
+    rm -rf "$sandbox"
+}
+
+# #3281: an implausible git common-dir was part of the observed corruption
+# evidence. The diagnostic may classify it and disclose bounded metadata, but
+# must never echo the raw payload into the CI log.
+test_implausible_git_common_dir_diagnostic_is_bounded() {
+    local sandbox out rc payload
+    sandbox="$(new_sandbox)"
+    mkdir -p "$sandbox/bin" "$sandbox/profiles"
+    payload="BEGIN-COMMON-DIR-$(awk 'BEGIN { for (i = 0; i < 32000; i++) printf "x" }')-END-COMMON-DIR"
+    cat >"$sandbox/bin/git" <<'GIT'
+#!/usr/bin/env bash
+printf '%s\n' "$COV_TEST_GIT_COMMON_DIR"
+GIT
+    cat >"$sandbox/producer.sh" <<'PRODUCER'
+#!/usr/bin/env bash
+echo 'error: no profile can be merged'
+exit 7
+PRODUCER
+    chmod +x "$sandbox/bin/git" "$sandbox/producer.sh"
+
+    out="$(cd "$sandbox" && PATH="$sandbox/bin:$PATH" \
+        COV_TEST_GIT_COMMON_DIR="$payload" \
+        COVERAGE_PRODUCER="$sandbox/producer.sh" COVERAGE_CLEAN=true \
+        COVERAGE_PROFILE_DIR="$sandbox/profiles" COVERAGE_LOG="$sandbox/cov.log" \
+        COVERAGE_MAX_ATTEMPTS=1 COVERAGE_DIAG_GRACE_SECS=0 \
+        "$wrapper" 2>&1)"
+    rc=$?
+
+    if [ "$rc" -ne 7 ]; then
+        report 1 "implausible git common-dir diagnostic is bounded" "wrapper exited $rc"
+    elif ! printf '%s\n' "$out" | grep -q 'git_common_dir=implausible reason=oversized bytes='; then
+        report 1 "implausible git common-dir diagnostic is bounded" "missing classification: $out"
+    elif printf '%s\n' "$out" | grep -q -- '-END-COMMON-DIR'; then
+        report 1 "implausible git common-dir diagnostic is bounded" "raw payload tail leaked"
+    elif [ "${#out}" -gt 12000 ]; then
+        report 1 "implausible git common-dir diagnostic is bounded" "diagnostic grew to ${#out} bytes"
+    else
+        report 0 "implausible git common-dir diagnostic is bounded"
     fi
     rm -rf "$sandbox"
 }
@@ -4211,6 +4260,15 @@ test_absent_tools_degrade_to_unavailable() {
     # shellcheck disable=SC2016  # this is the shim's SOURCE; $1 must reach it unexpanded
     printf '#!/usr/bin/env bash\ncase "$1" in --print) printf "%%s\\n" "/nonexistent/lib";; *) printf "rustc 9.9.9 (shim)\\n";; esac\n' >"$shim/rustc"
     chmod +x "$shim/rustc"
+    # Pin the Git-Bash failure mode even on hosts where /usr/bin/git exists:
+    # a failed provenance probe may emit shell-shaped stderr, but that text
+    # must never be copied into the structured evidence block.
+    cat >"$shim/git" <<'SHIM'
+#!/usr/bin/env bash
+printf '%s\n' "$0: line 99: git unavailable" >&2
+exit 127
+SHIM
+    chmod +x "$shim/git"
     cat >"$sandbox/producer.sh" <<'PRODUCER'
 #!/usr/bin/env bash
 printf 'partial' >"$COVERAGE_PROFILE_DIR/agend-terminal-4250-787_0.profraw"
@@ -4378,6 +4436,21 @@ printf 'called\n' >>"$sandbox/ps-called"
 exit 1
 SHIM
     chmod +x "$shim/ps"
+    # Keep the unrelated git-common-dir provenance probe outside this spy's
+    # measurement boundary.  This test is about PID consumers: letting the
+    # host's git implementation (or a site-local wrapper around it) run here
+    # makes any process inspection it performs indistinguishable from a PID
+    # lookup in coverage-run.sh.
+    cat >"$shim/git" <<'SHIM'
+#!/usr/bin/env bash
+if [ "$#" -eq 3 ] && [ "$1" = "rev-parse" ] && \
+        [ "$2" = "--path-format=absolute" ] && [ "$3" = "--git-common-dir" ]; then
+    printf '/coverage-test/.git\n'
+    exit 0
+fi
+exit 2
+SHIM
+    chmod +x "$shim/git"
     cat >"$sandbox/producer.sh" <<PRODUCER
 #!/usr/bin/env bash
 printf 'partial' >"\$COVERAGE_PROFILE_DIR/agend-terminal-$token-795_0.profraw"
@@ -4769,6 +4842,7 @@ test_native_symlink_skip_gate_is_scoped() {
 }
 
 test_default_producer_contains_partial_profiles
+test_implausible_git_common_dir_diagnostic_is_bounded
 test_contained_corruption_is_visible_and_all_bad_still_fails
 test_real_failure_wins_over_corruption_signature
 test_sink_failure_after_success_is_truthful
