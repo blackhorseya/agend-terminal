@@ -228,7 +228,7 @@ fn close_grace_passed(closed_at: &str) -> bool {
 
 /// t-worktree-leak (PR-1) must-fix #4 + codex gap ①c + P0 cross-lease fix:
 /// ALL tasks on (repo, branch) across EVERY project board are terminal
-/// (Done | Cancelled). Uses the strict cross-board aggregate that fails
+/// (Done | Cancelled | Superseded). Uses the strict cross-board aggregate that fails
 /// closed on enumeration/replay errors and rejects duplicate task ids.
 ///
 /// Fails closed (returns false) when:
@@ -242,7 +242,6 @@ fn close_grace_passed(closed_at: &str) -> bool {
 /// confirmed in a DIFFERENT repo does not block; an UNresolvable pending
 /// task (owner unbound) blocks (conservative — never mis-release).
 fn all_branch_tasks_done(home: &Path, repo: &str, branch: &str) -> bool {
-    use crate::task_events::TaskStatus;
     let all_tasks = match crate::tasks::list_all_strict(home) {
         Ok(tasks) => tasks,
         Err(e) => {
@@ -266,7 +265,7 @@ fn all_branch_tasks_done(home: &Path, repo: &str, branch: &str) -> bool {
     }
     branch_tasks
         .iter()
-        .filter(|t| !matches!(t.status, TaskStatus::Done | TaskStatus::Cancelled))
+        .filter(|t| !t.status.is_terminal())
         .all(|t| {
             let owner_repo = t
                 .assignee
@@ -352,7 +351,7 @@ fn is_reviewer_role(role: Option<&str>) -> bool {
 ///   1. the intent was enqueued by a terminal verdict (`event_kind == "verdict"`);
 ///   2. the bound agent IS the verdict sender (`intent.reviewer == assignee`) —
 ///      scopes the release strictly to the verdict-sender's own binding;
-///   3. the review task itself is terminal (Done | Cancelled);
+///   3. the review task itself is terminal (Done | Cancelled | Superseded);
 ///   4. the verdict sender's fleet ROLE is a reviewer (`is_reviewer_role`).
 ///
 /// #2010 codex-r1: condition 2 alone is NOT a reviewer-vs-implementer
@@ -373,14 +372,10 @@ fn reviewer_binding_release_bypass(
     assignee: &str,
     sender_role: Option<&str>,
 ) -> bool {
-    use crate::task_events::TaskStatus;
     intent.event_kind.as_deref() == Some("verdict")
         && intent.reviewer == assignee
         && is_reviewer_role(sender_role)
-        && matches!(
-            task.map(|t| &t.status),
-            Some(TaskStatus::Done | TaskStatus::Cancelled)
-        )
+        && task.is_some_and(|task| task.status.is_terminal())
 }
 
 /// Outcome of [`decide_release`] — pure helper unit-tested without

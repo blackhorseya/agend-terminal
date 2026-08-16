@@ -15,7 +15,7 @@
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::task_events::{self, InstanceName, TaskBoardState, TaskEvent, TaskId, TaskStatus};
+use crate::task_events::{self, InstanceName, TaskBoardState, TaskEvent, TaskId};
 
 /// Metadata key carrying the stable episode identity.
 pub const ALERT_KEY_META: &str = "system_alert_key";
@@ -42,11 +42,11 @@ impl HygieneUpsert {
     }
 }
 
-/// Find the ACTIVE (not Done/Cancelled) task carrying `key` in
+/// Find the ACTIVE (not Done/Cancelled/Superseded) task carrying `key` in
 /// `system_alert_key` metadata, plus its current occurrence count.
 fn find_active(state: &TaskBoardState, key: &str) -> Option<(TaskId, u64)> {
     state.tasks.values().find_map(|t| {
-        if matches!(t.status, TaskStatus::Done | TaskStatus::Cancelled) {
+        if t.status.is_terminal() {
             return None;
         }
         (t.metadata.get(ALERT_KEY_META)? == key).then(|| {
@@ -284,6 +284,7 @@ pub fn upsert_system_hygiene_task(
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use crate::task_events::TaskStatus;
 
     fn ev(reason: &str) -> serde_json::Value {
         serde_json::json!({

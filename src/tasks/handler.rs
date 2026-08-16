@@ -274,6 +274,21 @@ fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &
         }
     }
     let board = crate::task_events::board_root(home, &project);
+    if let Some(predecessor_id) = args["supersedes"]
+        .as_str()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        return super::supersession::create_with_supersession(
+            home,
+            &project,
+            &emitter,
+            &id,
+            predecessor_id,
+            event,
+            args,
+        );
+    }
     // #2760 item 2: create under the per-id router lock. The id routing NOWHERE
     // (NotFound) is re-proved under the lock BEFORE the Created append + index
     // record, so two racing creates of the same id (or a create racing a mutation)
@@ -1321,7 +1336,7 @@ fn handle_update(
             return serde_json::json!({
                 "error": format!(
                     "unknown status '{s}' (task {id}); valid: backlog, open, claimed, \
-                     in_progress, in_review, blocked, verified, done, cancelled"
+                     in_progress, in_review, blocked, verified, done, cancelled, superseded"
                 ),
                 "code": "unknown_status",
             });
@@ -1333,6 +1348,15 @@ fn handle_update(
                 "error": format!(
                     "status 'verified' is set by the review/verdict path (send kind=report \
                      with a VERIFIED verdict), not task update (task {id})"
+                ),
+                "code": "unsupported_status_transition",
+            });
+        }
+        if target == crate::task_events::TaskStatus::Superseded {
+            return serde_json::json!({
+                "error": format!(
+                    "status 'superseded' is set atomically by task create with 'supersedes', \
+                     not task update (task {id})"
                 ),
                 "code": "unsupported_status_transition",
             });
@@ -2270,7 +2294,7 @@ fn activity_timeline(home: &Path, task_id: &str) -> Value {
     let events: Vec<Value> = envelopes
         .iter()
         .map(|env| {
-            let (event_type, actor, summary) = summarize_event(env);
+            let (event_type, actor, summary) = super::activity::summarize_event(env);
             serde_json::json!({
                 "timestamp": env.timestamp,
                 "actor": actor,
@@ -2285,92 +2309,6 @@ fn activity_timeline(home: &Path, task_id: &str) -> Value {
         "events": events,
         "count": events.len(),
     })
-}
-
-fn summarize_event(env: &crate::task_events::TaskEventEnvelope) -> (&str, String, String) {
-    use crate::task_events::TaskEvent;
-    let actor = env.instance.0.clone();
-    match &env.event {
-        TaskEvent::Created {
-            title,
-            branch,
-            owner,
-            ..
-        } => {
-            let assignee = owner.as_ref().map(|o| o.0.as_str()).unwrap_or("unassigned");
-            let br = branch.as_deref().unwrap_or("");
-            let summary = if br.is_empty() {
-                format!("created task: {title} (assignee: {assignee})")
-            } else {
-                format!("created task: {title} (assignee: {assignee}, branch: {br})")
-            };
-            ("created", actor, summary)
-        }
-        TaskEvent::Claimed { by, .. } => ("claimed", by.0.clone(), "claimed task".to_string()),
-        TaskEvent::InProgress { by, .. } => {
-            ("in_progress", by.0.clone(), "started work".to_string())
-        }
-        TaskEvent::Verified { by_reviewer, .. } => {
-            ("verified", by_reviewer.0.clone(), "verified".to_string())
-        }
-        TaskEvent::Done { source, .. } => {
-            let detail = match source {
-                crate::task_events::DoneSource::PrMerged { pr_id, .. } => {
-                    format!("done (PR {} merged)", pr_id)
-                }
-                crate::task_events::DoneSource::OperatorManual { result, .. } => {
-                    format!(
-                        "done{}",
-                        result
-                            .as_ref()
-                            .map(|r| format!(": {r}"))
-                            .unwrap_or_default()
-                    )
-                }
-                _ => "done".to_string(),
-            };
-            ("done", actor, detail)
-        }
-        TaskEvent::Cancelled { by, reason, .. } => {
-            ("cancelled", by.0.clone(), format!("cancelled: {reason}"))
-        }
-        TaskEvent::Blocked { reason, .. } => ("blocked", actor, format!("blocked: {reason}")),
-        TaskEvent::Unblocked { .. } => ("unblocked", actor, "unblocked".to_string()),
-        TaskEvent::Reopened { reason, .. } => ("reopened", actor, format!("reopened: {reason}")),
-        TaskEvent::Released { reason, .. } => {
-            ("released", actor, format!("released claim: {reason}"))
-        }
-        TaskEvent::Linked { pr_id, .. } => ("linked", actor, format!("linked PR {pr_id}")),
-        TaskEvent::TaskCloseProposed { .. } => (
-            "close_proposed",
-            actor,
-            "close proposed by sweep".to_string(),
-        ),
-        TaskEvent::OwnerAssigned { owner, .. } => {
-            let o = owner.as_ref().map(|n| n.0.as_str()).unwrap_or("none");
-            ("owner_assigned", actor, format!("assigned to {o}"))
-        }
-        TaskEvent::PriorityChanged { priority, .. } => {
-            ("priority_changed", actor, format!("priority → {priority}"))
-        }
-        TaskEvent::DescriptionUpdated { .. } => (
-            "description_updated",
-            actor,
-            "description updated".to_string(),
-        ),
-        TaskEvent::TagsSet { tags, .. } => ("tags_set", actor, format!("tags → {tags:?}")),
-        TaskEvent::ResultSet { by, .. } => ("result_set", by.0.clone(), "result set".to_string()),
-        TaskEvent::MetadataSet { key, value, by, .. } => (
-            "metadata_set",
-            by.0.clone(),
-            format!("metadata[{key}] = {value}"),
-        ),
-        TaskEvent::MovedToBacklog { .. } => ("moved_to_backlog", actor, "→ backlog".to_string()),
-        TaskEvent::MovedToReview { .. } => ("moved_to_review", actor, "→ in_review".to_string()),
-        TaskEvent::BranchLinked { branch, by, .. } => {
-            ("branch_linked", by.0.clone(), format!("branch → {branch}"))
-        }
-    }
 }
 
 fn cascade_cancel_children(
