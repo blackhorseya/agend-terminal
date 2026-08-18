@@ -29,6 +29,10 @@ pub(crate) use unbind::{unbind_with_permit, BindingRemoval};
 mod unbind_compat;
 #[allow(unused_imports)]
 pub use unbind_compat::unbind;
+mod reaper_notify;
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+mod reaper_notify_tests;
 static INDEX: OnceLock<RwLock<HashMap<String, serde_json::Value>>> = OnceLock::new();
 
 /// #1990: parse a `binding.json` body, rejecting one a NEWER daemon wrote
@@ -874,13 +878,11 @@ pub fn reconcile_orphans(home: &Path) {
                                         // Heartbeat within 1h — agent still active, skip
                                         continue;
                                     }
-                                    let _ = std::fs::remove_file(&binding_path);
-                                    if let Ok(mut map) = binding_index().write() {
-                                        map.remove(&index_key(home, agent_name));
-                                    }
-                                    tracing::info!(
-                                        path = %binding_path.display(),
-                                        "removed orphan binding (>24h old, heartbeat stale)"
+                                    reaper_notify::remove_and_notify(
+                                        home,
+                                        agent_name,
+                                        &binding_path,
+                                        &v,
                                     );
                                 }
                             }
