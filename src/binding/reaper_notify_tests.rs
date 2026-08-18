@@ -133,12 +133,33 @@ fn reconcile_orphans_notifies_revoked_instance_and_orchestrator_case1_89366_26()
         text.contains("bind_self"),
         "must instruct bind_self recovery: {text}"
     );
+    assert!(
+        text.contains("`bind_self` (task_id=`t-fixture-1`, branch=`feat/stuck`)"),
+        "instance recovery must use the live bind_self schema: {text}"
+    );
+    assert!(
+        !text.contains("instance="),
+        "bind_self has no instance parameter: {text}"
+    );
 
     let orch_inbox = crate::inbox::storage::drain(&home, orch);
     assert_eq!(
         orch_inbox.len(),
         1,
         "team orchestrator must also receive exactly one notification: {orch_inbox:?}"
+    );
+    let orch_text = &orch_inbox[0].text;
+    assert!(
+        orch_text.contains(&format!("ask `{agent}` to run `bind_self`")),
+        "orchestrator must be told to ask the affected member to recover: {orch_text}"
+    );
+    assert!(
+        orch_text.contains("`bind_self` binds its caller, not another instance"),
+        "orchestrator guidance must prevent self-binding the member branch: {orch_text}"
+    );
+    assert!(
+        !orch_text.contains("instance="),
+        "orchestrator guidance must not invent an instance parameter: {orch_text}"
     );
 
     std::fs::remove_dir_all(&home).ok();
