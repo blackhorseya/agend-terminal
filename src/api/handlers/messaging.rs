@@ -21,6 +21,24 @@ fn reject_flat_review_smuggling(params: &Value) -> Option<Value> {
     )
 }
 
+/// #3293: project the neutral service's typed settlement outcome into this
+/// adapter's JSON envelope. The projection lives here, not in the service:
+/// `src/agent_ops/messaging.rs` is below both adapters and must stay free of
+/// raw-`Value` entry points (pinned by `send_typed_shared_service_boundary_guard_2454`).
+fn settlement_json(settlement: &crate::agent_ops::messaging::SettlementOutcome) -> Value {
+    let mut value = json!({"closed": settlement.closed});
+    if let Some(code) = settlement.code {
+        value["code"] = json!(code);
+    }
+    if let Some(reason) = &settlement.reason {
+        value["reason"] = json!(reason);
+    }
+    if let Some(condition) = settlement.closure_condition {
+        value["closure_condition"] = json!(condition);
+    }
+    value
+}
+
 pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
     if let Some(e) = reject_flat_review_smuggling(params) {
         return e;
@@ -31,6 +49,7 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             delivery_mode,
             branch_checked_out,
             auto_task_id,
+            settlement,
         } => {
             let mut resp = json!({"ok": true, "delivery_mode": delivery_mode});
             if let Some(branch) = branch_checked_out {
@@ -38,6 +57,12 @@ pub(crate) fn handle_send(params: &Value, ctx: &HandlerCtx) -> Value {
             }
             if let Some(ref tid) = auto_task_id {
                 resp["task_id"] = json!(tid);
+            }
+            // #3293: a caller that asked for settlement is told what happened,
+            // so it never has to read the board to tell a settled task from a
+            // refused one.
+            if let Some(settlement) = settlement {
+                resp["auto_close"] = settlement_json(&settlement);
             }
             resp
         }
