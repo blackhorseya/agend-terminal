@@ -90,7 +90,7 @@ fn notify_binding_reaped(home: &Path, agent_name: &str, binding: &serde_json::Va
     let task_id = binding["task_id"].as_str().unwrap_or("");
     let branch = binding["branch"].as_str().unwrap_or("");
     let worktree = binding["worktree"].as_str().unwrap_or("");
-    let body = notify_body(agent_name, task_id, branch, worktree);
+    let owner_body = notify_body(agent_name, task_id, branch, worktree, false);
     let task_id_opt = (!task_id.is_empty()).then_some(task_id);
 
     if let Err(e) = crate::inbox::notify_system(
@@ -98,7 +98,7 @@ fn notify_binding_reaped(home: &Path, agent_name: &str, binding: &serde_json::Va
         agent_name,
         "system:binding_reaper",
         "binding_reaper_revoked",
-        body.clone(),
+        owner_body,
         None,
         task_id_opt,
     ) {
@@ -115,12 +115,13 @@ fn notify_binding_reaped(home: &Path, agent_name: &str, binding: &serde_json::Va
     if recipient == agent_name {
         return;
     }
+    let orchestrator_body = notify_body(agent_name, task_id, branch, worktree, true);
     if let Err(e) = crate::inbox::notify_system(
         home,
         &recipient,
         "system:binding_reaper",
         "binding_reaper_revoked",
-        body,
+        orchestrator_body,
         None,
         task_id_opt,
     ) {
@@ -141,16 +142,34 @@ fn opt_field(v: &str) -> &str {
     }
 }
 
-fn notify_body(agent_name: &str, task_id: &str, branch: &str, worktree: &str) -> String {
+fn notify_body(
+    agent_name: &str,
+    task_id: &str,
+    branch: &str,
+    worktree: &str,
+    for_orchestrator: bool,
+) -> String {
+    let recovery = if for_orchestrator {
+        format!(
+            "ask `{agent_name}` to run `bind_self` (task_id=`{}`, branch=`{}`); \
+             `bind_self` binds its caller, not another instance",
+            opt_field(task_id),
+            opt_field(branch),
+        )
+    } else {
+        format!(
+            "recover with `bind_self` (task_id=`{}`, branch=`{}`)",
+            opt_field(task_id),
+            opt_field(branch),
+        )
+    };
     format!(
         "binding for instance `{agent_name}` was revoked by the daemon-startup orphan reaper \
          (binding issued_at > 24h ago AND heartbeat stale > 1h — #693 protection did not apply). \
          worktree=`{}` branch=`{}` task_id=`{}`. If `{agent_name}` still needs this worktree, \
-         recover with `bind_self` (instance=`{agent_name}`, task_id=`{}`, branch=`{}`).",
+         {recovery}.",
         opt_field(worktree),
         opt_field(branch),
         opt_field(task_id),
-        opt_field(task_id),
-        opt_field(branch),
     )
 }
