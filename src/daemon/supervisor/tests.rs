@@ -965,6 +965,347 @@ fn auth_error_gate_fires_when_held_past_window() {
 /// 2 teams (team-a: orch-a + worker-a, team-b: orch-b + worker-b).
 /// worker-a transitions Idle → UsageLimit.
 /// Assert: orch-a inbox has 1 event; orch-b/worker-a/worker-b have 0.
+/// #3306 fixture: the daemon's own development-channels startup modal, the
+/// exact shape `Backend::ClaudeCode` auto-dismisses at spawn/restart. Copied
+/// from the #3294/#3297 state fixture so this file stays self-contained.
+const DEV_CHANNEL_STARTUP_MODAL_3306: &str = "\
+────────────────────────────────────────────────────────────────────────────────
+  WARNING: Loading development channels
+
+  --dangerously-load-development-channels is for local channel development
+  only. Do not use this option to run channels you have downloaded off the
+  internet.
+
+  Please use --channels to run a list of approved channels.
+
+  Channels:   server:agend-claude-channel
+
+  ❯ 1. I am using this for local development
+    2. Exit
+
+  Enter to confirm · Esc to cancel
+";
+
+/// #3306: a Claude restart renders the dev-channel modal, the daemon
+/// auto-dismisses it (~300ms), and the pane goes Idle — yet the
+/// `starting → permission` member_state_change still reaches the team
+/// orchestrator with an "approve or deny" hint for a prompt the daemon has
+/// already pressed. This drives the production pipeline exactly as the
+/// supervisor tick does (feed → drain → reactions → notify) and pins that a
+/// DEV-TAGGED prompt entry produces NO immediate orchestrator notify — it is
+/// deferred behind the #3306 stability gate instead (see
+/// `dev_prompt_deferred_notify_fires_once_held_past_grace_3306` for the
+/// stuck-modal path that still notifies).
+#[test]
+fn dev_tagged_prompt_entry_does_not_notify_orchestrator_3306() {
+    let home = std::env::temp_dir().join(format!("agend-notify-3306-defer-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    crate::teams::create(
+        &home,
+        &serde_json::json!({"name": "edge", "members": ["lead-3306", "impl-3306"], "orchestrator": "lead-3306"}),
+    );
+
+    // The member tracker exactly as production builds it: ClaudeCode starts in
+    // `Starting`; the dev-shaped frame classifies PermissionPrompt honestly and
+    // tags the episode (#3297 prompt_latch).
+    let mut st = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+    st.feed(DEV_CHANNEL_STARTUP_MODAL_3306);
+    assert_eq!(
+        st.current,
+        crate::state::AgentState::PermissionPrompt,
+        "precondition: the modal must classify as PermissionPrompt"
+    );
+
+    let (transitions, _) = st.drain_pending_transitions();
+    let dev_prompt_held = st.dev_prompt_episode_held();
+    let mut tracks = std::collections::HashMap::new();
+    for decision in reactions_from_transitions(&transitions) {
+        // The same production gate the supervisor tick applies (§3.5.10):
+        // a dev-tagged prompt edge is recorded as pending, never emitted.
+        if dev_prompt_defers_member_notify(decision.to, dev_prompt_held.is_some()) {
+            continue;
+        }
+        super::maybe_notify_member_state_change(
+            &home,
+            "impl-3306",
+            decision.from,
+            decision.to,
+            "",
+            &mut tracks,
+        );
+    }
+
+    let lead_inbox = home.join("inbox").join("lead-3306.jsonl");
+    let lead_count = std::fs::read_to_string(&lead_inbox)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .count();
+    assert_eq!(
+        lead_count, 0,
+        "#3306: an auto-dismissed dev-channel modal must not member-notify the orchestrator"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3306 control (#1552 unchanged): a GENERIC permission prompt — no
+/// dev-channel shape, so no episode tag — still member-notifies the
+/// orchestrator immediately, edge-triggered, byte-identical to today.
+#[test]
+fn generic_prompt_entry_still_notifies_orchestrator_3306() {
+    let home =
+        std::env::temp_dir().join(format!("agend-notify-3306-generic-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    crate::teams::create(
+        &home,
+        &serde_json::json!({"name": "edge", "members": ["lead-3306g", "impl-3306g"], "orchestrator": "lead-3306g"}),
+    );
+
+    let mut st = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+    st.feed("  Requesting permission for: rm -rf /\n\n  Esc to cancel · Tab to amend\n");
+    assert_eq!(
+        st.current,
+        crate::state::AgentState::PermissionPrompt,
+        "precondition: the generic chrome must classify as PermissionPrompt"
+    );
+
+    let (transitions, _) = st.drain_pending_transitions();
+    let mut tracks = std::collections::HashMap::new();
+    for decision in reactions_from_transitions(&transitions) {
+        super::maybe_notify_member_state_change(
+            &home,
+            "impl-3306g",
+            decision.from,
+            decision.to,
+            "",
+            &mut tracks,
+        );
+    }
+
+    let lead_inbox = home.join("inbox").join("lead-3306g.jsonl");
+    let lead_count = std::fs::read_to_string(&lead_inbox)
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .count();
+    assert_eq!(
+        lead_count, 1,
+        "#1552: a real (untagged) permission prompt must still notify the orchestrator"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3306 wiring pin (mirrors the #1644/#1530-F2 source-grep convention for
+/// `tick`, whose size makes it undrivable from a unit test): the shared-fn
+/// tests above prove the gate/resolve SEMANTICS, but deleting the tick call
+/// sites would leave every one of them green while the orchestrator noise
+/// returns — the exact mutation-blind-wiring class #3304's review rejected.
+/// Pins all three wiring points: the under-lock capture, the defer branch in
+/// the emission loop, and the fire/cancel resolution.
+#[test]
+fn tick_wires_dev_prompt_defer_and_resolve_3306() {
+    let src = include_str!("../supervisor.rs");
+    let tick_start = src.find("\nfn tick(").expect("tick fn must exist");
+    let after = &src[tick_start..];
+    let tick_end = after[1..]
+        .find("\nfn ")
+        .map(|i| i + 1)
+        .unwrap_or(after.len());
+    let tick = &after[..tick_end];
+
+    assert!(
+        tick.contains("dev_prompt_held = core.state.dev_prompt_episode_held()"),
+        "#3306: tick must capture the dev-prompt episode age under the core lock"
+    );
+    assert!(
+        tick.contains("else if dev_prompt_defers_member_notify("),
+        "#3306: tick's emission loop must route a dev-tagged prompt edge into \
+         the pending map instead of notifying the orchestrator"
+    );
+    assert!(
+        tick.contains("resolve_pending_dev_prompt("),
+        "#3306: tick must resolve the pending dev-prompt notify each pass \
+         (fire past DEV_PROMPT_NOTIFY_STABILITY, cancel on release)"
+    );
+}
+
+/// #3306 fixture: the idle composer a dismissed modal leaves behind — no
+/// prompt chrome, so the #3297 tagged latch releases on this frame.
+const IDLE_AFTER_DISMISS_3306: &str = "\
+  ❯ try \"write a haiku\"
+
+  ? for shortcuts
+";
+
+/// #3306 / #1552: the deferred notify is NOT dropped — a dev-tagged episode
+/// that survives past `DEV_PROMPT_NOTIFY_STABILITY` (the auto-dismiss failed,
+/// the modal is genuinely stuck) fires exactly one orchestrator notify, and a
+/// boot-grace `Fire` is held rather than lost (#1741 B semantics).
+#[test]
+fn dev_prompt_deferred_notify_fires_once_held_past_grace_3306() {
+    let home = std::env::temp_dir().join(format!("agend-notify-3306-grace-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    crate::teams::create(
+        &home,
+        &serde_json::json!({"name": "edge", "members": ["lead-3306f", "impl-3306f"], "orchestrator": "lead-3306f"}),
+    );
+
+    let mut st = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+    st.feed(DEV_CHANNEL_STARTUP_MODAL_3306);
+    let (transitions, _) = st.drain_pending_transitions();
+    let mut pending: std::collections::HashMap<String, super::PendingDevPrompt> =
+        std::collections::HashMap::new();
+    let mut tracks = std::collections::HashMap::new();
+    for decision in reactions_from_transitions(&transitions) {
+        if dev_prompt_defers_member_notify(decision.to, st.dev_prompt_episode_held().is_some()) {
+            pending
+                .entry("impl-3306f".to_string())
+                .or_insert(super::PendingDevPrompt {
+                    from: decision.from,
+                    pane_tail: String::new(),
+                });
+        }
+    }
+    assert_eq!(
+        pending.len(),
+        1,
+        "the dev-tagged edge must be recorded as pending"
+    );
+
+    // Not yet held past the stability window → Wait: pending retained, no fire.
+    assert!(
+        super::resolve_pending_dev_prompt(
+            super::dev_prompt_gate(st.dev_prompt_episode_held()),
+            false,
+            "impl-3306f",
+            &mut pending,
+        )
+        .is_none(),
+        "a fresh episode must Wait, not fire"
+    );
+    assert_eq!(pending.len(), 1, "Wait must retain the pending entry");
+
+    // Age the episode past the stability window (the auto-dismiss failed).
+    st.since = std::time::Instant::now() - super::DEV_PROMPT_NOTIFY_STABILITY;
+
+    // Boot-grace holds a Fire without losing it (#1741 B).
+    assert!(
+        super::resolve_pending_dev_prompt(
+            super::dev_prompt_gate(st.dev_prompt_episode_held()),
+            true,
+            "impl-3306f",
+            &mut pending,
+        )
+        .is_none(),
+        "boot-grace must HOLD a Fire"
+    );
+    assert_eq!(
+        pending.len(),
+        1,
+        "boot-grace must not drop the pending entry"
+    );
+
+    // Past grace, no boot-grace → fires exactly once through the production
+    // notify path (§3.5.10).
+    let fired = super::resolve_pending_dev_prompt(
+        super::dev_prompt_gate(st.dev_prompt_episode_held()),
+        false,
+        "impl-3306f",
+        &mut pending,
+    )
+    .expect("a stuck dev modal must fire the deferred notify");
+    super::maybe_notify_member_state_change(
+        &home,
+        "impl-3306f",
+        fired.from,
+        crate::state::AgentState::PermissionPrompt,
+        &fired.pane_tail,
+        &mut tracks,
+    );
+    assert!(pending.is_empty(), "Fire must consume the pending entry");
+    let lead_count = std::fs::read_to_string(home.join("inbox").join("lead-3306f.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .count();
+    assert_eq!(
+        lead_count, 1,
+        "#1552 bounded-delay: a stuck dev modal must still reach the orchestrator exactly once"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3306: the normal case — the auto-dismiss lands, the #3297 latch releases
+/// on the no-prompt frame, and the pending entry is cancelled silently. The
+/// orchestrator never hears about an episode the daemon handled itself.
+#[test]
+fn dev_prompt_deferred_notify_cancelled_on_release_3306() {
+    let home =
+        std::env::temp_dir().join(format!("agend-notify-3306-cancel-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    crate::teams::create(
+        &home,
+        &serde_json::json!({"name": "edge", "members": ["lead-3306c", "impl-3306c"], "orchestrator": "lead-3306c"}),
+    );
+
+    let mut st = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
+    st.feed(DEV_CHANNEL_STARTUP_MODAL_3306);
+    let (transitions, _) = st.drain_pending_transitions();
+    let mut pending: std::collections::HashMap<String, super::PendingDevPrompt> =
+        std::collections::HashMap::new();
+    for decision in reactions_from_transitions(&transitions) {
+        if dev_prompt_defers_member_notify(decision.to, st.dev_prompt_episode_held().is_some()) {
+            pending
+                .entry("impl-3306c".to_string())
+                .or_insert(super::PendingDevPrompt {
+                    from: decision.from,
+                    pane_tail: String::new(),
+                });
+        }
+    }
+    assert_eq!(pending.len(), 1);
+
+    // The dismiss lands: the next frame shows no prompt, the tagged latch
+    // releases (#3297), and the episode is over.
+    st.feed(IDLE_AFTER_DISMISS_3306);
+    assert_ne!(
+        st.current,
+        crate::state::AgentState::PermissionPrompt,
+        "precondition: the release must have landed"
+    );
+    assert!(
+        st.dev_prompt_episode_held().is_none(),
+        "precondition: no dev episode is live after the release"
+    );
+
+    // Cancel: pending dropped, nothing fired, orchestrator inbox stays empty.
+    assert!(
+        super::resolve_pending_dev_prompt(
+            super::dev_prompt_gate(st.dev_prompt_episode_held()),
+            false,
+            "impl-3306c",
+            &mut pending,
+        )
+        .is_none(),
+        "a released episode must Cancel, never fire"
+    );
+    assert!(pending.is_empty(), "Cancel must drop the pending entry");
+    let lead_count = std::fs::read_to_string(home.join("inbox").join("lead-3306c.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .count();
+    assert_eq!(
+        lead_count, 0,
+        "a self-dismissed modal must never page the orchestrator"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn notify_single_receiver_2x2_invariant() {
     let home = std::env::temp_dir().join(format!("agend-notify-2x2-{}", std::process::id()));
