@@ -26,6 +26,8 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 use uuid::Uuid;
 
+mod replay;
+
 pub(crate) const CHANNEL_SERVER_NAME: &str = "agend-claude-channel";
 const MIN_CLAUDE_VERSION: (u64, u64, u64) = (2, 1, 80);
 const BRIDGE_VERSION: &str = "0.1.0";
@@ -119,6 +121,24 @@ enum ChannelLogRecord {
         content: String,
         recorded_at: String,
     },
+    InboundPrepared {
+        delivery_id: Uuid,
+        chat_id: String,
+        sender_id: Option<String>,
+        content: String,
+        recorded_at: String,
+    },
+    InboundAccepted {
+        delivery_id: Uuid,
+        chat_id: String,
+        sender_id: Option<String>,
+        content: String,
+        recorded_at: String,
+    },
+    InboundRejected {
+        delivery_id: Uuid,
+        recorded_at: String,
+    },
     Reply {
         delivery_id: Uuid,
         chat_id: String,
@@ -135,6 +155,27 @@ struct ReplyEvent {
     text: String,
     reply_id: String,
     recorded_at: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboundIdentity {
+    chat_id: String,
+    sender_id: String,
+    content: String,
+}
+
+#[derive(Default)]
+struct InboundIndex {
+    by_chat: HashMap<String, Uuid>,
+    by_delivery: HashMap<Uuid, InboundIdentity>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotificationAdmission {
+    Accepted,
+    Duplicate,
+    Conflict,
+    Unavailable,
 }
 
 fn append_log(home: &Path, instance: &str, record: &ChannelLogRecord) -> anyhow::Result<()> {
@@ -172,7 +213,7 @@ struct ChannelRuntime {
     token: String,
     ready: AtomicBool,
     client_version: Mutex<Option<String>>,
-    inbound: Mutex<HashMap<String, Uuid>>,
+    inbound: Mutex<InboundIndex>,
     replies: Mutex<HashMap<Uuid, ReplyEvent>>,
     subscribers: Mutex<Vec<Sender<ReplyEvent>>>,
     mcp_sender: Mutex<Option<SyncSender<Value>>>,
@@ -180,16 +221,66 @@ struct ChannelRuntime {
 
 impl ChannelRuntime {
     fn new(home: &Path, instance: &str, locator: &SessionLocator) -> anyhow::Result<Self> {
-        let mut inbound = HashMap::new();
+        let mut inbound = InboundIndex::default();
+        let mut prepared = HashMap::new();
         let mut replies = HashMap::new();
         for record in load_log(home, instance)? {
             match record {
                 ChannelLogRecord::Inbound {
                     delivery_id,
                     chat_id,
+                    sender_id,
+                    content,
                     ..
                 } => {
-                    inbound.insert(chat_id, delivery_id);
+                    // Legacy `Inbound` was persisted before the notification
+                    // entered the bridge queue, so it has the same ambiguous
+                    // replay contract as an unresolved `InboundPrepared`.
+                    prepared.insert(
+                        delivery_id,
+                        InboundIdentity {
+                            chat_id,
+                            sender_id: sender_id.unwrap_or_else(|| "agend-terminal".to_string()),
+                            content,
+                        },
+                    );
+                }
+                ChannelLogRecord::InboundAccepted {
+                    delivery_id,
+                    chat_id,
+                    sender_id,
+                    content,
+                    ..
+                } => {
+                    prepared.remove(&delivery_id);
+                    inbound.by_chat.insert(chat_id.clone(), delivery_id);
+                    inbound.by_delivery.insert(
+                        delivery_id,
+                        InboundIdentity {
+                            chat_id,
+                            sender_id: sender_id.unwrap_or_else(|| "agend-terminal".to_string()),
+                            content,
+                        },
+                    );
+                }
+                ChannelLogRecord::InboundPrepared {
+                    delivery_id,
+                    chat_id,
+                    sender_id,
+                    content,
+                    ..
+                } => {
+                    prepared.insert(
+                        delivery_id,
+                        InboundIdentity {
+                            chat_id,
+                            sender_id: sender_id.unwrap_or_else(|| "agend-terminal".to_string()),
+                            content,
+                        },
+                    );
+                }
+                ChannelLogRecord::InboundRejected { delivery_id, .. } => {
+                    prepared.remove(&delivery_id);
                 }
                 ChannelLogRecord::Reply {
                     delivery_id,
@@ -211,6 +302,7 @@ impl ChannelRuntime {
                 }
             }
         }
+        replay::restore_prepared(home, instance, &mut inbound, prepared)?;
         Ok(Self {
             home: home.to_path_buf(),
             instance: instance.to_string(),
@@ -233,15 +325,27 @@ impl ChannelRuntime {
     }
 
     fn clear_sender(&self) {
+        let mut client_version = self.client_version.lock();
         *self.mcp_sender.lock() = None;
+        *client_version = None;
+        self.ready.store(false, Ordering::Release);
     }
 
     fn set_client_version(&self, version: String) {
         *self.client_version.lock() = Some(version);
-        self.ready.store(true, Ordering::Release);
+        self.ready.store(false, Ordering::Release);
+    }
+
+    fn mark_initialized(&self) {
+        let client_version = self.client_version.lock();
+        if client_version.is_some() && self.mcp_sender.lock().is_some() {
+            self.ready.store(true, Ordering::Release);
+        }
     }
 
     fn mark_unready(&self) {
+        let mut client_version = self.client_version.lock();
+        *client_version = None;
         self.ready.store(false, Ordering::Release);
     }
 
@@ -267,6 +371,7 @@ impl ChannelRuntime {
         })
     }
 
+    #[cfg(test)]
     fn remember_inbound(
         &self,
         delivery_id: Uuid,
@@ -285,19 +390,23 @@ impl ChannelRuntime {
                 recorded_at: Utc::now().to_rfc3339(),
             },
         )?;
-        self.inbound.lock().insert(chat_id.to_string(), delivery_id);
+        let identity = InboundIdentity {
+            chat_id: chat_id.to_string(),
+            sender_id: sender_id.unwrap_or("agend-terminal").to_string(),
+            content: content.to_string(),
+        };
+        let mut inbound = self.inbound.lock();
+        inbound.by_chat.insert(chat_id.to_string(), delivery_id);
+        inbound.by_delivery.insert(delivery_id, identity);
         Ok(())
     }
 
     fn delivery_for_chat(&self, chat_id: &str) -> Option<Uuid> {
-        self.inbound.lock().get(chat_id).copied()
+        self.inbound.lock().by_chat.get(chat_id).copied()
     }
 
     fn inbound_contains_delivery(&self, delivery_id: Uuid) -> bool {
-        self.inbound
-            .lock()
-            .values()
-            .any(|candidate| *candidate == delivery_id)
+        self.inbound.lock().by_delivery.contains_key(&delivery_id)
     }
 
     fn self_kick_receipt(
@@ -328,12 +437,15 @@ impl ChannelRuntime {
         if current.state == DeliveryState::TurnStarted {
             return Ok(current);
         }
-        if current.state.is_terminal() {
+        if current.state.is_terminal() && current.state != DeliveryState::Ambiguous {
             anyhow::bail!("self-kick delivery is no longer awaiting start acknowledgement")
         }
         if !matches!(
             current.state,
-            DeliveryState::Queued | DeliveryState::ProtocolAccepted | DeliveryState::AckOverdue
+            DeliveryState::Queued
+                | DeliveryState::ProtocolAccepted
+                | DeliveryState::Ambiguous
+                | DeliveryState::AckOverdue
         ) {
             anyhow::bail!("self-kick delivery is not awaiting start acknowledgement")
         }
@@ -364,7 +476,7 @@ impl ChannelRuntime {
         }
         if !matches!(
             current.state,
-            DeliveryState::ProtocolAccepted | DeliveryState::AckOverdue
+            DeliveryState::ProtocolAccepted | DeliveryState::Ambiguous | DeliveryState::AckOverdue
         ) {
             anyhow::bail!("self-kick delivery is not protocol-accepted")
         }
@@ -388,7 +500,9 @@ impl ChannelRuntime {
             }
             if !matches!(
                 latest.state,
-                DeliveryState::ProtocolAccepted | DeliveryState::AckOverdue
+                DeliveryState::ProtocolAccepted
+                    | DeliveryState::Ambiguous
+                    | DeliveryState::AckOverdue
             ) {
                 anyhow::bail!("self-kick start acknowledgement lost a receipt race")
             }
@@ -500,13 +614,27 @@ impl ChannelRuntime {
         (receiver, replay)
     }
 
-    fn send_channel_notification(
+    fn admit_channel_notification(
         &self,
         delivery_id: Uuid,
         chat_id: &str,
         sender_id: Option<&str>,
         content: &str,
-    ) -> bool {
+    ) -> anyhow::Result<NotificationAdmission> {
+        let identity = InboundIdentity {
+            chat_id: chat_id.to_string(),
+            sender_id: sender_id.unwrap_or("agend-terminal").to_string(),
+            content: content.to_string(),
+        };
+        let mut inbound = self.inbound.lock();
+        if let Some(existing) = inbound.by_delivery.get(&delivery_id) {
+            return Ok(if existing == &identity {
+                NotificationAdmission::Duplicate
+            } else {
+                NotificationAdmission::Conflict
+            });
+        }
+
         let notification = json!({
             "jsonrpc": "2.0",
             "method": "notifications/claude/channel",
@@ -520,13 +648,57 @@ impl ChannelRuntime {
             }
         });
         let sender = self.mcp_sender.lock().clone();
-        match sender {
-            Some(sender) => match sender.try_send(notification) {
-                Ok(()) => true,
-                Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => false,
+        let Some(sender) = sender else {
+            return Ok(NotificationAdmission::Unavailable);
+        };
+
+        append_log(
+            &self.home,
+            &self.instance,
+            &ChannelLogRecord::InboundPrepared {
+                delivery_id,
+                chat_id: identity.chat_id.clone(),
+                sender_id: sender_id.map(str::to_string),
+                content: identity.content.clone(),
+                recorded_at: Utc::now().to_rfc3339(),
             },
-            None => false,
+        )?;
+        inbound
+            .by_chat
+            .insert(identity.chat_id.clone(), delivery_id);
+        inbound.by_delivery.insert(delivery_id, identity.clone());
+
+        if matches!(
+            sender.try_send(notification),
+            Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_))
+        ) {
+            append_log(
+                &self.home,
+                &self.instance,
+                &ChannelLogRecord::InboundRejected {
+                    delivery_id,
+                    recorded_at: Utc::now().to_rfc3339(),
+                },
+            )?;
+            inbound.by_delivery.remove(&delivery_id);
+            if inbound.by_chat.get(chat_id) == Some(&delivery_id) {
+                inbound.by_chat.remove(chat_id);
+            }
+            return Ok(NotificationAdmission::Unavailable);
         }
+
+        append_log(
+            &self.home,
+            &self.instance,
+            &ChannelLogRecord::InboundAccepted {
+                delivery_id,
+                chat_id: identity.chat_id,
+                sender_id: sender_id.map(str::to_string),
+                content: identity.content,
+                recorded_at: Utc::now().to_rfc3339(),
+            },
+        )?;
+        Ok(NotificationAdmission::Accepted)
     }
 }
 
@@ -629,7 +801,10 @@ fn mcp_message(message: Value, runtime: &ChannelRuntime) -> Option<Value> {
     let method = message.get("method").and_then(Value::as_str)?;
     match method {
         "initialize" => Some(mcp_initialize(&message, runtime)),
-        "notifications/initialized" => None,
+        "notifications/initialized" => {
+            runtime.mark_initialized();
+            None
+        }
         "ping" => Some(json!({
             "jsonrpc":"2.0",
             "id": message.get("id").cloned().unwrap_or(Value::Null),
@@ -1026,15 +1201,26 @@ fn handle_http(mut stream: TcpStream, runtime: Arc<ChannelRuntime>) -> anyhow::R
             return Ok(());
         };
         let sender_id = payload.get("sender_id").and_then(Value::as_str);
-        runtime.remember_inbound(delivery_id, chat_id, sender_id, content)?;
-        if !runtime.send_channel_notification(delivery_id, chat_id, sender_id, content) {
-            write_http_response(
-                &mut stream,
-                503,
-                "application/json",
-                br#"{"error":"channel_queue_unavailable"}"#,
-            )?;
-            return Ok(());
+        match runtime.admit_channel_notification(delivery_id, chat_id, sender_id, content)? {
+            NotificationAdmission::Accepted | NotificationAdmission::Duplicate => {}
+            NotificationAdmission::Conflict => {
+                write_http_response(
+                    &mut stream,
+                    409,
+                    "application/json",
+                    br#"{"error":"delivery_id_payload_conflict"}"#,
+                )?;
+                return Ok(());
+            }
+            NotificationAdmission::Unavailable => {
+                write_http_response(
+                    &mut stream,
+                    503,
+                    "application/json",
+                    br#"{"error":"channel_queue_unavailable"}"#,
+                )?;
+                return Ok(());
+            }
         }
         write_http_response(
             &mut stream,
@@ -1815,630 +2001,5 @@ impl ClaudeChannelBridge {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::backend::Backend;
-    use crate::transport::{mode_for_backend, mode_for_instance};
-    use std::fs;
-    use std::sync::atomic::AtomicUsize;
-
-    fn home(tag: &str) -> std::path::PathBuf {
-        let home =
-            std::env::temp_dir().join(format!("agend-claude-channel-{}-{}", tag, Uuid::new_v4()));
-        fs::create_dir_all(&home).expect("home");
-        home
-    }
-
-    fn test_published_locator(home: &Path, instance: &str) -> SessionLocator {
-        let mut locator = SessionLocator::claude(
-            "http://127.0.0.1:43123".to_string(),
-            "claude-test-session".to_string(),
-            "test-token".to_string(),
-        );
-        locator.managed = true;
-        locator.server_pid = Some(std::process::id());
-        locator.server_start_token = crate::process::process_start_token(std::process::id());
-        super::super::registry::save_session_locator(home, instance, &locator)
-            .expect("published test locator");
-        locator
-    }
-
-    #[test]
-    fn claude_uses_channel_bridge_by_default() {
-        assert_eq!(
-            mode_for_backend(&Backend::ClaudeCode),
-            TransportMode::ChannelBridge
-        );
-    }
-
-    #[test]
-    fn explicit_legacy_pty_is_the_only_claude_fallback() {
-        let home = home("legacy");
-        fs::write(
-            crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  claude-agent:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: legacy_pty\n",
-        )
-        .expect("fleet");
-        assert_eq!(
-            mode_for_instance(&home, "claude-agent"),
-            TransportMode::LegacyPty
-        );
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn channel_locator_persists_across_daemon_restart() {
-        let home = home("locator");
-        let (first, first_listener) =
-            bind_and_publish_channel(&home, "claude-agent").expect("initial bridge");
-        assert!(first.managed);
-        assert!(
-            TcpListener::bind(endpoint_address(&first).expect("first endpoint")).is_err(),
-            "the published endpoint must remain owned by the bridge"
-        );
-        assert_eq!(
-            prepare_claude_channel(&home, "claude-agent").expect("first published locator"),
-            first
-        );
-        drop(first_listener);
-        let (second, second_listener) =
-            bind_and_publish_channel(&home, "claude-agent").expect("restart bridge");
-        assert!(second.managed);
-        assert_ne!(second.password, first.password);
-        assert_ne!(second.session_id, first.session_id);
-        assert_eq!(
-            prepare_claude_channel(&home, "claude-agent").expect("second published locator"),
-            second
-        );
-        drop(second_listener);
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn existing_non_claude_locator_is_not_replaced() {
-        let home = home("foreign-locator");
-        let locator = SessionLocator::opencode(
-            "http://127.0.0.1:43123".to_string(),
-            Some("opencode-session".to_string()),
-            "agend".to_string(),
-            "secret".to_string(),
-        );
-        super::super::registry::save_session_locator(&home, "claude-agent", &locator)
-            .expect("foreign locator");
-        assert!(prepare_claude_channel(&home, "claude-agent").is_err());
-        let stored = super::super::registry::load_session_locator(&home, "claude-agent")
-            .expect("stored locator");
-        assert_eq!(stored.backend, "opencode");
-        stop_instance_state(&home, "claude-agent");
-        assert!(
-            super::super::registry::load_session_locator(&home, "claude-agent").is_ok(),
-            "Claude cleanup must not remove another backend's locator"
-        );
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn stale_locator_rejects_port_squatter_without_sending_bearer() {
-        let home = home("port-squatter");
-        let listener = TcpListener::bind("127.0.0.1:0").expect("squatter listener");
-        listener
-            .set_nonblocking(true)
-            .expect("nonblocking squatter listener");
-        let port = listener.local_addr().expect("squatter address").port();
-        let mut stale = SessionLocator::claude(
-            format!("http://127.0.0.1:{port}"),
-            "stale-session".to_string(),
-            "SUPER-SECRET-BEARER".to_string(),
-        );
-        stale.server_pid = Some(0);
-        stale.server_start_token = Some(1);
-        super::super::registry::save_session_locator(&home, "claude-agent", &stale)
-            .expect("stale locator");
-
-        assert!(prepare_claude_channel(&home, "claude-agent").is_err());
-        assert!(client_request(&stale, "GET", "/health", &[], "application/json").is_err());
-        assert!(
-            matches!(listener.accept(), Err(error) if error.kind() == io::ErrorKind::WouldBlock)
-        );
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn channel_ready_wait_is_bounded_when_locator_never_publishes() {
-        let home = home("bounded-ready-wait");
-        let started = Instant::now();
-        let error =
-            wait_for_ready_claude_channel_until(&home, "claude-agent", Duration::from_millis(50))
-                .expect_err("missing locator must time out");
-        assert!(
-            error.to_string().contains("did not become ready within"),
-            "unexpected readiness error: {error:#}"
-        );
-        assert!(
-            started.elapsed() < Duration::from_secs(1),
-            "bounded readiness wait must not hang"
-        );
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn health_probe_rejects_mismatched_session_identity() {
-        let listener = TcpListener::bind("127.0.0.1:0").expect("health listener");
-        let port = listener.local_addr().expect("health address").port();
-        let server = thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("health request");
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 1024];
-            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
-                let read = stream.read(&mut chunk).expect("health request read");
-                assert!(read > 0, "health request closed before headers");
-                request.extend_from_slice(&chunk[..read]);
-            }
-            let body = json!({
-                "ready": true,
-                "session_id": "wrong-session",
-                "backend_version": "2.1.89",
-                "capabilities": {"claude/channel": true, "tools": true}
-            })
-            .to_string();
-            let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
-            stream
-                .write_all(response.as_bytes())
-                .expect("health response");
-        });
-        let mut locator = SessionLocator::claude(
-            format!("http://127.0.0.1:{port}"),
-            "expected-session".to_string(),
-            "health-token".to_string(),
-        );
-        locator.managed = true;
-        locator.server_pid = Some(std::process::id());
-        locator.server_start_token = crate::process::process_start_token(std::process::id());
-        let error = health_probe(&locator).expect_err("mismatched session must fail closed");
-        assert!(
-            error.to_string().contains("session identity mismatch"),
-            "unexpected health probe error: {error:#}"
-        );
-        server.join().expect("health server");
-    }
-
-    #[test]
-    fn persisted_claude_locator_keeps_channel_mode() {
-        let home = home("mode");
-        let locator = test_published_locator(&home, "claude-agent");
-        fs::write(
-            crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  claude-agent:\n    backend: claude\n",
-        )
-        .expect("fleet");
-        assert_eq!(
-            mode_for_instance(&home, "claude-agent"),
-            TransportMode::ChannelBridge
-        );
-        assert_eq!(locator.backend, "claude");
-        let _ = fs::remove_dir_all(home);
-    }
-
-    /// Why the fake channel server's accept loop ended. The fixture used to
-    /// `break` on ANY non-`WouldBlock` accept error and leave no trace, so a
-    /// transient `Interrupted`/`ConnectionAborted` silently killed the helper and
-    /// every later request failed with `Broken pipe (os error 32)` — a dead test
-    /// server that read as a product failure. The reason is recorded so the test
-    /// can assert the loop ended because we stopped it.
-    #[derive(Debug, Clone, PartialEq, Eq)]
-    enum FakeChannelExit {
-        StopRequested,
-        AcceptFailed(String),
-    }
-
-    /// `WouldBlock` is the nonblocking-accept idle case; `Interrupted` and
-    /// `ConnectionAborted` are transient kernel conditions that say nothing about
-    /// the listener's health. Only something else is a reason to stop serving.
-    fn accept_error_is_fatal(kind: io::ErrorKind) -> bool {
-        !matches!(
-            kind,
-            io::ErrorKind::WouldBlock
-                | io::ErrorKind::Interrupted
-                | io::ErrorKind::ConnectionAborted
-        )
-    }
-
-    struct FakeChannel {
-        port: u16,
-        stop: Arc<AtomicBool>,
-        health_probes: Arc<AtomicUsize>,
-        not_ready_answers: Arc<AtomicUsize>,
-        exit: Arc<Mutex<Option<FakeChannelExit>>>,
-        handle: Option<thread::JoinHandle<()>>,
-    }
-
-    impl FakeChannel {
-        /// Readiness is an ORDERING fact here, not a delay: `/health` answers
-        /// `ready: false` until it has served `ready_from_probe` probes, so
-        /// readiness arrives strictly AFTER the waiter has observed not-ready.
-        /// The old fixture simulated lateness with `sleep(150ms)` + `sleep(200ms)`
-        /// inside a 1-second budget, which proved nothing about ordering and
-        /// failed outright when the machine was loaded.
-        fn spawn(ready_from_probe: usize) -> Self {
-            let listener = TcpListener::bind("127.0.0.1:0").expect("fake channel listener");
-            listener
-                .set_nonblocking(true)
-                .expect("nonblocking listener");
-            let port = listener.local_addr().expect("listener address").port();
-            let stop = Arc::new(AtomicBool::new(false));
-            let health_probes = Arc::new(AtomicUsize::new(0));
-            let not_ready_answers = Arc::new(AtomicUsize::new(0));
-            let exit = Arc::new(Mutex::new(None));
-            let thread_stop = Arc::clone(&stop);
-            let thread_probes = Arc::clone(&health_probes);
-            let thread_not_ready = Arc::clone(&not_ready_answers);
-            let thread_exit = Arc::clone(&exit);
-            let handle = thread::spawn(move || {
-                let reason = loop {
-                    if thread_stop.load(Ordering::Acquire) {
-                        break FakeChannelExit::StopRequested;
-                    }
-                    match listener.accept() {
-                        Ok((mut stream, _)) => {
-                            let mut request = [0_u8; 4096];
-                            let read = stream.read(&mut request).unwrap_or(0);
-                            let request = String::from_utf8_lossy(&request[..read]);
-                            let path = request.split_whitespace().nth(1).unwrap_or("/");
-                            let (status, body) = if path == "/health" {
-                                let served = thread_probes.fetch_add(1, Ordering::AcqRel) + 1;
-                                let ready = served >= ready_from_probe;
-                                if !ready {
-                                    thread_not_ready.fetch_add(1, Ordering::AcqRel);
-                                }
-                                (
-                                    "200 OK",
-                                    json!({
-                                        "ready": ready,
-                                        "session_id": "claude-registry-session",
-                                        "backend_version": "2.1.89",
-                                        "capabilities": {
-                                            "claude/channel": ready,
-                                            "tools": ready
-                                        }
-                                    })
-                                    .to_string(),
-                                )
-                            } else if path == "/webhook" {
-                                ("202 Accepted", json!({"accepted": true}).to_string())
-                            } else {
-                                ("404 Not Found", json!({"reply": null}).to_string())
-                            };
-                            let response = format!(
-                                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                                body.len()
-                            );
-                            let _ = stream.write_all(response.as_bytes());
-                        }
-                        Err(error) if !accept_error_is_fatal(error.kind()) => {
-                            // Idle or transient: keep serving. The 5 ms backoff is
-                            // an accept poll, not a readiness budget.
-                            thread::sleep(Duration::from_millis(5));
-                        }
-                        Err(error) => {
-                            break FakeChannelExit::AcceptFailed(error.kind().to_string())
-                        }
-                    }
-                };
-                *thread_exit.lock() = Some(reason);
-            });
-            Self {
-                port,
-                stop,
-                health_probes,
-                not_ready_answers,
-                exit,
-                handle: Some(handle),
-            }
-        }
-
-        fn stop_and_join(&mut self) -> FakeChannelExit {
-            self.stop.store(true, Ordering::Release);
-            if let Some(handle) = self.handle.take() {
-                let _ = handle.join();
-            }
-            self.exit
-                .lock()
-                .clone()
-                .expect("fake channel must record why its accept loop ended")
-        }
-    }
-
-    #[test]
-    fn accept_loop_treats_transient_errors_as_nonfatal() {
-        for kind in [
-            io::ErrorKind::WouldBlock,
-            io::ErrorKind::Interrupted,
-            io::ErrorKind::ConnectionAborted,
-        ] {
-            assert!(
-                !accept_error_is_fatal(kind),
-                "{kind:?} is transient: killing the helper on it is what produced \
-                 the historical Broken pipe"
-            );
-        }
-        for kind in [io::ErrorKind::InvalidInput, io::ErrorKind::PermissionDenied] {
-            assert!(
-                accept_error_is_fatal(kind),
-                "{kind:?} must still end the loop, with the reason recorded"
-            );
-        }
-    }
-
-    #[test]
-    fn registry_delivery_waits_for_delayed_channel_bridge_without_pty_fallback() {
-        let _delivery_hook_guard = super::super::registry::test_support::delivery_hook_guard();
-        let home = home("registry-delivery");
-        // Ready only from the SECOND probe: the waiter must see not-ready once.
-        let mut channel = FakeChannel::spawn(2);
-        let port = channel.port;
-        let mut locator = SessionLocator::claude(
-            format!("http://127.0.0.1:{port}"),
-            "claude-registry-session".to_string(),
-            "registry-token".to_string(),
-        );
-        locator.managed = true;
-        locator.server_pid = Some(std::process::id());
-        locator.server_start_token = crate::process::process_start_token(std::process::id());
-        fs::write(
-            crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  claude-agent:\n    backend: claude\n",
-        )
-        .expect("fleet");
-        // The locator is published up front and readiness is withheld by the
-        // server instead. The delay under test is READINESS, and gating it on the
-        // probe count makes "the bridge became ready after we started waiting" an
-        // observable ordering fact rather than a race against two sleeps.
-        super::super::registry::save_session_locator(&home, "claude-agent", &locator)
-            .expect("locator publication");
-        let legacy_called = Arc::new(AtomicBool::new(false));
-        let legacy_called_by_closure = Arc::clone(&legacy_called);
-        let result = super::super::registry::wait_for_notification_readiness(
-            &home,
-            "claude-agent",
-            Duration::from_secs(1),
-        )
-        .and_then(|()| {
-            super::super::registry::deliver_notification(
-                &home,
-                "claude-agent",
-                "registry delivery",
-                move |_, _, _| {
-                    legacy_called_by_closure.store(true, Ordering::Release);
-                    Ok(())
-                },
-            )
-        });
-        if let Ok(receipt) = &result {
-            assert_eq!(receipt.state, DeliveryState::ProtocolAccepted);
-            assert!(!legacy_called.load(Ordering::Acquire));
-            let stored = ReceiptStore::for_instance(&home, "claude-agent")
-                .expect("receipt store")
-                .latest(receipt.delivery_id)
-                .expect("receipt lookup")
-                .expect("stored receipt");
-            assert_eq!(stored.state, DeliveryState::ProtocolAccepted);
-        }
-        stop_instance_state(&home, "claude-agent");
-        let probes = channel.health_probes.load(Ordering::Acquire);
-        let not_ready = channel.not_ready_answers.load(Ordering::Acquire);
-        let exit = channel.stop_and_join();
-        let _ = fs::remove_dir_all(home);
-        result.expect("ChannelBridge delivery must wait for delayed readiness");
-        // The delivery only proves WAITING if a probe was actually answered
-        // not-ready. Counting probes alone does not: the delivery path probes
-        // `/health` again after the wait, so `probes >= 2` holds even when
-        // readiness was there from the first answer — a vacuous assertion that a
-        // spawn(1) mutant passed.
-        assert!(
-            not_ready >= 1,
-            "readiness must have been withheld for at least one probe \
-             (probes={probes}, not_ready={not_ready})"
-        );
-        // And the helper must have outlived the delivery: an accept-loop exit for
-        // any other reason is the historical failure mode, where the dead server
-        // turned into `Broken pipe` on the next request.
-        assert_eq!(
-            exit,
-            FakeChannelExit::StopRequested,
-            "fake channel must end because the test stopped it"
-        );
-    }
-
-    /// The historical shape, pinned deterministically: when the helper dies for
-    /// good, delivery fails with a transport error rather than falling back or
-    /// hanging. This is what the old fixture produced by accident whenever a
-    /// transient accept error broke its loop.
-    #[test]
-    fn permanently_terminated_channel_helper_surfaces_transport_error() {
-        let _delivery_hook_guard = super::super::registry::test_support::delivery_hook_guard();
-        let home = home("registry-delivery-dead");
-        let mut channel = FakeChannel::spawn(1);
-        let port = channel.port;
-        let mut locator = SessionLocator::claude(
-            format!("http://127.0.0.1:{port}"),
-            "claude-registry-session".to_string(),
-            "registry-token".to_string(),
-        );
-        locator.managed = true;
-        locator.server_pid = Some(std::process::id());
-        locator.server_start_token = crate::process::process_start_token(std::process::id());
-        fs::write(
-            crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  claude-agent:\n    backend: claude\n",
-        )
-        .expect("fleet");
-        super::super::registry::save_session_locator(&home, "claude-agent", &locator)
-            .expect("locator publication");
-        let exit = channel.stop_and_join();
-        assert_eq!(
-            exit,
-            FakeChannelExit::StopRequested,
-            "helper stopped on purpose"
-        );
-        let legacy_called = Arc::new(AtomicBool::new(false));
-        let legacy_called_by_closure = Arc::clone(&legacy_called);
-        let error = super::super::registry::wait_for_notification_readiness(
-            &home,
-            "claude-agent",
-            Duration::from_secs(1),
-        )
-        .and_then(|()| {
-            super::super::registry::deliver_notification(
-                &home,
-                "claude-agent",
-                "registry delivery",
-                move |_, _, _| {
-                    legacy_called_by_closure.store(true, Ordering::Release);
-                    Ok(())
-                },
-            )
-        })
-        .expect_err("a dead channel helper cannot accept a delivery");
-        stop_instance_state(&home, "claude-agent");
-        let _ = fs::remove_dir_all(home);
-        // Assert the PRODUCT'S failure path, never the platform's vocabulary for
-        // it. The errno is the part that differs — `Broken pipe (os error 32)`,
-        // `Connection refused (os error 61)`, and on Windows `No connection could
-        // be made because the target machine actively refused it. (os error
-        // 10061)`. An allowlist of the strings one happens to have seen is a
-        // platform-shaped assertion wearing a portability comment: this fixture
-        // exists because of a flaky failure and must not become one. What is
-        // stable is the product's own message, which every platform reaches by
-        // the same route when the bridge cannot be contacted. The full error is
-        // kept in the failure message so a real divergence stays diagnosable.
-        let rendered = format!("{error:#}").to_ascii_lowercase();
-        assert!(
-            rendered.contains("did not become ready") || rendered.contains("channelbridge"),
-            "dead helper must fail the readiness/transport path, got: {error:#}"
-        );
-        assert!(
-            !legacy_called.load(Ordering::Acquire),
-            "a dead bridge must not silently fall back to the legacy path"
-        );
-    }
-
-    #[test]
-    fn channel_server_entry_declares_authenticated_local_bridge() {
-        let home = home("entry");
-        let entry = channel_server_entry(&home, "claude-agent").expect("server entry");
-        assert_eq!(entry["env"]["AGEND_INSTANCE_NAME"], "claude-agent");
-        assert_eq!(entry["args"][0], "channel-bridge");
-        assert_eq!(entry["env"]["AGEND_HOME"], home.display().to_string());
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn channel_wire_notification_uses_delivery_and_chat_metadata() {
-        let delivery_id = Uuid::new_v4();
-        let value = json!({
-            "jsonrpc":"2.0",
-            "method":"notifications/claude/channel",
-            "params": {
-                "content":"hello",
-                "meta": {"delivery_id":delivery_id.to_string(),"chat_id":"chat-1","sender_id":"agend-terminal"}
-            }
-        });
-        assert_eq!(value["method"], "notifications/claude/channel");
-        assert_eq!(
-            value["params"]["meta"]["delivery_id"],
-            delivery_id.to_string()
-        );
-        assert_eq!(value["params"]["meta"]["chat_id"], "chat-1");
-    }
-
-    #[test]
-    fn channel_initialize_rejects_old_or_missing_client_version() {
-        let home = home("version");
-        let locator = test_published_locator(&home, "claude-agent");
-        let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
-        let missing = mcp_initialize(&json!({"jsonrpc":"2.0","id":1,"params":{}}), &runtime);
-        assert_eq!(missing["error"]["code"], -32001);
-        let old = mcp_initialize(
-            &json!({"jsonrpc":"2.0","id":2,"params":{"clientInfo":{"version":"2.1.79"}}}),
-            &runtime,
-        );
-        assert_eq!(old["error"]["code"], -32001);
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn reply_requires_delivery_and_chat_correlation() {
-        let home = home("correlation");
-        let locator = test_published_locator(&home, "claude-agent");
-        let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
-        let response = mcp_message(
-            json!({
-                "jsonrpc":"2.0",
-                "id":1,
-                "method":"tools/call",
-                "params": {
-                    "name":"reply",
-                    "arguments": {
-                        "chat_id":"unknown-chat",
-                        "delivery_id":Uuid::new_v4(),
-                        "text":"must be rejected"
-                    }
-                }
-            }),
-            &runtime,
-        )
-        .expect("tool response");
-        assert_eq!(response["error"]["code"], -32602);
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn concurrent_deliveries_keep_distinct_chat_correlations() {
-        let home = home("two-in-flight");
-        let locator = test_published_locator(&home, "claude-agent");
-        let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
-        let first = Uuid::new_v4();
-        let second = Uuid::new_v4();
-        let first_chat = chat_id_for_delivery("claude-agent", first);
-        let second_chat = chat_id_for_delivery("claude-agent", second);
-        assert_ne!(first_chat, second_chat);
-        runtime
-            .remember_inbound(first, &first_chat, None, "first")
-            .expect("first inbound");
-        runtime
-            .remember_inbound(second, &second_chat, None, "second")
-            .expect("second inbound");
-        assert_eq!(runtime.delivery_for_chat(&first_chat), Some(first));
-        assert_eq!(runtime.delivery_for_chat(&second_chat), Some(second));
-        let _ = fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn event_worker_switches_to_a_restarted_bridge_locator() {
-        let home = home("event-worker-restart");
-        let first = test_published_locator(&home, "claude-agent");
-        let mut second = first.clone();
-        second.endpoint_url = Some("http://127.0.0.1:43124".to_string());
-        second.session_id = Some("claude-restarted-session".to_string());
-        second.password = Some("restarted-token".to_string());
-
-        ensure_event_worker(&home, "claude-agent", &first);
-        ensure_event_worker(&home, "claude-agent", &second);
-        let key = worker_key(&home, "claude-agent");
-        assert_eq!(
-            event_workers()
-                .lock()
-                .get(&key)
-                .expect("restarted event worker")
-                .locator,
-            second
-        );
-        stop_instance_state(&home, "claude-agent");
-        let _ = fs::remove_dir_all(home);
-    }
-
-    mod self_kick_tests;
-}
+#[path = "claude_channel_tests.rs"]
+mod tests;
