@@ -1022,6 +1022,7 @@ pub(crate) fn canonicalize_repo_slug(s: &str) -> Option<String> {
         .or_else(|| s.strip_prefix("http://github.com/"))
         .or_else(|| s.strip_prefix("git@github.com:"))
         .or_else(|| s.strip_prefix("ssh://git@github.com/"))
+        .or_else(|| strip_github_ssh_alias(s))
         .unwrap_or(s);
     let slug = stripped.trim_end_matches('/').trim_end_matches(".git");
     let mut parts = slug.split('/');
@@ -1030,11 +1031,36 @@ pub(crate) fn canonicalize_repo_slug(s: &str) -> Option<String> {
     if parts.next().is_some() || owner.is_empty() || name.is_empty() {
         return None;
     }
+    // An unstripped SCP/URL remote (`git@host:owner/repo`) would otherwise
+    // split into owner=`git@host:owner` and leak into `gh -R` as a bogus slug.
+    if owner.contains([':', '@']) || name.contains([':', '@']) {
+        return None;
+    }
     Some(format!(
         "{}/{}",
         owner.to_ascii_lowercase(),
         name.to_ascii_lowercase()
     ))
+}
+
+/// Strip an ssh-config GitHub host alias — `git@github-<x>:` or
+/// `ssh://git@github-<x>/` (also `github.com-<x>`), the usual multi-account
+/// convention — returning the `owner/repo(.git)` remainder. Only
+/// `github-`/`github.com-` prefixed aliases qualify: an arbitrary SCP host
+/// may be GitLab/Bitbucket/self-hosted, which must not be passed to `gh`
+/// as a GitHub slug. Look-alikes such as `github.com.evil.com` don't match.
+pub(crate) fn strip_github_ssh_alias(s: &str) -> Option<&str> {
+    let (host, rest) = match s.strip_prefix("ssh://git@") {
+        Some(r) => r.split_once('/')?,
+        None => s.strip_prefix("git@")?.split_once(':')?,
+    };
+    let alias = host
+        .strip_prefix("github.com-")
+        .or_else(|| host.strip_prefix("github-"))?;
+    if alias.is_empty() || alias.contains(['/', ':', '@']) {
+        return None;
+    }
+    Some(rest)
 }
 
 /// Returns `None` for non-GitHub remotes. This GitHub-only derivation is the

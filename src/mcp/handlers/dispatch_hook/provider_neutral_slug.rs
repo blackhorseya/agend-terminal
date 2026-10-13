@@ -83,6 +83,11 @@ pub(crate) fn canonicalize_repo_slug_any_forge(s: &str) -> Option<String> {
     if let Some(rest) = strip_known_forge_host(s) {
         return super::canonicalize_repo_slug(rest);
     }
+    // ssh-config GitHub alias (`git@github-<x>:`) — lockstep with the storage
+    // canonicalizer, which strips the same form.
+    if let Some(rest) = super::strip_github_ssh_alias(s) {
+        return super::canonicalize_repo_slug(rest);
+    }
     // No known host: only a CLEAN bare `owner/repo` slug may pass. A valid slug
     // never contains ':' or '@', so any scheme (`://`), SCP host (`host:path`), or
     // user (`user@host`) is an unknown/look-alike transport we reject — without
@@ -172,6 +177,24 @@ mod tests {
         assert_eq!(canon("a/b/c"), None);
         assert_eq!(canon(""), None);
         assert_eq!(canon("   "), None);
+    }
+
+    /// ssh-config GitHub aliases (`git@github-<x>:`) canonicalize, in lockstep
+    /// with the storage canonicalizer.
+    #[test]
+    fn github_ssh_alias_lockstep_with_storage_canonicalizer() {
+        for url in [
+            "git@github-acme:Acme/Repo.git",
+            "git@github.com-work:o/r",
+            "ssh://git@github-acme/o/r.git",
+        ] {
+            assert!(canon(url).is_some(), "alias form {url:?} must canonicalize");
+            assert_eq!(
+                canon(url),
+                crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(url),
+                "any-forge must match the storage canonicalizer for {url:?}"
+            );
+        }
     }
 
     /// r3 (codex #2746): unknown/look-alike SCP + SSH transports must be `None`.

@@ -1149,6 +1149,14 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
     for (repo, due_states) in by_repo {
         match poller.poll(&repo) {
             Ok((prs, polled_at)) => {
+                // Author resolution may run `git remote get-url` (team /
+                // instance `source_repo`), so build its fleet index HERE —
+                // outside the per-PR flock — and only when some due state
+                // still needs its first-observation `pr_author`.
+                let author_index = due_states
+                    .iter()
+                    .any(|s| s.pr_author.is_empty())
+                    .then(|| gh_poll::AuthorIndex::build(home, &repo));
                 for state in due_states {
                     let branch = state.branch.clone();
                     // #986 Bug A (codex round-3): freshness gates ALL state-changing
@@ -1171,7 +1179,7 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
                         continue;
                     }
                     if let Err(e) = with_pr_state(home, &repo, &branch, |s| {
-                        apply_gh_observations(home, s, &prs, &now);
+                        apply_gh_observations(home, s, &prs, &now, author_index.as_ref());
                         s.gh_poll_failures = 0;
                         s.last_gh_poll_at = Some(now.clone());
                     }) {
@@ -1222,6 +1230,7 @@ fn apply_gh_observations(
     state: &mut PrState,
     prs: &[gh_poll::GhPrMetadata],
     now: &str,
+    author_index: Option<&gh_poll::AuthorIndex>,
 ) {
     let Some(meta) = prs.iter().find(|m| m.head_ref == state.branch) else {
         return;
@@ -1271,7 +1280,14 @@ fn apply_gh_observations(
     // First observation — populate identity fields.
     if state.pr_author.is_empty() {
         state.pr_number = meta.number;
-        state.pr_author = gh_poll::resolve_author_with_gh(home, Some(&meta.author_login), state);
+        state.pr_author = match author_index {
+            Some(index) => {
+                gh_poll::resolve_author_with_index(Some(index), Some(&meta.author_login), state)
+            }
+            // Snapshot said pr_author was set but the locked state is fresh
+            // (delete→recreate race): resolve inline rather than mis-route.
+            None => gh_poll::resolve_author_with_gh(home, Some(&meta.author_login), state),
+        };
         tracing::info!(
             repo = %state.repo,
             branch = %state.branch,

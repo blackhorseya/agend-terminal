@@ -2451,12 +2451,14 @@ fn t14_gh_poll_promotes_unknown_author_to_ready_event() {
     // "suzuke" instance that matches the gh author.login.
     let home = home_with_state("ready-promote", s);
     // gh author "suzuke" matches the fleet instance via tier-2 name match
-    // (drives pr_author resolution); the team's orchestrator "lead-z" is
+    // (drives pr_author resolution; eligible through the team's
+    // `source_repo` — no repo identity would fail closed); the team's orchestrator "lead-z" is
     // the #2059-#3 merge authority that the ready event routes to.
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
         "instances:\n  suzuke:\n    backend: claude\n  lead-z:\n    backend: claude\n\
-             teams:\n  squad:\n    orchestrator: lead-z\n    members:\n      - suzuke\n",
+             teams:\n  squad:\n    orchestrator: lead-z\n    source_repo: owner/repo\n    \
+             members:\n      - suzuke\n",
     )
     .unwrap();
     std::fs::create_dir_all(home.join("inbox")).ok();
