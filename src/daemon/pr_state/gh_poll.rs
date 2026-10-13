@@ -402,80 +402,285 @@ pub fn backoff_window(failures: u32) -> Duration {
 /// Tier order (operator-explicit FIRST):
 ///   1. `fleet.yaml github_login` field match for `author.login`
 ///   2. `author.login` direct name lookup against fleet.yaml instances
-///   3. `subscribers[0]` from ci_watch
-///   4. `"fixup-lead"` final fallback (with `tracing::warn`)
+///   3. first `subscribers` entry (from ci_watch)
+///   4. `"fixup-lead"` final fallback
 ///
-/// `home` is needed for tier 1+2 fleet.yaml lookup. When `gh_author`
-/// is None (pre-first-poll or poll-failed-no-match) the chain falls
-/// straight through to tier 3.
-pub fn resolve_author_with_gh(
+/// EVERY tier only yields an instance that is eligible for `state.repo`
+/// (see [`AuthorIndex`]): a subscriber or the fallback with no matching
+/// repo identity is skipped exactly like a tier-1/2 candidate. When no tier
+/// yields an eligible instance the result is `None` (fail-closed, with a
+/// `tracing::warn`) — callers must NOT deliver repo/branch-bearing notices.
+///
+/// Test convenience: builds the [`AuthorIndex`] inline (may run git). The
+/// scanner builds it OUTSIDE the per-PR flock and calls
+/// [`resolve_author_with_index`].
+#[cfg(test)]
+pub(crate) fn resolve_author_with_gh(
     home: &std::path::Path,
     gh_author: Option<&str>,
     state: &super::PrState,
-) -> String {
+) -> Option<String> {
+    let index = AuthorIndex::build(home, &state.repo);
+    resolve_author_with_index(&index, gh_author, state)
+}
+
+/// [`resolve_author_with_gh`] against a precomputed [`AuthorIndex`]
+/// (built for `state.repo`). Pure — no fleet.yaml load, no subprocess —
+/// so it is safe to call under the pr-state flock.
+pub(crate) fn resolve_author_with_index(
+    index: &AuthorIndex,
+    gh_author: Option<&str>,
+    state: &super::PrState,
+) -> Option<String> {
     if let Some(login) = gh_author {
-        if let Some(name) = match_via_github_login_field(home, login, &state.repo) {
-            return name;
+        if let Some(name) = index.match_github_login(login) {
+            return Some(name);
         }
-        if let Some(name) = match_via_instance_name(home, login, &state.repo) {
-            return name;
+        if let Some(name) = index.match_instance_name(login) {
+            return Some(name);
         }
     }
-    if let Some(first) = state.subscribers.first() {
-        return first.clone();
+    if let Some(sub) = state.subscribers.iter().find(|s| index.is_eligible(s)) {
+        return Some(sub.clone());
     }
-    // Tier 4 — reviewer MANDATORY: warn-log so operator sees the
-    // chain falling through.
+    if index.is_eligible("fixup-lead") {
+        return Some("fixup-lead".to_string());
+    }
+    // Reviewer MANDATORY: warn-log so the operator sees the chain fail closed.
     tracing::warn!(
         repo = %state.repo,
         branch = %state.branch,
         gh_author = ?gh_author,
-        "#986 author resolution fell through to fixup-lead fallback — \
-         consider setting `github_login` on the author's fleet.yaml entry"
+        subscribers = ?state.subscribers,
+        "#986 author resolution: no instance eligible for this repo — failing closed \
+         (no author notice). Give the author a `repo`/`source_repo` or put it in a team \
+         whose `source_repo` is this repo"
     );
-    "fixup-lead".to_string()
+    None
 }
 
-/// #2918: does `instance`'s configured repo identity match the PR's
-/// originating `repo` slug? Precedence: explicit `repo` override
-/// (Sprint 55 EC4) → `source_repo` derivation (bare slug / local
-/// origin remote). Match-any backward compat only when BOTH `repo`
-/// and `source_repo` are absent. Invalid/unresolvable → no match.
-fn source_repo_matches(inst: &crate::fleet::InstanceConfig, repo: &str) -> bool {
-    if let Some(explicit) = inst.repo.as_deref() {
-        return crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(explicit)
-            .is_some_and(|s| s.eq_ignore_ascii_case(repo));
-    }
-    let Some(sr) = inst.source_repo.as_deref() else {
-        return true;
-    };
-    let slug = crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(sr).or_else(|| {
-        crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(std::path::Path::new(sr))
-    });
-    slug.is_some_and(|s| s.eq_ignore_ascii_case(repo))
+/// Fleet instances eligible to be the author of a PR in one `repo`, i.e.
+/// whose repo identity matches it. Identity precedence per instance:
+///   1. explicit `repo` override (Sprint 55 EC4) — invalid slug (e.g. the
+///      `repo: none` opt-out sentinel) → no match, no fall-through;
+///   2. instance `source_repo` (bare slug / URL / local origin remote);
+///   3. `source_repo` of the team(s) listing the instance in `members` or
+///      naming it `orchestrator`;
+///   4. none of the above → NOT eligible (fail-closed).
+///
+/// Step 4 replaces the former match-any compat, under which every
+/// same-`github_login` instance qualified for every repo — in a
+/// shared-account fleet pr-state notices (carrying repo/branch names)
+/// went to a random unrelated instance. Step 3 keeps fleets that only
+/// configure `source_repo` at team level routable.
+///
+/// Building may run `git remote get-url` (local `source_repo` paths), so
+/// the scanner builds it before entering the per-PR flock.
+#[derive(Debug, Default)]
+pub(crate) struct AuthorIndex {
+    repo: String,
+    /// Eligible instances in deterministic preference order: team
+    /// orchestrators first, then instance name ascending — never the
+    /// iteration order of the `FleetConfig.instances` HashMap.
+    eligible: Vec<AuthorCandidate>,
+    /// Fingerprint of the fleet.yaml bytes this index was parsed from
+    /// (`None` = unreadable). See [`AuthorIndex::fleet_unchanged`].
+    fleet_fingerprint: Option<u64>,
 }
 
-fn match_via_github_login_field(
-    home: &std::path::Path,
-    gh_login: &str,
-    repo: &str,
-) -> Option<String> {
-    let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok()?;
-    cfg.instances.iter().find_map(|(name, inst)| {
-        inst.github_login
+#[derive(Debug)]
+struct AuthorCandidate {
+    name: String,
+    github_login: Option<String>,
+    is_orchestrator: bool,
+}
+
+impl AuthorIndex {
+    /// Read fleet.yaml and resolve eligibility for `repo`. May run
+    /// `git remote get-url` for local `source_repo` paths, so it MUST be
+    /// called outside the pr-state flock (#1617; debug-asserted).
+    ///
+    /// The fingerprint and the parsed config come from the SAME read, so a
+    /// concurrent write can only make [`Self::fleet_unchanged`] report a
+    /// change (conservative), never hide one.
+    pub(crate) fn build(home: &std::path::Path, repo: &str) -> Self {
+        let bytes = std::fs::read(crate::fleet::fleet_yaml_path(home)).ok();
+        let fleet_fingerprint = bytes.as_deref().map(fingerprint);
+        // Only `instances` (repo/source_repo/github_login) and `teams`
+        // (members/orchestrator/source_repo) are read — raw fields that
+        // `FleetConfig::normalize` does not touch, so a direct parse suffices.
+        let eligible = bytes
             .as_deref()
-            .filter(|gl| gl.eq_ignore_ascii_case(gh_login))
-            .filter(|_| source_repo_matches(inst, repo))
-            .map(|_| name.clone())
-    })
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(|y| serde_yaml_ng::from_str::<crate::fleet::FleetConfig>(y).ok())
+            .map(|cfg| eligible_for(&cfg, repo))
+            // Unreadable / unparsable fleet.yaml → nobody eligible (fail-closed).
+            .unwrap_or_default();
+        Self {
+            repo: repo.to_string(),
+            eligible,
+            fleet_fingerprint,
+        }
+    }
+
+    /// The repo slug this index was built for.
+    pub(crate) fn repo(&self) -> &str {
+        &self.repo
+    }
+
+    /// Lock-safe staleness check: re-read fleet.yaml (plain file read, NO
+    /// git) and compare with the bytes this index was built from. Called
+    /// under the pr-state flock right before a latched notice is queued; a
+    /// change means the pre-lock eligibility may be stale, so the caller
+    /// defers the emit to the next tick (no send, no latch).
+    pub(crate) fn fleet_unchanged(&self, home: &std::path::Path) -> bool {
+        let now = std::fs::read(crate::fleet::fleet_yaml_path(home))
+            .ok()
+            .as_deref()
+            .map(fingerprint);
+        now == self.fleet_fingerprint
+    }
+
+    /// Tier 1: first eligible instance whose `github_login` matches.
+    fn match_github_login(&self, gh_login: &str) -> Option<String> {
+        let hits: Vec<&AuthorCandidate> = self
+            .eligible
+            .iter()
+            .filter(|c| {
+                c.github_login
+                    .as_deref()
+                    .is_some_and(|gl| gl.eq_ignore_ascii_case(gh_login))
+            })
+            .collect();
+        let chosen = hits.first()?;
+        // Orchestrator-first is the routing rule, not an ambiguity; only a
+        // tie broken by name order is worth surfacing.
+        if hits
+            .get(1)
+            .is_some_and(|next| next.is_orchestrator == chosen.is_orchestrator)
+        {
+            let others: Vec<&str> = hits[1..].iter().map(|c| c.name.as_str()).collect();
+            tracing::warn!(
+                repo = %self.repo,
+                %gh_login,
+                chosen = %chosen.name,
+                ?others,
+                "pr_state author resolution: several equally-ranked instances match \
+                 github_login + repo — picked by name order; set `repo` on the intended \
+                 instance to disambiguate"
+            );
+        }
+        Some(chosen.name.clone())
+    }
+
+    /// Is `name` eligible to receive author notices for this repo?
+    pub(crate) fn is_eligible(&self, name: &str) -> bool {
+        self.eligible.iter().any(|c| c.name == name)
+    }
+
+    /// Tier 2: eligible instance literally named `gh_login`.
+    fn match_instance_name(&self, gh_login: &str) -> Option<String> {
+        self.eligible
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(gh_login))
+            .map(|c| c.name.clone())
+    }
 }
 
-fn match_via_instance_name(home: &std::path::Path, gh_login: &str, repo: &str) -> Option<String> {
-    let cfg = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok()?;
-    cfg.instances
-        .iter()
-        .find(|(name, inst)| name.eq_ignore_ascii_case(gh_login) && source_repo_matches(inst, repo))
-        .map(|(name, _)| name.clone())
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs between the scanner's pre-lock `AuthorIndex` build and
+    /// its pr-state flock, to simulate a concurrent fleet.yaml edit.
+    pub(crate) static AFTER_AUTHOR_INDEX_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Scanner call point for [`AFTER_AUTHOR_INDEX_HOOK`]; a no-op outside tests.
+#[inline]
+pub(crate) fn after_author_index_build() {
+    #[cfg(test)]
+    AFTER_AUTHOR_INDEX_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f();
+        }
+    });
+}
+
+/// Instances eligible for `repo`, sorted orchestrator-first then by name.
+/// Identity per instance: explicit `repo` → `source_repo` → `source_repo`
+/// of any team that lists it in `members` OR names it `orchestrator` →
+/// none (not eligible).
+fn eligible_for(cfg: &crate::fleet::FleetConfig, repo: &str) -> Vec<AuthorCandidate> {
+    // Per-build memo only: a path shared by several instances/teams is
+    // resolved once per build, never carried across builds.
+    let mut slugs: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
+    let mut resolve = |src: &str| -> Option<String> {
+        slugs
+            .entry(src.to_string())
+            .or_insert_with(|| slug_for_source(std::path::Path::new(src)))
+            .clone()
+    };
+    let matches_repo = |slug: Option<String>| slug.is_some_and(|s| s.eq_ignore_ascii_case(repo));
+    let mut eligible: Vec<AuthorCandidate> = Vec::new();
+    for (name, inst) in &cfg.instances {
+        let matches = if let Some(explicit) = inst.repo.as_deref() {
+            // Invalid slug (e.g. the `repo: none` opt-out) → not eligible,
+            // never falls through to source_repo / team.
+            matches_repo(crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(
+                explicit,
+            ))
+        } else if let Some(sr) = inst.source_repo.as_deref() {
+            matches_repo(resolve(sr))
+        } else {
+            cfg.teams
+                .values()
+                .filter(|t| {
+                    t.members.iter().any(|m| m == name)
+                        || t.orchestrator.as_deref() == Some(name.as_str())
+                })
+                .filter_map(|t| t.source_repo.as_deref().and_then(|p| p.to_str()))
+                .any(|src| matches_repo(resolve(src)))
+        };
+        if matches {
+            let is_orchestrator = cfg
+                .teams
+                .values()
+                .any(|t| t.orchestrator.as_deref() == Some(name.as_str()));
+            eligible.push(AuthorCandidate {
+                name: name.clone(),
+                github_login: inst.github_login.clone(),
+                is_orchestrator,
+            });
+        }
+    }
+    eligible.sort_by(|a, b| {
+        b.is_orchestrator
+            .cmp(&a.is_orchestrator)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    eligible
+}
+
+/// `source_repo` → canonical GitHub slug: a bare slug / URL directly,
+/// otherwise the local checkout's `origin` remote (a git subprocess).
+fn slug_for_source(src: &std::path::Path) -> Option<String> {
+    src.to_str()
+        .and_then(crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug)
+        .or_else(|| {
+            debug_assert!(
+                !super::in_pr_state_flock(),
+                "#1617: `git remote get-url` must not run under the pr-state flock"
+            );
+            crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(src)
+        })
+}
+
+fn fingerprint(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
 }
 
 // ─── tests ─────────────────────────────────────────────────────────────
@@ -722,19 +927,33 @@ pub(crate) mod tests {
         dir
     }
 
+    /// Write `yaml` as the fleet.yaml under a fresh tmp home.
+    fn home_with_fleet(tag: &str, yaml: &str) -> std::path::PathBuf {
+        let home = tmp_home(tag);
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+        home
+    }
+
+    fn resolve(
+        home: &std::path::Path,
+        login: Option<&str>,
+        state: &super::super::PrState,
+    ) -> Option<String> {
+        resolve_author_with_gh(home, login, state)
+    }
+
     /// T8-a: tier 1 — `github_login` field wins over name match.
     #[test]
     fn t8a_github_login_field_wins_over_name_match() {
-        let home = tmp_home("auth-tier1");
-        std::fs::write(
-            crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  dev:\n    backend: claude\n    github_login: alice\n  alice:\n    backend: claude\n",
-        )
-        .unwrap();
+        let home = home_with_fleet(
+            "auth-tier1",
+            "instances:\n  dev:\n    backend: claude\n    github_login: alice\n    repo: owner/repo\n  \
+             alice:\n    backend: claude\n    repo: owner/repo\n",
+        );
         let state = fresh_state("br");
-        let resolved = resolve_author_with_gh(&home, Some("alice"), &state);
         assert_eq!(
-            resolved, "dev",
+            resolve(&home, Some("alice"), &state).as_deref(),
+            Some("dev"),
             "github_login=alice on `dev` MUST beat name-match on `alice`"
         );
         let _ = std::fs::remove_dir_all(&home);
@@ -743,62 +962,80 @@ pub(crate) mod tests {
     /// T8-b: tier 2 — direct name lookup when no github_login set.
     #[test]
     fn t8b_direct_name_match_when_no_github_login() {
-        let home = tmp_home("auth-tier2");
-        std::fs::write(
-            crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  suzuke:\n    backend: claude\n",
-        )
-        .unwrap();
+        let home = home_with_fleet(
+            "auth-tier2",
+            "instances:\n  suzuke:\n    backend: claude\n    repo: owner/repo\n",
+        );
         let state = fresh_state("br");
-        let resolved = resolve_author_with_gh(&home, Some("suzuke"), &state);
-        assert_eq!(resolved, "suzuke");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// T8-c: tier 3 — subscribers[0] when no fleet.yaml match.
-    #[test]
-    fn t8c_subscribers_fallback() {
-        let home = tmp_home("auth-tier3");
-        std::fs::write(
-            crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  someone-else:\n    backend: claude\n",
-        )
-        .unwrap();
-        let state = fresh_state("br"); // subscribers = ["dev"]
-        let resolved = resolve_author_with_gh(&home, Some("nobody-matches"), &state);
-        assert_eq!(resolved, "dev");
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// T8-d / T11: tier 4 — fixup-lead final fallback + tracing::warn
-    /// observability hook. Reviewer #990 BLOCKING #2: assert the
-    /// `tracing::warn` event actually fires (operator visibility into
-    /// fall-through), not just the return value.
-    #[test]
-    #[tracing_test::traced_test]
-    fn t8d_fixup_lead_final_fallback_emits_tracing_warn() {
-        let home = tmp_home("auth-tier4");
-        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
-        let mut state = fresh_state("br");
-        state.subscribers.clear();
-        let resolved = resolve_author_with_gh(&home, Some("nobody"), &state);
-        assert_eq!(resolved, "fixup-lead");
-        assert!(
-            logs_contain("#986 author resolution fell through to fixup-lead"),
-            "tracing::warn MUST fire when chain falls through to tier 4 — \
-             operator needs visibility to fix fleet.yaml github_login"
+        assert_eq!(
+            resolve(&home, Some("suzuke"), &state).as_deref(),
+            Some("suzuke")
         );
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// T8-e: gh_author=None still falls through to subscribers/fallback.
+    /// T8-c: tier 3 — the first ELIGIBLE subscriber when no login match;
+    /// an ineligible subscriber ahead of it is skipped.
+    #[test]
+    fn t8c_subscribers_fallback_requires_eligibility() {
+        let home = home_with_fleet(
+            "auth-tier3",
+            "instances:\n  stranger:\n    backend: claude\n  \
+             dev:\n    backend: claude\n    repo: owner/repo\n",
+        );
+        let mut state = fresh_state("br");
+        state.subscribers = vec!["stranger".to_string(), "dev".to_string()];
+        assert_eq!(
+            resolve(&home, Some("nobody-matches"), &state).as_deref(),
+            Some("dev")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T8-d / T11: nothing eligible (not even a fallback) → `None` + warn.
+    /// Reviewer #990 BLOCKING #2: assert the `tracing::warn` fires.
+    #[test]
+    #[tracing_test::traced_test]
+    fn t8d_nothing_eligible_fails_closed_with_warn() {
+        let home = home_with_fleet("auth-tier4", "instances: {}\n");
+        let mut state = fresh_state("br");
+        state.subscribers.clear();
+        assert_eq!(resolve(&home, Some("nobody"), &state), None);
+        assert!(
+            logs_contain("no instance eligible for this repo"),
+            "tracing::warn MUST fire when the chain fails closed"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T8-d2: `fixup-lead` is still the last resort, but only when it is
+    /// itself eligible for the repo.
+    #[test]
+    fn t8d2_fixup_lead_only_when_eligible() {
+        let home = home_with_fleet(
+            "auth-fixup",
+            "instances:\n  fixup-lead:\n    backend: claude\n    repo: owner/repo\n",
+        );
+        let mut state = fresh_state("br");
+        state.subscribers.clear();
+        assert_eq!(
+            resolve(&home, Some("nobody"), &state).as_deref(),
+            Some("fixup-lead")
+        );
+        state.repo = "owner/elsewhere".to_string();
+        assert_eq!(resolve(&home, Some("nobody"), &state), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T8-e: gh_author=None still falls through to eligible subscribers.
     #[test]
     fn t8e_none_gh_author_falls_to_subscribers() {
-        let home = tmp_home("auth-none");
-        std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+        let home = home_with_fleet(
+            "auth-none",
+            "instances:\n  dev:\n    backend: claude\n    repo: owner/repo\n",
+        );
         let state = fresh_state("br"); // subscribers = ["dev"]
-        let resolved = resolve_author_with_gh(&home, None, &state);
-        assert_eq!(resolved, "dev");
+        assert_eq!(resolve(&home, None, &state).as_deref(), Some("dev"));
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -808,69 +1045,314 @@ pub(crate) mod tests {
     /// `repo` takes precedence over `source_repo` derivation.
     #[test]
     fn t8f_repo_aware_github_login_resolves_correct_agent() {
-        let home = tmp_home("auth-repo-aware");
-        std::fs::write(
-            crate::fleet::fleet_yaml_path(&home),
+        let home = home_with_fleet(
+            "auth-repo-aware",
             "instances:\n  \
              bot-repoA:\n    backend: claude\n    github_login: shared-bot\n    \
                source_repo: /nonexistent/local/path-a\n    repo: owner/repo-a\n  \
              bot-repoB:\n    backend: claude\n    github_login: shared-bot\n    \
                source_repo: /nonexistent/local/path-b\n    repo: owner/repo-b\n",
-        )
-        .unwrap();
+        );
         let mut state = fresh_state("br");
         state.repo = "owner/repo-b".to_string();
-        let resolved = resolve_author_with_gh(&home, Some("shared-bot"), &state);
         assert_eq!(
-            resolved, "bot-repoB",
+            resolve(&home, Some("shared-bot"), &state).as_deref(),
+            Some("bot-repoB"),
             "explicit repo override must distinguish same-login instances"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
 
     /// T8-g / #2918 Tier 2: instance name matches gh_login but repo
-    /// mismatches → falls through to subscriber (Tier 3).
+    /// mismatches → falls through to an eligible subscriber.
     #[test]
     fn t8g_tier2_repo_mismatch_falls_to_subscriber() {
-        let home = tmp_home("auth-t2-repo");
-        std::fs::write(
-            crate::fleet::fleet_yaml_path(&home),
+        let home = home_with_fleet(
+            "auth-t2-repo",
             "instances:\n  \
              shared-bot:\n    backend: claude\n    \
-               source_repo: /nonexistent/local/path\n    repo: owner/other-repo\n",
-        )
-        .unwrap();
+               source_repo: /nonexistent/local/path\n    repo: owner/other-repo\n  \
+             the-subscriber:\n    backend: claude\n    repo: owner/target-repo\n",
+        );
         let mut state = fresh_state("br");
         state.repo = "owner/target-repo".to_string();
         state.subscribers = vec!["the-subscriber".to_string()];
-        let resolved = resolve_author_with_gh(&home, Some("shared-bot"), &state);
         assert_eq!(
-            resolved, "the-subscriber",
+            resolve(&home, Some("shared-bot"), &state).as_deref(),
+            Some("the-subscriber"),
             "Tier 2 repo mismatch must fall through to subscriber"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
 
     /// T8-h / #2918: explicit `repo` without `source_repo` must still
-    /// filter — match-any only when BOTH are absent.
+    /// filter; with no eligible subscriber the result fails closed.
     #[test]
     fn t8h_explicit_repo_no_source_repo_filters() {
-        let home = tmp_home("auth-t2-nosrc");
-        std::fs::write(
-            crate::fleet::fleet_yaml_path(&home),
+        let home = home_with_fleet(
+            "auth-t2-nosrc",
             "instances:\n  \
              shared-bot:\n    backend: claude\n    repo: owner/other-repo\n",
-        )
-        .unwrap();
+        );
         let mut state = fresh_state("br");
         state.repo = "owner/target-repo".to_string();
         state.subscribers = vec!["fallback-sub".to_string()];
-        let resolved = resolve_author_with_gh(&home, Some("shared-bot"), &state);
         assert_eq!(
-            resolved, "fallback-sub",
-            "explicit repo mismatch (no source_repo) must fall through to subscriber"
+            resolve(&home, Some("shared-bot"), &state),
+            None,
+            "explicit repo mismatch + unknown subscriber must send nothing"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T8-i: an instance with NEITHER `repo` nor `source_repo`, in no team
+    /// with a `source_repo`, is not eligible on ANY tier — including as a
+    /// subscriber — so nothing is sent.
+    #[test]
+    fn t8i_no_repo_identity_fails_closed() {
+        let home = home_with_fleet(
+            "auth-failclosed",
+            "instances:\n  \
+             unrelated:\n    backend: claude\n    github_login: shared-bot\n  \
+             shared-bot:\n    backend: claude\n\
+             teams:\n  \
+             no-repo-team:\n    members: [unrelated, shared-bot]\n    orchestrator: unrelated\n",
+        );
+        let mut state = fresh_state("br");
+        state.subscribers = vec!["unrelated".to_string()];
+        assert_eq!(
+            resolve(&home, Some("shared-bot"), &state),
+            None,
+            "no repo identity anywhere → no recipient"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T8-j: `repo: none` (non-slug sentinel used in live fleet.yaml to
+    /// opt an instance out) never matches — not even as a subscriber.
+    #[test]
+    fn t8j_repo_none_sentinel_never_matches() {
+        let home = home_with_fleet(
+            "auth-none-sentinel",
+            "instances:\n  \
+             opted-out:\n    backend: claude\n    github_login: shared-bot\n    repo: none\n  \
+             shared-bot:\n    backend: claude\n    repo: none\n",
+        );
+        let mut state = fresh_state("br");
+        state.subscribers = vec!["opted-out".to_string()];
+        assert_eq!(resolve(&home, Some("shared-bot"), &state), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T8-k: several instances share `github_login` + `repo` and one is a
+    /// team orchestrator — the orchestrator wins regardless of HashMap
+    /// order or name order (it sorts last alphabetically here).
+    #[test]
+    fn t8k_multi_candidate_prefers_orchestrator() {
+        let home = home_with_fleet(
+            "auth-multi-orch",
+            "instances:\n  \
+             alpha:\n    backend: claude\n    github_login: shared-bot\n    repo: owner/repo\n  \
+             bravo:\n    backend: claude\n    github_login: shared-bot\n    repo: owner/repo\n  \
+             zulu-lead:\n    backend: claude\n    github_login: shared-bot\n    repo: owner/repo\n  \
+             other-repo-lead:\n    backend: claude\n    github_login: shared-bot\n    repo: owner/other\n\
+             teams:\n  \
+             t1:\n    members: [alpha, bravo, zulu-lead]\n    orchestrator: zulu-lead\n  \
+             t2:\n    members: [other-repo-lead]\n    orchestrator: other-repo-lead\n",
+        );
+        let state = fresh_state("br");
+        assert_eq!(
+            resolve(&home, Some("shared-bot"), &state).as_deref(),
+            Some("zulu-lead")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T8-l: several matching non-orchestrator candidates → alphabetical
+    /// first, independent of HashMap iteration order.
+    #[test]
+    fn t8l_multi_candidate_without_orchestrator_picks_name_order() {
+        let home = home_with_fleet(
+            "auth-multi-name",
+            "instances:\n  \
+             delta:\n    backend: claude\n    github_login: shared-bot\n    repo: owner/repo\n  \
+             charlie:\n    backend: claude\n    github_login: shared-bot\n    repo: owner/repo\n  \
+             echo:\n    backend: claude\n    github_login: shared-bot\n    repo: owner/repo\n  \
+             bravo:\n    backend: claude\n    github_login: shared-bot\n    repo: owner/repo\n  \
+             alpha:\n    backend: claude\n    github_login: shared-bot\n    repo: owner/other\n",
+        );
+        let state = fresh_state("br");
+        assert_eq!(
+            resolve(&home, Some("shared-bot"), &state).as_deref(),
+            Some("bravo"),
+            "alpha's repo mismatches; bravo is the alphabetical-first match"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T8-m: instance with no repo fields inherits its team's `source_repo`
+    /// (bare slug and ssh-alias remote forms); an unrelated team's member
+    /// with the same login is excluded; the team orchestrator wins.
+    #[test]
+    fn t8m_team_source_repo_resolves_member() {
+        let home = home_with_fleet(
+            "auth-team-tier",
+            "instances:\n  \
+             infra-lead:\n    backend: claude\n    github_login: shared-bot\n  \
+             infra-dev:\n    backend: claude\n    github_login: shared-bot\n  \
+             apps-lead:\n    backend: claude\n    github_login: shared-bot\n\
+             teams:\n  \
+             infra:\n    members: [infra-lead, infra-dev]\n    orchestrator: infra-lead\n    \
+               source_repo: \"git@github-acme:Acme/Infra.git\"\n  \
+             apps:\n    members: [apps-lead]\n    orchestrator: apps-lead\n    \
+               source_repo: acme/apps\n",
+        );
+        let mut state = fresh_state("br");
+        state.repo = "acme/infra".to_string();
+        assert_eq!(
+            resolve(&home, Some("shared-bot"), &state).as_deref(),
+            Some("infra-lead")
+        );
+        state.repo = "acme/apps".to_string();
+        assert_eq!(
+            resolve(&home, Some("shared-bot"), &state).as_deref(),
+            Some("apps-lead")
+        );
+        state.repo = "acme/unknown".to_string();
+        assert_eq!(
+            resolve(&home, Some("shared-bot"), &state),
+            None,
+            "no team owns the repo and subscriber `dev` is unknown → nothing"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// T8-n: an instance-level `repo` (here the `none` opt-out sentinel)
+    /// takes precedence and does NOT fall through to its team's
+    /// `source_repo` — keeps the live fleet.yaml stop-gap meaningful.
+    #[test]
+    fn t8n_instance_repo_overrides_team_tier() {
+        let home = home_with_fleet(
+            "auth-team-override",
+            "instances:\n  \
+             opted-out-lead:\n    backend: claude\n    github_login: shared-bot\n    repo: none\n  \
+             member:\n    backend: claude\n    github_login: shared-bot\n\
+             teams:\n  \
+             t:\n    members: [opted-out-lead, member]\n    orchestrator: opted-out-lead\n    \
+               source_repo: owner/repo\n",
+        );
+        let state = fresh_state("br");
+        assert_eq!(
+            resolve(&home, Some("shared-bot"), &state).as_deref(),
+            Some("member")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Init a real git repo at `dir` with `origin` = `url` (AGEND bypass).
+    fn git_repo_with_origin(dir: &std::path::Path, url: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["remote", "add", "origin", url],
+        ] {
+            let out = std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .expect("git spawn");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        }
+    }
+
+    /// TOCTOU (lock-safe check): `fleet_unchanged()` is true for the bytes
+    /// the index was built from and false after any fleet.yaml edit.
+    #[test]
+    fn t8o_fleet_unchanged_detects_edit_after_build() {
+        let home = home_with_fleet(
+            "auth-fingerprint",
+            "instances:\n  dev:\n    backend: claude\n    repo: owner/repo\n",
+        );
+        let index = AuthorIndex::build(&home, "owner/repo");
+        assert!(index.is_eligible("dev"));
+        assert!(index.fleet_unchanged(&home));
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  dev:\n    backend: claude\n    repo: none\n",
+        )
+        .unwrap();
+        assert!(
+            !index.fleet_unchanged(&home),
+            "edit after build must be detected"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A LOCAL `source_repo` checkout is resolved from its CURRENT `origin`
+    /// at build time (real git repo, team tier): a remote changed before the
+    /// pre-lock build is honoured; no path→slug cache survives across builds.
+    #[test]
+    fn t8p_build_resolves_current_local_origin() {
+        let home = tmp_home("auth-origin");
+        let work = home.join("work");
+        git_repo_with_origin(&work, "git@github.com:owner/other.git");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  dev:\n    backend: claude\n\
+                 teams:\n  t:\n    members: [dev]\n    source_repo: {}\n",
+                work.display()
+            ),
+        )
+        .unwrap();
+        assert!(
+            !AuthorIndex::build(&home, "owner/repo").is_eligible("dev"),
+            "origin is owner/other → ineligible for owner/repo"
+        );
+        let out = std::process::Command::new("git")
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:owner/repo.git",
+            ])
+            .current_dir(&work)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(
+            AuthorIndex::build(&home, "owner/repo").is_eligible("dev"),
+            "next build sees the moved origin"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1617 guard: resolving a local `source_repo` (git subprocess) inside
+    /// a pr-state flock closure trips the debug assertion.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "#1617")]
+    fn t8q_git_lookup_under_pr_state_flock_is_rejected() {
+        let home = tmp_home("auth-flock-guard");
+        let work = home.join("work");
+        git_repo_with_origin(&work, "git@github.com:owner/repo.git");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  dev:\n    backend: claude\n    source_repo: {}\n",
+                work.display()
+            ),
+        )
+        .unwrap();
+        let _ = super::super::with_pr_state_or_create(
+            &home,
+            "owner/repo",
+            "br",
+            || fresh_state("br"),
+            |_| AuthorIndex::build(&home, "owner/repo"),
+        );
     }
 
     /// MockGhPoller smoke — verifies the test seam itself works.

@@ -2,9 +2,10 @@ use std::path::Path;
 
 use super::gh_poll;
 use super::{
-    apply, format_ready_body, freshness_gate, is_merge_ready, pr_state_dir, remove, resolve_author,
-    resolve_merge_authority, with_pr_state, CiState, DraftState, Event, FreshnessGate, MergeState,
-    PrState, ReviewClass, VerdictState, FRESHNESS_TTL_SECS,
+    apply, format_ready_body, freshness_gate, is_merge_ready, pr_state_dir, remove,
+    resolve_author_checked, resolve_merge_authority, resolve_merge_authority_checked,
+    with_pr_state, CiState, DraftState, Event, FreshnessGate, MergeState, PrState, ReviewClass,
+    VerdictState, FRESHNESS_TTL_SECS,
 };
 
 enum ScanAction {
@@ -286,6 +287,42 @@ pub fn scan_and_emit_with(
         };
         let repo = snapshot.repo.clone();
         let branch = snapshot.branch.clone();
+        // Author/authority eligibility for this PR, built HERE — outside the
+        // per-PR flock (it may run `git remote get-url`; #1617) — and only
+        // for states that can emit a repo-bearing author notice. Per PR, not
+        // per tick, so the gap to the flock is just this iteration.
+        let author_index: Option<gh_poll::AuthorIndex> = matches!(
+            snapshot.merge_state,
+            MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. } | MergeState::MergeReady
+        )
+        .then(|| gh_poll::AuthorIndex::build(home, &repo));
+        gh_poll::after_author_index_build();
+        // Under the flock: the pre-built index is used only if fleet.yaml is
+        // byte-identical to what it was built from (plain read, NO git). No
+        // index (locked state diverged from the snapshot) or a changed
+        // fleet.yaml → defer: send nothing and set no latch this tick; the
+        // file is re-scanned next tick (terminal states included — gh-poll
+        // skips them, this loop does not) and the emit is retried there.
+        // The locked state must also be the SAME PR the index was built for:
+        // `pr_state_filename` is not injective (`a_b/c`+`x` and `a/b_c`+`x`
+        // share a file), so a file swapped between snapshot and flock must not
+        // be authorised by another repo's index.
+        let emit_index = |state: &PrState, kind: &str| -> Option<&gh_poll::AuthorIndex> {
+            let index = author_index.as_ref().filter(|i| {
+                i.repo() == state.repo && state.branch == branch && i.fleet_unchanged(home)
+            });
+            if index.is_none() {
+                tracing::warn!(
+                    repo = %state.repo,
+                    branch = %state.branch,
+                    snapshot_branch = %branch,
+                    kind,
+                    "pr_state: locked state differs from the pre-lock snapshot, fleet.yaml \
+                     changed, or no pre-lock index — deferring the notice to the next tick"
+                );
+            }
+            index
+        };
         // #3182: assignment authority is inspected before entering the
         // pr_state flock. `list_active` is lock-free and the tri-state probe
         // preserves the distinction between absent and unreadable authority.
@@ -478,8 +515,20 @@ pub fn scan_and_emit_with(
                             let body = format_needs_rebase_body(state, behind_by, &main_sha);
                             // Dedupe recipients BEFORE the ledger keys (owner ==
                             // authority ⇒ one notice, not two).
-                            let mut recipients =
-                                vec![resolve_merge_authority(home, state), resolve_author(state)];
+                            // Both halves are fail-closed on repo identity and may
+                            // be absent.
+                            // Deferred (see `emit_index`) → no recipients this tick;
+                            // the durable ledger dedups the retry.
+                            let mut recipients: Vec<String> =
+                                match emit_index(state, "pr-needs-rebase") {
+                                    Some(index) => {
+                                        resolve_merge_authority_checked(home, state, index)
+                                            .into_iter()
+                                            .chain(resolve_author_checked(state, index))
+                                            .collect()
+                                    }
+                                    None => Vec::new(),
+                                };
                             recipients.sort();
                             recipients.dedup();
                             for recipient in recipients {
@@ -672,12 +721,21 @@ pub fn scan_and_emit_with(
                     // this merge — survives the delete→recreate that resets the
                     // per-file `ready_emitted_for_sha`.
                     if !already_emitted && !ledger_says_emitted {
+                        // Deferred → no emit, no latch, no release/settle this
+                        // tick; the next tick re-enters this arm.
+                        let Some(index) = emit_index(state, "pr-merged") else {
+                            return if dirty {
+                                ScanAction::Saved
+                            } else {
+                                ScanAction::None
+                            };
+                        };
                         // #1344/#bughunt3: defer the worktree auto-release until
                         // AFTER this flock is dropped (the git subprocess +
                         // nested binding flock are the #1617 lock-while-blocking
                         // class). Record the branch; release runs post-unlock.
                         release_after_unlock = Some((state.branch.clone(), "merge"));
-                        let author = resolve_author(state);
+                        let author = resolve_author_checked(state, index);
                         let body = format!(
                             "[pr-merged] {}@{} (head_sha {}, merged_at {})\n\n\
                              ⚠ Action checklist:\n\
@@ -691,8 +749,12 @@ pub fn scan_and_emit_with(
                         );
                         // #1629: defer the enqueue (see top of fn) — run lock-free
                         // after the flock drops.
-                        let msg = build_event_message("pr-merged", &author, state, body);
-                        pending_emits.push((author, msg));
+                        // Fail-closed: no eligible author → nothing is sent, but
+                        // the terminal transition is still recorded (no re-emit).
+                        if let Some(author) = author {
+                            let msg = build_event_message("pr-merged", &author, state, body);
+                            pending_emits.push((author, msg));
+                        }
                         state.ready_emitted_for_sha = Some(state.head_sha.clone());
                         emitted_terminal = true; // [C1] record in ledger post-flock
                         dirty = true;
@@ -719,7 +781,14 @@ pub fn scan_and_emit_with(
                 }
                 MergeState::ClosedUnmerged { closed_at } => {
                     if !already_emitted && !ledger_says_emitted {
-                        let author = resolve_author(state);
+                        let Some(index) = emit_index(state, "pr-closed-unmerged") else {
+                            return if dirty {
+                                ScanAction::Saved
+                            } else {
+                                ScanAction::None
+                            };
+                        };
+                        let author = resolve_author_checked(state, index);
                         let body = format!(
                             "[pr-closed-unmerged] {}@{} (closed_at {})\n\n\
                              ⚠ Action checklist:\n\
@@ -730,8 +799,11 @@ pub fn scan_and_emit_with(
                         );
                         // #1629: defer the enqueue (see top of fn) — run lock-free
                         // after the flock drops.
-                        let msg = build_event_message("pr-closed-unmerged", &author, state, body);
-                        pending_emits.push((author, msg));
+                        if let Some(author) = author {
+                            let msg =
+                                build_event_message("pr-closed-unmerged", &author, state, body);
+                            pending_emits.push((author, msg));
+                        }
                         state.ready_emitted_for_sha = Some(state.head_sha.clone());
                         emitted_terminal = true; // [C1] record in ledger post-flock
                                                  // t-worktree-leak (PR-1): close-unmerged is a terminal PR
@@ -1149,6 +1221,14 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
     for (repo, due_states) in by_repo {
         match poller.poll(&repo) {
             Ok((prs, polled_at)) => {
+                // Author resolution may run `git remote get-url` (team /
+                // instance `source_repo`), so build its fleet index HERE —
+                // outside the per-PR flock — and only when some due state
+                // still needs its first-observation `pr_author`.
+                let author_index = due_states
+                    .iter()
+                    .any(|s| s.pr_author.is_empty())
+                    .then(|| gh_poll::AuthorIndex::build(home, &repo));
                 for state in due_states {
                     let branch = state.branch.clone();
                     // #986 Bug A (codex round-3): freshness gates ALL state-changing
@@ -1171,7 +1251,7 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
                         continue;
                     }
                     if let Err(e) = with_pr_state(home, &repo, &branch, |s| {
-                        apply_gh_observations(home, s, &prs, &now);
+                        apply_gh_observations(s, &prs, &now, author_index.as_ref());
                         s.gh_poll_failures = 0;
                         s.last_gh_poll_at = Some(now.clone());
                     }) {
@@ -1218,10 +1298,10 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
 /// - First observation: populate `pr_number` + `pr_author` from the
 ///   matching metadata (no Event needed; direct field assignment).
 fn apply_gh_observations(
-    home: &Path,
     state: &mut PrState,
     prs: &[gh_poll::GhPrMetadata],
     now: &str,
+    author_index: Option<&gh_poll::AuthorIndex>,
 ) {
     let Some(meta) = prs.iter().find(|m| m.head_ref == state.branch) else {
         return;
@@ -1271,7 +1351,16 @@ fn apply_gh_observations(
     // First observation — populate identity fields.
     if state.pr_author.is_empty() {
         state.pr_number = meta.number;
-        state.pr_author = gh_poll::resolve_author_with_gh(home, Some(&meta.author_login), state);
+        // `None` (fail-closed) leaves pr_author empty, so a later poll retries
+        // once the fleet config gives the author a repo identity.
+        // No pre-lock index (the snapshot already had pr_author but the locked
+        // state is fresh — delete→recreate race): leave it empty rather than
+        // build one here (git under the flock, #1617); the next poll resolves.
+        state.pr_author = author_index
+            .and_then(|index| {
+                gh_poll::resolve_author_with_index(index, Some(&meta.author_login), state)
+            })
+            .unwrap_or_default();
         tracing::info!(
             repo = %state.repo,
             branch = %state.branch,

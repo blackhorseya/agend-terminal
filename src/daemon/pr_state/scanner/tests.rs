@@ -540,11 +540,13 @@ const BEHIND_BASE: &str = "1234567890abcdef1234567890abcdef12345678";
 
 /// Write a fleet.yaml so `resolve_merge_authority` returns `orch` (the team
 /// orchestrator = merge authority) for a PR authored by team member `member`.
+/// The team owns `owner/repo`, so `member` is eligible for author notices.
 fn write_team_fleet(home: &std::path::Path, orch: &str, member: &str) {
     std::fs::create_dir_all(home.join("inbox")).ok();
     let y = format!(
         "instances:\n  {member}:\n    backend: claude\n  {orch}:\n    backend: claude\n\
-             teams:\n  squad:\n    orchestrator: {orch}\n    members:\n      - {member}\n"
+             teams:\n  squad:\n    orchestrator: {orch}\n    source_repo: owner/repo\n    \
+             members:\n      - {member}\n"
     );
     std::fs::write(crate::fleet::fleet_yaml_path(home), y).expect("write fleet.yaml");
 }
@@ -1182,12 +1184,93 @@ fn behind_needs_rebase_delivered_once_across_ticks() {
     }
 }
 
+/// Fail-closed authority half: the stale `pr_author` belongs to a team whose
+/// `source_repo` is ANOTHER repo; its orchestrator must not receive this
+/// repo's `[pr-needs-rebase]`. With no eligible author or authority, no
+/// inbox anywhere gets the notice.
+#[test]
+fn behind_needs_rebase_not_sent_to_foreign_team_authority() {
+    let home = tmp_home(line!());
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  foreign-dev:\n    backend: claude\n  foreign-lead:\n    backend: claude\n\
+         teams:\n  foreign:\n    orchestrator: foreign-lead\n    source_repo: owner/other\n    \
+         members:\n      - foreign-dev\n",
+    )
+    .unwrap();
+    let mut s = merge_ready_state("owner/repo", "feat/x", BEHIND_HEAD, 77);
+    s.pr_author = "foreign-dev".into();
+    stamp_fresh_tuple(&mut s, BEHIND_HEAD, BEHIND_BASE, 1);
+    save(&home, &s).unwrap();
+
+    scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+
+    let leaked: Vec<_> = crate::daemon::pr_state::tests::all_inbox_kinds(&home)
+        .into_iter()
+        .filter(|(_, kind)| kind == "pr-needs-rebase")
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "foreign-team orchestrator / author must not get this repo's notice: {leaked:?}"
+    );
+}
+
+/// The authority half survives on its own: author ineligible (foreign
+/// team), but this repo's team orchestrator is reached via a subscriber.
+#[test]
+fn behind_needs_rebase_reaches_only_eligible_authority() {
+    let home = tmp_home(line!());
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  foreign-dev:\n    backend: claude\n  foreign-lead:\n    backend: claude\n  \
+         dev:\n    backend: claude\n  lead:\n    backend: claude\n\
+         teams:\n  foreign:\n    orchestrator: foreign-lead\n    source_repo: owner/other\n    \
+         members:\n      - foreign-dev\n  \
+         home:\n    orchestrator: lead\n    source_repo: owner/repo\n    members:\n      - dev\n",
+    )
+    .unwrap();
+    let mut s = merge_ready_state("owner/repo", "feat/x", BEHIND_HEAD, 77);
+    s.pr_author = "foreign-dev".into();
+    s.subscribers = vec!["foreign-dev".into(), "dev".into()];
+    stamp_fresh_tuple(&mut s, BEHIND_HEAD, BEHIND_BASE, 1);
+    save(&home, &s).unwrap();
+
+    scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+
+    let total = crate::daemon::pr_state::tests::all_inbox_kinds(&home)
+        .into_iter()
+        .filter(|(_, kind)| kind == "pr-needs-rebase")
+        .count();
+    assert_eq!(
+        needs_rebase_msgs(&home, "lead").len(),
+        1,
+        "this repo's orchestrator"
+    );
+    assert_eq!(
+        needs_rebase_msgs(&home, "dev").len(),
+        1,
+        "eligible subscriber as author"
+    );
+    assert!(needs_rebase_msgs(&home, "foreign-lead").is_empty());
+    assert!(needs_rebase_msgs(&home, "foreign-dev").is_empty());
+    assert_eq!(total, 2, "exactly the two eligible recipients, nobody else");
+}
+
 /// RED#4: recipients deduped BEFORE the ledger keys — owner == merge authority
 /// (no team) ⇒ a single notice.
 #[test]
 fn behind_needs_rebase_dedups_recipient_when_owner_is_authority() {
     let home = tmp_home(line!());
-    std::fs::create_dir_all(home.join("inbox")).ok(); // no fleet.yaml ⇒ no team
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    // No team; `solo` is eligible for the repo (notices are fail-closed on
+    // repo identity) and so is both author and self-authority.
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  solo:\n    backend: claude\n    repo: owner/repo\n",
+    )
+    .unwrap();
     let mut s = merge_ready_state("owner/repo", "feat/x", BEHIND_HEAD, 77);
     s.pr_author = "solo".into();
     stamp_fresh_tuple(&mut s, BEHIND_HEAD, BEHIND_BASE, 1);

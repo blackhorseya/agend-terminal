@@ -3399,6 +3399,16 @@ fn canonicalize_repo_slug_collapses_all_known_divergence_forms() {
         // ci_watch only knows GitHub Actions polling)
         ("https://gitlab.com/owner/repo", None),
         ("https://bitbucket.org/owner/repo", None),
+        // ssh-config GitHub host aliases (multi-account convention)
+        ("git@github-acme:Acme/Repo.git", Some("acme/repo")),
+        ("git@github.com-work:owner/repo", Some("owner/repo")),
+        ("ssh://git@github-acme/owner/repo.git", Some("owner/repo")),
+        // non-GitHub / look-alike SCP hosts must NOT yield a slug (previously
+        // they leaked through as owner=`git@host:owner`)
+        ("git@gitlab.com:owner/repo.git", None),
+        ("git@example.com:owner/repo", None),
+        ("git@github.com.evil.com:owner/repo", None),
+        ("git@github-:owner/repo", None),
     ];
     for (input, expected) in cases {
         let got = super::canonicalize_repo_slug(input);

@@ -1839,11 +1839,16 @@ fn t21_parse_review_class_fail_closed_2745() {
 use crate::daemon::pr_state::gh_poll::tests::MockGhPoller;
 use crate::daemon::pr_state::gh_poll::{GhPrMetadata, GhPrState};
 
+/// Fleet where the fixture author/subscriber `dev` is eligible for the
+/// fixture repo — author notices are fail-closed on repo identity.
+pub(super) const DEV_ELIGIBLE_FLEET: &str =
+    "instances:\n  dev:\n    backend: claude\n    repo: owner/repo\n";
+
 fn home_with_state(tag: &str, state: PrState) -> std::path::PathBuf {
     let home = std::env::temp_dir().join(format!("agend-986-int-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), DEV_ELIGIBLE_FLEET).unwrap();
     std::fs::create_dir_all(home.join("inbox")).ok();
     save(&home, &state).unwrap();
     home
@@ -1885,7 +1890,7 @@ fn t9_first_gh_observation_populates_pr_identity() {
 
     let loaded = load(&home, "owner/repo", "feat/test").unwrap();
     assert_eq!(loaded.pr_number, 970);
-    assert_eq!(loaded.pr_author, "dev"); // tier 2 direct name match (no fleet entries)
+    assert_eq!(loaded.pr_author, "dev"); // tier 2 direct name match (`dev` eligible for owner/repo)
     assert_eq!(loaded.gh_poll_failures, 0);
     assert!(loaded.last_gh_poll_at.is_some());
     let _ = std::fs::remove_dir_all(&home);
@@ -2073,6 +2078,282 @@ fn pr3_bound_branch_with_no_seed_is_discovered_and_armed() {
         "subscriber must be the BOUND agent (not the gh author login): {subs:?}"
     );
     std::fs::remove_dir_all(&parent).ok();
+}
+
+/// Every `(inbox file, kind)` persisted under `home/inbox`, walked
+/// recursively (name- AND id-keyed files) — for "nothing delivered to
+/// ANYONE" assertions that cannot enumerate recipients up front.
+pub(super) fn all_inbox_kinds(home: &std::path::Path) -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in content.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(kind) = v["kind"].as_str() {
+                        out.push((path.display().to_string(), kind.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&home.join("inbox"), &mut out);
+    out
+}
+
+fn merged_meta_for(author: &str) -> GhPrMetadata {
+    GhPrMetadata {
+        number: 970,
+        author_login: author.into(),
+        head_ref: "feat/test".into(),
+        is_cross_repository: false,
+        is_draft: false,
+        state: GhPrState::Merged,
+        merged_at: Some("2026-05-20T04:17:09Z".to_string()),
+        head_ref_oid: None,
+        base_ref_oid: None,
+    }
+}
+
+/// Fail-closed delivery: a stored `pr_author` and a subscriber that have
+/// NO repo identity for this repo (pre-fix match-any leftovers) receive
+/// nothing — no `[pr-merged]` anywhere — and the terminal transition is
+/// still recorded so the next scan does not retry the emit.
+#[test]
+fn pr_merged_not_sent_when_no_recipient_is_eligible() {
+    let mut s = new_state("sha-A", ReviewClass::Single);
+    s.pr_author = "stranger".to_string();
+    s.subscribers = vec!["stranger".to_string()];
+    let home = home_with_state("merged-failclosed", s);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  stranger:\n    backend: claude\n    github_login: dev\n  \
+         fixup-lead:\n    backend: claude\n",
+    )
+    .unwrap();
+
+    let poller = MockGhPoller::new(vec![Ok(vec![merged_meta_for("dev")])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+
+    let leaked: Vec<_> = all_inbox_kinds(&home)
+        .into_iter()
+        .filter(|(_, kind)| kind == "pr-merged")
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "no [pr-merged] may reach ANY inbox: {leaked:?}"
+    );
+    let persisted = load(&home, "owner/repo", "feat/test").expect("state persists");
+    assert_eq!(
+        persisted.ready_emitted_for_sha.as_deref(),
+        Some("sha-A"),
+        "terminal transition still recorded (no retry loop)"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// TOCTOU deferral: fleet.yaml changes between the pre-lock eligibility
+/// build and the flock → this tick sends nothing and sets NO latch; the next
+/// tick (terminal state, gh-poll skips it, the scan loop does not) emits.
+#[test]
+fn pr_merged_deferred_when_fleet_changes_before_lock_then_sent_next_tick() {
+    let mut s = new_state("sha-A", ReviewClass::Single);
+    s.pr_author = String::new();
+    let home = home_with_state("merged-defer", s);
+    let fleet = crate::fleet::fleet_yaml_path(&home);
+    let edit_target = fleet.clone();
+    super::gh_poll::AFTER_AUTHOR_INDEX_HOOK.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move || {
+            let mut y = std::fs::read_to_string(&edit_target).unwrap();
+            y.push_str("# concurrent edit\n");
+            std::fs::write(&edit_target, y).unwrap();
+        }));
+    });
+    let poller = MockGhPoller::new(vec![Ok(vec![merged_meta_for("dev")])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+    super::gh_poll::AFTER_AUTHOR_INDEX_HOOK.with(|h| *h.borrow_mut() = None);
+
+    assert!(
+        all_inbox_kinds(&home).iter().all(|(_, k)| k != "pr-merged"),
+        "deferred tick sends nothing"
+    );
+    let st = load(&home, "owner/repo", "feat/test").expect("state kept for retry");
+    assert!(matches!(st.merge_state, MergeState::Merged { .. }));
+    assert_eq!(
+        st.ready_emitted_for_sha, None,
+        "no latch on a deferred emit"
+    );
+
+    let poller2 = MockGhPoller::new(vec![Ok(vec![merged_meta_for("dev")])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller2);
+    let sent: Vec<_> = all_inbox_kinds(&home)
+        .into_iter()
+        .filter(|(_, k)| k == "pr-merged")
+        .collect();
+    assert_eq!(sent.len(), 1, "next tick emits exactly once: {sent:?}");
+    assert_eq!(
+        crate::inbox::drain(&home, "dev")
+            .iter()
+            .filter(|m| m.kind.as_deref() == Some("pr-merged"))
+            .count(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Non-injective filename (`a_b/c`+`x` and `a/b_c`+`x` both map to
+/// `a_b_c__x.json`): if the file is swapped for the colliding PR between the
+/// snapshot and the flock, repo A's eligibility index must NOT authorise
+/// repo B's notice — that tick defers (nothing delivered, no latch), and the
+/// next tick handles B with B's own index.
+#[test]
+fn pr_merged_deferred_when_locked_state_is_a_colliding_repo() {
+    let merged = |repo: &str, author: &str| {
+        let mut s = new_state("sha-A", ReviewClass::Single);
+        s.repo = repo.to_string();
+        s.branch = "x".to_string();
+        s.pr_author = author.to_string();
+        s.subscribers = vec![author.to_string()];
+        s.merge_state = MergeState::Merged {
+            merge_commit: "c0ffee00".to_string(),
+            merged_at: "2026-10-13T00:00:00Z".to_string(),
+        };
+        s
+    };
+    assert_eq!(
+        pr_state_filename("a_b/c", "x"),
+        pr_state_filename("a/b_c", "x"),
+        "precondition: the two PRs collide on one file"
+    );
+    let home = home_with_state("merged-collide", merged("a_b/c", "dev-a"));
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  dev-a:\n    backend: claude\n    repo: a_b/c\n  \
+         dev-b:\n    backend: claude\n    repo: a/b_c\n",
+    )
+    .unwrap();
+    let swap_home = home.clone();
+    super::gh_poll::AFTER_AUTHOR_INDEX_HOOK.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move || {
+            save(&swap_home, &merged("a/b_c", "dev-b")).unwrap();
+        }));
+    });
+    scan_and_emit_with(&home, &empty_registry(), &MockGhPoller::new(vec![]));
+    super::gh_poll::AFTER_AUTHOR_INDEX_HOOK.with(|h| *h.borrow_mut() = None);
+
+    assert!(
+        all_inbox_kinds(&home).iter().all(|(_, k)| k != "pr-merged"),
+        "swapped tick delivers nothing anywhere"
+    );
+    let st = load(&home, "a/b_c", "x").expect("swapped state kept");
+    assert_eq!(st.repo, "a/b_c");
+    assert_eq!(
+        st.ready_emitted_for_sha, None,
+        "no latch on the deferred tick"
+    );
+
+    scan_and_emit_with(&home, &empty_registry(), &MockGhPoller::new(vec![]));
+    assert!(crate::inbox::drain(&home, "dev-a")
+        .iter()
+        .all(|m| m.kind.as_deref() != Some("pr-merged")));
+    assert_eq!(
+        crate::inbox::drain(&home, "dev-b")
+            .iter()
+            .filter(|m| m.kind.as_deref() == Some("pr-merged"))
+            .count(),
+        1,
+        "next tick: B's own index → B's eligible author"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// #1617 end-to-end: eligibility that needs a LOCAL `source_repo` (git)
+/// still delivers — the git lookup runs before the flock (a lookup under
+/// the flock would trip the debug guard and fail this test).
+#[test]
+fn pr_merged_with_local_source_repo_runs_git_outside_flock() {
+    let mut s = new_state("sha-A", ReviewClass::Single);
+    s.pr_author = String::new();
+    let home = home_with_state("merged-local-src", s);
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["remote", "add", "origin", "git@github.com:owner/repo.git"],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&work)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  dev:\n    backend: claude\n\
+             teams:\n  t:\n    members: [dev]\n    source_repo: {}\n",
+            work.display()
+        ),
+    )
+    .unwrap();
+    let poller = MockGhPoller::new(vec![Ok(vec![merged_meta_for("dev")])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+    assert_eq!(
+        crate::inbox::drain(&home, "dev")
+            .iter()
+            .filter(|m| m.kind.as_deref() == Some("pr-merged"))
+            .count(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Emit-time re-validation: a `pr_author` persisted by the pre-fix
+/// resolver that is NOT eligible for this repo is ignored — the notice
+/// goes to the eligible subscriber instead, never to the stale author.
+#[test]
+fn stale_ineligible_pr_author_is_not_delivered_to() {
+    let mut s = new_state("sha-A", ReviewClass::Single);
+    s.pr_author = "stale-lead".to_string();
+    s.subscribers = vec!["dev".to_string()];
+    let home = home_with_state("merged-stale-author", s);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  stale-lead:\n    backend: claude\n    repo: owner/other\n  \
+         dev:\n    backend: claude\n    repo: owner/repo\n",
+    )
+    .unwrap();
+
+    let poller = MockGhPoller::new(vec![Ok(vec![merged_meta_for("someone")])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+
+    assert!(
+        crate::inbox::drain(&home, "stale-lead")
+            .iter()
+            .all(|m| m.kind.as_deref() != Some("pr-merged")),
+        "stale, repo-ineligible pr_author must not receive [pr-merged]"
+    );
+    let msgs = crate::inbox::drain(&home, "dev");
+    assert_eq!(
+        msgs.iter()
+            .filter(|m| m.kind.as_deref() == Some("pr-merged"))
+            .count(),
+        1,
+        "eligible subscriber receives it instead"
+    );
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// #986 T4 — `gh state=MERGED + mergedAt!=None` fires
@@ -2451,12 +2732,14 @@ fn t14_gh_poll_promotes_unknown_author_to_ready_event() {
     // "suzuke" instance that matches the gh author.login.
     let home = home_with_state("ready-promote", s);
     // gh author "suzuke" matches the fleet instance via tier-2 name match
-    // (drives pr_author resolution); the team's orchestrator "lead-z" is
+    // (drives pr_author resolution; eligible through the team's
+    // `source_repo` — no repo identity would fail closed); the team's orchestrator "lead-z" is
     // the #2059-#3 merge authority that the ready event routes to.
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
         "instances:\n  suzuke:\n    backend: claude\n  lead-z:\n    backend: claude\n\
-             teams:\n  squad:\n    orchestrator: lead-z\n    members:\n      - suzuke\n",
+             teams:\n  squad:\n    orchestrator: lead-z\n    source_repo: owner/repo\n    \
+             members:\n      - suzuke\n",
     )
     .unwrap();
     std::fs::create_dir_all(home.join("inbox")).ok();

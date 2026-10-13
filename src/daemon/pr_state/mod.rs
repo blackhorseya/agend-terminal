@@ -884,6 +884,34 @@ pub fn save(home: &Path, state: &PrState) -> anyhow::Result<()> {
     Ok(())
 }
 
+thread_local! {
+    /// Depth of `with_pr_state*` closures running on this thread.
+    static PR_STATE_FLOCK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Is this thread inside a pr-state flock closure? Code that would spawn a
+/// subprocess (e.g. `git remote get-url`) asserts this is false — #1617
+/// lock-while-blocking: no git / self-IPC while the pr-state flock is held.
+pub(crate) fn in_pr_state_flock() -> bool {
+    PR_STATE_FLOCK_DEPTH.with(|d| d.get() > 0)
+}
+
+/// RAII marker for [`in_pr_state_flock`] (unwinds correctly on panic).
+struct PrStateFlockMarker;
+
+impl PrStateFlockMarker {
+    fn enter() -> Self {
+        PR_STATE_FLOCK_DEPTH.with(|d| d.set(d.get() + 1));
+        Self
+    }
+}
+
+impl Drop for PrStateFlockMarker {
+    fn drop(&mut self) {
+        PR_STATE_FLOCK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// #1342: flock-serialized read-modify-write for pr_state files.
 /// All mutation paths MUST go through this helper to prevent lost-update
 /// races (e.g. gh-poll save overwriting scanner's `ready_emitted_for_sha`).
@@ -902,7 +930,10 @@ where
     let dir = pr_state_dir(home);
     std::fs::create_dir_all(&dir)?;
     let data_path = dir.join(pr_state_filename(repo, branch));
-    crate::store::with_json_state(&data_path, mutate)
+    crate::store::with_json_state(&data_path, |s| {
+        let _held = PrStateFlockMarker::enter();
+        mutate(s)
+    })
 }
 
 pub fn with_pr_state_or_create<F, D, R>(
@@ -919,7 +950,10 @@ where
     let dir = pr_state_dir(home);
     std::fs::create_dir_all(&dir)?;
     let data_path = dir.join(pr_state_filename(repo, branch));
-    crate::store::with_json_state_or_create(&data_path, default_fn, mutate)
+    crate::store::with_json_state_or_create(&data_path, default_fn, |s| {
+        let _held = PrStateFlockMarker::enter();
+        mutate(s)
+    })
 }
 
 /// #2800/#3168: ensure a PrState exists for a PR whose CI has not yet
@@ -1870,6 +1904,35 @@ pub fn resolve_author(state: &PrState) -> String {
     "fixup-lead".to_string()
 }
 
+/// Emit-time author for the repo/branch-bearing author notices
+/// (`[pr-merged]`, `[pr-closed-unmerged]`, `[pr-needs-rebase]`).
+///
+/// The stored `pr_author` is RE-VALIDATED against the current fleet rules
+/// (`index`, built for `state.repo`) rather than trusted: a value written by
+/// the pre-fix match-any resolver may name an instance unrelated to the repo.
+/// Ineligible → `tracing::warn` and fall back to the remaining eligible tiers
+/// (subscribers, then `fixup-lead`); nothing eligible → `None` and the caller
+/// sends nothing (fail-closed). The gh login is not persisted, so tiers 1-2
+/// cannot be re-run here; a later first-observation (empty `pr_author`) does.
+pub(crate) fn resolve_author_checked(
+    state: &PrState,
+    index: &gh_poll::AuthorIndex,
+) -> Option<String> {
+    if !state.pr_author.is_empty() {
+        if index.is_eligible(&state.pr_author) {
+            return Some(state.pr_author.clone());
+        }
+        tracing::warn!(
+            repo = %state.repo,
+            branch = %state.branch,
+            pr_author = %state.pr_author,
+            "pr_state: stored pr_author is not eligible for this repo under current rules \
+             (pre-fix match-any value?) — ignoring it"
+        );
+    }
+    gh_poll::resolve_author_with_index(index, None, state)
+}
+
 /// t-verdict-to-author-routing-design (#2): resolve the AGENT to notify for an
 /// author-facing pr-state signal (`[review-verdict]`, `[pr-ready-for-merge]`).
 ///
@@ -1996,6 +2059,56 @@ pub fn resolve_merge_authority(home: &Path, state: &PrState) -> String {
         return state.pr_author.clone();
     }
     "fixup-lead".to_string()
+}
+
+/// [`resolve_merge_authority`] for the repo/branch-bearing `[pr-needs-rebase]`
+/// notice, fail-closed on repo identity: a candidate orchestrator (and the
+/// author / `fixup-lead` fallbacks) must be eligible for `state.repo` under
+/// `index` — the same rules as the author half. Without this a stale
+/// `pr_author` from another team's repo routes the notice to THAT team's
+/// orchestrator. Nothing eligible → `None` + warn; the caller sends nothing.
+pub(crate) fn resolve_merge_authority_checked(
+    home: &Path,
+    state: &PrState,
+    index: &gh_poll::AuthorIndex,
+) -> Option<String> {
+    let mut candidates: Vec<&str> = Vec::new();
+    match &state.verdict_state {
+        VerdictState::Verified { reviewers } => {
+            candidates.extend(reviewers.iter().map(|(r, _)| r.as_str()));
+        }
+        VerdictState::Rejected { reviewer, .. } | VerdictState::Unverified { reviewer, .. } => {
+            candidates.push(reviewer.as_str());
+        }
+        VerdictState::None | VerdictState::Pending => {}
+    }
+    candidates.extend(state.subscribers.iter().map(String::as_str));
+    if !state.pr_author.is_empty() {
+        candidates.push(state.pr_author.as_str());
+    }
+    for member in candidates {
+        if let Some(orch) = crate::teams::find_team_for(home, member)
+            .and_then(|t| t.orchestrator)
+            .filter(|o| !o.is_empty())
+        {
+            if index.is_eligible(&orch) {
+                return Some(orch);
+            }
+        }
+    }
+    for fallback in [state.pr_author.as_str(), "fixup-lead"] {
+        if !fallback.is_empty() && index.is_eligible(fallback) {
+            return Some(fallback.to_string());
+        }
+    }
+    tracing::warn!(
+        repo = %state.repo,
+        branch = %state.branch,
+        pr_author = %state.pr_author,
+        "pr_state: no merge authority eligible for this repo — failing closed \
+         (authority half of the notice not sent)"
+    );
+    None
 }
 
 /// t-verdict-to-author-routing-design (#2): the wire label for a verdict kind.
