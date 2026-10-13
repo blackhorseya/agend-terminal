@@ -302,11 +302,10 @@ pub fn scan_and_emit_with(
                 .or_insert_with(|| gh_poll::AuthorIndex::build(home, &repo))
         });
         // Emit-time eligibility, evaluated UNDER the flock right before a
-        // (latched, one-shot) notice is queued: fleet.yaml is re-read so an
-        // edit after the pre-lock build is honoured; the pre-lock index only
-        // contributes its resolved slugs (no git for already-seen paths). If
-        // the locked state differs from the snapshot (no pre-lock index), the
-        // index is built inline — the rare snapshot/lock race.
+        // (latched, one-shot) notice is queued: fleet.yaml is re-read and
+        // local `source_repo` origins re-resolved, so an edit after the
+        // pre-lock build (which only pre-filters) is honoured. Emits are rare;
+        // that is where the git cost lands.
         let fresh_index = |state: &PrState| match author_index {
             Some(index) => index.refreshed(home),
             None => gh_poll::AuthorIndex::build(home, &state.repo),

@@ -482,10 +482,6 @@ pub(crate) struct AuthorIndex {
     /// orchestrators first, then instance name ascending — never the
     /// iteration order of the `FleetConfig.instances` HashMap.
     eligible: Vec<AuthorCandidate>,
-    /// `source_repo` string → resolved slug. Local paths cost a
-    /// `git remote get-url`; [`AuthorIndex::refreshed`] reuses these so the
-    /// in-flock re-validation only shells out for a path it has never seen.
-    slugs: std::collections::HashMap<String, Option<String>>,
 }
 
 #[derive(Debug)]
@@ -496,36 +492,28 @@ struct AuthorCandidate {
 }
 
 impl AuthorIndex {
-    /// Load fleet.yaml and resolve eligibility for `repo` (may run git).
+    /// Load fleet.yaml and resolve eligibility for `repo` (may run git for
+    /// local `source_repo` paths).
     pub(crate) fn build(home: &std::path::Path, repo: &str) -> Self {
-        Self::load(home, repo, std::collections::HashMap::new())
-    }
-
-    /// Re-read fleet.yaml NOW and re-derive eligibility, reusing this
-    /// index's resolved `source_repo` slugs. Called under the pr-state flock
-    /// right before an author/authority notice is enqueued, so a fleet.yaml
-    /// edit between the pre-lock build and the (latched, one-shot) emit is
-    /// honoured. Only a `source_repo` path absent from the cache costs a git
-    /// subprocess under the lock — the rare "path added mid-tick" case.
-    pub(crate) fn refreshed(&self, home: &std::path::Path) -> Self {
-        Self::load(home, &self.repo, self.slugs.clone())
-    }
-
-    fn load(
-        home: &std::path::Path,
-        repo: &str,
-        mut slugs: std::collections::HashMap<String, Option<String>>,
-    ) -> Self {
         let eligible = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
-            Ok(cfg) => eligible_for(&cfg, repo, &mut slugs),
+            Ok(cfg) => eligible_for(&cfg, repo),
             // Unreadable fleet.yaml → nobody is eligible (fail-closed).
             Err(_) => Vec::new(),
         };
         Self {
             repo: repo.to_string(),
             eligible,
-            slugs,
         }
+    }
+
+    /// Re-derive eligibility from scratch NOW: fleet.yaml is re-read AND
+    /// every local `source_repo` path's `origin` is re-resolved — nothing
+    /// from the pre-lock build is reused, so a fleet.yaml edit or an origin
+    /// URL change after it is honoured. Called under the pr-state flock
+    /// only right before a latched author/authority notice is enqueued (rare),
+    /// which is where the git cost lands; the pre-lock build is a pre-filter.
+    pub(crate) fn refreshed(&self, home: &std::path::Path) -> Self {
+        Self::build(home, &self.repo)
     }
 
     /// Tier 1: first eligible instance whose `github_login` matches.
@@ -578,11 +566,11 @@ impl AuthorIndex {
 /// Identity per instance: explicit `repo` → `source_repo` → `source_repo`
 /// of any team that lists it in `members` OR names it `orchestrator` →
 /// none (not eligible).
-fn eligible_for(
-    cfg: &crate::fleet::FleetConfig,
-    repo: &str,
-    slugs: &mut std::collections::HashMap<String, Option<String>>,
-) -> Vec<AuthorCandidate> {
+fn eligible_for(cfg: &crate::fleet::FleetConfig, repo: &str) -> Vec<AuthorCandidate> {
+    // Per-build memo only: a path shared by several instances/teams is
+    // resolved once per build, never carried across builds.
+    let mut slugs: std::collections::HashMap<String, Option<String>> =
+        std::collections::HashMap::new();
     let mut resolve = |src: &str| -> Option<String> {
         slugs
             .entry(src.to_string())
@@ -1205,10 +1193,9 @@ pub(crate) mod tests {
     }
 
     /// TOCTOU: `refreshed()` re-reads fleet.yaml, so an edit made after the
-    /// pre-lock `build()` decides eligibility at emit time (both directions),
-    /// and it carries the resolved `source_repo` slugs forward.
+    /// pre-lock `build()` decides eligibility at emit time (both directions).
     #[test]
-    fn t8o_refreshed_rereads_fleet_yaml_and_reuses_slugs() {
+    fn t8o_refreshed_rereads_fleet_yaml() {
         let home = home_with_fleet(
             "auth-refresh",
             "instances:\n  dev:\n    backend: claude\n    source_repo: owner/repo\n  \
@@ -1217,11 +1204,6 @@ pub(crate) mod tests {
         let pre = AuthorIndex::build(&home, "owner/repo");
         assert!(pre.is_eligible("dev"));
         assert!(!pre.is_eligible("later"));
-        assert_eq!(
-            pre.slugs.get("owner/repo"),
-            Some(&Some("owner/repo".to_string())),
-            "resolved source_repo slug cached for reuse"
-        );
 
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
@@ -1238,9 +1220,51 @@ pub(crate) mod tests {
             fresh.is_eligible("later"),
             "identity added after build is honoured"
         );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// TOCTOU: a LOCAL `source_repo` checkout whose `origin` changes after
+    /// the pre-lock `build()` is re-resolved by `refreshed()` (no stale
+    /// path→slug cache). Real git repo; team-tier path.
+    #[test]
+    fn t8p_refreshed_reresolves_local_origin_change() {
+        let home = tmp_home("auth-refresh-origin");
+        let work = home.join("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .expect("git spawn");
+            assert!(out.status.success(), "git {args:?} failed: {out:?}");
+        };
+        git(&["init", "-b", "main"]);
+        git(&["remote", "add", "origin", "git@github.com:owner/repo.git"]);
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  dev:\n    backend: claude\n\
+                 teams:\n  t:\n    members: [dev]\n    source_repo: {}\n",
+                work.display()
+            ),
+        )
+        .unwrap();
+
+        let pre = AuthorIndex::build(&home, "owner/repo");
+        assert!(pre.is_eligible("dev"), "origin owner/repo → eligible");
+
+        git(&[
+            "remote",
+            "set-url",
+            "origin",
+            "git@github.com:owner/other.git",
+        ]);
+        let fresh = pre.refreshed(&home);
         assert!(
-            fresh.slugs.contains_key("owner/repo"),
-            "slug cache carried forward"
+            !fresh.is_eligible("dev"),
+            "origin moved to owner/other after build → must be ineligible at emit"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
