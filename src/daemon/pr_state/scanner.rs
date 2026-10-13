@@ -303,15 +303,22 @@ pub fn scan_and_emit_with(
         // fleet.yaml → defer: send nothing and set no latch this tick; the
         // file is re-scanned next tick (terminal states included — gh-poll
         // skips them, this loop does not) and the emit is retried there.
+        // The locked state must also be the SAME PR the index was built for:
+        // `pr_state_filename` is not injective (`a_b/c`+`x` and `a/b_c`+`x`
+        // share a file), so a file swapped between snapshot and flock must not
+        // be authorised by another repo's index.
         let emit_index = |state: &PrState, kind: &str| -> Option<&gh_poll::AuthorIndex> {
-            let index = author_index.as_ref().filter(|i| i.fleet_unchanged(home));
+            let index = author_index.as_ref().filter(|i| {
+                i.repo() == state.repo && state.branch == branch && i.fleet_unchanged(home)
+            });
             if index.is_none() {
                 tracing::warn!(
                     repo = %state.repo,
                     branch = %state.branch,
+                    snapshot_branch = %branch,
                     kind,
-                    "pr_state: fleet.yaml changed (or no pre-lock index) since eligibility \
-                     was resolved — deferring the notice to the next tick"
+                    "pr_state: locked state differs from the pre-lock snapshot, fleet.yaml \
+                     changed, or no pre-lock index — deferring the notice to the next tick"
                 );
             }
             index

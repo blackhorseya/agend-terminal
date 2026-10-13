@@ -2211,6 +2211,72 @@ fn pr_merged_deferred_when_fleet_changes_before_lock_then_sent_next_tick() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Non-injective filename (`a_b/c`+`x` and `a/b_c`+`x` both map to
+/// `a_b_c__x.json`): if the file is swapped for the colliding PR between the
+/// snapshot and the flock, repo A's eligibility index must NOT authorise
+/// repo B's notice — that tick defers (nothing delivered, no latch), and the
+/// next tick handles B with B's own index.
+#[test]
+fn pr_merged_deferred_when_locked_state_is_a_colliding_repo() {
+    let merged = |repo: &str, author: &str| {
+        let mut s = new_state("sha-A", ReviewClass::Single);
+        s.repo = repo.to_string();
+        s.branch = "x".to_string();
+        s.pr_author = author.to_string();
+        s.subscribers = vec![author.to_string()];
+        s.merge_state = MergeState::Merged {
+            merge_commit: "c0ffee00".to_string(),
+            merged_at: "2026-10-13T00:00:00Z".to_string(),
+        };
+        s
+    };
+    assert_eq!(
+        pr_state_filename("a_b/c", "x"),
+        pr_state_filename("a/b_c", "x"),
+        "precondition: the two PRs collide on one file"
+    );
+    let home = home_with_state("merged-collide", merged("a_b/c", "dev-a"));
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  dev-a:\n    backend: claude\n    repo: a_b/c\n  \
+         dev-b:\n    backend: claude\n    repo: a/b_c\n",
+    )
+    .unwrap();
+    let swap_home = home.clone();
+    super::gh_poll::AFTER_AUTHOR_INDEX_HOOK.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move || {
+            save(&swap_home, &merged("a/b_c", "dev-b")).unwrap();
+        }));
+    });
+    scan_and_emit_with(&home, &empty_registry(), &MockGhPoller::new(vec![]));
+    super::gh_poll::AFTER_AUTHOR_INDEX_HOOK.with(|h| *h.borrow_mut() = None);
+
+    assert!(
+        all_inbox_kinds(&home).iter().all(|(_, k)| k != "pr-merged"),
+        "swapped tick delivers nothing anywhere"
+    );
+    let st = load(&home, "a/b_c", "x").expect("swapped state kept");
+    assert_eq!(st.repo, "a/b_c");
+    assert_eq!(
+        st.ready_emitted_for_sha, None,
+        "no latch on the deferred tick"
+    );
+
+    scan_and_emit_with(&home, &empty_registry(), &MockGhPoller::new(vec![]));
+    assert!(crate::inbox::drain(&home, "dev-a")
+        .iter()
+        .all(|m| m.kind.as_deref() != Some("pr-merged")));
+    assert_eq!(
+        crate::inbox::drain(&home, "dev-b")
+            .iter()
+            .filter(|m| m.kind.as_deref() == Some("pr-merged"))
+            .count(),
+        1,
+        "next tick: B's own index → B's eligible author"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// #1617 end-to-end: eligibility that needs a LOCAL `source_repo` (git)
 /// still delivers — the git lookup runs before the flock (a lookup under
 /// the flock would trip the debug guard and fail this test).

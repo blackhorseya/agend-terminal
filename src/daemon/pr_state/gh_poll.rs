@@ -523,6 +523,11 @@ impl AuthorIndex {
         }
     }
 
+    /// The repo slug this index was built for.
+    pub(crate) fn repo(&self) -> &str {
+        &self.repo
+    }
+
     /// Lock-safe staleness check: re-read fleet.yaml (plain file read, NO
     /// git) and compare with the bytes this index was built from. Called
     /// under the pr-state flock right before a latched notice is queued; a
