@@ -884,6 +884,34 @@ pub fn save(home: &Path, state: &PrState) -> anyhow::Result<()> {
     Ok(())
 }
 
+thread_local! {
+    /// Depth of `with_pr_state*` closures running on this thread.
+    static PR_STATE_FLOCK_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Is this thread inside a pr-state flock closure? Code that would spawn a
+/// subprocess (e.g. `git remote get-url`) asserts this is false — #1617
+/// lock-while-blocking: no git / self-IPC while the pr-state flock is held.
+pub(crate) fn in_pr_state_flock() -> bool {
+    PR_STATE_FLOCK_DEPTH.with(|d| d.get() > 0)
+}
+
+/// RAII marker for [`in_pr_state_flock`] (unwinds correctly on panic).
+struct PrStateFlockMarker;
+
+impl PrStateFlockMarker {
+    fn enter() -> Self {
+        PR_STATE_FLOCK_DEPTH.with(|d| d.set(d.get() + 1));
+        Self
+    }
+}
+
+impl Drop for PrStateFlockMarker {
+    fn drop(&mut self) {
+        PR_STATE_FLOCK_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// #1342: flock-serialized read-modify-write for pr_state files.
 /// All mutation paths MUST go through this helper to prevent lost-update
 /// races (e.g. gh-poll save overwriting scanner's `ready_emitted_for_sha`).
@@ -902,7 +930,10 @@ where
     let dir = pr_state_dir(home);
     std::fs::create_dir_all(&dir)?;
     let data_path = dir.join(pr_state_filename(repo, branch));
-    crate::store::with_json_state(&data_path, mutate)
+    crate::store::with_json_state(&data_path, |s| {
+        let _held = PrStateFlockMarker::enter();
+        mutate(s)
+    })
 }
 
 pub fn with_pr_state_or_create<F, D, R>(
@@ -919,7 +950,10 @@ where
     let dir = pr_state_dir(home);
     std::fs::create_dir_all(&dir)?;
     let data_path = dir.join(pr_state_filename(repo, branch));
-    crate::store::with_json_state_or_create(&data_path, default_fn, mutate)
+    crate::store::with_json_state_or_create(&data_path, default_fn, |s| {
+        let _held = PrStateFlockMarker::enter();
+        mutate(s)
+    })
 }
 
 /// #2800/#3168: ensure a PrState exists for a PR whose CI has not yet

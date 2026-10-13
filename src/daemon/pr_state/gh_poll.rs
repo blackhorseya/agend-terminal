@@ -411,10 +411,11 @@ pub fn backoff_window(failures: u32) -> Duration {
 /// yields an eligible instance the result is `None` (fail-closed, with a
 /// `tracing::warn`) — callers must NOT deliver repo/branch-bearing notices.
 ///
-/// Builds the [`AuthorIndex`] inline, which may shell out to
-/// `git remote get-url`; the scanner precomputes it OUTSIDE the per-PR
-/// flock and calls [`resolve_author_with_index`] instead.
-pub fn resolve_author_with_gh(
+/// Test convenience: builds the [`AuthorIndex`] inline (may run git). The
+/// scanner builds it OUTSIDE the per-PR flock and calls
+/// [`resolve_author_with_index`].
+#[cfg(test)]
+pub(crate) fn resolve_author_with_gh(
     home: &std::path::Path,
     gh_author: Option<&str>,
     state: &super::PrState,
@@ -482,6 +483,9 @@ pub(crate) struct AuthorIndex {
     /// orchestrators first, then instance name ascending — never the
     /// iteration order of the `FleetConfig.instances` HashMap.
     eligible: Vec<AuthorCandidate>,
+    /// Fingerprint of the fleet.yaml bytes this index was parsed from
+    /// (`None` = unreadable). See [`AuthorIndex::fleet_unchanged`].
+    fleet_fingerprint: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -492,28 +496,44 @@ struct AuthorCandidate {
 }
 
 impl AuthorIndex {
-    /// Load fleet.yaml and resolve eligibility for `repo` (may run git for
-    /// local `source_repo` paths).
+    /// Read fleet.yaml and resolve eligibility for `repo`. May run
+    /// `git remote get-url` for local `source_repo` paths, so it MUST be
+    /// called outside the pr-state flock (#1617; debug-asserted).
+    ///
+    /// The fingerprint and the parsed config come from the SAME read, so a
+    /// concurrent write can only make [`Self::fleet_unchanged`] report a
+    /// change (conservative), never hide one.
     pub(crate) fn build(home: &std::path::Path, repo: &str) -> Self {
-        let eligible = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
-            Ok(cfg) => eligible_for(&cfg, repo),
-            // Unreadable fleet.yaml → nobody is eligible (fail-closed).
-            Err(_) => Vec::new(),
-        };
+        let bytes = std::fs::read(crate::fleet::fleet_yaml_path(home)).ok();
+        let fleet_fingerprint = bytes.as_deref().map(fingerprint);
+        // Only `instances` (repo/source_repo/github_login) and `teams`
+        // (members/orchestrator/source_repo) are read — raw fields that
+        // `FleetConfig::normalize` does not touch, so a direct parse suffices.
+        let eligible = bytes
+            .as_deref()
+            .and_then(|b| std::str::from_utf8(b).ok())
+            .and_then(|y| serde_yaml_ng::from_str::<crate::fleet::FleetConfig>(y).ok())
+            .map(|cfg| eligible_for(&cfg, repo))
+            // Unreadable / unparsable fleet.yaml → nobody eligible (fail-closed).
+            .unwrap_or_default();
         Self {
             repo: repo.to_string(),
             eligible,
+            fleet_fingerprint,
         }
     }
 
-    /// Re-derive eligibility from scratch NOW: fleet.yaml is re-read AND
-    /// every local `source_repo` path's `origin` is re-resolved — nothing
-    /// from the pre-lock build is reused, so a fleet.yaml edit or an origin
-    /// URL change after it is honoured. Called under the pr-state flock
-    /// only right before a latched author/authority notice is enqueued (rare),
-    /// which is where the git cost lands; the pre-lock build is a pre-filter.
-    pub(crate) fn refreshed(&self, home: &std::path::Path) -> Self {
-        Self::build(home, &self.repo)
+    /// Lock-safe staleness check: re-read fleet.yaml (plain file read, NO
+    /// git) and compare with the bytes this index was built from. Called
+    /// under the pr-state flock right before a latched notice is queued; a
+    /// change means the pre-lock eligibility may be stale, so the caller
+    /// defers the emit to the next tick (no send, no latch).
+    pub(crate) fn fleet_unchanged(&self, home: &std::path::Path) -> bool {
+        let now = std::fs::read(crate::fleet::fleet_yaml_path(home))
+            .ok()
+            .as_deref()
+            .map(fingerprint);
+        now == self.fleet_fingerprint
     }
 
     /// Tier 1: first eligible instance whose `github_login` matches.
@@ -560,6 +580,25 @@ impl AuthorIndex {
             .find(|c| c.name.eq_ignore_ascii_case(gh_login))
             .map(|c| c.name.clone())
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: runs between the scanner's pre-lock `AuthorIndex` build and
+    /// its pr-state flock, to simulate a concurrent fleet.yaml edit.
+    pub(crate) static AFTER_AUTHOR_INDEX_HOOK: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        std::cell::RefCell::new(None);
+}
+
+/// Scanner call point for [`AFTER_AUTHOR_INDEX_HOOK`]; a no-op outside tests.
+#[inline]
+pub(crate) fn after_author_index_build() {
+    #[cfg(test)]
+    AFTER_AUTHOR_INDEX_HOOK.with(|h| {
+        if let Some(f) = h.borrow().as_ref() {
+            f();
+        }
+    });
 }
 
 /// Instances eligible for `repo`, sorted orchestrator-first then by name.
@@ -619,11 +658,24 @@ fn eligible_for(cfg: &crate::fleet::FleetConfig, repo: &str) -> Vec<AuthorCandid
 }
 
 /// `source_repo` → canonical GitHub slug: a bare slug / URL directly,
-/// otherwise the local checkout's `origin` remote.
+/// otherwise the local checkout's `origin` remote (a git subprocess).
 fn slug_for_source(src: &std::path::Path) -> Option<String> {
     src.to_str()
         .and_then(crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug)
-        .or_else(|| crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(src))
+        .or_else(|| {
+            debug_assert!(
+                !super::in_pr_state_flock(),
+                "#1617: `git remote get-url` must not run under the pr-state flock"
+            );
+            crate::mcp::handlers::dispatch_hook::derive_repo_from_remote_pub(src)
+        })
+}
+
+fn fingerprint(bytes: &[u8]) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    bytes.hash(&mut h);
+    h.finish()
 }
 
 // ─── tests ─────────────────────────────────────────────────────────────
@@ -1192,56 +1244,54 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// TOCTOU: `refreshed()` re-reads fleet.yaml, so an edit made after the
-    /// pre-lock `build()` decides eligibility at emit time (both directions).
-    #[test]
-    fn t8o_refreshed_rereads_fleet_yaml() {
-        let home = home_with_fleet(
-            "auth-refresh",
-            "instances:\n  dev:\n    backend: claude\n    source_repo: owner/repo\n  \
-             later:\n    backend: claude\n",
-        );
-        let pre = AuthorIndex::build(&home, "owner/repo");
-        assert!(pre.is_eligible("dev"));
-        assert!(!pre.is_eligible("later"));
-
-        std::fs::write(
-            crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  dev:\n    backend: claude\n    repo: none\n  \
-             later:\n    backend: claude\n    source_repo: owner/repo\n",
-        )
-        .unwrap();
-        let fresh = pre.refreshed(&home);
-        assert!(
-            !fresh.is_eligible("dev"),
-            "opt-out edited in after build is honoured"
-        );
-        assert!(
-            fresh.is_eligible("later"),
-            "identity added after build is honoured"
-        );
-        let _ = std::fs::remove_dir_all(&home);
-    }
-
-    /// TOCTOU: a LOCAL `source_repo` checkout whose `origin` changes after
-    /// the pre-lock `build()` is re-resolved by `refreshed()` (no stale
-    /// path→slug cache). Real git repo; team-tier path.
-    #[test]
-    fn t8p_refreshed_reresolves_local_origin_change() {
-        let home = tmp_home("auth-refresh-origin");
-        let work = home.join("work");
-        std::fs::create_dir_all(&work).unwrap();
-        let git = |args: &[&str]| {
+    /// Init a real git repo at `dir` with `origin` = `url` (AGEND bypass).
+    fn git_repo_with_origin(dir: &std::path::Path, url: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        for args in [
+            vec!["init", "-b", "main"],
+            vec!["remote", "add", "origin", url],
+        ] {
             let out = std::process::Command::new("git")
-                .args(args)
-                .current_dir(&work)
+                .args(&args)
+                .current_dir(dir)
                 .env("AGEND_GIT_BYPASS", "1")
                 .output()
                 .expect("git spawn");
             assert!(out.status.success(), "git {args:?} failed: {out:?}");
-        };
-        git(&["init", "-b", "main"]);
-        git(&["remote", "add", "origin", "git@github.com:owner/repo.git"]);
+        }
+    }
+
+    /// TOCTOU (lock-safe check): `fleet_unchanged()` is true for the bytes
+    /// the index was built from and false after any fleet.yaml edit.
+    #[test]
+    fn t8o_fleet_unchanged_detects_edit_after_build() {
+        let home = home_with_fleet(
+            "auth-fingerprint",
+            "instances:\n  dev:\n    backend: claude\n    repo: owner/repo\n",
+        );
+        let index = AuthorIndex::build(&home, "owner/repo");
+        assert!(index.is_eligible("dev"));
+        assert!(index.fleet_unchanged(&home));
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  dev:\n    backend: claude\n    repo: none\n",
+        )
+        .unwrap();
+        assert!(
+            !index.fleet_unchanged(&home),
+            "edit after build must be detected"
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// A LOCAL `source_repo` checkout is resolved from its CURRENT `origin`
+    /// at build time (real git repo, team tier): a remote changed before the
+    /// pre-lock build is honoured; no path→slug cache survives across builds.
+    #[test]
+    fn t8p_build_resolves_current_local_origin() {
+        let home = tmp_home("auth-origin");
+        let work = home.join("work");
+        git_repo_with_origin(&work, "git@github.com:owner/other.git");
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
             format!(
@@ -1251,22 +1301,53 @@ pub(crate) mod tests {
             ),
         )
         .unwrap();
-
-        let pre = AuthorIndex::build(&home, "owner/repo");
-        assert!(pre.is_eligible("dev"), "origin owner/repo → eligible");
-
-        git(&[
-            "remote",
-            "set-url",
-            "origin",
-            "git@github.com:owner/other.git",
-        ]);
-        let fresh = pre.refreshed(&home);
         assert!(
-            !fresh.is_eligible("dev"),
-            "origin moved to owner/other after build → must be ineligible at emit"
+            !AuthorIndex::build(&home, "owner/repo").is_eligible("dev"),
+            "origin is owner/other → ineligible for owner/repo"
+        );
+        let out = std::process::Command::new("git")
+            .args([
+                "remote",
+                "set-url",
+                "origin",
+                "git@github.com:owner/repo.git",
+            ])
+            .current_dir(&work)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        assert!(
+            AuthorIndex::build(&home, "owner/repo").is_eligible("dev"),
+            "next build sees the moved origin"
         );
         let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// #1617 guard: resolving a local `source_repo` (git subprocess) inside
+    /// a pr-state flock closure trips the debug assertion.
+    #[cfg(debug_assertions)]
+    #[test]
+    #[should_panic(expected = "#1617")]
+    fn t8q_git_lookup_under_pr_state_flock_is_rejected() {
+        let home = tmp_home("auth-flock-guard");
+        let work = home.join("work");
+        git_repo_with_origin(&work, "git@github.com:owner/repo.git");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  dev:\n    backend: claude\n    source_repo: {}\n",
+                work.display()
+            ),
+        )
+        .unwrap();
+        let _ = super::super::with_pr_state_or_create(
+            &home,
+            "owner/repo",
+            "br",
+            || fresh_state("br"),
+            |_| AuthorIndex::build(&home, "owner/repo"),
+        );
     }
 
     /// MockGhPoller smoke — verifies the test seam itself works.

@@ -2162,6 +2162,98 @@ fn pr_merged_not_sent_when_no_recipient_is_eligible() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// TOCTOU deferral: fleet.yaml changes between the pre-lock eligibility
+/// build and the flock → this tick sends nothing and sets NO latch; the next
+/// tick (terminal state, gh-poll skips it, the scan loop does not) emits.
+#[test]
+fn pr_merged_deferred_when_fleet_changes_before_lock_then_sent_next_tick() {
+    let mut s = new_state("sha-A", ReviewClass::Single);
+    s.pr_author = String::new();
+    let home = home_with_state("merged-defer", s);
+    let fleet = crate::fleet::fleet_yaml_path(&home);
+    let edit_target = fleet.clone();
+    super::gh_poll::AFTER_AUTHOR_INDEX_HOOK.with(|h| {
+        *h.borrow_mut() = Some(Box::new(move || {
+            let mut y = std::fs::read_to_string(&edit_target).unwrap();
+            y.push_str("# concurrent edit\n");
+            std::fs::write(&edit_target, y).unwrap();
+        }));
+    });
+    let poller = MockGhPoller::new(vec![Ok(vec![merged_meta_for("dev")])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+    super::gh_poll::AFTER_AUTHOR_INDEX_HOOK.with(|h| *h.borrow_mut() = None);
+
+    assert!(
+        all_inbox_kinds(&home).iter().all(|(_, k)| k != "pr-merged"),
+        "deferred tick sends nothing"
+    );
+    let st = load(&home, "owner/repo", "feat/test").expect("state kept for retry");
+    assert!(matches!(st.merge_state, MergeState::Merged { .. }));
+    assert_eq!(
+        st.ready_emitted_for_sha, None,
+        "no latch on a deferred emit"
+    );
+
+    let poller2 = MockGhPoller::new(vec![Ok(vec![merged_meta_for("dev")])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller2);
+    let sent: Vec<_> = all_inbox_kinds(&home)
+        .into_iter()
+        .filter(|(_, k)| k == "pr-merged")
+        .collect();
+    assert_eq!(sent.len(), 1, "next tick emits exactly once: {sent:?}");
+    assert_eq!(
+        crate::inbox::drain(&home, "dev")
+            .iter()
+            .filter(|m| m.kind.as_deref() == Some("pr-merged"))
+            .count(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// #1617 end-to-end: eligibility that needs a LOCAL `source_repo` (git)
+/// still delivers — the git lookup runs before the flock (a lookup under
+/// the flock would trip the debug guard and fail this test).
+#[test]
+fn pr_merged_with_local_source_repo_runs_git_outside_flock() {
+    let mut s = new_state("sha-A", ReviewClass::Single);
+    s.pr_author = String::new();
+    let home = home_with_state("merged-local-src", s);
+    let work = home.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    for args in [
+        vec!["init", "-b", "main"],
+        vec!["remote", "add", "origin", "git@github.com:owner/repo.git"],
+    ] {
+        let out = std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&work)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "git {args:?}: {out:?}");
+    }
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  dev:\n    backend: claude\n\
+             teams:\n  t:\n    members: [dev]\n    source_repo: {}\n",
+            work.display()
+        ),
+    )
+    .unwrap();
+    let poller = MockGhPoller::new(vec![Ok(vec![merged_meta_for("dev")])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+    assert_eq!(
+        crate::inbox::drain(&home, "dev")
+            .iter()
+            .filter(|m| m.kind.as_deref() == Some("pr-merged"))
+            .count(),
+        1
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
 /// Emit-time re-validation: a `pr_author` persisted by the pre-fix
 /// resolver that is NOT eligible for this repo is ignored — the notice
 /// goes to the eligible subscriber instead, never to the stale author.
