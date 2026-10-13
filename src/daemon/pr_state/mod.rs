@@ -1870,6 +1870,35 @@ pub fn resolve_author(state: &PrState) -> String {
     "fixup-lead".to_string()
 }
 
+/// Emit-time author for the repo/branch-bearing author notices
+/// (`[pr-merged]`, `[pr-closed-unmerged]`, `[pr-needs-rebase]`).
+///
+/// The stored `pr_author` is RE-VALIDATED against the current fleet rules
+/// (`index`, built for `state.repo`) rather than trusted: a value written by
+/// the pre-fix match-any resolver may name an instance unrelated to the repo.
+/// Ineligible → `tracing::warn` and fall back to the remaining eligible tiers
+/// (subscribers, then `fixup-lead`); nothing eligible → `None` and the caller
+/// sends nothing (fail-closed). The gh login is not persisted, so tiers 1-2
+/// cannot be re-run here; a later first-observation (empty `pr_author`) does.
+pub(crate) fn resolve_author_checked(
+    state: &PrState,
+    index: &gh_poll::AuthorIndex,
+) -> Option<String> {
+    if !state.pr_author.is_empty() {
+        if index.is_eligible(&state.pr_author) {
+            return Some(state.pr_author.clone());
+        }
+        tracing::warn!(
+            repo = %state.repo,
+            branch = %state.branch,
+            pr_author = %state.pr_author,
+            "pr_state: stored pr_author is not eligible for this repo under current rules \
+             (pre-fix match-any value?) — ignoring it"
+        );
+    }
+    gh_poll::resolve_author_with_index(index, None, state)
+}
+
 /// t-verdict-to-author-routing-design (#2): resolve the AGENT to notify for an
 /// author-facing pr-state signal (`[review-verdict]`, `[pr-ready-for-merge]`).
 ///

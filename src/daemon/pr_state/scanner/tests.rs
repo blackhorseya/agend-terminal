@@ -540,11 +540,13 @@ const BEHIND_BASE: &str = "1234567890abcdef1234567890abcdef12345678";
 
 /// Write a fleet.yaml so `resolve_merge_authority` returns `orch` (the team
 /// orchestrator = merge authority) for a PR authored by team member `member`.
+/// The team owns `owner/repo`, so `member` is eligible for author notices.
 fn write_team_fleet(home: &std::path::Path, orch: &str, member: &str) {
     std::fs::create_dir_all(home.join("inbox")).ok();
     let y = format!(
         "instances:\n  {member}:\n    backend: claude\n  {orch}:\n    backend: claude\n\
-             teams:\n  squad:\n    orchestrator: {orch}\n    members:\n      - {member}\n"
+             teams:\n  squad:\n    orchestrator: {orch}\n    source_repo: owner/repo\n    \
+             members:\n      - {member}\n"
     );
     std::fs::write(crate::fleet::fleet_yaml_path(home), y).expect("write fleet.yaml");
 }

@@ -1839,11 +1839,16 @@ fn t21_parse_review_class_fail_closed_2745() {
 use crate::daemon::pr_state::gh_poll::tests::MockGhPoller;
 use crate::daemon::pr_state::gh_poll::{GhPrMetadata, GhPrState};
 
+/// Fleet where the fixture author/subscriber `dev` is eligible for the
+/// fixture repo — author notices are fail-closed on repo identity.
+pub(super) const DEV_ELIGIBLE_FLEET: &str =
+    "instances:\n  dev:\n    backend: claude\n    repo: owner/repo\n";
+
 fn home_with_state(tag: &str, state: PrState) -> std::path::PathBuf {
     let home = std::env::temp_dir().join(format!("agend-986-int-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), DEV_ELIGIBLE_FLEET).unwrap();
     std::fs::create_dir_all(home.join("inbox")).ok();
     save(&home, &state).unwrap();
     home
@@ -1885,7 +1890,7 @@ fn t9_first_gh_observation_populates_pr_identity() {
 
     let loaded = load(&home, "owner/repo", "feat/test").unwrap();
     assert_eq!(loaded.pr_number, 970);
-    assert_eq!(loaded.pr_author, "dev"); // tier 2 direct name match (no fleet entries)
+    assert_eq!(loaded.pr_author, "dev"); // tier 2 direct name match (`dev` eligible for owner/repo)
     assert_eq!(loaded.gh_poll_failures, 0);
     assert!(loaded.last_gh_poll_at.is_some());
     let _ = std::fs::remove_dir_all(&home);
@@ -2073,6 +2078,93 @@ fn pr3_bound_branch_with_no_seed_is_discovered_and_armed() {
         "subscriber must be the BOUND agent (not the gh author login): {subs:?}"
     );
     std::fs::remove_dir_all(&parent).ok();
+}
+
+fn merged_meta_for(author: &str) -> GhPrMetadata {
+    GhPrMetadata {
+        number: 970,
+        author_login: author.into(),
+        head_ref: "feat/test".into(),
+        is_cross_repository: false,
+        is_draft: false,
+        state: GhPrState::Merged,
+        merged_at: Some("2026-05-20T04:17:09Z".to_string()),
+        head_ref_oid: None,
+        base_ref_oid: None,
+    }
+}
+
+/// Fail-closed delivery: a stored `pr_author` and a subscriber that have
+/// NO repo identity for this repo (pre-fix match-any leftovers) receive
+/// nothing — no `[pr-merged]` anywhere — and the terminal transition is
+/// still recorded so the next scan does not retry the emit.
+#[test]
+fn pr_merged_not_sent_when_no_recipient_is_eligible() {
+    let mut s = new_state("sha-A", ReviewClass::Single);
+    s.pr_author = "stranger".to_string();
+    s.subscribers = vec!["stranger".to_string()];
+    let home = home_with_state("merged-failclosed", s);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  stranger:\n    backend: claude\n    github_login: dev\n  \
+         fixup-lead:\n    backend: claude\n",
+    )
+    .unwrap();
+
+    let poller = MockGhPoller::new(vec![Ok(vec![merged_meta_for("dev")])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+
+    for who in ["stranger", "dev", "fixup-lead"] {
+        assert!(
+            crate::inbox::drain(&home, who)
+                .iter()
+                .all(|m| m.kind.as_deref() != Some("pr-merged")),
+            "no [pr-merged] may reach `{who}`"
+        );
+    }
+    let persisted = load(&home, "owner/repo", "feat/test").expect("state persists");
+    assert_eq!(
+        persisted.ready_emitted_for_sha.as_deref(),
+        Some("sha-A"),
+        "terminal transition still recorded (no retry loop)"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Emit-time re-validation: a `pr_author` persisted by the pre-fix
+/// resolver that is NOT eligible for this repo is ignored — the notice
+/// goes to the eligible subscriber instead, never to the stale author.
+#[test]
+fn stale_ineligible_pr_author_is_not_delivered_to() {
+    let mut s = new_state("sha-A", ReviewClass::Single);
+    s.pr_author = "stale-lead".to_string();
+    s.subscribers = vec!["dev".to_string()];
+    let home = home_with_state("merged-stale-author", s);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  stale-lead:\n    backend: claude\n    repo: owner/other\n  \
+         dev:\n    backend: claude\n    repo: owner/repo\n",
+    )
+    .unwrap();
+
+    let poller = MockGhPoller::new(vec![Ok(vec![merged_meta_for("someone")])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+
+    assert!(
+        crate::inbox::drain(&home, "stale-lead")
+            .iter()
+            .all(|m| m.kind.as_deref() != Some("pr-merged")),
+        "stale, repo-ineligible pr_author must not receive [pr-merged]"
+    );
+    let msgs = crate::inbox::drain(&home, "dev");
+    assert_eq!(
+        msgs.iter()
+            .filter(|m| m.kind.as_deref() == Some("pr-merged"))
+            .count(),
+        1,
+        "eligible subscriber receives it instead"
+    );
+    let _ = std::fs::remove_dir_all(&home);
 }
 
 /// #986 T4 — `gh state=MERGED + mergedAt!=None` fires
