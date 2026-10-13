@@ -2027,6 +2027,56 @@ pub fn resolve_merge_authority(home: &Path, state: &PrState) -> String {
     "fixup-lead".to_string()
 }
 
+/// [`resolve_merge_authority`] for the repo/branch-bearing `[pr-needs-rebase]`
+/// notice, fail-closed on repo identity: a candidate orchestrator (and the
+/// author / `fixup-lead` fallbacks) must be eligible for `state.repo` under
+/// `index` — the same rules as the author half. Without this a stale
+/// `pr_author` from another team's repo routes the notice to THAT team's
+/// orchestrator. Nothing eligible → `None` + warn; the caller sends nothing.
+pub(crate) fn resolve_merge_authority_checked(
+    home: &Path,
+    state: &PrState,
+    index: &gh_poll::AuthorIndex,
+) -> Option<String> {
+    let mut candidates: Vec<&str> = Vec::new();
+    match &state.verdict_state {
+        VerdictState::Verified { reviewers } => {
+            candidates.extend(reviewers.iter().map(|(r, _)| r.as_str()));
+        }
+        VerdictState::Rejected { reviewer, .. } | VerdictState::Unverified { reviewer, .. } => {
+            candidates.push(reviewer.as_str());
+        }
+        VerdictState::None | VerdictState::Pending => {}
+    }
+    candidates.extend(state.subscribers.iter().map(String::as_str));
+    if !state.pr_author.is_empty() {
+        candidates.push(state.pr_author.as_str());
+    }
+    for member in candidates {
+        if let Some(orch) = crate::teams::find_team_for(home, member)
+            .and_then(|t| t.orchestrator)
+            .filter(|o| !o.is_empty())
+        {
+            if index.is_eligible(&orch) {
+                return Some(orch);
+            }
+        }
+    }
+    for fallback in [state.pr_author.as_str(), "fixup-lead"] {
+        if !fallback.is_empty() && index.is_eligible(fallback) {
+            return Some(fallback.to_string());
+        }
+    }
+    tracing::warn!(
+        repo = %state.repo,
+        branch = %state.branch,
+        pr_author = %state.pr_author,
+        "pr_state: no merge authority eligible for this repo — failing closed \
+         (authority half of the notice not sent)"
+    );
+    None
+}
+
 /// t-verdict-to-author-routing-design (#2): the wire label for a verdict kind.
 #[cfg(test)]
 fn verdict_label(kind: &VerdictKind) -> &'static str {

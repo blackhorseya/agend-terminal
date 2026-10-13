@@ -3,8 +3,9 @@ use std::path::Path;
 use super::gh_poll;
 use super::{
     apply, format_ready_body, freshness_gate, is_merge_ready, pr_state_dir, remove,
-    resolve_author_checked, resolve_merge_authority, with_pr_state, CiState, DraftState, Event,
-    FreshnessGate, MergeState, PrState, ReviewClass, VerdictState, FRESHNESS_TTL_SECS,
+    resolve_author_checked, resolve_merge_authority, resolve_merge_authority_checked,
+    with_pr_state, CiState, DraftState, Event, FreshnessGate, MergeState, PrState, ReviewClass,
+    VerdictState, FRESHNESS_TTL_SECS,
 };
 
 enum ScanAction {
@@ -300,11 +301,15 @@ pub fn scan_and_emit_with(
                 .entry(repo.clone())
                 .or_insert_with(|| gh_poll::AuthorIndex::build(home, &repo))
         });
-        // Locked state can differ from the snapshot (it is re-read under the
-        // flock); only in that rare race is the index built under the lock.
-        let checked_author = |state: &PrState| match author_index {
-            Some(index) => resolve_author_checked(state, index),
-            None => resolve_author_checked(state, &gh_poll::AuthorIndex::build(home, &state.repo)),
+        // Emit-time eligibility, evaluated UNDER the flock right before a
+        // (latched, one-shot) notice is queued: fleet.yaml is re-read so an
+        // edit after the pre-lock build is honoured; the pre-lock index only
+        // contributes its resolved slugs (no git for already-seen paths). If
+        // the locked state differs from the snapshot (no pre-lock index), the
+        // index is built inline — the rare snapshot/lock race.
+        let fresh_index = |state: &PrState| match author_index {
+            Some(index) => index.refreshed(home),
+            None => gh_poll::AuthorIndex::build(home, &state.repo),
         };
         // #3182: assignment authority is inspected before entering the
         // pr_state flock. `list_active` is lock-free and the tri-state probe
@@ -498,10 +503,14 @@ pub fn scan_and_emit_with(
                             let body = format_needs_rebase_body(state, behind_by, &main_sha);
                             // Dedupe recipients BEFORE the ledger keys (owner ==
                             // authority ⇒ one notice, not two).
-                            // The author is fail-closed (may be absent); the merge
-                            // authority is the team orchestrator from fleet.yaml.
-                            let mut recipients = vec![resolve_merge_authority(home, state)];
-                            recipients.extend(checked_author(state));
+                            // Both halves are fail-closed on repo identity and may
+                            // be absent.
+                            let index = fresh_index(state);
+                            let mut recipients: Vec<String> =
+                                resolve_merge_authority_checked(home, state, &index)
+                                    .into_iter()
+                                    .chain(resolve_author_checked(state, &index))
+                                    .collect();
                             recipients.sort();
                             recipients.dedup();
                             for recipient in recipients {
@@ -699,7 +708,7 @@ pub fn scan_and_emit_with(
                         // nested binding flock are the #1617 lock-while-blocking
                         // class). Record the branch; release runs post-unlock.
                         release_after_unlock = Some((state.branch.clone(), "merge"));
-                        let author = checked_author(state);
+                        let author = resolve_author_checked(state, &fresh_index(state));
                         let body = format!(
                             "[pr-merged] {}@{} (head_sha {}, merged_at {})\n\n\
                              ⚠ Action checklist:\n\
@@ -745,7 +754,7 @@ pub fn scan_and_emit_with(
                 }
                 MergeState::ClosedUnmerged { closed_at } => {
                     if !already_emitted && !ledger_says_emitted {
-                        let author = checked_author(state);
+                        let author = resolve_author_checked(state, &fresh_index(state));
                         let body = format!(
                             "[pr-closed-unmerged] {}@{} (closed_at {})\n\n\
                              ⚠ Action checklist:\n\

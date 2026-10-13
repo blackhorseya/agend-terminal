@@ -463,7 +463,8 @@ pub(crate) fn resolve_author_with_index(
 ///   1. explicit `repo` override (Sprint 55 EC4) — invalid slug (e.g. the
 ///      `repo: none` opt-out sentinel) → no match, no fall-through;
 ///   2. instance `source_repo` (bare slug / URL / local origin remote);
-///   3. `source_repo` of the team(s) listing the instance in `members`;
+///   3. `source_repo` of the team(s) listing the instance in `members` or
+///      naming it `orchestrator`;
 ///   4. none of the above → NOT eligible (fail-closed).
 ///
 /// Step 4 replaces the former match-any compat, under which every
@@ -481,6 +482,10 @@ pub(crate) struct AuthorIndex {
     /// orchestrators first, then instance name ascending — never the
     /// iteration order of the `FleetConfig.instances` HashMap.
     eligible: Vec<AuthorCandidate>,
+    /// `source_repo` string → resolved slug. Local paths cost a
+    /// `git remote get-url`; [`AuthorIndex::refreshed`] reuses these so the
+    /// in-flock re-validation only shells out for a path it has never seen.
+    slugs: std::collections::HashMap<String, Option<String>>,
 }
 
 #[derive(Debug)]
@@ -491,58 +496,35 @@ struct AuthorCandidate {
 }
 
 impl AuthorIndex {
+    /// Load fleet.yaml and resolve eligibility for `repo` (may run git).
     pub(crate) fn build(home: &std::path::Path, repo: &str) -> Self {
-        let Ok(cfg) = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) else {
-            return Self {
-                repo: repo.to_string(),
-                eligible: Vec::new(),
-            };
-        };
-        Self::from_config(&cfg, repo)
+        Self::load(home, repo, std::collections::HashMap::new())
     }
 
-    fn from_config(cfg: &crate::fleet::FleetConfig, repo: &str) -> Self {
-        // Team slugs are resolved lazily, once per team.
-        let mut team_slugs: std::collections::HashMap<&str, Option<String>> =
-            std::collections::HashMap::new();
-        let mut eligible: Vec<AuthorCandidate> = Vec::new();
-        for (name, inst) in &cfg.instances {
-            let matches = match instance_repo_identity(inst) {
-                InstanceRepoIdentity::Explicit(slug) => {
-                    slug.is_some_and(|s| s.eq_ignore_ascii_case(repo))
-                }
-                InstanceRepoIdentity::Absent => cfg
-                    .teams
-                    .iter()
-                    .filter(|(_, t)| t.members.iter().any(|m| m == name))
-                    .any(|(team_name, t)| {
-                        team_slugs
-                            .entry(team_name.as_str())
-                            .or_insert_with(|| t.source_repo.as_deref().and_then(slug_for_source))
-                            .as_deref()
-                            .is_some_and(|s| s.eq_ignore_ascii_case(repo))
-                    }),
-            };
-            if matches {
-                let is_orchestrator = cfg
-                    .teams
-                    .values()
-                    .any(|t| t.orchestrator.as_deref() == Some(name.as_str()));
-                eligible.push(AuthorCandidate {
-                    name: name.clone(),
-                    github_login: inst.github_login.clone(),
-                    is_orchestrator,
-                });
-            }
-        }
-        eligible.sort_by(|a, b| {
-            b.is_orchestrator
-                .cmp(&a.is_orchestrator)
-                .then_with(|| a.name.cmp(&b.name))
-        });
+    /// Re-read fleet.yaml NOW and re-derive eligibility, reusing this
+    /// index's resolved `source_repo` slugs. Called under the pr-state flock
+    /// right before an author/authority notice is enqueued, so a fleet.yaml
+    /// edit between the pre-lock build and the (latched, one-shot) emit is
+    /// honoured. Only a `source_repo` path absent from the cache costs a git
+    /// subprocess under the lock — the rare "path added mid-tick" case.
+    pub(crate) fn refreshed(&self, home: &std::path::Path) -> Self {
+        Self::load(home, &self.repo, self.slugs.clone())
+    }
+
+    fn load(
+        home: &std::path::Path,
+        repo: &str,
+        mut slugs: std::collections::HashMap<String, Option<String>>,
+    ) -> Self {
+        let eligible = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+            Ok(cfg) => eligible_for(&cfg, repo, &mut slugs),
+            // Unreadable fleet.yaml → nobody is eligible (fail-closed).
+            Err(_) => Vec::new(),
+        };
         Self {
             repo: repo.to_string(),
             eligible,
+            slugs,
         }
     }
 
@@ -592,24 +574,60 @@ impl AuthorIndex {
     }
 }
 
-enum InstanceRepoIdentity {
-    /// Instance-level `repo` or `source_repo` is configured; `None` when it
-    /// does not resolve to a slug (never falls through to the team tier).
-    Explicit(Option<String>),
-    /// Neither field set — defer to team membership.
-    Absent,
-}
-
-fn instance_repo_identity(inst: &crate::fleet::InstanceConfig) -> InstanceRepoIdentity {
-    if let Some(explicit) = inst.repo.as_deref() {
-        return InstanceRepoIdentity::Explicit(
-            crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(explicit),
-        );
+/// Instances eligible for `repo`, sorted orchestrator-first then by name.
+/// Identity per instance: explicit `repo` → `source_repo` → `source_repo`
+/// of any team that lists it in `members` OR names it `orchestrator` →
+/// none (not eligible).
+fn eligible_for(
+    cfg: &crate::fleet::FleetConfig,
+    repo: &str,
+    slugs: &mut std::collections::HashMap<String, Option<String>>,
+) -> Vec<AuthorCandidate> {
+    let mut resolve = |src: &str| -> Option<String> {
+        slugs
+            .entry(src.to_string())
+            .or_insert_with(|| slug_for_source(std::path::Path::new(src)))
+            .clone()
+    };
+    let matches_repo = |slug: Option<String>| slug.is_some_and(|s| s.eq_ignore_ascii_case(repo));
+    let mut eligible: Vec<AuthorCandidate> = Vec::new();
+    for (name, inst) in &cfg.instances {
+        let matches = if let Some(explicit) = inst.repo.as_deref() {
+            // Invalid slug (e.g. the `repo: none` opt-out) → not eligible,
+            // never falls through to source_repo / team.
+            matches_repo(crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(
+                explicit,
+            ))
+        } else if let Some(sr) = inst.source_repo.as_deref() {
+            matches_repo(resolve(sr))
+        } else {
+            cfg.teams
+                .values()
+                .filter(|t| {
+                    t.members.iter().any(|m| m == name)
+                        || t.orchestrator.as_deref() == Some(name.as_str())
+                })
+                .filter_map(|t| t.source_repo.as_deref().and_then(|p| p.to_str()))
+                .any(|src| matches_repo(resolve(src)))
+        };
+        if matches {
+            let is_orchestrator = cfg
+                .teams
+                .values()
+                .any(|t| t.orchestrator.as_deref() == Some(name.as_str()));
+            eligible.push(AuthorCandidate {
+                name: name.clone(),
+                github_login: inst.github_login.clone(),
+                is_orchestrator,
+            });
+        }
     }
-    match inst.source_repo.as_deref() {
-        Some(sr) => InstanceRepoIdentity::Explicit(slug_for_source(std::path::Path::new(sr))),
-        None => InstanceRepoIdentity::Absent,
-    }
+    eligible.sort_by(|a, b| {
+        b.is_orchestrator
+            .cmp(&a.is_orchestrator)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    eligible
 }
 
 /// `source_repo` → canonical GitHub slug: a bare slug / URL directly,
@@ -1182,6 +1200,47 @@ pub(crate) mod tests {
         assert_eq!(
             resolve(&home, Some("shared-bot"), &state).as_deref(),
             Some("member")
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// TOCTOU: `refreshed()` re-reads fleet.yaml, so an edit made after the
+    /// pre-lock `build()` decides eligibility at emit time (both directions),
+    /// and it carries the resolved `source_repo` slugs forward.
+    #[test]
+    fn t8o_refreshed_rereads_fleet_yaml_and_reuses_slugs() {
+        let home = home_with_fleet(
+            "auth-refresh",
+            "instances:\n  dev:\n    backend: claude\n    source_repo: owner/repo\n  \
+             later:\n    backend: claude\n",
+        );
+        let pre = AuthorIndex::build(&home, "owner/repo");
+        assert!(pre.is_eligible("dev"));
+        assert!(!pre.is_eligible("later"));
+        assert_eq!(
+            pre.slugs.get("owner/repo"),
+            Some(&Some("owner/repo".to_string())),
+            "resolved source_repo slug cached for reuse"
+        );
+
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  dev:\n    backend: claude\n    repo: none\n  \
+             later:\n    backend: claude\n    source_repo: owner/repo\n",
+        )
+        .unwrap();
+        let fresh = pre.refreshed(&home);
+        assert!(
+            !fresh.is_eligible("dev"),
+            "opt-out edited in after build is honoured"
+        );
+        assert!(
+            fresh.is_eligible("later"),
+            "identity added after build is honoured"
+        );
+        assert!(
+            fresh.slugs.contains_key("owner/repo"),
+            "slug cache carried forward"
         );
         let _ = std::fs::remove_dir_all(&home);
     }

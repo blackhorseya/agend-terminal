@@ -2080,6 +2080,37 @@ fn pr3_bound_branch_with_no_seed_is_discovered_and_armed() {
     std::fs::remove_dir_all(&parent).ok();
 }
 
+/// Every `(inbox file, kind)` persisted under `home/inbox`, walked
+/// recursively (name- AND id-keyed files) — for "nothing delivered to
+/// ANYONE" assertions that cannot enumerate recipients up front.
+pub(super) fn all_inbox_kinds(home: &std::path::Path) -> Vec<(String, String)> {
+    fn walk(dir: &std::path::Path, out: &mut Vec<(String, String)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() {
+                walk(&path, out);
+                continue;
+            }
+            let Ok(content) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            for line in content.lines() {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(line) {
+                    if let Some(kind) = v["kind"].as_str() {
+                        out.push((path.display().to_string(), kind.to_string()));
+                    }
+                }
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(&home.join("inbox"), &mut out);
+    out
+}
+
 fn merged_meta_for(author: &str) -> GhPrMetadata {
     GhPrMetadata {
         number: 970,
@@ -2114,14 +2145,14 @@ fn pr_merged_not_sent_when_no_recipient_is_eligible() {
     let poller = MockGhPoller::new(vec![Ok(vec![merged_meta_for("dev")])]);
     scan_and_emit_with(&home, &empty_registry(), &poller);
 
-    for who in ["stranger", "dev", "fixup-lead"] {
-        assert!(
-            crate::inbox::drain(&home, who)
-                .iter()
-                .all(|m| m.kind.as_deref() != Some("pr-merged")),
-            "no [pr-merged] may reach `{who}`"
-        );
-    }
+    let leaked: Vec<_> = all_inbox_kinds(&home)
+        .into_iter()
+        .filter(|(_, kind)| kind == "pr-merged")
+        .collect();
+    assert!(
+        leaked.is_empty(),
+        "no [pr-merged] may reach ANY inbox: {leaked:?}"
+    );
     let persisted = load(&home, "owner/repo", "feat/test").expect("state persists");
     assert_eq!(
         persisted.ready_emitted_for_sha.as_deref(),
