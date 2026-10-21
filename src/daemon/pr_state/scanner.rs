@@ -3,9 +3,8 @@ use std::path::Path;
 use super::gh_poll;
 use super::{
     apply, format_ready_body, freshness_gate, is_merge_ready, pr_state_dir, remove,
-    resolve_author_checked, resolve_merge_authority, resolve_merge_authority_checked,
-    with_pr_state, CiState, DraftState, Event, FreshnessGate, MergeState, PrState, ReviewClass,
-    VerdictState, FRESHNESS_TTL_SECS,
+    resolve_author_checked, resolve_merge_authority_checked, with_pr_state, CiState, DraftState,
+    Event, FreshnessGate, MergeState, PrState, ReviewClass, VerdictState, FRESHNESS_TTL_SECS,
 };
 
 enum ScanAction {
@@ -20,6 +19,44 @@ enum ReviewDispatchStatus {
     Satisfied,
     Required,
     AuthorityUnavailable,
+}
+
+/// Whether `snapshot` can emit a repo-bearing notice this tick: the author
+/// half (`[pr-merged]` / `[pr-closed-unmerged]` / `[pr-needs-rebase]`) or the
+/// merge-authority half (`[pr-ready-for-merge]`, `[pr-needs-rebase]`,
+/// `[review-class-unresolved]`, `[review-dispatch-*]`). Only these pay for a
+/// [`gh_poll::AuthorIndex`] build (it may run `git`); a locked state that has
+/// diverged from the snapshot is caught by `emit_index` and deferred.
+fn may_emit_repo_notice(
+    snapshot: &PrState,
+    authority: crate::daemon::assignment_authority::BranchAuthority,
+    assignments: &[crate::daemon::assignment_authority::ActiveAssignment],
+) -> bool {
+    if matches!(
+        snapshot.merge_state,
+        MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. } | MergeState::MergeReady
+    ) {
+        return true;
+    }
+    let head = Some(snapshot.head_sha.as_str());
+    let class_unresolved_due = matches!(snapshot.review_class, ReviewClass::Unresolved)
+        && matches!(snapshot.merge_state, MergeState::NotReady)
+        && matches!(&snapshot.ci_state, CiState::Green { sha, .. } if sha == &snapshot.head_sha)
+        && matches!(&snapshot.verdict_state, VerdictState::Verified { .. })
+        && snapshot.diagnostic_emitted_for_sha.as_deref() != head;
+    let dispatch_due = match review_dispatch_status(snapshot, authority, assignments) {
+        ReviewDispatchStatus::Required => {
+            snapshot.review_dispatch_emitted_for_sha.as_deref() != head
+        }
+        ReviewDispatchStatus::AuthorityUnavailable => {
+            snapshot
+                .review_dispatch_unavailable_emitted_for_sha
+                .as_deref()
+                != head
+        }
+        ReviewDispatchStatus::Satisfied | ReviewDispatchStatus::NotApplicable => false,
+    };
+    class_unresolved_due || dispatch_due
 }
 
 /// Classify the review-dispatch obligation from an already-read authority
@@ -291,11 +328,25 @@ pub fn scan_and_emit_with(
         // per-PR flock (it may run `git remote get-url`; #1617) — and only
         // for states that can emit a repo-bearing author notice. Per PR, not
         // per tick, so the gap to the flock is just this iteration.
-        let author_index: Option<gh_poll::AuthorIndex> = matches!(
-            snapshot.merge_state,
-            MergeState::Merged { .. } | MergeState::ClosedUnmerged { .. } | MergeState::MergeReady
-        )
-        .then(|| gh_poll::AuthorIndex::build(home, &repo));
+        //
+        // #3182: assignment authority is inspected before entering the
+        // pr_state flock. `list_active` is lock-free and the tri-state probe
+        // preserves the distinction between absent and unreadable authority.
+        // Probed before the index so the index predicate can see whether a
+        // review-dispatch diagnostic is due.
+        let review_authority =
+            crate::daemon::assignment_authority::probe_branch_authority(home, &repo, &branch);
+        let review_assignments = if matches!(
+            review_authority,
+            crate::daemon::assignment_authority::BranchAuthority::Active
+        ) {
+            crate::daemon::assignment_authority::list_active(home, &repo, &branch)
+        } else {
+            Vec::new()
+        };
+        let author_index: Option<gh_poll::AuthorIndex> =
+            may_emit_repo_notice(&snapshot, review_authority, &review_assignments)
+                .then(|| gh_poll::AuthorIndex::build(home, &repo));
         gh_poll::after_author_index_build();
         // Under the flock: the pre-built index is used only if fleet.yaml is
         // byte-identical to what it was built from (plain read, NO git). No
@@ -323,20 +374,6 @@ pub fn scan_and_emit_with(
             }
             index
         };
-        // #3182: assignment authority is inspected before entering the
-        // pr_state flock. `list_active` is lock-free and the tri-state probe
-        // preserves the distinction between absent and unreadable authority.
-        let review_authority =
-            crate::daemon::assignment_authority::probe_branch_authority(home, &repo, &branch);
-        let review_assignments = if matches!(
-            review_authority,
-            crate::daemon::assignment_authority::BranchAuthority::Active
-        ) {
-            crate::daemon::assignment_authority::list_active(home, &repo, &branch)
-        } else {
-            Vec::new()
-        };
-
         // #1342: all emit + flag-set under flock to prevent lost-update race.
         // #bughunt3 (#1617 lock-while-blocking class): the worktree auto-release
         // does a `git` subprocess + acquires a SECOND (binding) flock — it must
@@ -474,30 +511,45 @@ pub fn scan_and_emit_with(
                             // (the PR #2058 mis-route). `[review-verdict]` keeps the
                             // author-facing resolver; only this terminal signal changes
                             // audience.
-                            let recipient = resolve_merge_authority(home, state);
-                            let body = format_ready_body(state);
-                            let msg =
-                                build_event_message("pr-ready-for-merge", &recipient, state, body);
-                            // #1629: defer the enqueue (see top of fn). Set the dedup
-                            // flag optimistically under the flock. The pr-ready arm has
-                            // NO persistent ledger backstop (unlike the Merged/
-                            // ClosedUnmerged arms), so the deferred `pending_ready` drain
-                            // below RESETS this flag if the post-flock enqueue fails —
-                            // otherwise a failed enqueue would leave the flag set and the
-                            // signal would be lost until head_sha next changes. The
-                            // flock-free emit (the reset is a separate post-flock
-                            // `with_pr_state`) preserves the #1617 lock-while-blocking
-                            // guarantee.
-                            state.ready_emitted_for_sha = Some(state.head_sha.clone());
-                            dirty = true;
-                            tracing::info!(
-                                repo = %state.repo,
-                                branch = %state.branch,
-                                head = %state.head_sha,
-                                recipient = %recipient,
-                                "#972 pr_state: [pr-ready-for-merge] queued (emit after flock drop)"
-                            );
-                            pending_ready = Some((recipient, msg, state.head_sha.clone()));
+                            //
+                            // The authority must be eligible for this repo (same fail-closed
+                            // rules as the author half): a stale reviewer / subscriber / author
+                            // from another team must not route this repo's notice to THAT
+                            // team's orchestrator. Deferred (see `emit_index`) → no emit, no
+                            // latch; retried next tick. Nothing eligible → latched as if sent,
+                            // nothing queued (the resolver warn-logs).
+                            if let Some(index) = emit_index(state, "pr-ready-for-merge") {
+                                let recipient = resolve_merge_authority_checked(home, state, index);
+                                // #1629: defer the enqueue (see top of fn). Set the dedup
+                                // flag optimistically under the flock. The pr-ready arm has
+                                // NO persistent ledger backstop (unlike the Merged/
+                                // ClosedUnmerged arms), so the deferred `pending_ready` drain
+                                // below RESETS this flag if the post-flock enqueue fails —
+                                // otherwise a failed enqueue would leave the flag set and the
+                                // signal would be lost until head_sha next changes. The
+                                // flock-free emit (the reset is a separate post-flock
+                                // `with_pr_state`) preserves the #1617 lock-while-blocking
+                                // guarantee.
+                                state.ready_emitted_for_sha = Some(state.head_sha.clone());
+                                dirty = true;
+                                if let Some(recipient) = recipient {
+                                    let body = format_ready_body(state);
+                                    let msg = build_event_message(
+                                        "pr-ready-for-merge",
+                                        &recipient,
+                                        state,
+                                        body,
+                                    );
+                                    tracing::info!(
+                                        repo = %state.repo,
+                                        branch = %state.branch,
+                                        head = %state.head_sha,
+                                        recipient = %recipient,
+                                        "#972 pr_state: [pr-ready-for-merge] queued (emit after flock drop)"
+                                    );
+                                    pending_ready = Some((recipient, msg, state.head_sha.clone()));
+                                }
+                            }
                         }
                         FreshnessGate::Behind { behind_by } => {
                             // #2749: PROVEN behind current main — suppress pr-ready
@@ -588,26 +640,36 @@ pub fn scan_and_emit_with(
                 && matches!(&state.verdict_state, VerdictState::Verified { .. })
                 && state.diagnostic_emitted_for_sha.as_deref() != Some(state.head_sha.as_str())
             {
-                let recipient = resolve_merge_authority(home, state);
-                let sha_short = &state.head_sha[..8.min(state.head_sha.len())];
-                let body = format!(
-                    "[review-class-unresolved] {}@{} (head {sha_short}): CI green ∧ VERIFIED, but \
-                     the ci-watch review_class is UNRESOLVED (absent/unknown/typo) — the merge gate \
-                     is fail-closed and will NOT open (#2745). Re-arm with an explicit threshold: \
-                     `ci action=watch repository={} branch={} review_class=single|dual`.",
-                    state.repo, state.branch, state.repo, state.branch,
-                );
-                let msg = build_event_message("review-class-unresolved", &recipient, state, body);
-                pending_emits.push((recipient, msg));
-                state.diagnostic_emitted_for_sha = Some(state.head_sha.clone());
-                dirty = true;
-                tracing::warn!(
-                    repo = %state.repo,
-                    branch = %state.branch,
-                    head = %state.head_sha,
-                    "#2745 pr_state: [review-class-unresolved] queued — legacy/absent review_class; \
-                     watch needs explicit re-arm (no merge-ready possible until then)"
-                );
+                // Fail-closed on repo identity, same rules as `[pr-needs-rebase]`.
+                // Deferred (see `emit_index`) → no emit, no latch; nothing eligible →
+                // latched as if sent, nothing queued (the resolver warn-logs).
+                if let Some(index) = emit_index(state, "review-class-unresolved") {
+                    if let Some(recipient) = resolve_merge_authority_checked(home, state, index) {
+                        let sha_short = &state.head_sha[..8.min(state.head_sha.len())];
+                        let body = format!(
+                            "[review-class-unresolved] {}@{} (head {sha_short}): CI green ∧ VERIFIED, but \
+                             the ci-watch review_class is UNRESOLVED (absent/unknown/typo) — the merge gate \
+                             is fail-closed and will NOT open (#2745). Re-arm with an explicit threshold: \
+                             `ci action=watch repository={} branch={} review_class=single|dual`.",
+                            state.repo, state.branch, state.repo, state.branch,
+                        );
+                        let msg =
+                            build_event_message("review-class-unresolved", &recipient, state, body);
+                        pending_emits.push((recipient, msg));
+                        state.diagnostic_emitted_for_sha = Some(state.head_sha.clone());
+                        dirty = true;
+                        tracing::warn!(
+                            repo = %state.repo,
+                            branch = %state.branch,
+                            head = %state.head_sha,
+                            "#2745 pr_state: [review-class-unresolved] queued — legacy/absent review_class; \
+                             watch needs explicit re-arm (no merge-ready possible until then)"
+                        );
+                    } else {
+                        state.diagnostic_emitted_for_sha = Some(state.head_sha.clone());
+                        dirty = true;
+                    }
+                }
             }
 
             // #3182: an Open, non-draft, exact-head PR with a resolved review
@@ -627,37 +689,50 @@ pub fn scan_and_emit_with(
                     if state.review_dispatch_emitted_for_sha.as_deref()
                         != Some(state.head_sha.as_str())
                     {
-                        let recipient = resolve_merge_authority(home, state);
-                        let class = match state.review_class {
-                            ReviewClass::Single => "single",
-                            ReviewClass::Dual => "dual",
-                            ReviewClass::Unresolved => "unresolved",
-                        };
-                        let sha_short = &state.head_sha[..8.min(state.head_sha.len())];
-                        let body = format!(
-                            "[review-dispatch-required] {}#{} (head {sha_short}): PR is OPEN and non-draft at the exact observed head, but exact typed reviewer coverage is below the required threshold (review_class={class}). Merge state remains NotReady. The merge authority must dispatch explicit reviewer-assignment coverage for this exact PR head; no reviewer or CI target was inferred (#3182).",
-                            state.repo, state.pr_number,
-                        );
-                        let msg = build_event_message(
-                            "review-dispatch-required",
-                            &recipient,
-                            state,
-                            body,
-                        );
-                        pending_review_dispatch.push(PendingReviewDispatch {
-                            recipient,
-                            message: msg,
-                            head_sha: state.head_sha.clone(),
-                            status: ReviewDispatchStatus::Required,
-                        });
-                        state.review_dispatch_emitted_for_sha = Some(state.head_sha.clone());
-                        dirty = true;
-                        tracing::warn!(
-                            repo = %state.repo,
-                            branch = %state.branch,
-                            head = %state.head_sha,
-                            "#3182 pr_state: [review-dispatch-required] queued for merge authority"
-                        );
+                        // Fail-closed on repo identity, same rules as `[pr-needs-rebase]`.
+                        // Deferred (see `emit_index`) → no emit, no latch; nothing eligible →
+                        // latched as if sent, nothing queued (the resolver warn-logs).
+                        if let Some(index) = emit_index(state, "review-dispatch-required") {
+                            if let Some(recipient) =
+                                resolve_merge_authority_checked(home, state, index)
+                            {
+                                let class = match state.review_class {
+                                    ReviewClass::Single => "single",
+                                    ReviewClass::Dual => "dual",
+                                    ReviewClass::Unresolved => "unresolved",
+                                };
+                                let sha_short = &state.head_sha[..8.min(state.head_sha.len())];
+                                let body = format!(
+                                    "[review-dispatch-required] {}#{} (head {sha_short}): PR is OPEN and non-draft at the exact observed head, but exact typed reviewer coverage is below the required threshold (review_class={class}). Merge state remains NotReady. The merge authority must dispatch explicit reviewer-assignment coverage for this exact PR head; no reviewer or CI target was inferred (#3182).",
+                                    state.repo, state.pr_number,
+                                );
+                                let msg = build_event_message(
+                                    "review-dispatch-required",
+                                    &recipient,
+                                    state,
+                                    body,
+                                );
+                                pending_review_dispatch.push(PendingReviewDispatch {
+                                    recipient,
+                                    message: msg,
+                                    head_sha: state.head_sha.clone(),
+                                    status: ReviewDispatchStatus::Required,
+                                });
+                                state.review_dispatch_emitted_for_sha =
+                                    Some(state.head_sha.clone());
+                                dirty = true;
+                                tracing::warn!(
+                                    repo = %state.repo,
+                                    branch = %state.branch,
+                                    head = %state.head_sha,
+                                    "#3182 pr_state: [review-dispatch-required] queued for merge authority"
+                                );
+                            } else {
+                                state.review_dispatch_emitted_for_sha =
+                                    Some(state.head_sha.clone());
+                                dirty = true;
+                            }
+                        }
                     }
                 }
                 ReviewDispatchStatus::AuthorityUnavailable => {
@@ -667,33 +742,45 @@ pub fn scan_and_emit_with(
                     if state.review_dispatch_unavailable_emitted_for_sha.as_deref()
                         != Some(state.head_sha.as_str())
                     {
-                        let recipient = resolve_merge_authority(home, state);
-                        let sha_short = &state.head_sha[..8.min(state.head_sha.len())];
-                        let body = format!(
-                            "[review-dispatch-unavailable] {}#{} (head {sha_short}): the reviewer-assignment authority store is unreadable, so exact reviewer dispatch cannot be proven. Merge state remains NotReady and the daemon will not infer reviewers, tasks, branches, or CI targets. Repair the assignment authority and retry this exact head (#3182).",
-                            state.repo, state.pr_number,
-                        );
-                        let msg = build_event_message(
-                            "review-dispatch-unavailable",
-                            &recipient,
-                            state,
-                            body,
-                        );
-                        pending_review_dispatch.push(PendingReviewDispatch {
-                            recipient,
-                            message: msg,
-                            head_sha: state.head_sha.clone(),
-                            status: ReviewDispatchStatus::AuthorityUnavailable,
-                        });
-                        state.review_dispatch_unavailable_emitted_for_sha =
-                            Some(state.head_sha.clone());
-                        dirty = true;
-                        tracing::error!(
-                            repo = %state.repo,
-                            branch = %state.branch,
-                            head = %state.head_sha,
-                            "#3182 pr_state: [review-dispatch-unavailable] queued for merge authority"
-                        );
+                        // Fail-closed on repo identity, same rules as `[pr-needs-rebase]`.
+                        // Deferred (see `emit_index`) → no emit, no latch; nothing eligible →
+                        // latched as if sent, nothing queued (the resolver warn-logs).
+                        if let Some(index) = emit_index(state, "review-dispatch-unavailable") {
+                            if let Some(recipient) =
+                                resolve_merge_authority_checked(home, state, index)
+                            {
+                                let sha_short = &state.head_sha[..8.min(state.head_sha.len())];
+                                let body = format!(
+                                    "[review-dispatch-unavailable] {}#{} (head {sha_short}): the reviewer-assignment authority store is unreadable, so exact reviewer dispatch cannot be proven. Merge state remains NotReady and the daemon will not infer reviewers, tasks, branches, or CI targets. Repair the assignment authority and retry this exact head (#3182).",
+                                    state.repo, state.pr_number,
+                                );
+                                let msg = build_event_message(
+                                    "review-dispatch-unavailable",
+                                    &recipient,
+                                    state,
+                                    body,
+                                );
+                                pending_review_dispatch.push(PendingReviewDispatch {
+                                    recipient,
+                                    message: msg,
+                                    head_sha: state.head_sha.clone(),
+                                    status: ReviewDispatchStatus::AuthorityUnavailable,
+                                });
+                                state.review_dispatch_unavailable_emitted_for_sha =
+                                    Some(state.head_sha.clone());
+                                dirty = true;
+                                tracing::error!(
+                                    repo = %state.repo,
+                                    branch = %state.branch,
+                                    head = %state.head_sha,
+                                    "#3182 pr_state: [review-dispatch-unavailable] queued for merge authority"
+                                );
+                            } else {
+                                state.review_dispatch_unavailable_emitted_for_sha =
+                                    Some(state.head_sha.clone());
+                                dirty = true;
+                            }
+                        }
                     }
                 }
                 ReviewDispatchStatus::Satisfied => {

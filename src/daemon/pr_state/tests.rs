@@ -939,6 +939,50 @@ fn t16_format_ready_body_with_and_without_pr_number() {
     assert!(body.contains("rev-1"), "reviewers: {body}");
 }
 
+/// -209(a): `[review-class-unresolved]` goes to the merge authority, which
+/// must be eligible for the PR's repo — a candidate from another team's repo
+/// must not route it to that team's orchestrator.
+#[test]
+fn review_class_unresolved_not_sent_to_foreign_team_authority_209a() {
+    let dir = tmp_home_for_1002("unresolved-foreign-209a");
+    std::fs::create_dir_all(dir.join("inbox")).ok();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&dir),
+        "instances:\n  dev:\n    backend: claude\n  lead-w:\n    backend: claude\n\
+         teams:\n  foreign:\n    orchestrator: lead-w\n    source_repo: owner/other\n    \
+         members:\n      - dev\n",
+    )
+    .unwrap();
+    let mut s = new_state("sha-A", ReviewClass::Unresolved);
+    s.ci_state = CiState::Green {
+        sha: "sha-A".to_string(),
+        observed_at: now(),
+    };
+    s.verdict_state = VerdictState::Verified {
+        reviewers: vec![("rev-1".to_string(), "sha-A".to_string())],
+    };
+    s.merge_state = MergeState::NotReady;
+    s.pr_author = "dev".to_string();
+    save(&dir, &s).unwrap();
+
+    let poller = MockGhPoller::new(vec![Ok(vec![])]);
+    scan_and_emit_with(&dir, &empty_registry(), &poller);
+
+    assert!(
+        all_inbox_kinds(&dir)
+            .iter()
+            .all(|(_, k)| k != "review-class-unresolved"),
+        "foreign-team orchestrator must not get this repo's diagnostic"
+    );
+    let reloaded = load(&dir, "owner/repo", "feat/test").unwrap();
+    assert_eq!(
+        reloaded.diagnostic_emitted_for_sha.as_deref(),
+        Some("sha-A"),
+        "fail-closed is latched for this head"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// T_integration: scan_and_emit fires `[pr-ready-for-merge]` to
 /// author's inbox once per MergeReady transition. Subsequent
 /// scans (same head_sha) do NOT re-emit (debounce). Hits
@@ -3525,13 +3569,15 @@ fn t20_1017_replay_age_threshold_is_fixed_1h() {
 }
 
 /// #2059-#3: write a fleet.yaml team so `find_team_for` resolves.
+/// The orchestrator is an instance too, and the team owns `owner/repo` (the
+/// fixtures' PR repo), so orchestrator and members pass the repo-identity gate on every author / authority notice.
 pub(super) fn write_team_fleet(home: &std::path::Path, orch: &str, members: &[&str]) {
     let mut y = String::from("instances:\n");
-    for m in members {
+    for m in members.iter().copied().chain(std::iter::once(orch)) {
         y.push_str(&format!("  {m}:\n    backend: claude\n"));
     }
     y.push_str(&format!(
-        "teams:\n  squad:\n    orchestrator: {orch}\n    members:\n"
+        "teams:\n  squad:\n    orchestrator: {orch}\n    source_repo: owner/repo\n    members:\n"
     ));
     for m in members {
         y.push_str(&format!("      - {m}\n"));

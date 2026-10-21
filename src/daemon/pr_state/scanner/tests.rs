@@ -2323,3 +2323,111 @@ fn b4_scanner_self_heal_persists_then_redrive_recomputes_bidirectional() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+// -209(a): the merge-authority half of every repo-bearing notice is
+// fail-closed on repo identity — `[pr-ready-for-merge]`,
+// `[review-dispatch-required]` (and `[review-class-unresolved]`, pinned in
+// `pr_state::tests`). A candidate from another team's repo must not route
+// this repo's notice to THAT team's orchestrator.
+
+fn write_foreign_fleet(home: &std::path::Path) {
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(home),
+        "instances:\n  foreign-dev:\n    backend: claude\n  foreign-lead:\n    backend: claude\n\
+         teams:\n  foreign:\n    orchestrator: foreign-lead\n    source_repo: owner/other\n    \
+         members:\n      - foreign-dev\n",
+    )
+    .unwrap();
+}
+
+fn kind_count(home: &std::path::Path, kind: &str) -> usize {
+    crate::daemon::pr_state::tests::all_inbox_kinds(home)
+        .into_iter()
+        .filter(|(_, k)| k == kind)
+        .count()
+}
+
+#[test]
+fn pr_ready_not_sent_to_foreign_team_authority_209a() {
+    let home = tmp_home(line!());
+    write_foreign_fleet(&home);
+    let mut s = merge_ready_state("owner/repo", "feat/x", BEHIND_HEAD, 77);
+    s.pr_author = "foreign-dev".into();
+    stamp_fresh_tuple(&mut s, BEHIND_HEAD, BEHIND_BASE, 0);
+    save(&home, &s).unwrap();
+
+    scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+
+    assert_eq!(
+        kind_count(&home, "pr-ready-for-merge"),
+        0,
+        "foreign-team orchestrator must not get this repo's pr-ready"
+    );
+    // Fail-closed is latched for this head (not re-evaluated every tick).
+    let reloaded = load(&home, "owner/repo", "feat/x").unwrap();
+    assert_eq!(reloaded.ready_emitted_for_sha.as_deref(), Some(BEHIND_HEAD));
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// Positive control for the test above: same state, but the author's team
+/// owns the repo ⇒ its orchestrator gets exactly one pr-ready.
+#[test]
+fn pr_ready_reaches_eligible_authority_209a() {
+    let home = tmp_home(line!());
+    write_team_fleet(&home, "lead", "dev");
+    let mut s = merge_ready_state("owner/repo", "feat/x", BEHIND_HEAD, 77);
+    s.pr_author = "dev".into();
+    stamp_fresh_tuple(&mut s, BEHIND_HEAD, BEHIND_BASE, 0);
+    save(&home, &s).unwrap();
+
+    scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+
+    assert_eq!(
+        kind_count(&home, "pr-ready-for-merge"),
+        1,
+        "exactly one notice"
+    );
+    let to_lead = crate::inbox::drain(&home, "lead");
+    assert_eq!(to_lead.len(), 1, "and it went to this repo's orchestrator");
+    assert_eq!(to_lead[0].kind.as_deref(), Some("pr-ready-for-merge"));
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn review_dispatch_not_sent_to_foreign_team_authority_209a() {
+    let home = tmp_home(line!());
+    write_foreign_fleet(&home);
+    let head = "abcdef0123456789abcdef0123456789abcdef01";
+    let base = "1234567890abcdef1234567890abcdef12345678";
+    super::super::record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/review-dispatch",
+        head,
+        super::super::CiConclusion::Green,
+        vec!["foreign-dev".into()],
+        ReviewClass::Single,
+    );
+    let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(
+        3182,
+        "feat/review-dispatch",
+        head,
+        base,
+    )])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+
+    assert_eq!(
+        kind_count(&home, "review-dispatch-required"),
+        0,
+        "foreign-team orchestrator must not get this repo's review-dispatch"
+    );
+    let state = load(&home, "owner/repo", "feat/review-dispatch").unwrap();
+    assert_eq!(state.merge_state, MergeState::NotReady);
+    assert_eq!(
+        state.review_dispatch_emitted_for_sha.as_deref(),
+        Some(head),
+        "fail-closed is latched for this head"
+    );
+    let _ = std::fs::remove_dir_all(home);
+}
