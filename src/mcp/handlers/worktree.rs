@@ -176,9 +176,23 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
             let code = match err.code {
                 ErrorCode::ProtectedBranch => "e4_5_protected_branch",
                 ErrorCode::LeaseConflict => "cross_agent_conflict",
+                ErrorCode::StaleWorktreeDir => "stale_worktree_dir",
+                ErrorCode::EnvSourceMissing => "env_source_missing",
                 _ => "lease_failed",
             };
-            json!({"error": err.message, "code": code})
+            let mut response = json!({"error": err.message, "code": code});
+            if err.code == ErrorCode::StaleWorktreeDir {
+                if let Some(context) = err
+                    .raw
+                    .as_deref()
+                    .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                {
+                    for key in ["path", "marker", "hint"] {
+                        response[key] = context[key].clone();
+                    }
+                }
+            }
+            response
         }
     }
 }
@@ -201,7 +215,9 @@ pub(crate) fn handle_release_worktree(home: &Path, args: &Value, sender: &Option
     };
 
     if args["force"].as_bool().unwrap_or(false) {
-        return handle_release_worktree_force(home, args, agent, sender);
+        let response = handle_release_worktree_force(home, args, agent, sender);
+        notify_release_completed(home, agent, sender, &response);
+        return response;
     }
 
     crate::validate_name_or_err!(agent);
@@ -216,10 +232,24 @@ pub(crate) fn handle_release_worktree(home: &Path, args: &Value, sender: &Option
                 "released": false,
                 "error": format!("release refused: bind/rebase in flight; {error}"),
                 "code": "lifecycle_conflict"
-            })
+            });
         }
     };
     let dry_run = args["dry_run"].as_bool().unwrap_or(false);
+    // #3696: clean_empty_init_commits mutates the bound worktree before the
+    // lower release transaction starts, so publish the signed recovery fence
+    // at the real MCP entry point first.  An absent binding remains the normal
+    // idempotent no-op and is handled by release_full below.
+    if !dry_run {
+        if let Err(error) = crate::worktree_pool::prepare_release_journal(home, agent) {
+            return json!({
+                "released": false,
+                "error": error,
+                "code": "release_incomplete",
+                "stage": "release_journal"
+            });
+        }
+    }
     // #789: clean empty init commits before removal (best-effort).
     if !dry_run {
         if let Some(wt) = crate::binding::read(home, agent)
@@ -229,7 +259,38 @@ pub(crate) fn handle_release_worktree(home: &Path, args: &Value, sender: &Option
         }
     }
     let outcome = crate::worktree_pool::release_full_with_permit(home, agent, dry_run, &permit);
-    serde_json::to_value(&outcome).unwrap_or_else(|_| json!({"error": "serialize failed"}))
+    let response =
+        serde_json::to_value(&outcome).unwrap_or_else(|_| json!({"error": "serialize failed"}));
+    if !dry_run {
+        notify_release_completed(home, agent, sender, &response);
+    }
+    response
+}
+
+fn notify_release_completed(home: &Path, agent: &str, sender: &Option<Sender>, response: &Value) {
+    let Some(recipient) = sender.as_ref().map(|sender| sender.as_str()) else {
+        return;
+    };
+    if response.get("released").is_none() {
+        return;
+    }
+    let status = if response["released"].as_bool() == Some(true) {
+        "completed"
+    } else {
+        "failed"
+    };
+    let detail = response["error"].as_str().unwrap_or("none");
+    let source = crate::inbox::NotifySource::System("release_completed");
+    let message = crate::inbox::InboxMessage {
+        from: source.to_string(),
+        text: format!("release_worktree {status}: instance={agent} error={detail}"),
+        kind: Some("update".to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        ..Default::default()
+    };
+    if let Err(error) = crate::inbox::enqueue_with_idle_hint(home, recipient, message) {
+        tracing::warn!(%error, %agent, %recipient, "release completion notification failed");
+    }
 }
 
 /// `release_worktree(force:true)` (#2548 PR-2) — absorbed from the former

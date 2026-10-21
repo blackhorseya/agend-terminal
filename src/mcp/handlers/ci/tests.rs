@@ -2040,6 +2040,105 @@ fn p780_checkout_target(home: &Path, agent: &str, source: &Path) -> std::path::P
         ))
 }
 
+#[test]
+fn checkout_path_digest_normalizes_equivalent_source_spellings_3550() {
+    let parent = p778_tmp_home("3550-path-digest-normalization");
+    let source = parent.join("repo");
+    std::fs::create_dir_all(&source).unwrap();
+    let alias = parent.join(".").join("repo");
+
+    assert_eq!(
+        super::checkout_path::bounded_mangled("reviewer", &source.display().to_string()),
+        super::checkout_path::bounded_mangled("reviewer", &alias.display().to_string()),
+        "one repository must have one bounded checkout identity"
+    );
+    std::fs::remove_dir_all(parent).ok();
+}
+
+#[test]
+#[cfg(not(windows))]
+fn checkout_path_warn_strategy_preserves_old_raw_digest_directory_3550() {
+    let home = p778_tmp_home("3550-old-raw-digest-home");
+    let parent = p778_tmp_home("3550-old-raw-digest-source");
+    let source = parent.join("repo");
+    std::fs::create_dir_all(&source).unwrap();
+    let alias = parent.join(".").join("repo").display().to_string();
+    let raw_digest = crate::daemon::utils::sha256_hex(alias.as_bytes());
+    let old_target = home
+        .join("worktrees")
+        .join(format!("reviewer-repo-{}", &raw_digest[..32]));
+    std::fs::create_dir_all(&old_target).unwrap();
+
+    let target = super::checkout_path::resolve_worktree_target(&home, "reviewer", &alias).unwrap();
+    assert_ne!(
+        target.path, old_target,
+        "new checkouts use the canonical digest instead of perpetuating the old spelling"
+    );
+    assert!(
+        old_target.exists(),
+        "compatibility policy warns but never renames or deletes a legacy raw-digest directory"
+    );
+    std::fs::remove_dir_all(home).ok();
+    std::fs::remove_dir_all(parent).ok();
+}
+
+#[test]
+#[cfg(unix)]
+#[tracing_test::traced_test]
+fn reviewer_real_checkout_warns_about_raw_identity_3570() {
+    struct Cleanup(Vec<std::path::PathBuf>);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for path in &self.0 {
+                let _ = std::fs::remove_dir_all(path);
+            }
+        }
+    }
+    let home = std::env::temp_dir().join(format!("review3570-home-{}", uuid::Uuid::new_v4()));
+    let parent = std::env::temp_dir().join(format!("review3570-source-{}", uuid::Uuid::new_v4()));
+    let _cleanup = Cleanup(vec![home.clone(), parent.clone()]);
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&parent).unwrap();
+    let source = p780_setup_source_broken_origin(&parent);
+    let alias = source
+        .parent()
+        .unwrap()
+        .join(".")
+        .join(source.file_name().unwrap());
+    let alias = alias.display().to_string();
+    let raw_digest = crate::daemon::utils::sha256_hex(alias.as_bytes());
+    let label: String = source
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .chars()
+        .take(16)
+        .collect();
+    let raw_target = home
+        .join("worktrees")
+        .join(format!("review3570-{label}-{}", &raw_digest[..32]));
+    std::fs::create_dir_all(&raw_target).unwrap();
+    let response = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": alias, "branch": "main", "bind": false
+        }),
+        "review3570",
+    );
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(raw_target.exists());
+    let entry_warned = logs_contain("legacy raw-path checkout identity remains");
+    let _ = super::checkout_path::resolve_worktree_target(&home, "review3570", &alias);
+    assert!(
+        logs_contain("legacy raw-path checkout identity remains"),
+        "positive helper control must prove log capture and raw target identity"
+    );
+    assert!(
+        entry_warned,
+        "real checkout must emit the claimed legacy warning"
+    );
+}
+
 #[cfg(unix)]
 fn p780_branch_exists(source: &Path, branch: &str) -> bool {
     std::process::Command::new("git")
@@ -2051,6 +2150,178 @@ fn p780_branch_exists(source: &Path, branch: &str) -> bool {
         .status()
         .expect("git rev-parse branch")
         .success()
+}
+
+/// #3550 RED→GREEN: the worktree path key is `(agent, repo)` and carries no
+/// branch, so an agent already bound to branch A that checks out a DIFFERENT
+/// branch B targets the very directory its own binding occupies. Before this
+/// fix the raw `git worktree add` failure surfaced as `worktree_add_failed`
+/// with a bare `'<path>' already exists`, naming neither the binding nor the
+/// branch holding it — the reporter of #3550 read it as a daemon fault. The
+/// refusal must name the current branch, path and task, and a branch this
+/// refused checkout auto-created must not survive it (arch14's rule).
+///
+/// Uses the arch14 source fixture because it stages a `refs/remotes/origin/*`
+/// view: without one the #3546 create-path guard fail-closes on branch B long
+/// before this gap, and the auto-create arm is never reached.
+#[test]
+#[cfg(unix)]
+fn checkout_bind_reports_binding_conflict_for_other_branch_3550() {
+    let home = p778_tmp_home("3550-conflict");
+    let parent = p778_tmp_home("3550-conflict-src");
+    let source = p780_setup_source_broken_origin(&parent);
+    let agent = "agent-3550";
+
+    let first = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/bound-3550",
+            "bind": true,
+            "task_id": "t-3550-owner",
+        }),
+        agent,
+    );
+    assert!(
+        first.get("error").is_none(),
+        "first checkout must bind: {first}"
+    );
+    let bound_path = first["path"].as_str().unwrap_or_default().to_string();
+    assert!(
+        !bound_path.is_empty(),
+        "first checkout must report its path: {first}"
+    );
+
+    let second = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": "feat/other-3550",
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert_eq!(
+        second["code"].as_str(),
+        Some("binding_conflict"),
+        "{second}"
+    );
+    assert_eq!(
+        second["current_branch"].as_str(),
+        Some("feat/bound-3550"),
+        "the refusal must name the branch actually holding the path: {second}"
+    );
+    assert_eq!(
+        second["current_path"].as_str(),
+        Some(bound_path.as_str()),
+        "the refusal must name the occupied path: {second}"
+    );
+    assert_eq!(
+        second["current_task_id"].as_str(),
+        Some("t-3550-owner"),
+        "the refusal must name the task that owns the binding: {second}"
+    );
+    assert!(
+        second["hint"]
+            .as_str()
+            .is_some_and(|h| h.contains("release_worktree")),
+        "the refusal must say how to proceed: {second}"
+    );
+    // The refused checkout DID auto-create its branch, and must roll it back —
+    // the same rule the `worktree_add_failed` path follows (arch14).
+    assert_eq!(
+        second["auto_created_branch"].as_bool(),
+        Some(true),
+        "fixture must reach the auto-create arm: {second}"
+    );
+    assert!(
+        !p780_branch_exists(&source, "feat/other-3550"),
+        "a branch auto-created by the refused checkout must not survive: {second}"
+    );
+    // The existing binding is untouched by the refusal.
+    let binding = crate::binding::read(&home, agent).expect("binding survives the refusal");
+    assert_eq!(
+        binding["branch"].as_str(),
+        Some("feat/bound-3550"),
+        "{binding}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+/// #3550 follow-up: an agent binding is global even though checkout paths are
+/// keyed by `(agent, repo)`. A checkout in repo B must therefore describe the
+/// existing repo-A binding without claiming that it occupies repo B's target.
+#[test]
+#[cfg(unix)]
+fn checkout_bind_cross_repo_conflict_does_not_claim_target_is_occupied_3550() {
+    let home = p778_tmp_home("3550-cross-repo-conflict");
+    let parent_a = p778_tmp_home("3550-cross-repo-a");
+    let parent_b = p778_tmp_home("3550-cross-repo-b");
+    let source_a = p780_setup_source_broken_origin(&parent_a);
+    let source_b = p780_setup_source_broken_origin(&parent_b);
+    let agent = "agent-3550-cross-repo";
+
+    let first = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source_a.display().to_string(),
+            "branch": "feat/bound-cross-repo-3550",
+            "bind": true,
+            "task_id": "t-3550-cross-repo-owner",
+        }),
+        agent,
+    );
+    assert!(
+        first.get("error").is_none(),
+        "first checkout must bind: {first}"
+    );
+
+    let second = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source_b.display().to_string(),
+            "branch": "feat/other-cross-repo-3550",
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert_eq!(
+        second["code"].as_str(),
+        Some("binding_conflict"),
+        "{second}"
+    );
+    let error = second["error"].as_str().unwrap_or_default();
+    assert!(
+        !error.contains("in this repository") && !error.contains("occupies the path"),
+        "cross-repo refusal must not claim repo B's target is occupied: {second}"
+    );
+    assert!(
+        error.contains("feat/bound-cross-repo-3550"),
+        "refusal must still name the existing branch: {second}"
+    );
+    assert_eq!(
+        second["current_path"].as_str(),
+        first["path"].as_str(),
+        "cross-repo refusal must retain the existing binding's path: {second}"
+    );
+    assert_eq!(
+        second["current_task_id"].as_str(),
+        Some("t-3550-cross-repo-owner"),
+        "cross-repo refusal must retain the existing binding's task: {second}"
+    );
+    assert_eq!(
+        second["hint"].as_str(),
+        Some("release_worktree first"),
+        "cross-repo refusal must not suggest reusing a branch from another repo: {second}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent_a).ok();
+    std::fs::remove_dir_all(&parent_b).ok();
 }
 
 /// Arch14 residue: a checkout that auto-created its branch must delete only that
@@ -2088,6 +2359,58 @@ fn checkout_bind_true_worktree_add_failure_rolls_back_auto_created_branch_arch14
     assert!(
         keep.exists(),
         "the pre-existing occupied target and its dirty state must be preserved"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+/// #3613 RED: a marker-bearing checkout target with no binding is a stale
+/// daemon lifecycle artifact, not an opaque Git failure. Preserve it and tell
+/// the caller to use the guarded force-release recovery path.
+#[test]
+#[cfg(unix)]
+fn checkout_reports_stale_managed_worktree_dir_without_binding() {
+    let home = p778_tmp_home("3613-stale-target");
+    let parent = p778_tmp_home("3613-stale-target-src");
+    let source = p780_setup_source_broken_origin(&parent);
+    let agent = "agent-3613-stale";
+    let branch = "feat/stale-3613";
+    let target = p780_checkout_target(&home, agent, &source);
+    std::fs::create_dir_all(&target).expect("stale checkout target");
+    let marker = format!(
+        "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+        source.canonicalize().expect("canonical source").display()
+    );
+    std::fs::write(target.join(crate::worktree_pool::MANAGED_MARKER), &marker)
+        .expect("managed marker");
+
+    let response = super::handle_checkout_repo(
+        &home,
+        &serde_json::json!({
+            "repository_path": source.display().to_string(),
+            "branch": branch,
+            "bind": true,
+        }),
+        agent,
+    );
+
+    assert_eq!(response["code"], "stale_worktree_dir", "{response}");
+    assert_eq!(response["path"], target.display().to_string(), "{response}");
+    assert_eq!(response["marker"], marker, "{response}");
+    assert!(
+        response["hint"]
+            .as_str()
+            .is_some_and(|hint| hint.contains("release_worktree") && hint.contains("force")),
+        "{response}"
+    );
+    assert!(
+        target.exists(),
+        "typed refusal must preserve stale evidence"
+    );
+    assert!(
+        !p780_branch_exists(&source, branch),
+        "auto-created branch must be rolled back on stale-dir refusal"
     );
 
     std::fs::remove_dir_all(&home).ok();
@@ -3047,9 +3370,14 @@ fn merge_force_audit_write_failure_refuses_merge() {
         "dev",
     );
     let err = result["error"].as_str().unwrap();
+    // #3416: the fixture makes the log a DIRECTORY, so the failure is an OPEN
+    // failure, not a write failure. The appender now distinguishes the two because
+    // only a write failure can leave a partial line behind, so this asserts what
+    // the test actually guards — the force-merge audit gate refused — rather than a
+    // phrase that would now be inaccurate for this fixture.
     assert!(
-        err.contains("audit log write failed"),
-        "expected audit failure error, got: {err}"
+        err.contains("force-merge refused") && err.contains("audit log"),
+        "expected the force-merge audit gate to refuse, got: {err}"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -3105,10 +3433,11 @@ fn merge_force_reaches_handler_through_full_dispatch_chain_2539() {
     }
 
     let err = result["error"].as_str().unwrap_or_default();
+    // #3416: same open-vs-write distinction as the handler-direct test above.
     assert!(
-        err.contains("audit log write failed"),
+        err.contains("force-merge refused") && err.contains("audit log"),
         "#2539: force/force_reason must survive the full handle_tool dispatch chain \
-         unmodified (same audit-write reject as the handler-direct test), got: {result}"
+         unmodified (same audit reject as the handler-direct test), got: {result}"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -3454,11 +3783,24 @@ fn tombstone_rearm_clears_notify_cursors_and_rotates_generation() {
     assert_eq!(tombstone["auto_arm_optout"], true);
     assert_eq!(tombstone["last_run_id"].as_u64(), Some(100));
 
+    // t-…-21627-5: re-arm against a REAL routed typed task. This fixture used to
+    // pass a phantom `t-1`, which only worked because the `NotFound` arm accepted
+    // the caller's own class; the epoch behaviour under test is unrelated to that.
+    let rearm_task = crate::tasks::handle(
+        &home,
+        "dev-2",
+        &serde_json::json!({
+            "action": "create",
+            "title": "tombstone re-arm task",
+            "review_class": "dual",
+        }),
+    );
+    let rearm_task_id = rearm_task["id"].as_str().expect("task id").to_string();
     super::handle_watch_ci(
         &home,
         &serde_json::json!({
             "repository": "o/r", "branch": "feat/x",
-            "task_id": "t-1", "review_class": "dual", "next_after_ci": "lead",
+            "task_id": rearm_task_id, "review_class": "dual", "next_after_ci": "lead",
         }),
         "dev-2",
     );
@@ -3490,7 +3832,7 @@ fn tombstone_rearm_clears_notify_cursors_and_rotates_generation() {
     assert_eq!(v["rate_limit_remaining"].as_u64(), Some(17));
     assert_eq!(v["consecutive_skips"].as_u64(), Some(3));
     assert_eq!(v["effective_interval_secs"].as_u64(), Some(120));
-    assert_eq!(v["task_id"], "t-1");
+    assert_eq!(v["task_id"], rearm_task_id.as_str());
     assert_eq!(v["review_class"], "dual");
     // Single target is stored in its scalar form by `next_after_ci_json`.
     assert_eq!(v["next_after_ci"], serde_json::json!("lead"));
@@ -3498,6 +3840,218 @@ fn tombstone_rearm_clears_notify_cursors_and_rotates_generation() {
     assert_eq!(
         crate::daemon::ci_watch::parse_subscribers(&v),
         vec!["dev-2".to_string()]
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn task_linked_watch_rejects_review_class_divergence_3419() {
+    let home = watch_test_home("task-linked-review-class-mismatch-3419");
+    let created = crate::tasks::handle(
+        &home,
+        "dev-1",
+        &serde_json::json!({
+            "action": "create",
+            "title": "governed watch task",
+            "review_class": "dual",
+        }),
+    );
+    let task_id = created["id"].as_str().expect("task id").to_string();
+    let response = super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "o/r",
+            "branch": "feat/governed",
+            "task_id": task_id,
+            "review_class": "single",
+        }),
+        "dev-1",
+    );
+    assert_eq!(
+        response["code"], "watch_review_class_mismatch",
+        "{response}"
+    );
+    assert!(
+        !crate::daemon::ci_watch::ci_watches_dir(&home).exists(),
+        "watch divergence must be rejected before watch-file creation"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// t-…-21627-5 RED: the `TaskRouteError::NotFound` arm used to accept the
+/// caller's own `review_class` verbatim, so an identified caller could name a
+/// task that exists on NO board and still stamp a class onto the watch — the
+/// dangerous direction being `single` asserted onto a dual-required subject.
+///
+/// Authority here is the empty/non-empty caller split; the gate never consults
+/// team role, so an orchestrator takes exactly the same branch as a plain agent.
+/// Both caller shapes are pinned so a future refactor cannot quietly make the
+/// decision role-sensitive without a failing test.
+#[test]
+fn manual_rearm_rejects_unroutable_task_for_identified_callers() {
+    for caller in ["dev-1", "lead"] {
+        let home = watch_test_home(&format!("rearm-unroutable-{caller}"));
+        let response = super::handle_watch_ci(
+            &home,
+            &serde_json::json!({
+                "repository": "o/r",
+                "branch": "feat/x",
+                "task_id": "t-does-not-exist",
+                "review_class": "single",
+            }),
+            caller,
+        );
+        assert_eq!(
+            response["code"], "watch_task_link_unresolved",
+            "caller '{caller}' must not stamp its own class onto an unroutable task: {response}"
+        );
+        assert!(
+            !crate::daemon::ci_watch::ci_watches_dir(&home).exists(),
+            "rejection must precede watch-file creation for '{caller}'"
+        );
+        assert!(
+            !crate::daemon::pr_state::pr_state_dir(&home).exists(),
+            "rejection must precede PrState creation for '{caller}'"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+/// t-…-21627-5 BOUNDARY: the gate is deliberately scoped to the STAMPING case.
+/// An identified caller may still arm against an unroutable task when it supplies
+/// no class, because nothing is asserted — `review_class` is persisted only when
+/// resolved, so the sidecar carries none and the merge gate still fails closed on
+/// the PR state's own Unresolved class.
+///
+/// This test exists to pin that boundary in BOTH directions: widening the gate to
+/// classless arms breaks it (that widening also broke 24 pre-existing fixtures
+/// across notification_only / exact_head / dispatch_hook, none of which supply a
+/// class), and dropping the class check entirely reopens the fail-open pinned by
+/// `manual_rearm_rejects_unroutable_task_for_identified_callers`.
+#[test]
+fn manual_rearm_allows_classless_unroutable_arm_and_asserts_no_class() {
+    let home = watch_test_home("rearm-unroutable-classless");
+    let response = super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "o/r",
+            "branch": "feat/x",
+            "task_id": "t-does-not-exist",
+        }),
+        "dev-1",
+    );
+    assert!(
+        !response["error"].is_string(),
+        "a classless arm asserts no authority and must still be allowed: {response}"
+    );
+    let v = read_watch(&watch_path_for(&home, "o/r", "feat/x"));
+    assert!(
+        v.get("review_class").map(|c| c.is_null()).unwrap_or(true),
+        "a classless arm must persist NO review_class — that is why it is safe: {v}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// t-…-21627-5 positive control: tightening the NotFound arm must NOT turn
+/// legitimate inheritance into a rejection. A routed task with an omitted class
+/// still inherits the task's own durable authority.
+#[test]
+fn manual_rearm_inherits_routed_class_when_class_omitted() {
+    let home = watch_test_home("rearm-inherit-routed-class");
+    let created = crate::tasks::handle(
+        &home,
+        "dev-1",
+        &serde_json::json!({
+            "action": "create",
+            "title": "governed watch task",
+            "review_class": "dual",
+        }),
+    );
+    let task_id = created["id"].as_str().expect("task id").to_string();
+    let response = super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "o/r",
+            "branch": "feat/governed",
+            "task_id": task_id,
+        }),
+        "dev-1",
+    );
+    assert!(
+        !response["error"].is_string(),
+        "routed task with omitted class must arm: {response}"
+    );
+    let v = read_watch(&watch_path_for(&home, "o/r", "feat/governed"));
+    assert_eq!(
+        v["review_class"], "dual",
+        "omitted class must inherit the routed task's class: {v}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// t-…-21627-5 positive control: a routed task whose class MATCHES the explicit
+/// argument still arms (only divergence is fatal).
+#[test]
+fn manual_rearm_accepts_matching_explicit_class() {
+    let home = watch_test_home("rearm-matching-class");
+    let created = crate::tasks::handle(
+        &home,
+        "dev-1",
+        &serde_json::json!({
+            "action": "create",
+            "title": "governed watch task",
+            "review_class": "dual",
+        }),
+    );
+    let task_id = created["id"].as_str().expect("task id").to_string();
+    let response = super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "o/r",
+            "branch": "feat/governed",
+            "task_id": task_id,
+            "review_class": "dual",
+        }),
+        "dev-1",
+    );
+    assert!(
+        !response["error"].is_string(),
+        "matching explicit class must arm: {response}"
+    );
+    let v = read_watch(&watch_path_for(&home, "o/r", "feat/governed"));
+    assert_eq!(v["review_class"], "dual", "{v}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// t-…-21627-5: the operator (empty caller) keeps the taskless override, but it
+/// is no longer silent — the override is written to the audit log naming the
+/// task_id and the class it retained.
+#[test]
+fn manual_rearm_operator_taskless_override_is_retained_and_audited() {
+    let home = watch_test_home("rearm-operator-taskless");
+    let response = super::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "o/r",
+            "branch": "feat/x",
+            "task_id": "t-does-not-exist",
+            "review_class": "single",
+        }),
+        "",
+    );
+    assert!(
+        !response["error"].is_string(),
+        "operator taskless override must still arm: {response}"
+    );
+    let v = read_watch(&watch_path_for(&home, "o/r", "feat/x"));
+    assert_eq!(v["review_class"], "single", "{v}");
+    let log = std::fs::read_to_string(home.join("event-log.jsonl"))
+        .expect("taskless operator override must write an audit line");
+    assert!(
+        log.contains("ci_watch_taskless_class_override")
+            && log.contains("t-does-not-exist")
+            && log.contains("single"),
+        "audit must name the task_id and the retained class: {log}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -4717,6 +5271,98 @@ fn arch14_symlink_alias_lease_survives_alias_removal() {
     std::fs::remove_dir_all(&base).ok();
 }
 
+/// The absent-binding release arm must compare a present marker source by
+/// canonical identity: a symlink alias of Git's verified common-dir source is
+/// valid, while a present divergent marker source is refused before removal.
+/// This drives the public bind:false checkout/release path so the proof covers
+/// the marker and Git-linkage shape that production creates.
+#[test]
+#[cfg(unix)]
+fn arch14_bind_false_release_canonicalizes_marker_source() {
+    let checkout = |tag: &str| {
+        let base = release_guard_tmp(tag);
+        let home = base.join("home");
+        std::fs::create_dir_all(&home).expect("mkdir home");
+        let source = p778_setup_source_repo(&base, "seed");
+        let response = super::handle_checkout_repo(
+            &home,
+            &serde_json::json!({
+                "repository_path": source.display().to_string(),
+                "branch": "seed",
+                "bind": false,
+            }),
+            "arch14-bindfalse-agent",
+        );
+        assert!(
+            response.get("error").is_none(),
+            "bind:false checkout must succeed: {response}"
+        );
+        let worktree =
+            std::path::PathBuf::from(response["path"].as_str().expect("bind:false checkout path"));
+        (base, home, source, worktree)
+    };
+
+    let (base, home, source, worktree) = checkout("arch14-bindfalse-alias");
+    let alias = base.join("source-alias");
+    std::os::unix::fs::symlink(&source, &alias).expect("source alias");
+    std::fs::write(
+        worktree.join(crate::worktree_pool::MANAGED_MARKER),
+        format!(
+            "agent=arch14-bindfalse-agent\nbranch=seed\nsource_repo={}\nleased_at=x\n",
+            alias.display()
+        ),
+    )
+    .expect("alias marker");
+    assert_eq!(
+        std::fs::canonicalize(&alias).expect("alias resolves"),
+        std::fs::canonicalize(&source).expect("source resolves")
+    );
+
+    let released = dispatch_repo_release(
+        &home,
+        "arch14-bindfalse-agent",
+        worktree.to_str().expect("worktree path"),
+    );
+    assert_eq!(released["released"].as_bool(), Some(true), "{released}");
+    assert!(
+        released.get("error").and_then(|e| e.as_str()).is_none(),
+        "a canonical-equivalent marker source must be accepted: {released}"
+    );
+    assert!(
+        !worktree.exists(),
+        "accepted release must remove the worktree"
+    );
+    std::fs::remove_dir_all(&base).ok();
+
+    let (base, home, _source, worktree) = checkout("arch14-bindfalse-divergent");
+    let divergent = base.join("other-source");
+    std::fs::create_dir_all(&divergent).expect("divergent source");
+    std::fs::write(
+        worktree.join(crate::worktree_pool::MANAGED_MARKER),
+        format!(
+            "agent=arch14-bindfalse-agent\nbranch=seed\nsource_repo={}\nleased_at=x\n",
+            divergent.display()
+        ),
+    )
+    .expect("divergent marker");
+
+    let refused = dispatch_repo_release(
+        &home,
+        "arch14-bindfalse-agent",
+        worktree.to_str().expect("worktree path"),
+    );
+    assert_eq!(
+        refused["code"].as_str(),
+        Some("managed_release_source_mismatch"),
+        "a present divergent marker source must be refused: {refused}"
+    );
+    assert!(
+        worktree.exists(),
+        "refused divergent-source release must preserve the worktree"
+    );
+    std::fs::remove_dir_all(&base).ok();
+}
+
 // ═══ Arch14 legacy marker: absent-binding release (t-…-39872-18) ══════════
 // Superseding contract d-20260720044124067125-6. #2860 landed producer
 // canonical source parity + BINDING-authoritative legacy adoption; the
@@ -5250,4 +5896,80 @@ fn checkout_via_linked_worktree_binds_canonical_repo_root_and_keeps_one_lease() 
 
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&parent).ok();
+}
+
+/// #3416 RED: force-merge is the second FAIL-CLOSED audit gate. It already refuses
+/// when the audit write errors (`merge_force_audit_write_failure_refuses_merge`);
+/// once the append is serialized, a held companion lock past the bounded retry
+/// budget is the same class of failure and must produce the same explicit refusal
+/// with no record written.
+///
+/// The holder is a second `File` in this process: `flock(2)` binds the lock to the
+/// open file description, not the process, so this conflicts exactly as a separate
+/// process would — no sleeps, no scheduling assumptions.
+///
+/// Pre-fix this FAILS: nothing consults the lock, so the audit line is appended and
+/// the merge is not refused for this reason.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn merge_force_refuses_while_audit_lock_is_held() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-merge-audit-lock-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+
+    let lock_path = home.join("fleet_events.jsonl.lock");
+    let holder = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    // Explicit trait syntax — see the MSRV note in `src/store.rs`.
+    fs4::FileExt::lock(&holder).unwrap();
+
+    let _g = crate::scm::set_test_scm_provider(std::sync::Arc::new(MergeHeadBaseStub));
+    // `MergeHeadBaseStub::pr_merge` is `unimplemented!()` BY DESIGN: reaching the
+    // merge means the audit gate did not refuse. Catch that panic so the assertion
+    // below reports the actual defect (an unlocked append happened) instead of the
+    // stub's "not implemented", which says nothing about the contract under test.
+    let prior_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let called = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        super::handle_merge_repo(
+            &home,
+            &json!({
+                "pr": 9999,
+                "force": true,
+                "force_reason": "test emergency",
+                "repository": "suzuke/agend-terminal"
+            }),
+            "dev",
+        )
+    }));
+    std::panic::set_hook(prior_hook);
+
+    // Asserted FIRST and independently of the return value: this is the direct
+    // evidence of the defect — a record reached the file while the lock was held.
+    let written = std::fs::read_to_string(home.join("fleet_events.jsonl")).unwrap_or_default();
+    assert!(
+        written.trim().is_empty(),
+        "no unlocked fallback append may occur while the lock is held, found: {written}"
+    );
+
+    let result =
+        called.expect("force-merge must refuse at the audit gate, not proceed into the merge call");
+    let err = result["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("audit"),
+        "force-merge must REFUSE while the audit lock is held (fail-closed), got: {result}"
+    );
+
+    fs4::FileExt::unlock(&holder).ok();
+    let _ = std::fs::remove_dir_all(&home);
 }

@@ -241,12 +241,14 @@ fn build_pane_placeholder(
         // Filled by `attach_agent_to_pane` once the agent's authoritative UUID
         // is resolved; `Default` is the never-routed placeholder until then.
         instance_id: crate::types::InstanceId::default(),
+        instance_ref: None,
         vterm: VTerm::new(cols, rows),
         rx: fwd_rx,
         id: pane_id,
         backend,
         working_dir: Some(work_dir),
         display_name: None,
+        restart_error: None,
         scroll_offset: 0,
         has_notification: false,
         fleet_instance_name: None,
@@ -295,7 +297,7 @@ fn attach_agent_to_pane(
     // effects, same order. Splitting here is what lets the deferred path run
     // `spawn_and_subscribe` on a background worker (touches only the shareable
     // registry) while the render thread runs `apply_attachment` (pane mutation).
-    let (instance_id, rx, dump) = spawn_and_subscribe(
+    let (instance_id, instance_ref, sub, dump) = spawn_and_subscribe(
         registry,
         home,
         &name,
@@ -310,7 +312,15 @@ fn attach_agent_to_pane(
         identity,
         declared_backend,
     )?;
-    apply_attachment(pane, instance_id, rx, dump, fwd_tx, wakeup_tx);
+    apply_attachment(
+        pane,
+        instance_id,
+        instance_ref,
+        sub,
+        dump,
+        fwd_tx,
+        wakeup_tx,
+    );
     Ok(())
 }
 
@@ -321,7 +331,7 @@ fn attach_agent_to_pane(
 /// subscriber receiver + the initial screen dump for the main thread to finish
 /// wiring via [`apply_attachment`]. Mutates NO `Pane`/`Layout`, so it can run off
 /// the render thread on a background worker.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn spawn_and_subscribe(
     registry: &AgentRegistry,
     home: &Path,
@@ -338,7 +348,8 @@ fn spawn_and_subscribe(
     declared_backend: Option<&Backend>,
 ) -> Result<(
     crate::types::InstanceId,
-    crossbeam_channel::Receiver<Vec<u8>>,
+    Option<crate::types::InstanceRef>,
+    agent::Subscription,
     Vec<u8>,
 )> {
     let effective_backend = declared_backend
@@ -443,7 +454,7 @@ fn spawn_and_subscribe(
     )?;
 
     // Subscribe to the agent's output
-    let (rx, dump) = {
+    let (sub, dump) = {
         let reg = agent::lock_registry(registry);
         let handle = reg
             .get(&instance_id)
@@ -451,7 +462,10 @@ fn spawn_and_subscribe(
         agent::subscribe_with_dump(handle)
     };
 
-    Ok((instance_id, rx, dump))
+    let instance_ref = matches!(identity, SpawnIdentity::Managed)
+        .then(|| agent::instance_ref_for_id(registry, instance_id))
+        .flatten();
+    Ok((instance_id, instance_ref, sub, dump))
 }
 
 /// Cheap, **main-thread** half of an attach (#render-first phase-(b)): apply the
@@ -471,12 +485,14 @@ fn spawn_and_subscribe(
 fn apply_attachment(
     pane: &mut Pane,
     instance_id: crate::types::InstanceId,
-    rx: crossbeam_channel::Receiver<Vec<u8>>,
+    instance_ref: Option<crate::types::InstanceRef>,
+    sub: agent::Subscription,
     dump: Vec<u8>,
     fwd_tx: crossbeam_channel::Sender<Vec<u8>>,
     wakeup_tx: &crossbeam_channel::Sender<usize>,
 ) {
     pane.instance_id = instance_id;
+    pane.instance_ref = instance_ref;
     let pane_id = pane.id;
     // #freeze-4 A1: enqueue the dump through rx (chunked, FIFO before the forwarder)
     // rather than processing it unbounded into the VTerm here.
@@ -513,18 +529,24 @@ fn apply_attachment(
     // agent is quiet). H1: pane drop triggers forwarder exit on all three paths.
     std::thread::Builder::new()
         .name(format!("{name}_fwd"))
-        .spawn(move || loop {
-            crossbeam_channel::select! {
-                recv(rx) -> msg => match msg {
-                    Ok(data) => {
-                        if fwd_tx.send(data).is_err() {
-                            break; // H1: pane closed, fwd_rx dropped
+        .spawn(move || {
+            // #3682: hold the tap's liveness token for the forwarder's whole
+            // lifetime, so a later subscribe/broadcast only reclaims this entry
+            // once the pane (and thus this consumer) is really gone.
+            let agent::Subscription { rx, live: _live } = sub;
+            loop {
+                crossbeam_channel::select! {
+                    recv(rx) -> msg => match msg {
+                        Ok(data) => {
+                            if fwd_tx.send(data).is_err() {
+                                break; // H1: pane closed, fwd_rx dropped
+                            }
+                            let _ = tx.send(pane_id);
                         }
-                        let _ = tx.send(pane_id);
-                    }
-                    Err(_) => break, // agent removed, broadcast sender dropped
-                },
-                recv(fwd_cancel_rx) -> _ => break, // #forwarder-reap: pane closed
+                        Err(_) => break, // agent removed, broadcast sender dropped
+                    },
+                    recv(fwd_cancel_rx) -> _ => break, // #forwarder-reap: pane closed
+                }
             }
         })
         .ok();
@@ -617,13 +639,13 @@ pub(super) enum AttachOutcome {
     Ready {
         pane_id: usize,
         instance_id: crate::types::InstanceId,
-        rx: crossbeam_channel::Receiver<Vec<u8>>,
+        instance_ref: Option<crate::types::InstanceRef>,
+        /// True only for a direct/local shell with no fleet.yaml identity.
+        unmanaged: bool,
+        sub: agent::Subscription,
         dump: Vec<u8>,
         /// The real spawn cwd (worktree-resolved for agents) → update the pane.
         work_dir: std::path::PathBuf,
-        /// The agent's (deduped) name — used to kill the orphan if its pane was
-        /// closed while the attach was in flight (F1).
-        name: String,
     },
     Failed {
         pane_id: usize,
@@ -785,10 +807,12 @@ fn finish_attach(
     registry: &AgentRegistry,
     pane_id: usize,
     instance_id: crate::types::InstanceId,
-    rx: crossbeam_channel::Receiver<Vec<u8>>,
+    instance_ref: Option<crate::types::InstanceRef>,
+    sub: agent::Subscription,
     dump: Vec<u8>,
     work_dir: std::path::PathBuf,
     name: String,
+    unmanaged: bool,
 ) -> AttachOutcome {
     let shutting_down = super::app_shutdown_flag().load(std::sync::atomic::Ordering::SeqCst);
     if reap_late_registration_if_shutdown(registry, instance_id, shutting_down) {
@@ -801,10 +825,11 @@ fn finish_attach(
     AttachOutcome::Ready {
         pane_id,
         instance_id,
-        rx,
+        instance_ref,
+        unmanaged,
+        sub,
         dump,
         work_dir,
-        name,
     }
 }
 
@@ -858,14 +883,28 @@ pub(super) fn run_attach(
             // a worktree here (default OFF), and RESTART is idempotent — so not fixed
             // in this PR.
             let mut working_dir = resolved.working_directory.clone();
-            if let Some(wt) = crate::worktree::resolve_auto_worktree(home, &fleet_name, &resolved) {
-                working_dir = Some(wt);
+            // #2755 follow-up A r2: a WANTED-but-unprovisionable worktree fails the
+            // attach instead of silently starting on the source repo.
+            match crate::worktree::resolve_auto_worktree(home, &fleet_name, &resolved) {
+                Ok(Some(wt)) => working_dir = Some(wt),
+                Ok(None) => {}
+                Err(e) => {
+                    return AttachOutcome::Failed {
+                        pane_id,
+                        name: fleet_name.to_string(),
+                        err: format!("worktree provisioning failed (fail-closed): {e}"),
+                    };
+                }
             }
             let mut args = resolved.args.clone();
             if let Some(ref model) = resolved.model {
                 // #2744 r1: DECLARED identity + capability gate — never
                 // from_command inference or a blind append.
                 Backend::push_model_arg(&mut args, &resolved.backend, model);
+            }
+            if let Some(ref effort) = resolved.effort {
+                // #3541: same chokepoint as model above; fail-soft inside.
+                Backend::push_effort_arg(&mut args, &resolved.backend, effort);
             }
             let command = resolved.backend_command.clone();
             let work_dir = working_dir
@@ -886,7 +925,7 @@ pub(super) fn run_attach(
                 SpawnIdentity::Managed,
                 Some(&resolved.backend),
             ) {
-                Ok((instance_id, rx, dump)) => {
+                Ok((instance_id, instance_ref, sub, dump)) => {
                     // Overwrite basic instructions with the fleet-aware version
                     // (same ordering as the synchronous create_pane_from_resolved).
                     let team_ctx = team_record
@@ -921,10 +960,12 @@ pub(super) fn run_attach(
                         registry,
                         pane_id,
                         instance_id,
-                        rx,
+                        instance_ref,
+                        sub,
                         dump,
                         work_dir,
                         deduped_name,
+                        false,
                     )
                 }
                 Err(e) => AttachOutcome::Failed {
@@ -961,9 +1002,17 @@ pub(super) fn run_attach(
             SpawnIdentity::UnmanagedLocalShell,
             None,
         ) {
-            Ok((instance_id, rx, dump)) => {
-                finish_attach(registry, pane_id, instance_id, rx, dump, work_dir, name)
-            }
+            Ok((instance_id, instance_ref, sub, dump)) => finish_attach(
+                registry,
+                pane_id,
+                instance_id,
+                instance_ref,
+                sub,
+                dump,
+                work_dir,
+                name,
+                true,
+            ),
             Err(e) => AttachOutcome::Failed {
                 pane_id,
                 name,
@@ -988,13 +1037,22 @@ pub(super) fn apply_attach_outcome(
     match outcome {
         AttachOutcome::Ready {
             instance_id,
-            rx,
+            instance_ref,
+            sub,
             dump,
             work_dir,
             ..
         } => {
             pane.working_dir = Some(work_dir);
-            apply_attachment(pane, instance_id, rx, dump, fwd_tx, wakeup_tx);
+            apply_attachment(
+                pane,
+                instance_id,
+                instance_ref,
+                sub,
+                dump,
+                fwd_tx,
+                wakeup_tx,
+            );
             // #t-98760-8 (#2343 deferred-attach regression): snap the just-
             // registered PTY to the pane's CURRENT (already render-corrected) vterm
             // size. On a restored SPLIT layout the render loop corrected this
@@ -1020,89 +1078,6 @@ pub(super) fn apply_attach_outcome(
                 .process(format!("\u{26a0} failed to start {name}: {err}\r\n").as_bytes());
         }
     }
-}
-
-/// Attach a pane to an already-running agent (no spawn — subscribe only).
-/// Used when the API server creates an agent via MCP and the TUI needs to show it.
-pub(super) fn attach_pane(
-    name: &str,
-    registry: &AgentRegistry,
-    cols: u16,
-    rows: u16,
-    wakeup_tx: &crossbeam_channel::Sender<usize>,
-    layout: &mut Layout,
-) -> Result<Pane> {
-    // #1441: registry is UUID-keyed. Locate the live handle by its display
-    // name and adopt its authoritative `id` as the pane's routing key — the
-    // handle's id was itself resolved from fleet.yaml at spawn, so this is the
-    // same single source, no `home` threading needed on the attach path.
-    let (rx, dump, backend_command, instance_id) = {
-        let reg = agent::lock_registry(registry);
-        let (id, handle) = reg
-            .iter()
-            .find(|(_, h)| h.name.as_str() == name)
-            .ok_or_else(|| anyhow::anyhow!("agent '{name}' not found in registry"))?;
-        let (rx, dump) = agent::subscribe_with_dump(handle);
-        (rx, dump, handle.backend_command.clone(), *id)
-    };
-
-    let mut vterm = VTerm::new(cols, rows);
-    vterm.process(&dump);
-
-    let pane_id = layout.next_pane_id();
-    let tx = wakeup_tx.clone();
-    // #forwarder-reap: cancel pair so a pane close reaps the forwarder even when
-    // the agent is quiet (mirrors apply_attachment). `_fwd_cancel` goes on the
-    // returned Pane; dropping it disconnects `fwd_cancel_rx` → the `select!` exits.
-    let (fwd_cancel_tx, fwd_cancel_rx) = crossbeam_channel::unbounded::<()>();
-    let pane_rx = {
-        let n = name.to_string();
-        let (fwd_tx, fwd_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
-        // fire-and-forget: same lifecycle as create_pane forwarder — exits on
-        // fwd_tx.send fail (pane dropped), rx.recv fail (agent gone), or
-        // fwd_cancel_rx disconnect (pane dropped while agent quiet) (H1).
-        std::thread::Builder::new()
-            .name(format!("{n}_fwd"))
-            .spawn(move || loop {
-                crossbeam_channel::select! {
-                    recv(rx) -> msg => match msg {
-                        Ok(data) => {
-                            if fwd_tx.send(data).is_err() {
-                                break; // H1: pane closed, fwd_rx dropped
-                            }
-                            let _ = tx.send(pane_id);
-                        }
-                        Err(_) => break, // agent removed, broadcast sender dropped
-                    },
-                    recv(fwd_cancel_rx) -> _ => break, // #forwarder-reap: pane closed
-                }
-            })
-            .ok();
-        fwd_rx
-    };
-
-    let backend = Backend::from_command(&backend_command);
-
-    Ok(Pane {
-        agent_name: name.to_string().into(),
-        instance_id,
-        vterm,
-        rx: pane_rx,
-        id: pane_id,
-        backend,
-        working_dir: None,
-        display_name: None,
-        scroll_offset: 0,
-        has_notification: false,
-        fleet_instance_name: Some(name.to_string()),
-        last_input_at: None,
-        pending_notification_count: 0,
-        pending_decision_count: 0,
-        selection: None,
-        source: crate::layout::PaneSource::Local,
-        offthread: None,
-        _fwd_cancel: Some(fwd_cancel_tx),
-    })
 }
 
 /// Create a pane from a fleet ResolvedInstance (full config: env, args, model, etc.).
@@ -1165,8 +1140,14 @@ pub(super) fn create_pane_from_resolved(
     // can't drift. Opts in on `source_repo` / `git_branch` (#888) but only for
     // an explicit real-repo `working_directory`, never the daemon-managed
     // `workspace/<name>` default (which `ensure_project_root` git-inits).
-    if let Some(wt_path) = crate::worktree::resolve_auto_worktree(home, fleet_name, resolved) {
-        working_dir = Some(wt_path);
+    // #2755 follow-up A r2: same fail-closed contract as the boot path — never
+    // fall back to the source repo when a worktree was wanted.
+    match crate::worktree::resolve_auto_worktree(home, fleet_name, resolved) {
+        Ok(Some(wt_path)) => working_dir = Some(wt_path),
+        Ok(None) => {}
+        Err(e) => {
+            anyhow::bail!("worktree provisioning failed for '{fleet_name}' (fail-closed): {e}");
+        }
     }
 
     let mut args = resolved.args.clone();
@@ -1174,6 +1155,10 @@ pub(super) fn create_pane_from_resolved(
         // #2744 r1: DECLARED identity + capability gate — never from_command
         // inference or a blind append.
         Backend::push_model_arg(&mut args, &resolved.backend, model);
+    }
+    if let Some(ref effort) = resolved.effort {
+        // #3541: same chokepoint as model above; fail-soft inside.
+        Backend::push_effort_arg(&mut args, &resolved.backend, effort);
     }
 
     let mut pane = create_pane_with_backend(
@@ -1228,6 +1213,7 @@ pub(super) fn create_remote_pane(
     wakeup_tx: &crossbeam_channel::Sender<usize>,
 ) -> Result<Pane> {
     let mut client = BridgeClient::connect(home, name, cols, rows)?;
+    let instance_ref = client.instance_ref();
     let mut reader = client
         .take_reader()
         .ok_or_else(|| anyhow::anyhow!("bridge_client reader already taken"))?;
@@ -1235,6 +1221,8 @@ pub(super) fn create_remote_pane(
     let pane_id = layout.next_pane_id();
     let (fwd_tx, pane_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
     let tx = wakeup_tx.clone();
+    let connected = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let forwarder_connected = Arc::clone(&connected);
     let thread_name = format!("{name}_remote_fwd");
     // fire-and-forget: no JoinHandle — this thread is reaped on pane close by
     // `BridgeClient::drop`, which `shutdown`s the shared socket so this parked
@@ -1254,7 +1242,11 @@ pub(super) fn create_remote_pane(
                 // Daemon never emits TAG_RESIZE toward clients today. Ignore
                 // unknown tags rather than tearing down a healthy session.
                 Ok(_) => {}
-                Err(_) => break,
+                Err(_) => {
+                    forwarder_connected.store(false, std::sync::atomic::Ordering::Release);
+                    let _ = tx.send(pane_id);
+                    break;
+                }
             }
         })
         .ok();
@@ -1271,12 +1263,14 @@ pub(super) fn create_remote_pane(
         // it from fleet.yaml for consistency; default when absent (harmless —
         // unused on the remote path).
         instance_id: crate::fleet::resolve_uuid(home, name).unwrap_or_default(),
+        instance_ref,
         vterm: VTerm::new(cols, rows),
         rx: pane_rx,
         id: pane_id,
         backend,
         working_dir: None,
         display_name: None,
+        restart_error: None,
         scroll_offset: 0,
         has_notification: false,
         fleet_instance_name: Some(name.to_string()),
@@ -1284,7 +1278,7 @@ pub(super) fn create_remote_pane(
         pending_notification_count: 0,
         pending_decision_count: 0,
         selection: None,
-        source: crate::layout::PaneSource::Remote(Arc::new(Mutex::new(client))),
+        source: crate::layout::PaneSource::Remote(Arc::new(Mutex::new(client)), connected),
         offthread: None,
         // Remote panes forward from a dup'd socket reader, not a crossbeam agent
         // `rx`, so candidate-B's cancel channel does not apply here — the remote
@@ -1462,6 +1456,7 @@ mod tests {
             topic_id: None,
             git_branch: None,
             model: model.map(String::from),
+            effort: None,
             worktree: Some(false),
             instructions: None,
             source_repo: None,
@@ -1496,12 +1491,13 @@ mod tests {
             let sentinel = home.join("sentinel.txt");
             let script = argv_capture_script(&home, &sentinel);
             register_seat(&home, &format!("seat-{tag}"));
+            let work_dir = home.join(format!("seat-{tag}-work"));
             let resolved = resolved_seat(
                 &format!("seat-{tag}"),
                 backend.clone(),
                 vec![script],
                 model,
-                &home,
+                &work_dir,
             );
             let outcome = run_attach(
                 AttachSpec::Agent {
@@ -1549,12 +1545,13 @@ mod tests {
         let sentinel = home.join("sentinel.txt");
         let script = argv_capture_script(&home, &sentinel);
         register_seat(&home, "seat-sync");
+        let work_dir = home.join("seat-sync-work");
         let mut resolved = resolved_seat(
             "seat-sync",
             crate::backend::Backend::ClaudeCode,
             vec!["--model".into(), "pinned".into()],
             Some("fleet-loser"),
-            &home,
+            &work_dir,
         );
         // Use the capture script itself as the wrapper executable. The declared
         // Claude identity must enrich its argv without relying on its basename.
@@ -1662,10 +1659,11 @@ mod tests {
             AttachOutcome::Ready {
                 pane_id: pid,
                 instance_id: crate::types::InstanceId::default(),
-                rx: sub_rx,
+                instance_ref: None,
+                unmanaged: true,
+                sub: crate::agent::Subscription::detached(sub_rx),
                 dump: b"DUMP-XYZ".to_vec(),
                 work_dir: home.clone(),
-                name: "shell".into(),
             },
             fwd_tx,
             &wakeup_tx,
@@ -1733,10 +1731,11 @@ mod tests {
             AttachOutcome::Ready {
                 pane_id: pid,
                 instance_id: crate::types::InstanceId::default(),
-                rx: sub_rx,
+                instance_ref: None,
+                unmanaged: true,
+                sub: crate::agent::Subscription::detached(sub_rx),
                 dump: Vec::new(),
                 work_dir: home.clone(),
-                name: "shell".into(),
             },
             job.fwd_tx,
             &wakeup_tx,
@@ -1808,10 +1807,11 @@ mod tests {
             AttachOutcome::Ready {
                 pane_id: pid,
                 instance_id: crate::types::InstanceId::default(),
-                rx: sub_rx,
+                instance_ref: None,
+                unmanaged: true,
+                sub: crate::agent::Subscription::detached(sub_rx),
                 dump: Vec::new(),
                 work_dir: home.clone(),
-                name: "shell".into(),
             },
             job.fwd_tx,
             &wakeup_tx,
@@ -1948,10 +1948,11 @@ mod tests {
             AttachOutcome::Ready {
                 pane_id,
                 instance_id,
-                rx: sub_rx,
+                instance_ref: None,
+                unmanaged: true,
+                sub: crate::agent::Subscription::detached(sub_rx),
                 dump: Vec::new(),
                 work_dir: home.clone(),
-                name: "shell".into(),
             },
             fwd_tx,
             &wakeup_tx,

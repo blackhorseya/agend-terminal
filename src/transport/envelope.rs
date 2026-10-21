@@ -20,9 +20,11 @@ pub(crate) struct SessionLocator {
     /// OpenCode's HTTP Basic-auth username.  Never included in normal logs.
     #[serde(default)]
     pub username: Option<String>,
-    /// OpenCode's loopback server password.  The locator is stored in the
-    /// private transport state directory and is never logged.
-    #[serde(default)]
+    /// Loopback session credential: OpenCode's server password, or the Claude
+    /// ChannelBridge bearer token. Authoritative only in the private
+    /// session-locator artifact; durable delivery receipts and exports omit it
+    /// (see `durable_session_locator`), and it is never logged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub password: Option<String>,
     /// Optional provider/model selected for the shared OpenCode session.
     #[serde(default)]
@@ -126,6 +128,11 @@ pub(crate) enum DeliveryKind {
 pub(crate) struct DeliveryEnvelope {
     pub delivery_id: Uuid,
     pub instance: String,
+    /// Delivery persistence/export must retain the locator needed to identify
+    /// a session without copying any backend credential into the durable
+    /// receipt. The private session-locator artifact still serializes the
+    /// complete locator for backend restart/reconnect.
+    #[serde(with = "durable_session_locator")]
     pub session: SessionLocator,
     pub kind: DeliveryKind,
     pub body: String,
@@ -147,6 +154,43 @@ pub(crate) struct DeliveryEnvelope {
     /// independent internal deliveries, which must each remain attempt 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub logical_delivery_id: Option<String>,
+    /// #3324: the EXTERNAL channel this delivery originated on, when it did.
+    ///
+    /// The ChannelBridge is an inbound transport to the agent, not an outbound
+    /// sender: a bridge `reply` records a transport acknowledgement and never
+    /// reaches Telegram. Two tools are named `reply` in that environment, so
+    /// without a typed origin the wrong one succeeds silently. `None` means the
+    /// delivery originated inside AgEnD and the bridge owns its reply.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_origin: Option<crate::channel::ChannelKind>,
+}
+
+mod durable_session_locator {
+    use super::SessionLocator;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    pub(super) fn serialize<S>(locator: &SessionLocator, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        // EVERY backend: this field carries OpenCode's server password on one
+        // route and the Claude ChannelBridge bearer token on another, so an
+        // allowlist of one backend leaked the other. No production reader takes
+        // the credential from a durable envelope — the private session-locator
+        // artifact is authoritative — so it is always safe to drop here.
+        let mut redacted = locator.clone();
+        redacted.password = None;
+        redacted.serialize(serializer)
+    }
+
+    pub(super) fn deserialize<'de, D>(deserializer: D) -> Result<SessionLocator, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Accept legacy receipt rows that carried the password. New rows are
+        // emitted through `serialize`, which omits it for every backend.
+        SessionLocator::deserialize(deserializer)
+    }
 }
 
 impl DeliveryEnvelope {
@@ -171,6 +215,7 @@ impl DeliveryEnvelope {
             payload_digest,
             transport_mode: None,
             logical_delivery_id: None,
+            channel_origin: None,
         }
     }
 

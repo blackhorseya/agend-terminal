@@ -1,14 +1,30 @@
 [繁體中文](MCP-TOOLS.zh-TW.md)
 
-# AgEnD MCP Tools Reference (32 tools)
+# AgEnD MCP Tools Reference (34 tools)
 
-The daemon registry and live `tools/list` schema are authoritative. Role filtering can expose a subset of these 32 registered tools to an instance.
+> **Status:** Current exact schema reference
+> **Audience:** Agents and reviewers
+> **Authority:** Live tools/list schema and daemon registry
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
+The daemon registry and live `tools/list` schema are authoritative. Role filtering can expose a subset of these 34 registered tools to an instance.
 
 ## Action-based Tools
 
 ### `task`
 
-Manage task boards. Actions: `create`, `list`, `get`, `claim`, `done`, `update`, `sweep`, `health`, `activity`, `metadata_set`, `metadata_get`, `ack_plan`.
+Manage task boards. Actions: `create`, `list`, `get`, `claim`, `done`, `update`, `sweep`, `board_sweep`, `board_unretire`, `health`, `activity`, `metadata_set`, `metadata_get`, `ack_plan`, `orphan_reconcile_preview`, `orphan_reconcile_apply`.
+
+- **REQUIRED:** Every call supplies `action`. Orphan-reconcile preview requires the exact `decision_id`, `board`, a non-empty `audit_reason`, and the complete frozen seven-row `mappings` set. Apply consumes only the preview `confirmation` token; that token freezes the mappings and audit scope.
+- **STOP:** Never apply an orphan reconciliation without a matching preview confirmation.
+- **OPTIONAL:** Use `verbose`, `fields`, `include_history`, and filters to control list output.
+
+Preview, then apply only the frozen mapping:
+
+```json
+{"action":"orphan_reconcile_preview","decision_id":"d-20260922032524703479-91","board":"Hack_agend-terminal","audit_reason":"apply the approved seven-row orphan reconciliation","mappings":[{"predecessor_id":"t-20260907235055249429-95750-527","replacement_id":"t-20260911011514337302-80976-487"},{"predecessor_id":"t-20260914111234728581-87735-45","replacement_id":"t-20260914111408120558-87735-48"},{"predecessor_id":"t-20260914111259722658-87735-46","replacement_id":"t-20260914111408120558-87735-48"},{"predecessor_id":"t-20260914111332528060-87735-47","replacement_id":"t-20260914111408120558-87735-48"},{"predecessor_id":"t-20260915052051881509-87735-153","replacement_id":"t-20260915052412876647-87735-158"},{"predecessor_id":"t-20260914153935855471-87735-78","replacement_id":"t-20260914174754306925-87735-97"},{"predecessor_id":"t-20260921192747528323-35876-350","replacement_id":"t-20260921210143816824-35876-355"}]}
+{"action":"orphan_reconcile_apply","confirmation":"<preview confirmation UUID>"}
+```
 
 - Core fields include `id`/`task_id`, `title`, `description`, `assignee`, `priority`, `status`, `branch`, `depends_on`, `result`, `due_at`, `project`, and `scope`.
 - `list` returns actionable tasks by default; use `include_history:true` to include done/cancelled tasks and filters such as `filter_status` or `filter_assignee` to narrow it.
@@ -18,9 +34,11 @@ Manage task boards. Actions: `create`, `list`, `get`, `claim`, `done`, `update`,
 
 ### `decision`
 
-Manage durable decisions and operator questions. Actions: `post`, `list`, `update`, `answer`.
+Manage durable decisions and operator questions. Actions: `post`, `list`, `get`, `update`, `answer`, `archive_batch`.
 
 - Decision fields: `id`, `title`, `content`, `tags`, `scope`, `supersedes`, `archive`, `include_archived`, `ttl_days`.
+- `list` is terse by default and caps long `content` at about 200 characters. Use `verbose:true` for complete content or `fields:"minimal"` for only `id`, `title`, `author`, `status`, `tags`, `created_at`, and `archived`. Decision minimal retains `created_at` for chronological decision context; task minimal omits it to keep routine work polling lighter.
+- `get` returns one full record by `id`, including `supersedes`, `superseded_by`, and `archived`. `superseded_by` is recorded when the replacement is posted or when a guarded #3507 retroactive update links an existing replacement.
 - Questions use `needs_answer`, `options`, `allow_free_text`, `timeout_secs`, and `timeout_default`; `answer` records the selected/free-text response.
 
 ### `team`
@@ -32,7 +50,12 @@ Manage teams. Actions: `create`, `delete`, `list`, `update`.
 
 ### `schedule`
 
-Manage timed delivery. Actions: `create`, `list`, `update`, `delete`.
+Manage timed delivery. Actions: `create`, `list`, `update`, `delete`, `runs`, `complete`, `deliver`, `resolve_recovery`.
+
+- **REQUIRED:** `attempt_id` is required for `complete` and `deliver`; those actions also use `run_id`.
+- **STOP:** Use `resolve_recovery` only after an operator confirms workers are stopped, delivery is reconciled, and cleanup is complete.
+
+The normal lifecycle is `create` or `list`, inspect `runs`, then `complete` or `deliver` the selected `run_id` and `attempt_id`.
 
 - Fields: `id`, `label`, `instance`, `message`, `cron`, `run_at`, `timezone`, `enabled`.
 - `list` returns the newest three history entries and `runs_total` by default; use `full_history:true` for all retained entries, up to 50.
@@ -46,11 +69,29 @@ Manage batch deployments. Actions: `deploy`, `teardown`, `list`.
 
 ### `ci`
 
-Manage CI watches. Actions: `watch`, `unwatch`, `status`.
+Manage CI watches. Actions: `watch`, `unwatch`, `status`, `defer`, `ack_handoff`.
 
-- Fields: `repository`, `branch`, `interval_secs`, `next_after_ci`, `review_class`, `ci_provider`, `ci_provider_url`, `task_id`, `head_sha`.
+- **REQUIRED:** `watch` needs either an explicit `repository` or a valid caller binding with `source_repo`; `unwatch`, `defer`, and `ack_handoff` require explicit `repository`. `branch` is required for `defer` and `ack_handoff`; `episode` is required for `defer` and `ack_handoff`.
+- **REQUIRED for `defer`:** `wake_task_id`, `reason`, and bounded `defer_secs` (60–3600).
+- **OPTIONAL:** `notification_only`, `head_sha`, `subject_head_sha`, `review_class`, and provider fields.
+- **STOP:** Protected exact-head watches fail closed without the required full SHA, task, authorization, and continuation fields.
+
+```json
+{"action":"defer","repository":"owner/repo","episode":"episode-...","wake_task_id":"t-...","reason":"waiting for task","defer_secs":600}
+{"action":"ack_handoff","repository":"owner/repo","branch":"feat/example","episode":"episode-..."}
+```
+
+- Fields: `repository`, `branch`, `interval_secs`, `next_after_ci`, `review_class`, `ci_provider`, `ci_provider_url`, `task_id`, `head_sha`, `subject_head_sha`.
 - Use `repository` (GitHub `owner/repo`), not `repo`. `watch` may derive it from the caller's binding; `unwatch` requires it explicitly.
 - Generic `main`/`master` watches are rejected. A protected-ref exact-head watch requires a full 40/64-hex `head_sha`, `task_id`, explicit `next_after_ci`, GitHub, and an authorized orchestrator/operator caller.
+
+### `correct_review_class`
+
+Decision45 operator-only audited correction for one exact PR generation.
+
+- Fields: `action` (`preview` or `apply`), canonical `repository`, `pr_number`, subject `branch`, full current `head_sha`, `expected_old_class`, `new_class`, stable `operation_id`, and nonempty `reason`.
+- `preview` validates the provider/local exact-PR snapshot without changing state. `apply` persists intent before invalidating exact assignments and receipts, fences dispatch/receipt replay/merge while incomplete, and records an auditable effect snapshot for idempotent same-operation retry.
+- Agents and orchestrators are denied. Snapshot drift, journal uncertainty, mismatched operation reuse, and non-exact watch identity fail closed; CI, exact-head, base, and non-force merge gates remain unchanged.
 
 ### `repo`
 
@@ -103,6 +144,51 @@ Reply to the user/operator through an external channel; do not use it for inter-
 - Optional `task_id` and `correlation_id` preserve reply-to correlation.
 - Pair `default_action` with `timeout_secs` to record a timed default decision.
 
+### `operator_page`
+
+Page the **operator** on their Telegram, independent of any inbound channel binding — for milestones they explicitly asked to be told about while away or asleep. This is the agend-side answer to a gap in the harness: `PushNotification`'s mobile leg only reaches a phone when Remote Control is connected, and `reply` needs an inbound message to answer, which operator input typed in the TUI never creates.
+
+- Required: `message`. Plain text, truncated at 1000 characters, always prefixed with the calling instance's name. Before the cap and the prefix the body is normalised to ONE line: every **Cc** control character (LF, CR, TAB, VT, FF, NEL, the rest of C0/C1), every Unicode **White_Space** character (NBSP `U+00A0`, `U+1680`, `U+2000`–`U+200A`, `U+202F`, `U+205F`, `U+3000`, and the mandatory breaks `U+2028`/`U+2029`), every general-category **Cf** format character (ZWSP `U+200B`, ZWNJ/ZWJ, the bidi LRM/RLM/LRE/RLE/PDF/LRO/RLO set, the `U+2066`–`U+2069` isolates, `U+FEFF`) and every character carrying the Unicode **`Default_Ignorable_Code_Point`** property (CGJ `U+034F`, the variation selectors `U+FE00`–`U+FE0F` and `U+180B`–`U+180F`, the Hangul fillers) becomes ONE space, and runs of spaces collapse. Category **Mn** as a whole is deliberately NOT stripped — combining marks are how Vietnamese, Hebrew and Devanagari are written — so only the default-ignorable part of it is taken; the accepted cost is that `U+FE0F` is stripped from an emoji, which may then render in its text presentation.
+
+  If what is left still contains the daemon's sender marker `[operator-page from ` — matched **case-insensitively**, so `[Operator-Page From ops]` counts — the page is **REFUSED** with `marker_in_body`. The refusal runs immediately after the enabled switch and ahead of every other gate: before authority, before deliverability and before any budget claim, so a forged body can never cost the caller a rate slot, and the attempt is logged at `warn!` with the calling name so the operator can see it. It sits behind the switch on purpose — while paging is OFF the tool is inert and answers `operator_page_disabled`, so a disabled feature is not a way to make the daemon write log lines. An earlier version instead rewrote a literal marker to `[quoted: operator-page from ` and delivered the page; that silently MUTATED operator-visible text (no flag in the payload, nothing logged) and was defeated by case variants and by NBSP/ZWSP/RLO spellings anyway, so it is withdrawn. A legitimate page essentially never contains the marker, so refusing costs nothing and makes an attempt detectable.
+
+  Exactly what is and is not covered, stated precisely because an earlier version of this paragraph claimed more than the code delivers:
+
+  - **COVERED.** Every mandatory line break and every character that cannot survive verbatim: control characters (**Cc**), Unicode **`White_Space`** including NBSP, format characters (**Cf**) such as ZWSP and the bidi overrides, and the **`Default_Ignorable_Code_Point`** set (CGJ `U+034F`, the variation selectors). So the marker cannot begin a line, and it cannot be spelled with an invisible-format character or a look-alike space.
+  - **NOT COVERED.** A marker spelled with **homoglyphs** — `[оperator-page from ops]`, with Cyrillic `о` `U+043E` for Latin `o` — is **not detected and IS delivered**. Every character in it renders, so no test for invisibility can see it, and confusable folding is not attempted here.
+  - **Why the residual is bounded** — as the mitigation it is, and not more: the body is flattened to ONE line and the daemon's own prefix is always first, so a homoglyph forgery can only ever appear **mid-line, after a genuine `[operator-page from <caller>]` prefix**. It cannot open a line and it cannot displace the real sender.
+
+  The honest limit stands: a client that soft-wraps a long page can still start a visual row mid-body, and a body is still free to contain other sender-looking prose. None of this makes a page unimpersonatable.
+- **Orchestrator-only, bound to a LIVE instance.** The `instance` a call carries is resolved against the daemon's live registry before anything else: a name matching no running instance — or matching two — is refused with `unknown_caller`; a caller listed by more than one team is refused with `ambiguous_team` rather than answered from map order; a caller that is not its team's current orchestrator is refused with `not_orchestrator` and told who to route through. A standalone bridge call has no registry to resolve against and is refused with `no_live_identity`.
+
+  The honest limit: every agent and the daemon share ONE OS user, so a seat that presents the orchestrator's live name **is** admitted. The gate rejects names that mean nothing; it cannot reject a seat that lies. What bounds the damage is the rest of this list, and only the controls that do not live in an agent-writable file count — default-off, the operator-only switch, one dedicated topic inside the allowlisted group, and the fact that every page is attributed and lands in front of the operator. The three-an-hour cap is deliberately NOT on that list: it bounds accident and runaway, not a hostile seat (see the rate-cap bullet below).
+- **Off by default, and the switch is operator-only.** It lives in the daemon's runtime config, which the `config` MCP tool can READ but not write (`set` moved to the CLI in #2548). The operator turns paging on with:
+
+  ```
+  agend-terminal admin config-set operator_page.enabled true
+  ```
+
+  and picks the destination topic with `agend-terminal admin config-set operator_page.topic_name <NAME>` (default `operator-notifications`). A `channel.operator_page` stanza in `fleet.yaml` is no longer read at all: fleet.yaml is agent-writable, so a master switch there is one its own subjects could flip. Telegram itself still needs `channel.user_allowlist` in `fleet.yaml` — outbound is fail-closed without it.
+- **Telegram specifically.** The page has to be able to reach the operator's phone: an authorized Discord channel does not count, and a call that cannot reach telegram is refused with `not_delivered` without spending a rate slot.
+- **Rate-capped at 3 per orchestrator per rolling hour.** The excess is DROPPED, never queued; the refusal carries `retry_after_secs` so the caller can fall back to recording the milestone in `SESSION-HANDOFF.md`. The counter is authoritative in the daemon's memory behind a lock and is snapshotted to `$AGEND_HOME/operator_page_rate.json` so an HONEST restart does not refill the budget. What a hostile rewrite can still do across a restart is stated in full below.
+
+  **The snapshot is seeded by the operator, never by the daemon.** `agend-terminal admin config-set operator_page.enabled true` lays down an empty snapshot if there is not one already (it never clobbers an existing one, so re-running it does not refund spent pages). The daemon refuses to invent one: an ABSENT snapshot at startup is treated exactly like a corrupt one and DENIES. That closes a bypass — deleting the file and forcing a daemon restart used to re-initialise the budget empty, turning 3-per-hour into 3-per-restart.
+
+  Every untrustworthy state refuses with `budget_unavailable` — a code distinct from `rate_limited` — plus a `cause` naming which condition tripped it: `snapshot_absent`, `snapshot_corrupt`, `snapshot_missing` (it vanished while the daemon was running), `snapshot_unusable`, `snapshot_unwritable`. **The remedy in every case is the operator re-running the enable command** to re-seed; a corrupt snapshot must be repaired or deleted first.
+
+  **What that remedy costs, before you run it.** For `snapshot_absent` and `snapshot_corrupt` the daemon no longer holds the spent count for that home — it was destroyed with the snapshot — so re-seeding writes an empty counter and **STARTS A NEW ROLLING HOUR**: pages already spent inside the current hour are forgotten and the caller gets a full budget again. The refusal hint says so before the operator acts, and the seeding logs a `warn!` naming the snapshot path. For `snapshot_missing` and `snapshot_unwritable` memory still holds the true count, so re-seeding writes it back and the hour is preserved; those hints carry no such warning. This is not a claim that the snapshot is tamper-proof — see the next paragraph. Only the absent, corrupt, truncated and unreadable shapes are tamper-evident at all, and this operator-gated reset is the remedy for those.
+
+  **What the persisted counter covers, and what it does not.** An earlier version of this paragraph over-claimed and a PRIMARY reviewer disproved it with a repro, so the guarantee is now stated as a matrix of tampering shape against process lifetime rather than as a slogan.
+
+  - **COVERED.** While the daemon is RUNNING, every shape is closed: the counter is in memory behind a lock and the claim path never consults the file for a count, so what the bytes say cannot matter. Across an HONEST restart the spent rolling hour is preserved. After a restart, a snapshot that is ABSENT, CORRUPT, TRUNCATED or UNREADABLE fails **closed** — it refuses with `budget_unavailable` plus a `cause`, distinguishable from an ordinary `rate_limited`, and logged with the snapshot path. A snapshot the daemon cannot WRITE also denies, rolling the claim back rather than letting an uncounted page through. This is defence in depth against an accident, a clumsy reset and a crash.
+  - **NOT COVERED.** After a restart, any snapshot that PARSES is trusted, whatever it says. An agent that has spent the orchestrator's three pages can overwrite the file with a valid `{}` — or drop just one orchestrator's stamps, or put an older honest snapshot back — and after the next daemon restart page again. This **does** reset the window. It can be neither prevented nor detected while the file is agent-writable under one shared UID: any key the daemon can read at boot to verify a MAC is a key the agent can read too and then use to MAC `{}`, so detection fails for exactly the reason prevention does. See [architecture.md §1.2](architecture.md#12-shared-uid-trust-model).
+  - **Failing closed at every restart was considered and rejected.** Restoring no remaining budget after a daemon start would make "tampering can only deny" literally true. This deployment's event log carries 40 `daemon_start` events between 2026-08-24 and 2026-09-02 — one every ~5.5 hours — so that would leave the operator unpageable roughly 18% of the time, in a feature that exists to reach them overnight. It also turns "an attacker gains three extra pages" into "an attacker, or any crash, silences the operator's phone for an hour", and for an alerting feature suppression is the worse failure mode.
+  - **Therefore** the persisted 3-per-hour cap is **not** an independent same-UID damage bound and must not be described as one. It bounds accident and non-adversarial resets. The controls against a hostile seat are the ones listed under the orchestrator-only bullet above.
+
+  The durability clause this was built for — the counter must survive a daemon restart, or the restart itself becomes the bypass — is still met: an honest restart preserves the spent hour. Provenance, stated because getting it wrong drove four rounds of work: that clause is the **orchestrator's expansion in the implementation task**, not the operator's words. The operator decision `d-20260902104216571473-11` settles the 3-per-hour cap, the DROP semantics and the structured refusal, and contains no restart term at all. What has been withdrawn is the stronger claim that a hostile agent cannot refill the hour by itself.
+- **Routing.** Pages land in a dedicated forum topic (default `operator-notifications`), auto-created and registered on first use, so they collect in one place the operator can mute. If that topic cannot be created the page falls back to the sender's own topic — both live inside the allowlisted group.
+- **Operator Away/Sleep mode does NOT suppress pages.** That is deliberate: the feature exists because the operator was asleep and asked to be woken for milestones. The controls for pages are the `enabled` switch (the master off) and the hourly cap — not the mode. Ordinary daemon notices remain mode-gated as before.
+
 ### `download_attachment`
 
 Download a Telegram multimedia attachment and return its local path.
@@ -139,9 +225,10 @@ Restart an instance.
 
 ### `set_model`
 
-Persist exactly one model intent (`model` or `tier`) for an instance; setting one clears the other. `restart:true` applies it immediately, otherwise it takes effect on the next respawn.
+Persist model and/or reasoning-effort intent for an instance. `model` and `tier` stay mutually exclusive (setting one clears the other); `effort` composes with either or stands alone, and an empty-string `effort` clears it. `restart:true` applies it immediately, otherwise it takes effect on the next respawn.
 
-- Required: `instance` and exactly one of `model`/`tier`.
+- Required: `instance` and at least one of `model`/`tier`/`effort`.
+- `effort` accepts `low` / `medium` / `high` / `xhigh` / `max` (per-backend range applies at spawn; out-of-range values are safely dropped with a warning). On backends without effort support the intent persists with an `effort_unsupported_dropped` warning.
 
 ### `bind_topic`
 
@@ -202,10 +289,13 @@ Guardedly release the exact daemon-managed worktree and binding. The normal path
 
 - Required: `instance`; optional `dry_run` and `force`.
 - `force:true` additionally requires `branch`; `repository_path` is an optional cleanup hint. Markerless, opaque, ambiguous, or mismatched state is preserved.
+- Before removing a verified managed worktree, release deletes its ignored `target/` cache, removes the Git worktree, and only then clears the binding. A failed phase returns `code: release_incomplete` with `stage`, `path`, and `bytes_remaining`; the binding remains authoritative.
+- Slow releases continue in the daemon worker after the proxy returns `accepted:true, release_in_flight:true`. `binding_state` reports `release_in_flight` and `release_progress`; completion is delivered as `release_completed`.
+- Checkout/typed dispatch reports a marker-bearing unbound target as `code: stale_worktree_dir` with the marker and guarded force-release advice.
 
 ### `binding_state`
 
-Non-destructively report binding content, worktree/marker state, signature diagnostics, CI subscriptions, in-flight guard, and branch holders.
+Non-destructively report binding content, worktree/marker state, signature diagnostics, CI subscriptions, bind/release in-flight progress, and branch holders.
 
 - Required: `instance`.
 
@@ -228,7 +318,7 @@ Operator-only PREPARE step for a persisted usage-limit takeover episode. It writ
 Read runtime configuration. Actions: `get`, `list`; MCP mutation is not supported.
 
 - `get` requires `key`.
-- Current keys: `dev_idle_threshold_secs`, `fleet_idle_threshold_secs`, `fleet_idle_ack_ttl_secs`, `hang_auto_recovery_enabled`, `usage_limit_propagation_enabled`, `idle_watchdog_enabled`, `show_pane_state`, `copy_on_select`, `dim_unfocused_panes`, `observed_badge`, `context_alert_pct`, `context_handoff_pct`, `context_handoff_escalate_pct`.
+- Current keys: `dev_idle_threshold_secs`, `fleet_idle_threshold_secs`, `fleet_idle_ack_ttl_secs`, `hang_auto_recovery_enabled`, `usage_limit_propagation_enabled`, `idle_watchdog_enabled`, `show_pane_state`, `copy_on_select`, `dim_unfocused_panes`, `observed_badge`, `context_alert_pct`, `context_handoff_pct`, `context_handoff_escalate_pct`, `experimental.tool_cli_enabled`, `operator_page.enabled`, `operator_page.topic_name`.
 - Change a value with `agend-terminal admin config-set <KEY> <VALUE>`.
 
 ### `restart_daemon`
@@ -246,6 +336,11 @@ Request a graceful daemon restart. Parameters: none.
 The daemon is the only authority for the tool registry, authorization, task
 state, and side effects. `agend-mcp-bridge` is a near-zero-state relay; it has
 no local tool implementation or filesystem fallback.
+
+The experimental `agend-terminal tool <NAME>` command uses the same daemon
+handlers, names, arguments, and instance claim as MCP. An instance should use
+one invocation surface at a time; translate mechanically when coordinating
+with a peer using the other surface.
 
 ```text
 MCP client

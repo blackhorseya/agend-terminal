@@ -14,6 +14,7 @@ pub(crate) mod comms_gates;
 pub(crate) mod dispatch;
 pub(crate) mod dispatch_hook;
 mod force_release;
+pub(crate) mod review_class_correction;
 pub(crate) use force_release::{
     classify_target, prune_exact_git_metadata, ExactMetadataState, TargetState,
 };
@@ -263,6 +264,9 @@ pub(crate) fn handle_tool_with_runtime_and_requester(
             Some(id) => dispatch::dispatch_restart_daemon_with_requester(&dispatch_ctx, Some(id)),
             None => dispatch::dispatch_restart_daemon(&dispatch_ctx),
         };
+    }
+    if tool == "team" && args["action"].as_str() == Some("update") {
+        return dispatch::dispatch_scoped_team(&dispatch_ctx, requester_id);
     }
     if let Some(value) = dispatch::try_dispatch(tool, &dispatch_ctx) {
         return value;

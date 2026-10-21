@@ -85,6 +85,34 @@ agend-terminal status                                       # alias of `list` (k
 
 當 `mode != live` 時，單純（非 JSON）的 `list` 會在 stderr 加上一行提示，讓互動式執行此指令的 operator 不必重跑 `--json` 也能看到 fallback 狀態。
 
+### `tool`（實驗性，Phase 0a）
+
+隱藏的 `tool` 指令是與 `agend-mcp-bridge` 使用相同 daemon MCP tools 的通用
+Bash 介面。daemon 圍欄預設關閉；operator 可在隔離環境以以下指令開啟：
+
+```
+agend-terminal admin config-set experimental.tool_cli_enabled true
+```
+
+從即時、依角色過濾的目錄與 schema 發現工具：
+
+```
+agend-terminal tool list
+agend-terminal tool schema send
+agend-terminal tool task --action get --arg id=t-123
+agend-terminal tool send --json - <<'EOF'
+{"instance":"ane-review","request_kind":"query","message":"..."}
+EOF
+```
+
+`--json` 接受內嵌 JSON object、`-`（stdin）或 `@FILE`。重複的
+`--arg K=V` 會以字串覆寫 JSON object，最後由 `--action` 覆寫 `action`。
+含引號、換行、`$` 或反引號的值必須使用帶引號的 `--json -` heredoc
+（`<<'EOF'`）。同一 instance 不應混用兩種 invocation surface。
+
+Exit code：`0` 完成（含 `accepted_in_progress`，不可重送）、`1` tool error、
+`2` refused／未執行、`3` 格式錯誤、`4` 結果不明（重送前先用唯讀 tool 查狀態）。
+
 ### `admin`
 
 Operator 端的維護子指令。具破壞性的路徑會提示 `[y/N]`，除非提供 `--yes`（供腳本化的復原任務使用）。
@@ -121,6 +149,21 @@ Exit code：
 #### `admin cleanup-branches`
 
 刪除其 PR 已被 merge 的本地分支（對 squash-merge 安全）。預設為 dry-run（僅預覽）；`--yes` 才會實際刪除。squash-merge 偵測的啟發式做法見 `docs/RCA-*` 筆記。
+
+#### 操作者精確結案
+
+daemon 執行中時，先預覽單一任務，檢查回傳的任務內容及理由，再明確套用確認碼：
+
+```sh
+agend-terminal admin task-settlement-preview --task-id TASK_ID --target cancelled --result '檢查後確認為重複任務'
+agend-terminal admin task-settlement-apply --confirmation TOKEN_FROM_PREVIEW
+```
+
+目標限 `done` 或 `cancelled`。未使用的確認碼有效 15 分鐘；任務內容改變後須重新預覽。
+命令使用 operator 認證，不提供 agent MCP 權限。輸出為 JSON；拒絕或連線失敗時退出碼非零。
+只處理指定任務，不連帶取消子任務、不產生 PR／CI 證據，也不直接清理 worktree。
+`cleanup_status: not_verified` 不代表背景清理已完成。重送會分別顯示原始結果與目前任務狀態，
+不會把重新開啟的任務再次關閉。
 
 #### `admin task-sweep-config` (#2547)
 
@@ -177,11 +220,15 @@ agend-terminal kill <name>
 ```
 
 ### `stop`
-停止 daemon（同時終止所有受管理的 agent）。
+停止 daemon（同時終止所有受管理的 agent）。`stop` 預設會在有上限的時間內等 daemon 行程真正退出，再印出結果，因此 `stop && start` 不會再撞上還在退出的 daemon（#3539）。
 
 ```
-agend-terminal stop
+agend-terminal stop                 # 最多等 30 秒讓 daemon 退出
+agend-terminal stop --timeout 60    # 拉長上限；到期仍在跑則以非零碼結束
+agend-terminal stop --no-wait       # 請求被接受即返回（舊行為）
 ```
+
+daemon 退出後，`stop` 會列出「看起來像 agend 相關」的已重新掛載（reparented）行程——本 crate 的 cargo 測試二進位、debug 版 daemon、cwd 在 `worktrees/` 下——以 `hint=…` 欄標示。它們不歸 daemon 所有，daemon 不會動它們；`doctor` 有同一個 hint 欄，`doctor orphans preview` 可啟動人工確認的清理。
 
 ### `agend-mcp-bridge`（獨立的二進位檔）
 

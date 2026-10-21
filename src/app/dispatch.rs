@@ -7,7 +7,7 @@ use std::path::Path;
 
 use crate::agent::AgentRegistry;
 use crate::keybinds::Action;
-use crate::layout::{Layout, SplitDir};
+use crate::layout::{Layout, Pane, PaneReconnectOutcome, SplitDir};
 
 use super::overlay::{CloseTarget, Overlay};
 
@@ -23,6 +23,8 @@ pub(super) struct DispatchCtx<'a> {
     pub last_tab: &'a mut usize,
     pub wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
+    pub task_rpc_tx: &'a crossbeam_channel::Sender<super::rpc::TaskRequest>,
+    pub task_snapshot: &'a [crate::tasks::Task],
 }
 
 /// Signals back to `run_app`. Fields are applied independently — a single
@@ -48,7 +50,7 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
         }
         Action::NewTab => {
             out.new_overlay = Some(Overlay::NewTabMenu {
-                items: super::build_menu_items(ctx.fleet_path, ctx.registry),
+                items: super::build_menu_items(ctx.fleet_path, ctx.registry, ctx.layout),
                 selected: 0,
             });
         }
@@ -81,6 +83,12 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
                 .map(|p| p.label().to_string())
                 .unwrap_or_default();
             out.new_overlay = Some(Overlay::RenamePane { input: current });
+        }
+        Action::ReconnectPane => {
+            let feedback = reconnect_focused_pane(ctx);
+            let message = feedback.message();
+            tracing::info!(%message, "focused pane bridge reconnect requested");
+            out.new_overlay = Some(Overlay::ReconnectNotice { message });
         }
         Action::RenameTab => {
             let current_name = ctx
@@ -128,14 +136,14 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
         }
         Action::SplitVertical => {
             out.new_overlay = Some(Overlay::SplitMenu {
-                items: super::build_menu_items(ctx.fleet_path, ctx.registry),
+                items: super::build_menu_items(ctx.fleet_path, ctx.registry, ctx.layout),
                 selected: 0,
                 dir: SplitDir::Vertical,
             });
         }
         Action::SplitHorizontal => {
             out.new_overlay = Some(Overlay::SplitMenu {
-                items: super::build_menu_items(ctx.fleet_path, ctx.registry),
+                items: super::build_menu_items(ctx.fleet_path, ctx.registry, ctx.layout),
                 selected: 0,
                 dir: SplitDir::Horizontal,
             });
@@ -163,6 +171,20 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
             out.new_overlay = Some(Overlay::ConfirmClose {
                 target: CloseTarget::Tab,
             });
+        }
+        Action::DeleteInstance => {
+            if let Some(name) = ctx
+                .layout
+                .active_tab()
+                .and_then(|tab| tab.focused_pane())
+                .and_then(|pane| pane.fleet_instance_name.clone())
+            {
+                out.new_overlay = Some(Overlay::ConfirmDeleteInstance {
+                    name,
+                    input: String::new(),
+                    notice: None,
+                });
+            }
         }
         Action::FocusUp => {
             if let Some(tab) = ctx.layout.active_tab_mut() {
@@ -204,46 +226,66 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
             });
         }
         Action::ShowTasks => {
-            let items = crate::tasks::list_all(ctx.home);
+            let pending = ctx
+                .task_rpc_tx
+                .try_send(super::rpc::TaskRequest::List)
+                .is_ok();
             out.new_overlay = Some(Overlay::Tasks {
-                items,
+                items: ctx.task_snapshot.to_vec(),
                 col: 0,
                 row: 0,
                 mode: super::overlay::TaskBoardMode::Board,
                 view: super::overlay::BoardView::Tasks,
+                pending,
+                notice: (!pending).then(|| "task request already pending".to_string()),
             });
         }
         Action::ShowFleet => {
-            let items = crate::tasks::list_all(ctx.home);
+            let pending = ctx
+                .task_rpc_tx
+                .try_send(super::rpc::TaskRequest::List)
+                .is_ok();
             out.new_overlay = Some(Overlay::Tasks {
-                items,
+                items: ctx.task_snapshot.to_vec(),
                 col: 0,
                 row: 0,
                 mode: super::overlay::TaskBoardMode::Board,
                 view: super::overlay::BoardView::Fleet,
+                pending,
+                notice: (!pending).then(|| "task request already pending".to_string()),
             });
         }
         Action::ShowHelp => {
             out.new_overlay = Some(Overlay::Help);
         }
         Action::ShowStatus => {
-            let items = crate::tasks::list_all(ctx.home);
+            let pending = ctx
+                .task_rpc_tx
+                .try_send(super::rpc::TaskRequest::List)
+                .is_ok();
             out.new_overlay = Some(Overlay::Tasks {
-                items,
+                items: ctx.task_snapshot.to_vec(),
                 col: 0,
                 row: 0,
                 mode: super::overlay::TaskBoardMode::Board,
                 view: super::overlay::BoardView::Status,
+                pending,
+                notice: (!pending).then(|| "task request already pending".to_string()),
             });
         }
         Action::ShowMonitor => {
-            let items = crate::tasks::list_all(ctx.home);
+            let pending = ctx
+                .task_rpc_tx
+                .try_send(super::rpc::TaskRequest::List)
+                .is_ok();
             out.new_overlay = Some(Overlay::Tasks {
-                items,
+                items: ctx.task_snapshot.to_vec(),
                 col: 0,
                 row: 0,
                 mode: super::overlay::TaskBoardMode::Board,
                 view: super::overlay::BoardView::Monitor,
+                pending,
+                notice: (!pending).then(|| "task request already pending".to_string()),
             });
         }
         Action::Detach => {
@@ -383,6 +425,90 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
     out
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ReconnectFeedback {
+    Reconnected(String),
+    Appended(String),
+    AlreadyConnected(String),
+    Failed(String),
+}
+
+impl ReconnectFeedback {
+    fn message(self) -> String {
+        match self {
+            Self::Reconnected(name) => {
+                format!("Reconnected bridge for {name}. Agent process was not restarted.")
+            }
+            Self::Appended(name) => {
+                format!(
+                    "Opened a new bridge view for {name}; retained pane was not replaced because its identity was unavailable."
+                )
+            }
+            Self::AlreadyConnected(name) => {
+                format!("{name} is already connected. Agent process was not restarted.")
+            }
+            Self::Failed(reason) => format!("Bridge reconnect failed: {reason}"),
+        }
+    }
+}
+
+fn reconnect_focused_pane(ctx: &mut DispatchCtx<'_>) -> ReconnectFeedback {
+    reconnect_focused_pane_with(ctx, super::pane_factory::create_remote_pane)
+}
+
+fn reconnect_focused_pane_with<F>(
+    ctx: &mut DispatchCtx<'_>,
+    create_remote_pane: F,
+) -> ReconnectFeedback
+where
+    F: FnOnce(
+        &str,
+        &Path,
+        &Path,
+        &mut Layout,
+        u16,
+        u16,
+        &crossbeam_channel::Sender<usize>,
+    ) -> anyhow::Result<Pane>,
+{
+    let Some((name, disconnected)) = ctx
+        .layout
+        .active_tab()
+        .and_then(|tab| tab.focused_pane())
+        .map(|pane| {
+            (
+                pane.fleet_instance_name
+                    .clone()
+                    .unwrap_or_else(|| pane.agent_name.to_string()),
+                pane.is_disconnected(),
+            )
+        })
+    else {
+        return ReconnectFeedback::Failed("no focused pane".to_string());
+    };
+
+    if !disconnected {
+        return ReconnectFeedback::AlreadyConnected(name);
+    }
+
+    let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    match create_remote_pane(
+        &name,
+        ctx.home,
+        ctx.fleet_path,
+        ctx.layout,
+        cols.saturating_sub(2),
+        rows.saturating_sub(4),
+        ctx.wakeup_tx,
+    ) {
+        Ok(pane) => match ctx.layout.reconnect_or_append_agent_pane(&name, pane) {
+            PaneReconnectOutcome::Reconnected => ReconnectFeedback::Reconnected(name),
+            PaneReconnectOutcome::Appended => ReconnectFeedback::Appended(name),
+        },
+        Err(error) => ReconnectFeedback::Failed(format!("{name}: {error:#}")),
+    }
+}
+
 /// Capture a clipboard image (via `capture`) and inject its `[AGEND-IMAGE-PASTE]`
 /// marker into the focused pane — the `app`-mode half of #2435.
 ///
@@ -413,17 +539,22 @@ mod tests {
     use crate::layout::{Layout, Pane, PaneSource, Tab};
     use crate::vterm::VTerm;
     use std::collections::HashMap;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::AtomicBool;
+    use std::sync::Arc;
 
     fn test_pane(id: usize, name: &str) -> Pane {
         Pane {
             agent_name: name.into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -452,8 +583,21 @@ mod tests {
             fleet_path: home,
             last_tab,
             wakeup_tx,
+            task_rpc_tx: &test_task_channel().0,
+            task_snapshot: &[],
             name_counter,
         }
+    }
+
+    fn test_task_channel() -> &'static (
+        crossbeam_channel::Sender<crate::app::rpc::TaskRequest>,
+        crossbeam_channel::Receiver<crate::app::rpc::TaskRequest>,
+    ) {
+        static CHANNEL: std::sync::OnceLock<(
+            crossbeam_channel::Sender<crate::app::rpc::TaskRequest>,
+            crossbeam_channel::Receiver<crate::app::rpc::TaskRequest>,
+        )> = std::sync::OnceLock::new();
+        CHANNEL.get_or_init(crossbeam_channel::unbounded)
     }
 
     #[test]
@@ -685,6 +829,240 @@ mod tests {
         assert!(
             !focused_last_input_some(&ctx),
             "#2435: a failed clipboard capture injects nothing"
+        );
+    }
+
+    fn disconnected_remote_pane(id: usize, name: &str) -> (Pane, TcpStream) {
+        let listener = TcpListener::bind((crate::ipc::LOOPBACK, 0)).expect("bind test bridge");
+        let client_stream = TcpStream::connect(listener.local_addr().expect("listener addr"))
+            .expect("connect test bridge");
+        let (server_stream, _) = listener.accept().expect("accept test bridge");
+        let client = crate::bridge_client::BridgeClient::from_stream_for_test(client_stream);
+        let mut pane = test_pane(id, name);
+        pane.fleet_instance_name = Some(name.to_string());
+        pane.source = PaneSource::Remote(
+            Arc::new(parking_lot::Mutex::new(client)),
+            Arc::new(AtomicBool::new(false)),
+        );
+        (pane, server_stream)
+    }
+
+    #[test]
+    fn reconnect_disconnected_pane_replaces_only_bridge_without_respawn() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir().join(format!(
+            "agend-tui-reconnect-negative-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create test home");
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        let (mut disconnected, _server) = disconnected_remote_pane(7, "healthy-agent");
+        let original_instance_id = crate::types::InstanceId::new();
+        let original_instance_ref = crate::types::InstanceRef::new(original_instance_id, 1);
+        disconnected.instance_id = original_instance_id;
+        disconnected.instance_ref = Some(original_instance_ref);
+        layout.add_tab(Tab::new("healthy-agent".to_string(), disconnected));
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+        let events_before = std::fs::read(home.join("event-log.jsonl")).ok();
+        let registry_before = crate::agent::lock_registry(&registry).len();
+
+        let feedback = reconnect_focused_pane_with(&mut ctx, |name, _, _, layout, _, _, _| {
+            let mut fresh = test_pane(layout.next_pane_id(), name);
+            fresh.fleet_instance_name = Some(name.to_string());
+            fresh.instance_id = original_instance_id;
+            fresh.instance_ref = Some(original_instance_ref);
+            Ok(fresh)
+        });
+
+        assert_eq!(
+            feedback,
+            ReconnectFeedback::Reconnected("healthy-agent".into())
+        );
+        let pane = ctx
+            .layout
+            .active_tab()
+            .and_then(|tab| tab.focused_pane())
+            .expect("focused pane remains");
+        assert_eq!(pane.id, 7, "existing pane position/id must be retained");
+        assert_eq!(
+            pane.instance_id, original_instance_id,
+            "agent identity is unchanged"
+        );
+        assert_eq!(
+            crate::agent::lock_registry(&registry).len(),
+            registry_before
+        );
+        assert_eq!(
+            std::fs::read(home.join("event-log.jsonl")).ok(),
+            events_before,
+            "bridge reconnect must emit no restart/respawn event"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn reconnect_legacy_name_only_pane_reports_append_without_failure() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        let (disconnected, _server) = disconnected_remote_pane(7, "legacy-agent");
+        layout.add_tab(Tab::new("legacy-agent".to_string(), disconnected));
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+
+        let feedback = reconnect_focused_pane_with(&mut ctx, |name, _, _, layout, _, _, _| {
+            let mut fresh = test_pane(layout.next_pane_id(), name);
+            fresh.fleet_instance_name = Some(name.to_string());
+            Ok(fresh)
+        });
+
+        assert_eq!(feedback, ReconnectFeedback::Appended("legacy-agent".into()));
+        assert_eq!(ctx.layout.tabs.len(), 2);
+        assert!(ctx.layout.tabs[0]
+            .focused_pane()
+            .is_some_and(Pane::is_disconnected));
+    }
+
+    #[test]
+    fn reconnect_action_reports_already_connected_without_mutation() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        let (connected, _server) = {
+            let (pane, server) = disconnected_remote_pane(1, "healthy");
+            if let PaneSource::Remote(_, connected) = &pane.source {
+                connected.store(true, std::sync::atomic::Ordering::Release);
+            }
+            (pane, server)
+        };
+        layout.add_tab(Tab::new("healthy".to_string(), connected));
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+
+        let result = dispatch(Action::ReconnectPane, &mut ctx);
+
+        assert!(matches!(
+            result.new_overlay,
+            Some(Overlay::ReconnectNotice { message }) if message.contains("already connected")
+        ));
+        assert_eq!(ctx.layout.tabs.len(), 1);
+        assert_eq!(
+            ctx.layout
+                .active_tab()
+                .expect("connected pane tab remains")
+                .focus_id,
+            1
+        );
+    }
+
+    #[test]
+    fn reconnect_failure_reports_the_bridge_error() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        let (disconnected, _server) = disconnected_remote_pane(1, "healthy");
+        layout.add_tab(Tab::new("healthy".to_string(), disconnected));
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+
+        let feedback = reconnect_focused_pane_with(&mut ctx, |_, _, _, _, _, _, _| {
+            Err(anyhow::anyhow!("connection refused"))
+        });
+
+        assert_eq!(
+            feedback.message(),
+            "Bridge reconnect failed: healthy: connection refused"
+        );
+        assert!(ctx
+            .layout
+            .active_tab()
+            .and_then(|tab| tab.focused_pane())
+            .is_some_and(Pane::is_disconnected));
+    }
+
+    #[test]
+    fn delete_instance_targets_only_focused_managed_pane() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home = std::env::temp_dir();
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        let mut managed = test_pane(1, "display-label");
+        managed.fleet_instance_name = Some("managed".to_string());
+        layout.add_tab(Tab::new("managed".to_string(), managed));
+        let mut last_tab = 0;
+        let mut names = HashMap::new();
+        let mut ctx = make_ctx(
+            &mut layout,
+            &registry,
+            &home,
+            &mut last_tab,
+            &tx,
+            &mut names,
+        );
+
+        let result = dispatch(Action::DeleteInstance, &mut ctx);
+        assert!(matches!(
+            result.new_overlay,
+            Some(Overlay::ConfirmDeleteInstance {
+                name,
+                input,
+                notice: None,
+            }) if name == "managed" && input.is_empty()
+        ));
+
+        let mut local_layout = Layout::new();
+        local_layout.add_tab(Tab::new("shell".to_string(), test_pane(2, "shell")));
+        let mut local_last_tab = 0;
+        let mut local_names = HashMap::new();
+        let mut local_ctx = make_ctx(
+            &mut local_layout,
+            &registry,
+            &home,
+            &mut local_last_tab,
+            &tx,
+            &mut local_names,
+        );
+        let local_result = dispatch(Action::DeleteInstance, &mut local_ctx);
+        assert!(
+            local_result.new_overlay.is_none(),
+            "unmanaged shell must fail closed without a delete overlay"
         );
     }
 }

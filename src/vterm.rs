@@ -45,6 +45,12 @@ struct CellView {
     wide_spacer: bool,
 }
 
+fn row_buffer(cols: usize) -> String {
+    // Capacity is measured in bytes, while `cols` is terminal columns. A single
+    // visible cell can hold a four-byte UTF-8 scalar, so reserve the safe bound.
+    String::with_capacity(cols.saturating_mul(4))
+}
+
 /// Shared core for `VTerm::tail_lines` / `tail_lines_with_fg` / `tail_lines_with_dim`
 /// AND their [`GridSnapshot`] equivalents. `get(row, col)` yields the visible-grid
 /// cell at `(row, col)` (row 0 = visible top); the caller supplies the source — the
@@ -77,9 +83,20 @@ fn tail_lines_core(
     // physical row whose logical line continues on the next row).
     let mut wrapped: Vec<bool> = Vec::with_capacity(rows);
     for row in 0..rows {
-        let mut line = String::with_capacity(cols);
-        let mut fg: Vec<CellFg> = Vec::new();
-        let mut dim: Vec<bool> = Vec::new();
+        // #cjk-render-cost: the capacity is in BYTES but `cols` counts COLUMNS. For
+        // ASCII the two coincide, so this looked exact; a CJK row needs ~1.5 bytes per
+        // column (two columns per 3-byte char), so EVERY wide-char row overflowed the
+        // preallocation and forced a realloc + memmove — per row, per frame, inside
+        // `terminal.draw` on the render thread (see `DRAIN_OUTPUT_BUDGET_BYTES`).
+        // `cols * 4` is the most any single column can contribute in UTF-8.
+        let mut line = row_buffer(cols);
+        // Same class: these grew from ZERO capacity one push at a time whenever
+        // `collect_fg` is on. Sized once here; still empty when the caller opted out.
+        let (mut fg, mut dim): (Vec<CellFg>, Vec<bool>) = if collect_fg {
+            (Vec::with_capacity(cols), Vec::with_capacity(cols))
+        } else {
+            (Vec::new(), Vec::new())
+        };
         let mut col = 0;
         while col < cols {
             let cell = get(row, col);
@@ -101,16 +118,21 @@ fn tail_lines_core(
         // trailing space can be a significant inter-word space at the wrap column, and
         // the next row is about to be concatenated WITHOUT a `\n` — trimming it would
         // fuse two words and re-break the phrase the de-wrap exists to keep whole.
-        let trimmed = if row_wrapped {
-            line.as_str()
+        // #cjk-render-cost: trim in place and MOVE the row out. `trimmed.to_string()`
+        // copied every row into a SECOND allocation on every frame, and
+        // `trimmed.chars().count()` ran the full UTF-8 decode scan TWICE per row.
+        let keep_bytes = if row_wrapped {
+            line.len()
         } else {
-            line.trim_end()
+            line.trim_end().len()
         };
         if collect_fg {
-            fg.truncate(trimmed.chars().count());
-            dim.truncate(trimmed.chars().count());
+            let keep_chars = line[..keep_bytes].chars().count();
+            fg.truncate(keep_chars);
+            dim.truncate(keep_chars);
         }
-        lines.push(trimmed.to_string());
+        line.truncate(keep_bytes);
+        lines.push(line);
         line_fgs.push(fg);
         line_dims.push(dim);
         wrapped.push(row_wrapped);
@@ -203,6 +225,12 @@ impl EventListener for PtyWriteListener {
         if let Some(mut w) = writer.try_lock() {
             let _ = w.write_all(text.as_bytes());
             let _ = w.flush();
+            drop(w);
+            // #3314: this bypasses `write_with_timeout`, so it must invalidate an
+            // in-flight startup-modal candidate itself. Bumped only when the
+            // bytes actually went out — a skipped write on lock contention has
+            // not touched the child's frame.
+            crate::agent::dev_modal::note_pty_write(writer);
         }
     }
 }
@@ -352,6 +380,9 @@ impl Dimensions for VTermSize {
         self.cols as usize
     }
 }
+
+#[rustfmt::skip]
+fn append_termode_sequences(out: &mut Vec<u8>, mode: term::TermMode) { for (m,s) in [(term::TermMode::ALT_SCREEN,b"\x1b[?1049h" as &[u8]),(term::TermMode::MOUSE_REPORT_CLICK,b"\x1b[?1000h"),(term::TermMode::MOUSE_DRAG,b"\x1b[?1002h"),(term::TermMode::MOUSE_MOTION,b"\x1b[?1003h"),(term::TermMode::SGR_MOUSE,b"\x1b[?1006h")] { if mode.contains(m) { out.extend_from_slice(s); } } }
 
 pub struct VTerm {
     term: term::Term<PtyWriteListener>,
@@ -977,9 +1008,8 @@ impl VTerm {
         let cols = self.cols as usize;
         let rows = self.rows as usize;
 
-        if self.term.mode().contains(term::TermMode::ALT_SCREEN) {
-            out.extend_from_slice(b"\x1b[?1049h");
-        }
+        // rustfmt::skip
+        append_termode_sequences(&mut out, *self.term.mode());
         out.extend_from_slice(b"\x1b[H\x1b[2J");
 
         let mut last_fg: Option<Color> = None;
@@ -1604,6 +1634,10 @@ fn write_color(out: &mut Vec<u8>, color: Color, is_fg: bool) {
 #[cfg(test)]
 #[path = "vterm_scrollback_tests.rs"]
 mod scrollback_tests;
+
+#[cfg(test)]
+#[path = "vterm_cjk_alloc_tests.rs"]
+mod cjk_alloc_tests;
 
 #[cfg(test)]
 mod tests {

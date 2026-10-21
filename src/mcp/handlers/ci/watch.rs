@@ -123,6 +123,139 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         return json!({"error": "Bitbucket Server not yet supported — track Sprint 41+ candidate. Use bitbucket_cloud for Bitbucket Cloud repos."});
     }
 
+    // A task-linked watch must use the task's freshly revalidated authority.
+    // Derive the requested class before creating or mutating any watch/PrState
+    // file, so an omitted class inherits safely and a mismatch fails closed.
+    let requested_review_class: Option<String> = if let Some(task_id) =
+        args["task_id"].as_str().filter(|id| !id.is_empty())
+    {
+        match crate::tasks::load_routed(home, task_id) {
+            Ok(routed) => {
+                let task_class = match crate::tasks::governance::validate_existing_authority(
+                    home,
+                    task_id,
+                    routed.record(),
+                ) {
+                    Ok(Some(class)) => Some(class),
+                    Ok(None) => {
+                        // Preserve the pre-#3419 task-linked watch contract for
+                        // ungoverned legacy tasks that never carried a typed
+                        // class. A governed task (or an explicit class on a
+                        // classless task) still has no durable authority and
+                        // must fail closed.
+                        let has_explicit_class = args
+                            .get("review_class")
+                            .is_some_and(|value| !value.is_null());
+                        if routed
+                            .record()
+                            .metadata
+                            .contains_key("governing_decision_id")
+                            || has_explicit_class
+                        {
+                            return json!({
+                                "error": "task-linked CI watch requires a resolved task review_class",
+                                "code": "watch_review_class_unspecified",
+                                "task_id": task_id,
+                            });
+                        }
+                        None
+                    }
+                    Err(error) => return error,
+                };
+                if let Some(value) = args.get("review_class").filter(|value| !value.is_null()) {
+                    let Some(raw) = value.as_str().filter(|raw| !raw.is_empty()) else {
+                        return json!({
+                            "error": "task-linked CI watch review_class must be exactly 'single' or 'dual'",
+                            "code": "watch_review_class_invalid",
+                            "task_id": task_id,
+                        });
+                    };
+                    let Some(task_class) = task_class else {
+                        return json!({
+                            "error": "task-linked CI watch requires a resolved task review_class",
+                            "code": "watch_review_class_unspecified",
+                            "task_id": task_id,
+                        });
+                    };
+                    if crate::daemon::pr_state::ReviewClass::parse_fail_closed(Some(raw))
+                        != task_class
+                    {
+                        return json!({
+                            "error": format!(
+                                "task review_class={} conflicts with CI watch review_class",
+                                task_class.as_token()
+                            ),
+                            "code": "watch_review_class_mismatch",
+                            "task_id": task_id,
+                        });
+                    }
+                }
+                task_class.map(|class| class.as_token().to_string())
+            }
+            // A task id that routes to NO board carries no authority, so an
+            // identified caller must not supply the class itself — that was the
+            // fail-open here: any agent could name a phantom task and stamp its
+            // own class (e.g. `single` onto a dual-required subject).
+            //
+            // The transient the previous comment invoked ("record not yet
+            // available") cannot reach this arm: `route_task` resolves through
+            // the cross-board catalog, whose `route_with_revision` calls
+            // `ensure_fresh()` and reports a not-yet-Ready board as `Unreadable`
+            // — handled by the reject arm below. `NotFound` here means the task
+            // exists nowhere.
+            Err(crate::tasks::TaskRouteError::NotFound) => {
+                let explicit_class = args["review_class"]
+                    .as_str()
+                    .filter(|class| !class.is_empty())
+                    .map(String::from);
+                match (instance_name.is_empty(), explicit_class) {
+                    // The fail-open this arm used to be: an identified caller
+                    // names a task that routes to NO board and stamps its own
+                    // class (e.g. `single` onto a dual-required subject). The
+                    // task carries no authority, so neither does the caller.
+                    (false, Some(_)) => {
+                        return json!({
+                            "error": "task-linked CI watch names a task that routes to no board",
+                            "code": "watch_task_link_unresolved",
+                            "task_id": task_id,
+                        })
+                    }
+                    // Deliberately still allowed: with no class supplied nothing
+                    // is asserted — `review_class` is written below only when
+                    // `Some`, so the sidecar carries none and the merge gate
+                    // still fails closed on the PR state's own Unresolved class.
+                    // Narrowing the gate to the stamping case keeps it surgical.
+                    (false, None) => None,
+                    // Operator override (empty caller) keeps its explicit class,
+                    // but never silently: record who retained which class for
+                    // which task.
+                    (true, Some(class)) => {
+                        crate::event_log::log(
+                            home,
+                            "ci_watch_taskless_class_override",
+                            instance_name,
+                            &format!("task_id={task_id} review_class={class}"),
+                        );
+                        Some(class)
+                    }
+                    (true, None) => None,
+                }
+            }
+            Err(error) => {
+                return json!({
+                    "error": format!("task-linked CI watch route is unresolved: {error}"),
+                    "code": "watch_task_route_unresolved",
+                    "task_id": task_id,
+                })
+            }
+        }
+    } else {
+        args["review_class"]
+            .as_str()
+            .filter(|class| !class.is_empty())
+            .map(String::from)
+    };
+
     let ci_dir = crate::daemon::ci_watch::ci_watches_dir(home);
     // #779 P2 Piece 3 site A: surface a dir-create failure as a structured
     // `{error, code}` (pre-#779-P2 swallowed it and returned happy-path even when
@@ -152,7 +285,6 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     let existing = std::fs::read_to_string(&watch_path)
         .ok()
         .and_then(|s| serde_json::from_str::<Value>(&s).ok());
-    let requested_review_class = args["review_class"].as_str().filter(|s| !s.is_empty());
     // Re-arming an unwatch TOMBSTONE? Same predicate as `sweep.rs`
     // (`auto_arm_optout` + no subscribers), read from the PRE-EXISTING file —
     // before this call appends its subscriber or removes the optout below.
@@ -308,15 +440,19 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
         watch["task_id"] = json!(tid);
     }
     // #972: persist review_class for §3.5 dual-review gate.
-    if let Some(rc) = requested_review_class {
+    if let Some(rc) = requested_review_class.as_deref() {
         watch["review_class"] = json!(rc);
     }
-    // S1: persist the (validated, lowercased) exact-head pin. Its PRESENCE marks
-    // this as a protected post-merge watch the poller resolves by target SHA and
-    // `gc_stale_watches` preserves across restart. Only reachable here after the
-    // exact-head gate above, so a non-protected watch never carries it.
+    // S1: persist the validated exact-head pin for protected post-merge watches.
     if let Some(sha) = exact_head_sha.as_deref() {
         watch["target_head_sha"] = json!(sha);
+    }
+    // Preserve the immutable dispatch generation for Decision45 fencing.
+    if let Some(sha) = args["subject_head_sha"]
+        .as_str()
+        .filter(|sha| crate::review_receipt::is_full_head(sha))
+    {
+        watch["subject_head_sha"] = json!(sha);
     }
     // #2812: notification-only watch — short TTL (1h), persisted flag.
     // Only valid on protected refs (the gate above validates all guards).
@@ -361,7 +497,7 @@ pub(crate) fn handle_watch_ci(home: &Path, args: &Value, instance_name: &str) ->
     // when CI already notified at this head. Reconcile the gate directly rather
     // than clearing CI cursors, which would replay ci-pass/ci-ready messages.
     // Run this on every explicit class so a partial prior failure is retryable.
-    if let Some(requested) = requested_review_class {
+    if let Some(requested) = requested_review_class.as_deref() {
         let requested = crate::daemon::pr_state::ReviewClass::parse_fail_closed(Some(requested));
         if let Err(e) = crate::daemon::pr_state::with_pr_state(home, repo, branch, |state| {
             let was_unresolved = matches!(
@@ -458,6 +594,8 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
     let now_secs = chrono::Utc::now().timestamp();
 
     let mut out: Vec<Value> = Vec::new();
+    // t-…-67: watches on the requested filter the caller cannot see (`status_scope`).
+    let mut hidden_watches: usize = 0;
     for entry in entries.flatten() {
         let path = entry.path();
         let watch: Value = match std::fs::read_to_string(&path)
@@ -487,6 +625,7 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
         // they're a subscriber of. Anonymous calls (empty instance)
         // see everything — useful for operator triage via the CLI.
         if !instance_name.is_empty() && !subscribers.iter().any(|s| s == instance_name) {
+            hidden_watches += 1;
             continue;
         }
         let rate_limit_until = watch["rate_limit_until"].as_i64();
@@ -586,7 +725,17 @@ pub(crate) fn handle_status_ci(home: &Path, args: &Value, instance_name: &str) -
             })
         })
         .collect();
-    let mut resp = json!({"watches": out, "pending_handoffs": pending_handoffs});
+    // t-…-67: the view names its scope and what it hid — see `status_scope`.
+    let mut resp = json!({
+        "watches": out,
+        "pending_handoffs": pending_handoffs,
+        "scope": super::status_scope::scope_label(instance_name),
+        "hidden_watches": hidden_watches,
+    });
+    if hidden_watches > 0 {
+        let filtered = filter_repo.is_some() || filter_branch.is_some();
+        resp["hint"] = json!(super::status_scope::hidden_hint(hidden_watches, filtered));
+    }
     if let Some(w) = crate::daemon::ci_watch::github_token_warning_from_env() {
         resp["setup_warning"] = json!(w);
     }

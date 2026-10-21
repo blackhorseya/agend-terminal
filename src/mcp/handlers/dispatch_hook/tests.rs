@@ -20,11 +20,38 @@ fn minimal_runtime() -> RuntimeContext {
 /// id. Under R3 finding 2 an EXISTING-task dispatch must reference a task that
 /// carries durable review_class metadata (a send arg can NOT fill a missing one), so
 /// dispatch tests exercising the lease/watch path seed a real tagged task here.
+/// A board task that exists but carries NO review_class metadata — the shape
+/// the #2745 matrix needs now that the exact-task resolver distinguishes "task
+/// not found" (`review_class_route_unresolved`) from "task has no class".
+fn create_untagged_task(home: &std::path::Path) -> String {
+    let created = crate::tasks::handle(
+        home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "seed (untagged)"}),
+    );
+    created["id"].as_str().expect("created task id").to_string()
+}
+
 fn create_review_class_task(home: &std::path::Path, class: &str) -> String {
     let created = crate::tasks::handle(
         home,
         "lead",
         &serde_json::json!({"action": "create", "title": "seed", "review_class": class}),
+    );
+    created["id"].as_str().expect("created task id").to_string()
+}
+
+fn create_governed_task(home: &std::path::Path, decision_id: &str, class: &str) -> String {
+    let created = crate::tasks::handle(
+        home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "governed seed",
+            "assignee": "target-agent",
+            "governing_decision_id": decision_id,
+            "review_class": class,
+        }),
     );
     created["id"].as_str().expect("created task id").to_string()
 }
@@ -101,6 +128,44 @@ fn setup_test_repo(home: &std::path::Path, agent: &str) -> std::path::PathBuf {
     )
     .ok();
     repo
+}
+
+#[test]
+fn dispatch_rejects_missing_env_source_before_stub_fallback_3540_r1() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = std::env::temp_dir().join(format!(
+        "agend-3540-r1-dispatch-missing-env-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "target-agent");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  target-agent:\n    backend: claude\n    working_directory: {}\n    env:\n      DESTINATION_TOKEN:\n        from_env: AGEND_TEST_MISSING_ENV_3540_R1\n",
+            repo.display()
+        ),
+    )
+    .expect("fleet");
+
+    let result = super::dispatch_auto_bind_lease_with_source_and_chain(
+        &home,
+        "target-agent",
+        "task-3540-r1",
+        "feat/3540-r1-missing-env",
+        None,
+        None,
+        None,
+        &[],
+        None,
+        false,
+    );
+
+    let error = result.expect_err("configured but unresolvable target must fail closed");
+    assert!(error.message.contains("AGEND_TEST_MISSING_ENV_3540_R1"));
+    assert_eq!(error.stage, super::Stage::ResolveSourceRepo);
+    std::fs::remove_dir_all(&home).ok();
 }
 
 /// #1755: `ensure_branch_exists` must REFRESH a remote-tracking `from_ref`
@@ -362,6 +427,214 @@ fn dispatch_with_branch_creates_binding_and_worktree() {
     assert_eq!(v["branch"], "feat/test");
     assert_eq!(v["task_id"], "T-100");
 
+    std::fs::remove_dir_all(&home).ok();
+}
+
+fn commit_and_advance_origin_main(repo: &std::path::Path, message: &str) -> String {
+    let commit = std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            message,
+        ])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git commit");
+    assert!(
+        commit.status.success(),
+        "git commit failed: {}",
+        String::from_utf8_lossy(&commit.stderr)
+    );
+    let head = crate::git_helpers::git_cmd(repo, &["rev-parse", "HEAD"]).expect("HEAD");
+    let head = head.trim().to_string();
+    let update = std::process::Command::new("git")
+        .args(["update-ref", "refs/remotes/origin/main", &head])
+        .current_dir(repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git update-ref");
+    assert!(update.status.success(), "advance origin/main");
+    head
+}
+
+/// #3479 PR-B: the real untyped send entry may opt into an exact branch base.
+/// The expected head deliberately differs from the default tip, so silently
+/// ignoring the new field reproduces the production bug.
+#[test]
+fn untyped_send_expected_head_binds_exact_non_default_commit_3479() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!("agend-3479-exact-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "target-agent");
+    let expected = crate::git_helpers::git_cmd(&repo, &["rev-parse", "HEAD"])
+        .expect("initial HEAD")
+        .trim()
+        .to_string();
+    let default_tip = commit_and_advance_origin_main(&repo, "default-tip");
+    assert_ne!(
+        expected, default_tip,
+        "test requires distinct exact/default heads"
+    );
+    let tid = create_review_class_task(&home, "single");
+    let sender = Some(Sender::new("lead").expect("sender"));
+
+    let result = super::super::comms::handle_unified_send(
+        &home,
+        &serde_json::json!({
+            "instance": "target-agent",
+            "request_kind": "task",
+            "message": "review exact head",
+            "task_id": tid,
+            "branch": "review/3479-exact",
+            "expected_head": expected,
+        }),
+        &sender,
+        Some(&minimal_runtime()),
+    );
+    assert!(
+        result.get("error").is_none(),
+        "exact dispatch failed: {result}"
+    );
+    let binding = crate::binding::read(&home, "target-agent").expect("binding");
+    let worktree = std::path::Path::new(binding["worktree"].as_str().expect("worktree"));
+    let actual =
+        crate::git_helpers::git_cmd(worktree, &["rev-parse", "HEAD"]).expect("worktree HEAD");
+    assert_eq!(actual.trim(), expected, "dispatch must bind the exact head");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3479 PR-B: a nonexistent exact head is rejected through the real send entry
+/// before delivery and leaves no target binding behind.
+#[test]
+fn untyped_send_nonexistent_expected_head_rejects_without_binding_3479() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!("agend-3479-missing-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "target-agent");
+    let tid = create_review_class_task(&home, "single");
+    let sender = Some(Sender::new("lead").expect("sender"));
+
+    let result = super::super::comms::handle_unified_send(
+        &home,
+        &serde_json::json!({
+            "instance": "target-agent",
+            "request_kind": "task",
+            "message": "review missing head",
+            "task_id": tid,
+            "branch": "review/3479-missing",
+            "expected_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        }),
+        &sender,
+        Some(&minimal_runtime()),
+    );
+    assert_eq!(result["code"], "expected_head_mismatch", "{result}");
+    assert!(
+        crate::binding::read(&home, "target-agent").is_none(),
+        "rejected exact-head dispatch must leave no binding: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn untyped_send_mismatched_remote_branch_rolls_back_binding_3479() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!("agend-3479-mismatch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "target-agent");
+    let expected = crate::git_helpers::git_cmd(&repo, &["rev-parse", "HEAD"])
+        .expect("initial HEAD")
+        .trim()
+        .to_string();
+    let remote_tip = commit_and_advance_origin_main(&repo, "remote-tip");
+    let remote_branch = "refs/remotes/origin/review/3479-mismatch";
+    crate::git_helpers::git_cmd(&repo, &["update-ref", remote_branch, &remote_tip])
+        .expect("seed remote branch");
+    let worktree = crate::worktree::worktree_path(&home, "target-agent", "review/3479-mismatch");
+    let tid = create_review_class_task(&home, "single");
+    let sender = Some(Sender::new("lead").expect("sender"));
+
+    let result = super::super::comms::handle_unified_send(
+        &home,
+        &serde_json::json!({
+            "instance": "target-agent",
+            "request_kind": "task",
+            "message": "reject mismatched branch",
+            "task_id": tid,
+            "branch": "review/3479-mismatch",
+            "expected_head": expected,
+        }),
+        &sender,
+        Some(&minimal_runtime()),
+    );
+    assert_eq!(result["code"], "expected_head_mismatch", "{result}");
+    assert!(crate::binding::read(&home, "target-agent").is_none());
+    assert!(
+        !worktree.exists(),
+        "rollback must remove the auto-created worktree: {}",
+        worktree.display()
+    );
+    assert!(
+        crate::git_helpers::git_cmd(
+            &repo,
+            &["rev-parse", "--verify", "refs/heads/review/3479-mismatch"]
+        )
+        .is_err(),
+        "rollback must delete the newly-created local branch"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3479 PR-B KISS control: omitting expected_head preserves today's default-tip
+/// branch creation behavior through the same real send entry.
+#[test]
+fn untyped_send_without_expected_head_keeps_default_tip_3479() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!("agend-3479-omit-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "target-agent");
+    let default_tip = commit_and_advance_origin_main(&repo, "default-tip");
+    let tid = create_review_class_task(&home, "single");
+    let sender = Some(Sender::new("lead").expect("sender"));
+
+    let result = super::super::comms::handle_unified_send(
+        &home,
+        &serde_json::json!({
+            "instance": "target-agent",
+            "request_kind": "task",
+            "message": "ordinary dispatch",
+            "task_id": tid,
+            "branch": "feat/3479-default",
+        }),
+        &sender,
+        Some(&minimal_runtime()),
+    );
+    assert!(
+        result.get("error").is_none(),
+        "ordinary dispatch failed: {result}"
+    );
+    let binding = crate::binding::read(&home, "target-agent").expect("binding");
+    let worktree = std::path::Path::new(binding["worktree"].as_str().expect("worktree"));
+    let actual =
+        crate::git_helpers::git_cmd(worktree, &["rev-parse", "HEAD"]).expect("worktree HEAD");
+    assert_eq!(
+        actual.trim(),
+        default_tip,
+        "omitted field must keep default base"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -1015,6 +1288,100 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3419 real-entry race: if the governing decision is superseded after the
+/// branch preflight but before auto-create, no watch/bind/delivery may escape
+/// the failed Created boundary. This drives the actual `handle_delegate_task`
+/// path with `bind:false`; the watch side effect is therefore directly
+/// observable without requiring a real worktree lease.
+#[test]
+#[serial_test::serial]
+fn governed_auto_create_rejects_superseded_before_watch_or_delivery_3419() {
+    use crate::identity::Sender;
+
+    let home =
+        std::env::temp_dir().join(format!("agend-3419-real-entry-race-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create race home");
+    setup_test_repo(&home, "target-agent");
+
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governed dispatch",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    assert_eq!(decision["status"], "posted", "seed decision: {decision}");
+    let decision_id = decision["id"]
+        .as_str()
+        .expect("seed decision id")
+        .to_string();
+    let supersede_id = decision_id.clone();
+    crate::tasks::governance::install_authority_resolved_hook(Box::new(move |hook_home| {
+        let replacement = crate::decisions::post(
+            hook_home,
+            "lead",
+            &serde_json::json!({
+                "title": "replacement authority",
+                "content": "single review required",
+                "review_class": "single",
+                "supersedes": supersede_id,
+            }),
+        );
+        assert_eq!(
+            replacement["status"], "posted",
+            "supersede decision: {replacement}"
+        );
+    }));
+
+    let args = serde_json::json!({
+        "instance": "target-agent",
+        "task": "implement governed feature",
+        "branch": "feat/3419-real-entry",
+        "repository": "owner/repo",
+        "governing_decision_id": decision_id,
+        "bind": false,
+    });
+    let sender = Some(Sender::new("lead").expect("sender"));
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+
+    assert_eq!(
+        result["code"], "governing_decision_unresolved",
+        "superseded governing create must reject before dispatch side effects: {result}"
+    );
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-real-entry"),
+    );
+    assert!(
+        !watch_path.exists(),
+        "failed governed Created must not arm a watch: {}",
+        watch_path.display()
+    );
+    let board = crate::tasks::handle(&home, "lead", &serde_json::json!({"action": "list"}));
+    assert!(
+        board["tasks"].as_array().is_none_or(Vec::is_empty),
+        "failed governed Created must not leave a task: {board}"
+    );
+    let inbox_content = std::fs::read_dir(home.join("inbox"))
+        .ok()
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.path().extension().is_some_and(|ext| ext == "jsonl"))
+        .filter_map(|entry| std::fs::read_to_string(entry.path()).ok())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        !inbox_content.contains("implement governed feature"),
+        "failed governed Created must not deliver: {inbox_content}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2745 fail-closed (root pre-review finding 2): a merge-authority (branch)
 /// dispatch whose review_class is UNRESOLVED (omitted / typo) or MISMATCHED
 /// (task=single vs second_reviewer=true) is REJECTED atomically at the handler
@@ -1025,7 +1392,9 @@ fn delegate_task_with_repo_creates_ci_watch_via_handle_delegate_task() {
 fn merge_authority_dispatch_rejected_when_review_class_unresolved_2745() {
     use crate::identity::Sender;
 
-    // T-100 is REFERENCED but has NO review_class metadata on the board. Per R3
+    // The referenced task EXISTS but has NO review_class metadata on the board
+    // (#3419: a task id that is not on the board is refused earlier as
+    // `review_class_route_unresolved`, which is a different finding). Per R3
     // finding 2, a send `review_class` arg / `second_reviewer` is consistency-evidence
     // only — it can NEVER supply the missing durable authority for an existing task.
     // So EVERY case fails closed with `review_class_unspecified` (never a silent arm).
@@ -1041,11 +1410,12 @@ fn merge_authority_dispatch_rejected_when_review_class_unresolved_2745() {
         let _ = std::fs::remove_dir_all(&home);
         std::fs::create_dir_all(&home).ok();
         setup_test_repo(&home, "target-agent");
+        let untagged = create_untagged_task(&home);
 
         let mut args = serde_json::json!({
             "instance": "target-agent",
             "task": "implement feature X",
-            "task_id": "T-100",
+            "task_id": untagged,
             "branch": "feat/p02-reject",
             "repository": "owner/repo",
         });
@@ -1143,6 +1513,195 @@ fn existing_tagged_task_contradictory_send_rejects_2745() {
     assert!(
         !watch_path.exists(),
         "rejected contradictory dispatch must NOT arm a ci-watch: {}",
+        watch_path.display()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3419 B2: an existing branch task must reload its exact governing decision
+/// at the production dispatch entry. A decision superseded after task creation
+/// is no longer authority, so the branch dispatch must stop before the
+/// bind:false watch side effect.
+#[test]
+#[serial_test::serial]
+fn existing_governed_task_rejects_superseded_authority_before_branch_watch_3419() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!(
+        "agend-3419-existing-superseded-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create home");
+    setup_test_repo(&home, "target-agent");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "existing task authority",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id").to_string();
+    let task_id = create_governed_task(&home, &decision_id, "dual");
+    let superseded = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "replacement authority",
+            "content": "single review required",
+            "review_class": "single",
+            "supersedes": decision_id,
+        }),
+    );
+    assert_eq!(
+        superseded["status"], "posted",
+        "supersede decision: {superseded}"
+    );
+
+    let args = serde_json::json!({
+        "instance": "target-agent",
+        "task": "dispatch existing governed task",
+        "task_id": task_id,
+        "branch": "feat/3419-existing-superseded",
+        "repository": "owner/repo",
+        "bind": false,
+    });
+    let sender = Some(Sender::new("lead").expect("sender"));
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+
+    assert_eq!(
+        result["code"], "task_governing_decision_unresolved",
+        "superseded existing authority must reject at dispatch entry: {result}"
+    );
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-existing-superseded"),
+    );
+    assert!(
+        !watch_path.exists(),
+        "rejected existing-task dispatch must not arm a watch: {}",
+        watch_path.display()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3419 B2: direct task-linked watch is another real entry point and must
+/// reload the exact governing decision before writing its watch file.
+#[test]
+#[serial_test::serial]
+fn task_linked_watch_rejects_corrupt_governing_authority_3419() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3419-watch-corrupt-authority-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create home");
+    setup_test_repo(&home, "target-agent");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "watch authority",
+            "content": "single review required",
+            "review_class": "single",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id").to_string();
+    let task_id = create_governed_task(&home, &decision_id, "single");
+    std::fs::write(
+        crate::decisions::decision_path(&home, &decision_id),
+        b"{corrupt decision",
+    )
+    .expect("corrupt exact decision record");
+
+    let result = crate::mcp::handlers::ci::handle_watch_ci(
+        &home,
+        &serde_json::json!({
+            "repository": "owner/repo",
+            "branch": "feat/3419-watch-corrupt-authority",
+            "task_id": task_id,
+        }),
+        "target-agent",
+    );
+    assert_eq!(
+        result["code"], "task_governing_decision_unresolved",
+        "corrupt governing authority must reject task-linked watch: {result}"
+    );
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-watch-corrupt-authority"),
+    );
+    assert!(
+        !watch_path.exists(),
+        "corrupt authority must not write a watch: {}",
+        watch_path.display()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3419 B2: task authority metadata is immutable at the public task API, but
+/// replay must still fail closed if a tampered event changes the class. The
+/// production branch dispatch must reject before creating its watch.
+#[test]
+#[serial_test::serial]
+fn existing_governed_task_rejects_class_divergent_metadata_3419() {
+    use crate::identity::Sender;
+
+    let home = std::env::temp_dir().join(format!(
+        "agend-3419-existing-metadata-tamper-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).expect("create home");
+    setup_test_repo(&home, "target-agent");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "metadata authority",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id").to_string();
+    let task_id = create_governed_task(&home, &decision_id, "dual");
+    crate::task_events::append(
+        &home,
+        &crate::task_events::InstanceName("system:tamper".into()),
+        crate::task_events::TaskEvent::MetadataSet {
+            task_id: crate::task_events::TaskId(task_id.clone()),
+            by: crate::task_events::InstanceName("system:tamper".into()),
+            key: "review_class".into(),
+            value: serde_json::json!("single"),
+        },
+    )
+    .expect("append tampered metadata event");
+
+    let args = serde_json::json!({
+        "instance": "target-agent",
+        "task": "dispatch tampered governed task",
+        "task_id": task_id,
+        "branch": "feat/3419-existing-metadata-tamper",
+        "repository": "owner/repo",
+        "bind": false,
+    });
+    let sender = Some(Sender::new("lead").expect("sender"));
+    let result =
+        super::super::comms::handle_delegate_task(&home, &args, &sender, Some(&minimal_runtime()));
+    assert_eq!(
+        result["code"], "task_governance_tampered",
+        "class-divergent task metadata must reject at dispatch entry: {result}"
+    );
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-existing-metadata-tamper"),
+    );
+    assert!(
+        !watch_path.exists(),
+        "tampered authority must not arm a watch: {}",
         watch_path.display()
     );
 
@@ -2087,10 +2646,15 @@ fn all_dispatch_directives_reach_armed_watch_1877() {
     ));
     let (home, _canonical) =
         p781_canonical_with_team_source_repo(&parent, "feat/1877-all", true, "val", &["val-dev"]);
+    // t-…-21627-5: this arm supplies an explicit `dual`, so it is in the #2745 R3
+    // regime — a class-carrying watch must reference a task that actually routes.
+    // The phantom `T-1877-all` used to work only because the NotFound arm accepted
+    // the caller's own class, which is the fail-open this change closes.
+    let task_id = create_review_class_task(&home, "dual");
     let r = super::dispatch_auto_bind_lease_with_chain(
         &home,
         "val-dev",
-        "T-1877-all",
+        &task_id,
         "feat/1877-all",
         None,
         Some("reviewer"),
@@ -2110,7 +2674,7 @@ fn all_dispatch_directives_reach_armed_watch_1877() {
     );
     assert_eq!(
         watch["task_id"].as_str(),
-        Some("T-1877-all"),
+        Some(task_id.as_str()),
         "#1031: task_id dropped from armed watch. Got: {watch}"
     );
     assert_eq!(
@@ -2466,6 +3030,13 @@ fn teams_json_migration_preserves_existing_fleet_yaml_source_repo() {
 /// worktree branches off `main` so subsequent commits land in
 /// `origin/main..HEAD`. Returns `(repo_dir, worktree_dir)`.
 fn setup_repo_and_worktree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    setup_repo_and_worktree_on(tag, "main")
+}
+
+/// t-20260831221907643452-32048-13: trunk-parametrized variant of the #814
+/// fixture — the default≠main REDs need a master-default repo whose ONLY
+/// remote-tracking trunk is `refs/remotes/origin/master` (no origin/main).
+fn setup_repo_and_worktree_on(tag: &str, trunk: &str) -> (std::path::PathBuf, std::path::PathBuf) {
     let base = std::env::temp_dir().join(format!("agend-814-{}-{tag}", std::process::id()));
     std::fs::create_dir_all(&base).ok();
     let repo = base.join("repo");
@@ -2482,7 +3053,7 @@ fn setup_repo_and_worktree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf
             .output()
             .expect("git ran")
     };
-    git_run(&repo, &["init", "-b", "main"]);
+    git_run(&repo, &["init", "-b", trunk]);
     // #1452: disable git auto-gc/maintenance in the fixture repo. The SUT runs
     // a `git rebase` over 50+ loose-object commits; under llvm-cov's slow,
     // heavily-parallel CI run an auto-gc repack can fire mid-rebase and race
@@ -2502,10 +3073,8 @@ fn setup_repo_and_worktree(tag: &str) -> (std::path::PathBuf, std::path::PathBuf
     let main_sha = String::from_utf8_lossy(&git_run(&repo, &["rev-parse", "HEAD"]).stdout)
         .trim()
         .to_string();
-    git_run(
-        &repo,
-        &["update-ref", "refs/remotes/origin/main", &main_sha],
-    );
+    let trunk_ref = format!("refs/remotes/origin/{trunk}");
+    git_run(&repo, &["update-ref", &trunk_ref, &main_sha]);
     let worktree = base.join("wt");
     git_run(
         &repo,
@@ -2669,6 +3238,88 @@ fn clean_empty_init_commits_handles_50_interleaved_inits() {
         elapsed < std::time::Duration::from_secs(30),
         "high-count must complete in < 30s, took {elapsed:?}"
     );
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}
+
+// ── t-20260831221907643452-32048-13: default≠main trunk resolution ──
+//
+// At the RED commit, `clean_empty_init_commits` hardcodes `origin/main` at all
+// three operational sites (log enumeration, soft reset, rebase), so on a
+// master-default repo with no origin/main ref every call errors before any
+// cleanup — the two master REDs below FAIL there. The dual-trunk test also
+// fails at RED (the old code blindly uses origin/main instead of refusing).
+
+/// RED (all-empty arm): master-default repo, no origin/main — the soft-reset
+/// path must resolve the real trunk and clean everything.
+#[test]
+fn clean_empty_init_commits_cleans_all_empty_on_master_default_repo() {
+    let (_repo, worktree) = setup_repo_and_worktree_on("master_all_empty", "master");
+    create_interleaved_commit_chain(&worktree, 3, 0);
+
+    let result = super::clean_empty_init_commits(&worktree);
+    assert!(
+        result.is_ok(),
+        "cleanup must work on a master-default repo, got: {result:?}"
+    );
+    assert_eq!(result.unwrap(), 3, "all 3 empty inits should be dropped");
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}
+
+/// RED (mixed/rebase arm): master-default repo, no origin/main — the rebase
+/// path must resolve the real trunk, drop only the inits and keep the real
+/// commit.
+#[test]
+fn clean_empty_init_commits_cleans_mixed_on_master_default_repo() {
+    let (_repo, worktree) = setup_repo_and_worktree_on("master_mixed", "master");
+    create_interleaved_commit_chain(&worktree, 2, 1);
+
+    let result = super::clean_empty_init_commits(&worktree);
+    assert!(
+        result.is_ok(),
+        "mixed cleanup must work on a master-default repo, got: {result:?}"
+    );
+    assert_eq!(result.unwrap(), 2, "both empty inits should be dropped");
+
+    std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
+}
+
+/// Both conventional trunks present and origin/HEAD unset → AMBIGUOUS: the
+/// helper must refuse (Err) rather than guess a base for a history rewrite
+/// (same #2662 rationale as the vendored pre-push cleanup's resolver). At the
+/// RED commit the old code blindly picks origin/main here, so this fails too.
+#[test]
+fn clean_empty_init_commits_refuses_ambiguous_dual_trunk() {
+    let (_repo, worktree) = setup_repo_and_worktree("dual_trunk");
+    // Second conventional trunk alongside the fixture's origin/main.
+    let sha = String::from_utf8_lossy(
+        &std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&worktree)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git ran")
+            .stdout,
+    )
+    .trim()
+    .to_string();
+    std::process::Command::new("git")
+        .args(["update-ref", "refs/remotes/origin/master", &sha])
+        .current_dir(&worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git ran");
+    create_interleaved_commit_chain(&worktree, 1, 0);
+
+    let result = super::clean_empty_init_commits(&worktree);
+    match result {
+        Err(msg) => assert!(
+            msg.contains("ambiguous"),
+            "refusal must name the ambiguity, got: {msg}"
+        ),
+        Ok(n) => panic!("dual-trunk repo must refuse, not rewrite (cleaned {n})"),
+    }
 
     std::fs::remove_dir_all(_repo.parent().unwrap()).ok();
 }
@@ -3809,6 +4460,92 @@ fn ensure_branch_fail_open_when_unreachable_but_has_view_state3_83936_5() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3546 (RED): the reported symptom — a worktree provisioned from a base tens of
+/// commits behind the default branch, with every health check green. The reporter's
+/// canonical repo had `origin` pointing at an unreachable local path, which is state
+/// 3: the branch IS created (fail-open is deliberate, an offline agent must still be
+/// able to start), but it is created from a remote-tracking ref nothing in the call
+/// could refresh. Before this fix that fact was computed, written to the event log,
+/// and dropped, so the caller had no way to know.
+#[test]
+fn provisioning_from_an_unrefreshable_view_is_reported_as_stale_3546() {
+    let home = std::env::temp_dir().join(format!("agend-3546-stale-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).ok();
+    let workspace = crate::paths::workspace_dir(&home);
+    std::fs::create_dir_all(&workspace).ok();
+    let repo = workspace.join("agent");
+    std::fs::create_dir_all(&repo).ok();
+    s5_git(&["init", "-b", "main"], &repo);
+    s5_git(
+        &[
+            "remote",
+            "add",
+            "origin",
+            "file:///dev/null/unreachable-3546",
+        ],
+        &repo,
+    );
+    let sha_a = s5_commit(&repo, "A");
+    // We have synced before (a view exists) but cannot reach origin now, so BOTH
+    // fetches on the create path fail — exactly the reporter's environment.
+    s5_git(&["update-ref", "refs/remotes/origin/main", &sha_a], &repo);
+
+    let provision =
+        super::ensure_branch_exists_provisioned(&home, &repo, "feat/stale", "origin/main", "agent")
+            .expect("state 3 stays fail-OPEN: the branch must still be created");
+
+    assert!(provision.created, "state 3 still creates the branch");
+    assert!(
+        provision.base_from_stale_view,
+        "the base came from a view neither fetch could refresh — the caller must be \
+         told, or a tree tens of commits behind looks exactly like a correct one"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3546 reverse: when the base ref IS refreshed, nothing is flagged. This also pins
+/// that the #1755 pre-create fetch still runs — the fix must not turn a working
+/// refresh into a false alarm, which would train readers to ignore the flag.
+#[test]
+fn provisioning_from_a_refreshed_view_is_not_flagged_3546() {
+    let home = std::env::temp_dir().join(format!("agend-3546-fresh-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).ok();
+    let workspace = crate::paths::workspace_dir(&home);
+    std::fs::create_dir_all(&workspace).ok();
+
+    // A REACHABLE origin: a real local repo, reached by path.
+    let origin = workspace.join("origin-src");
+    std::fs::create_dir_all(&origin).ok();
+    s5_git(&["init", "-b", "main"], &origin);
+    let origin_sha = s5_commit(&origin, "O");
+
+    let repo = workspace.join("agent");
+    std::fs::create_dir_all(&repo).ok();
+    s5_git(&["init", "-b", "main"], &repo);
+    s5_git(
+        &["remote", "add", "origin", &origin.display().to_string()],
+        &repo,
+    );
+    s5_commit(&repo, "A");
+
+    let provision =
+        super::ensure_branch_exists_provisioned(&home, &repo, "feat/fresh", "origin/main", "agent")
+            .expect("a reachable origin must provision");
+
+    assert!(
+        !provision.base_from_stale_view,
+        "the fetch succeeded, so the base is current and must NOT be flagged"
+    );
+    let head = s5_git(&["rev-parse", "refs/heads/feat/fresh"], &repo);
+    assert_eq!(
+        head, origin_sha,
+        "and the base must actually be origin's tip, not the local view"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// STATE 4 (fail-CLOSED): origin is UNREACHABLE and there is NO remote-tracking
 /// view at all (never synced) → cannot rule out an existing origin/<branch> →
 /// REFUSE (Err) rather than silently orphan it. This is the guard the lead
@@ -4018,13 +4755,11 @@ fn dispatch_skip_lease_preserves_uncommitted_on_live_same_branch_2158() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// (b) #2115 PRESERVED: the skip is gated on a PRESENT binding. With binding.json CLEARED
-/// (what `release_worktree` does) but the worktree dir surviving as dirty residue (the
-/// #869-ref-advance / prior-lease shape), a re-dispatch must NOT skip — it re-leases, and
-/// `worktree::create`'s reuse-path `sync_worktree_to_head` STILL scrubs the residue. Proves
-/// the #2158 skip does not over-fire onto a released binding.
+/// #3613: an unbound, marker-bearing directory is preserved release evidence.
+/// Dispatch must return the typed force-release route instead of reusing and
+/// scrubbing it as though a prior release had completed successfully.
 #[test]
-fn dispatch_reuse_after_binding_cleared_still_resets_dirty_2115_preserved_2158() {
+fn dispatch_after_binding_cleared_reports_stale_worktree_dir_3613() {
     let home = std::env::temp_dir().join(format!("agend-2158-reuse-{}", std::process::id()));
     std::fs::create_dir_all(&home).ok();
     setup_test_repo(&home, "agent-reuse");
@@ -4050,15 +4785,24 @@ fn dispatch_reuse_after_binding_cleared_still_resets_dirty_2115_preserved_2158()
         "unbind must clear the binding (file + index) so binding::read returns None"
     );
 
-    // Re-dispatch same branch → binding::read None → #2158 skip does NOT fire → lease →
-    // worktree::create reuses the surviving dir → sync_worktree_to_head resets + cleans it.
-    let r2 = super::dispatch_auto_bind_lease(&home, "agent-reuse", "T-2", "feat/reuse", None);
-    assert!(r2.is_ok(), "reuse re-dispatch must succeed: {r2:?}");
-
+    let error = super::dispatch_auto_bind_lease(&home, "agent-reuse", "T-2", "feat/reuse", None)
+        .expect_err("stale managed target must refuse dispatch");
+    assert_eq!(error.code, super::ErrorCode::StaleWorktreeDir, "{error:?}");
+    assert_eq!(
+        error.stage,
+        super::Stage::StaleWorktreePreflight,
+        "{error:?}"
+    );
+    let context: serde_json::Value =
+        serde_json::from_str(error.raw.as_deref().expect("stale context")).unwrap();
+    assert_eq!(context["path"], wt.display().to_string(), "{context}");
+    assert!(context["marker"].as_str().is_some_and(|m| !m.is_empty()));
+    assert!(context["hint"]
+        .as_str()
+        .is_some_and(|hint| { hint.contains("release_worktree") && hint.contains("force=true") }));
     assert!(
-        !pollution.exists(),
-        "#2115 preserved: a true REUSE (binding released + dirty residue) MUST still reset — \
-         the #2158 skip must not over-fire on an absent binding"
+        pollution.exists(),
+        "typed refusal must preserve stale worktree evidence"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -4449,13 +5193,18 @@ fn typed_send_echoes_normalized_ci_watch_targets_3145() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// #3145 RED: a skipped auto-bind must not claim that a CI watch was armed.
+/// #3145 pinned "bind:false must not report an ARMED watch" while bind:false
+/// skipped the watch entirely. #3419 changed that contract: a `bind: false`
+/// branch dispatch still runs the authority preflight and arms the EQUIVALENT
+/// typed CI watch — only the worktree binding is skipped — so it can never be
+/// used to bypass the review gate. This is the replacement pin: the watch is
+/// armed, it carries the task's class, and no binding was created.
 #[test]
-fn typed_send_omits_ci_watch_when_bind_is_false_3145() {
+fn typed_send_arms_typed_watch_without_binding_when_bind_is_false_3419() {
     use crate::identity::Sender;
 
     let home = std::env::temp_dir().join(format!(
-        "agend-3145-ci-watch-skipped-{}",
+        "agend-3419-bind-false-typed-watch-{}",
         std::process::id()
     ));
     let _ = std::fs::remove_dir_all(&home);
@@ -4469,9 +5218,9 @@ fn typed_send_omits_ci_watch_when_bind_is_false_3145() {
         &serde_json::json!({
             "instance": "target-agent",
             "request_kind": "task",
-            "message": "do not arm a watch",
+            "message": "arm the typed watch, do not bind",
             "task_id": tid,
-            "branch": "feat/3145-skipped",
+            "branch": "feat/3419-bind-false",
             "repository": "owner/repo",
             "bind": false
         }),
@@ -4479,9 +5228,24 @@ fn typed_send_omits_ci_watch_when_bind_is_false_3145() {
         Some(&minimal_runtime()),
     );
 
+    assert_eq!(
+        result["ci_watch"]["armed"],
+        serde_json::json!(true),
+        "#3419: bind:false must arm the typed watch: {result}"
+    );
     assert!(
-        result.get("ci_watch").is_none(),
-        "#3145: bind:false must not report an armed watch: {result}"
+        crate::binding::read(&home, "target-agent").is_none(),
+        "#3419: bind:false must not create a binding: {result}"
+    );
+    let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-bind-false");
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
+    let watch: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(&watch_path).expect("armed watch sidecar must exist"),
+    )
+    .expect("watch sidecar is JSON");
+    assert_eq!(
+        watch["review_class"], "single",
+        "#3419: the armed watch must carry the task's resolved class: {watch}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -4519,5 +5283,295 @@ fn typed_send_omits_ci_watch_when_repository_is_unresolved_3145() {
         result.get("ci_watch").is_none(),
         "#3145: unresolved repository must not report an armed watch: {result}"
     );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3419 audit pin (watch/bind mutation ordering): a branch dispatch binds
+/// FIRST and arms the typed ci-watch only after `bind_full` succeeded; a bind
+/// failure returns before the arm. Nothing pinned that order — a regression
+/// that arms before binding, or arms despite the bind error, would leave a
+/// review-gate watch behind for a dispatch that never bound. The seam injects
+/// the bind failure on this thread; the watch file must not exist afterwards.
+#[test]
+fn dispatch_bind_failure_arms_no_ci_watch_3419() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3419-bindfail-nowatch-{}",
+        std::process::id()
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "target-agent");
+    let tid = create_review_class_task(&home, "dual");
+    let _seam = super::bind_test_seam::install(|| Some("injected bind failure".to_string()));
+
+    let result = super::dispatch_auto_bind_lease_with_source_and_chain(
+        &home,
+        "target-agent",
+        &tid,
+        "feat/3419-bindfail",
+        Some("owner/repo"),
+        None,
+        None,
+        &[],
+        Some("dual"),
+        true,
+    );
+    let err = match result {
+        Err(err) => err,
+        Ok(_) => panic!("injected bind failure must surface as Err"),
+    };
+    assert!(
+        err.message.contains("injected bind failure"),
+        "the injected failure must be the reported cause: {}",
+        err.message
+    );
+    let filename = crate::daemon::ci_watch::watch_filename("owner/repo", "feat/3419-bindfail");
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(&filename);
+    assert!(
+        !watch_path.exists(),
+        "a failed bind must not leave a typed ci-watch behind: {}",
+        watch_path.display()
+    );
+    assert!(
+        crate::binding::read(&home, "target-agent").is_none(),
+        "a failed bind must not leave a binding behind"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ── #3479 PR-A negative controls: `repository` derivation is byte-identical ──
+// The PR-A diff declares `repository` on the def_send SCHEMA only; these pin the
+// handler's two derivation paths so any accidental behavior change would fail.
+
+/// The explicit-slug path (mod.rs `resolve_review_assignment_repo` consumes
+/// `args["repository"]` FIRST): a canonical slug passes through unchanged, and
+/// never touches home/target resolution.
+#[test]
+fn review_assignment_repo_explicit_repository_is_consumed_first_3479() {
+    let home = std::env::temp_dir().join(format!("agend-3479a-explicit-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let args = serde_json::json!({"repository": "suzuke/agend-terminal"});
+    let resolved = super::resolve_review_assignment_repo(&home, &args, "any-target");
+    assert_eq!(
+        resolved.ok().as_deref(),
+        Some("suzuke/agend-terminal"),
+        "an explicit owner/repo slug must be consumed first and canonicalized"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The absent-field fallback stays fail-closed: with no explicit slug and no
+/// resolvable source_repo for the target, the dispatch is rejected with the
+/// same `review_assignment_repo_unresolved` code (same-board derivation
+/// behavior byte-identical — the schema declaration changes nothing here).
+#[test]
+fn review_assignment_repo_absent_field_fallback_fails_closed_3479() {
+    let home = std::env::temp_dir().join(format!("agend-3479a-absent-{}", std::process::id()));
+    std::fs::create_dir_all(&home).ok();
+    let args = serde_json::json!({});
+    let resolved = super::resolve_review_assignment_repo(&home, &args, "agent-with-no-source");
+    let err = resolved.expect_err("no explicit slug + no resolvable source_repo must fail closed");
+    assert_eq!(
+        err["code"].as_str(),
+        Some("review_assignment_repo_unresolved"),
+        "absent-field fallback must keep the fail-closed unresolved code"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3546 R1 blocker 1: the DISPATCH path must write the flag too.
+///
+/// `send kind=task` with a branch is how most worktrees in this fleet are born,
+/// and it hits the same state-3 fail-open as `repo checkout`. It used to call the
+/// back-compat tuple wrapper, which drops `base_from_stale_view`, so `bind_full`
+/// hardcoded false into the signed binding — and `binding_state` then reported,
+/// positively, that the base was fresh. A reader cannot distinguish that from a
+/// genuinely refreshed base, which is worse than saying nothing.
+///
+/// `setup_test_repo` points origin at `file:///dev/null/agend-fixture`, i.e. the
+/// fixture IS state 3: the branch is created (fail-open, deliberate) from a
+/// remote-tracking ref no fetch could refresh.
+#[test]
+fn dispatch_path_records_the_stale_base_in_the_signed_binding_3546() {
+    let home = std::env::temp_dir().join(format!("agend-3546-dispatch-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "stale-dispatch-3546");
+
+    super::dispatch_auto_bind_lease(
+        &home,
+        "stale-dispatch-3546",
+        "T-3546",
+        "feat/dispatch-3546",
+        None,
+    )
+    .expect("state 3 stays fail-OPEN: dispatch must still bind a worktree");
+
+    let binding_path = crate::paths::runtime_dir(&home)
+        .join("stale-dispatch-3546")
+        .join("binding.json");
+    let v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&binding_path).expect("read binding.json"))
+            .expect("parse binding.json");
+    assert_eq!(
+        v["base_from_stale_view"],
+        serde_json::json!(true),
+        "the dispatch path provisioned from an unrefreshable view and must say so \
+         in the signed binding; got {v}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3638: a missing or unusable configured working directory must not be
+/// reported as an origin connectivity outage. Drive the production dispatch
+/// seam so the source-resolution fallback and branch-provisioning guard are
+/// exercised together.
+#[test]
+fn dispatch_classifies_unusable_source_repo_as_configuration_error_3638() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home =
+        std::env::temp_dir().join(format!("agend-3638-unusable-source-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).unwrap();
+    let missing = home.join("configured-working-directory");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  target-agent:\n    backend: claude\n    working_directory: {}\n",
+            missing.display()
+        ),
+    )
+    .unwrap();
+
+    let err = super::dispatch_auto_bind_lease_with_source_and_chain(
+        &home,
+        "target-agent",
+        "task-3638-unusable",
+        "feat/3638-unusable",
+        None,
+        None,
+        None,
+        &[],
+        None,
+        false,
+    )
+    .expect_err("an unavailable source repository must fail closed");
+
+    assert_eq!(err.code, super::ErrorCode::EnvSourceMissing);
+    assert_eq!(err.stage, super::Stage::ResolveSourceRepo);
+    assert!(err.message.contains(&missing.display().to_string()));
+    assert!(err.message.contains("working_directory"));
+    assert!(!err.message.contains("cannot reach origin"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3638 negative control: a valid configured Git repository whose origin is
+/// unreachable remains the existing fail-closed connectivity error.
+#[test]
+fn dispatch_preserves_connectivity_error_for_unreachable_origin_3638() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = std::env::temp_dir().join(format!(
+        "agend-3638-unreachable-origin-{}",
+        std::process::id()
+    ));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).unwrap();
+    let repo = setup_test_repo(&home, "target-agent");
+    std::process::Command::new("git")
+        .args(["update-ref", "-d", "refs/remotes/origin/main"])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  target-agent:\n    backend: claude\n    source_repo: {}\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+
+    let err = super::dispatch_auto_bind_lease_with_source_and_chain(
+        &home,
+        "target-agent",
+        "task-3638-unreachable",
+        "feat/3638-unreachable",
+        None,
+        None,
+        None,
+        &[],
+        None,
+        false,
+    )
+    .expect_err("an unreachable origin with no tracking view must fail closed");
+
+    assert_eq!(err.code, super::ErrorCode::FetchFailed);
+    assert_eq!(err.stage, super::Stage::Fetch);
+    assert!(err.message.contains("cannot reach origin"));
+    assert!(err.message.contains(&repo.display().to_string()));
+    assert!(err.message.contains("fleet_source_repo"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3546 R1 blocker 2 (the reviewer's P1 shape): an existing local branch that was
+/// never pushed, with origin perfectly reachable, must NOT be flagged.
+///
+/// `git fetch origin <branch>` fails for such a branch no matter how healthy the
+/// network is — there is nothing on origin to fetch. Deriving the flag from that
+/// failure marked every unpushed branch as standing on a stale base, permanently,
+/// which is precisely the kind of false alarm that teaches readers to ignore the
+/// field. On this path the base actually comes from `from_ref`, refreshed by the
+/// #2107 fetch whose result used to be discarded.
+#[test]
+fn an_unpushed_existing_branch_with_a_reachable_origin_is_not_flagged_3546() {
+    let home = std::env::temp_dir().join(format!("agend-3546-unpushed-{}", std::process::id()));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::create_dir_all(&home).ok();
+    let workspace = crate::paths::workspace_dir(&home);
+    std::fs::create_dir_all(&workspace).ok();
+
+    // A REACHABLE origin, reached by path.
+    let origin = workspace.join("origin-src");
+    std::fs::create_dir_all(&origin).ok();
+    s5_git(&["init", "-b", "main"], &origin);
+    let origin_sha = s5_commit(&origin, "O");
+
+    let repo = workspace.join("agent");
+    std::fs::create_dir_all(&repo).ok();
+    s5_git(&["init", "-b", "main"], &repo);
+    s5_git(
+        &["remote", "add", "origin", &origin.display().to_string()],
+        &repo,
+    );
+    s5_commit(&repo, "A");
+    s5_git(&["fetch", "origin", "main", "--quiet"], &repo);
+    // The branch exists locally, sits exactly on origin/main, and was never
+    // pushed — so `refs/remotes/origin/feat/unpushed-3546` does not exist.
+    s5_git(
+        &["branch", "feat/unpushed-3546", "refs/remotes/origin/main"],
+        &repo,
+    );
+
+    let provision = super::ensure_branch_exists_provisioned(
+        &home,
+        &repo,
+        "feat/unpushed-3546",
+        "origin/main",
+        "agent",
+    )
+    .expect("an existing branch with a reachable origin must provision");
+
+    assert!(
+        !provision.created,
+        "fixture: the branch already exists, so this must take the EXISTS path"
+    );
+    assert!(
+        !provision.base_from_stale_view,
+        "origin is reachable and the base ref refreshed — an unpushed branch is \
+         not evidence of a stale base"
+    );
+    let head = s5_git(&["rev-parse", "refs/heads/feat/unpushed-3546"], &repo);
+    assert_eq!(head, origin_sha, "fixture: the branch sits on origin/main");
     std::fs::remove_dir_all(&home).ok();
 }

@@ -5,6 +5,7 @@
 //!   2. review_assignment bind/worktree_binding_required rejection (tests 7-8)
 //!   3. `send` schema `bind` parameter exposure (test 9)
 
+#[cfg(unix)]
 use serde_json::json;
 #[cfg(unix)]
 use std::path::Path;
@@ -272,6 +273,128 @@ fn checkout_expected_head_existing_branch_mismatch() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
+// 2b. public repo action — mismatch creates no checkout state
+// ══════════════════════════════════════════════════════════════════════
+
+/// The public `repo action=checkout` boundary must reject a review head that
+/// differs from an existing branch before it creates or replaces any state.
+/// The mismatch call starts from a fresh caller, while the exact-head success
+/// call below proves that valid disposable checkout still provisions normally.
+#[test]
+#[cfg(unix)]
+fn checkout_expected_head_public_mismatch_has_no_state() {
+    let home = tmp_home("eh-public-mismatch");
+    let parent = tmp_home("eh-public-mismatch-src");
+    let source = setup_source_repo(&parent, "review/public-mismatch");
+    let expected = get_sha(&source, "main");
+    let review_head = commit_tree(&source, &expected, "review head");
+    configure_local_github_origin(&source, &parent);
+    let sender = None;
+    let checkout = |args: &serde_json::Value| {
+        crate::mcp::handlers::dispatch::dispatch_repo(&crate::mcp::handlers::dispatch::HandlerCtx {
+            home: &home,
+            args,
+            instance_name: "public-mismatch-agent",
+            sender: &sender,
+            runtime: None,
+        })
+    };
+
+    let args = json!({
+        "action": "checkout",
+        "repository_path": source.display().to_string(),
+        "branch": "review/public-mismatch",
+        "bind": true,
+        "task_id": "task-public-mismatch",
+        "expected_head": &review_head,
+        "from_ref": "main",
+        "checkout_purpose": "disposable_review",
+    });
+    let watch_args = json!({
+        "repository": "owner/repo",
+        "branch": "review/public-mismatch",
+    });
+    let watch = super::handle_watch_ci(&home, &watch_args, "public-mismatch-agent");
+    assert!(
+        watch.get("error").is_none(),
+        "pre-existing watch fixture must arm: {watch}"
+    );
+    let watch_path = crate::daemon::ci_watch::ci_watches_dir(&home).join(
+        crate::daemon::ci_watch::watch_filename("owner/repo", "review/public-mismatch"),
+    );
+    let watch_before = std::fs::read(&watch_path).expect("watch fixture bytes");
+    let watch_count_before = std::fs::read_dir(crate::daemon::ci_watch::ci_watches_dir(&home))
+        .expect("watch directory")
+        .count();
+
+    let mismatch = checkout(&args);
+    assert_eq!(
+        mismatch["code"].as_str(),
+        Some("expected_head_mismatch"),
+        "public mismatch must fail at the expected-head gate: {mismatch}"
+    );
+    assert!(
+        crate::binding::read(&home, "public-mismatch-agent").is_none(),
+        "fresh mismatch must not create a binding"
+    );
+    assert!(
+        !derived_worktree(&home, "public-mismatch-agent", &source).exists(),
+        "fresh mismatch must not create a worktree"
+    );
+    assert_eq!(
+        std::fs::read(&watch_path).expect("watch after mismatch"),
+        watch_before,
+        "mismatch must preserve the pre-existing watch"
+    );
+    assert_eq!(
+        std::fs::read_dir(crate::daemon::ci_watch::ci_watches_dir(&home))
+            .expect("watch directory after mismatch")
+            .count(),
+        watch_count_before,
+        "mismatch must not create a new watch"
+    );
+    assert_eq!(
+        get_sha(&source, "review/public-mismatch"),
+        expected,
+        "mismatch must not move the existing branch"
+    );
+
+    seed_terminal_task(&home, "task-public-success", "review/public-success", false);
+    let success_args = json!({
+        "action": "checkout",
+        "repository_path": source.display().to_string(),
+        "branch": "review/public-success",
+        "bind": true,
+        "task_id": "task-public-success",
+        "expected_head": &expected,
+        "from_ref": "main",
+        "checkout_purpose": "disposable_review",
+    });
+    let success = checkout(&success_args);
+    assert!(
+        success.get("error").is_none(),
+        "exact-head public checkout control must succeed: {success}"
+    );
+    assert_eq!(success["actual_head"].as_str(), Some(expected.as_str()));
+    assert!(
+        crate::binding::read(&home, "public-mismatch-agent").is_some(),
+        "exact-head success must create a binding"
+    );
+    assert!(
+        std::path::Path::new(success["path"].as_str().expect("success worktree path")).exists(),
+        "exact-head success must create a worktree"
+    );
+    assert_eq!(
+        get_sha(&source, "review/public-success"),
+        expected,
+        "exact-head success must create the branch at the expected commit"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+// ══════════════════════════════════════════════════════════════════════
 // 3. checkout expected_head — idempotent same head
 // ══════════════════════════════════════════════════════════════════════
 
@@ -483,103 +606,8 @@ fn checkout_expected_head_correct_head_wrong_from_ref() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 7. review_assignment bind=true rejected before store
+// 7. send schema exposes bind parameter
 // ══════════════════════════════════════════════════════════════════════
-
-#[test]
-fn review_assignment_bind_true_rejected_before_store() {
-    use crate::identity::Sender;
-    use crate::mcp::handlers::comms_gates::DispatchPreChecks;
-    use crate::mcp::handlers::comms_gates::ReviewAuthor;
-    use crate::mcp::handlers::review_assignment::validate_review_assignment_marker;
-
-    let home = tmp_home("ra-bind");
-    let sender = Sender::new("lead").unwrap();
-    let args = json!({
-        "instance": "reviewer",
-        "task_id": "t-test",
-        "branch": "feat/x",
-        "repository": "owner/repo",
-        "pr_number": 42,
-        "reviewed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "bind": true,
-    });
-    let checks = DispatchPreChecks {
-        force: false,
-        force_reason: None,
-        second_reviewer: false,
-        plan_ack_required: 0,
-        review_assignment: true,
-        review_author: Some(ReviewAuthor::Agent("author".into())),
-        pr_number: Some(42),
-    };
-
-    let result = validate_review_assignment_marker(&home, &sender, "reviewer", &args, &checks);
-    assert!(
-        result.is_err(),
-        "review_assignment with bind=true must be rejected: {result:?}"
-    );
-    let err = result.unwrap_err();
-    assert_eq!(
-        err["code"].as_str(),
-        Some("review_assignment_bind_rejected"),
-        "error code must be review_assignment_bind_rejected: {err}"
-    );
-
-    std::fs::remove_dir_all(&home).ok();
-}
-
-// ══════════════════════════════════════════════════════════════════════
-// 8. review_assignment worktree_binding_required=true rejected
-// ══════════════════════════════════════════════════════════════════════
-
-#[test]
-fn review_assignment_worktree_binding_required_rejected() {
-    use crate::identity::Sender;
-    use crate::mcp::handlers::comms_gates::DispatchPreChecks;
-    use crate::mcp::handlers::comms_gates::ReviewAuthor;
-    use crate::mcp::handlers::review_assignment::validate_review_assignment_marker;
-
-    let home = tmp_home("ra-wbr");
-    let sender = Sender::new("lead").unwrap();
-    let args = json!({
-        "instance": "reviewer",
-        "task_id": "t-test",
-        "branch": "feat/x",
-        "repository": "owner/repo",
-        "pr_number": 42,
-        "reviewed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "worktree_binding_required": true,
-    });
-    let checks = DispatchPreChecks {
-        force: false,
-        force_reason: None,
-        second_reviewer: false,
-        plan_ack_required: 0,
-        review_assignment: true,
-        review_author: Some(ReviewAuthor::Agent("author".into())),
-        pr_number: Some(42),
-    };
-
-    let result = validate_review_assignment_marker(&home, &sender, "reviewer", &args, &checks);
-    assert!(
-        result.is_err(),
-        "review_assignment with worktree_binding_required=true must be rejected: {result:?}"
-    );
-    let err = result.unwrap_err();
-    assert_eq!(
-        err["code"].as_str(),
-        Some("review_assignment_worktree_binding_rejected"),
-        "error code must be review_assignment_worktree_binding_rejected: {err}"
-    );
-
-    std::fs::remove_dir_all(&home).ok();
-}
-
-// ══════════════════════════════════════════════════════════════════════
-// 9. send schema exposes bind parameter
-// ══════════════════════════════════════════════════════════════════════
-
 #[test]
 fn send_schema_exposes_bind_parameter() {
     let send_def = crate::mcp::tools::def_send();
@@ -592,11 +620,11 @@ fn send_schema_exposes_bind_parameter() {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-// 10. review_assignment omitted bind does not auto-bind
+// 8. review_assignment marker validation remains side-effect-free
 // ══════════════════════════════════════════════════════════════════════
 
 #[test]
-fn review_assignment_omitted_bind_does_not_auto_bind() {
+fn review_assignment_marker_validation_does_not_bind() {
     use crate::identity::Sender;
     use crate::mcp::handlers::comms_gates::DispatchPreChecks;
     use crate::mcp::handlers::comms_gates::ReviewAuthor;
@@ -611,7 +639,7 @@ fn review_assignment_omitted_bind_does_not_auto_bind() {
         "repository": "owner/repo",
         "pr_number": 42,
         "reviewed_head": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        // NO bind field — must still not auto-bind
+        // The marker validator itself has no workspace side effects.
     });
     let checks = DispatchPreChecks {
         force: false,
@@ -625,12 +653,13 @@ fn review_assignment_omitted_bind_does_not_auto_bind() {
 
     let result = validate_review_assignment_marker(&home, &sender, "reviewer", &args, &checks);
     // The validation will fail (no PrState exists), but the error should be about
-    // PrState, not about bind/lease conflict
+    // PrState, not about bind/lease conflict. Public dispatch provisioning is
+    // covered by the exact-head integration tests in the comms-delegate suite.
     if let Err(e) = &result {
         let code = e["code"].as_str().unwrap_or("");
         assert!(
             !code.contains("lease") && !code.contains("bind"),
-            "omitted bind on review_assignment must not produce a bind/lease error: {e}"
+            "marker validation must not produce a bind/lease error: {e}"
         );
     }
     std::fs::remove_dir_all(&home).ok();
@@ -775,9 +804,8 @@ fn checkout_expected_head_absent_branch_pins_movable_from_ref() {
     let home = tmp_home("eh-drift-absent");
     let parent = tmp_home("eh-drift-absent-src");
     let source = setup_source_repo(&parent, "feat/eh-drift-base");
-    remove_origin(&source);
     let expected = get_sha(&source, "main");
-    seed_origin_view(&source, "main", &expected);
+    configure_local_github_origin(&source, &parent);
     let source_for_hook = source.clone();
     let _hook = super::checkout_helpers::install_expected_head_validation_hook(move || {
         advance_ref(&source_for_hook, "main", "movable from_ref after precheck");
@@ -894,6 +922,8 @@ fn seed_terminal_task(home: &Path, task_id: &str, branch: &str, terminal: bool) 
             eta_secs: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .expect("create task");
@@ -929,8 +959,7 @@ fn checkout_disposable_review_persists_provenance_and_terminal_release_deletes()
     let parent = tmp_home("disposable-review-fresh-src");
     let source = setup_source_repo(&parent, "seed");
     let expected = get_sha(&source, "main");
-    remove_origin(&source);
-    seed_origin_view(&source, "main", &expected);
+    configure_local_github_origin(&source, &parent);
     seed_terminal_task(
         &home,
         "task-disposable-fresh",
@@ -968,10 +997,11 @@ fn checkout_disposable_review_persists_provenance_and_terminal_release_deletes()
         Some(expected.as_str())
     );
 
-    // This fixture intentionally has no SCM provider to answer PR state. A
+    // This fixture intentionally has no SCM provider to answer PR state. The
     // missing origin is the deterministic "no open PR" signal; the review
     // branch's strict provisioned-head CAS still drives deletion after the
     // terminal task gate passes.
+    remove_origin(&source);
 
     let active_release = crate::mcp::handlers::worktree::handle_release_worktree(
         &home,
@@ -1006,6 +1036,155 @@ fn checkout_disposable_review_persists_provenance_and_terminal_release_deletes()
         "branch must be deleted after terminal release: {released} binding={binding:?}"
     );
     assert!(crate::binding::read(&home, "disposable-review-agent").is_none());
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&parent).ok();
+}
+
+/// A fixture root the PUBLIC release entry can actually accept.
+///
+/// `validate_release_path` refuses `/tmp`, `/var` and `/private` outright, and
+/// on macOS `std::env::temp_dir()` canonicalizes into `/private/var/folders/...`
+/// — so every `tmp_home` fixture in this file is unreachable through
+/// `handle_release_repo` by construction. That is why no test has ever driven
+/// checkout and the public release against each other.
+///
+/// Anchored at `CARGO_MANIFEST_DIR`'s PARENT for the reason documented on
+/// `release_guard_tmp` in `ci/tests.rs`: it is compile-time stable, so a sibling
+/// test that reassigns `$HOME` mid-run cannot move it underneath us.
+#[cfg(unix)]
+fn releasable_home(tag: &str) -> std::path::PathBuf {
+    let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = manifest.parent().unwrap_or(manifest).join(format!(
+        ".agend-roundtrip-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0)
+    ));
+    std::fs::create_dir_all(&dir).expect("fixture root");
+    dir
+}
+
+/// The public round trip this lane is named for: `repo action=checkout` and
+/// `repo action=release`, the two entries an agent actually calls, driven end to
+/// end against each other.
+///
+/// The asymmetry that opened this lane was that checkout's `.agend-managed`
+/// marker omitted `source_repo` while the canonical release transaction requires
+/// a non-empty, canonically-equal one under lock — so a perfectly valid managed
+/// checkout could not be released through the public entry. #2860 (dd54e3c9) put
+/// the field in, but nothing pinned the pairing: every existing test drives ONE
+/// side, or writes a marker by hand. The sibling test above releases through
+/// `handle_release_worktree`; this one goes through `handle_release_repo`, which
+/// is a different entry that routes daemon-managed paths into the strict managed
+/// transaction.
+///
+/// The marker assertion is not decoration. It is the exact field whose absence
+/// broke the round trip, so reverting it in checkout's marker body must fail this
+/// test — that is what makes a test which passes on a fixed tree worth keeping.
+#[test]
+#[cfg(unix)]
+fn checkout_then_public_repo_release_round_trip_marker_symmetry() {
+    let home = releasable_home("home");
+    let parent = releasable_home("src");
+    let source = setup_source_repo(&parent, "seed");
+    let expected = get_sha(&source, "main");
+    configure_local_github_origin(&source, &parent);
+    seed_terminal_task(&home, "task-roundtrip", "review/roundtrip", false);
+
+    let checkout = super::handle_checkout_repo(
+        &home,
+        &json!({
+            "repository_path": source.display().to_string(),
+            "branch": "review/roundtrip",
+            "bind": true,
+            "task_id": "task-roundtrip",
+            "expected_head": &expected,
+            "from_ref": "main",
+            "checkout_purpose": "disposable_review",
+        }),
+        "roundtrip-agent",
+    );
+    assert!(
+        checkout.get("error").is_none(),
+        "checkout must succeed: {checkout}"
+    );
+    let worktree_path = checkout["path"]
+        .as_str()
+        .expect("checkout returns the worktree path")
+        .to_string();
+
+    // The identity the release transaction validates under lock. `source_repo`
+    // must be present AND canonically equal to the source the binding recorded;
+    // an empty or divergent value is what made the public release refuse.
+    let marker = std::fs::read_to_string(
+        std::path::Path::new(&worktree_path).join(crate::worktree_pool::MANAGED_MARKER),
+    )
+    .expect("managed marker must exist after a bound checkout");
+    let marker_source = marker
+        .lines()
+        .find_map(|line| line.strip_prefix("source_repo="))
+        .map(str::trim)
+        .unwrap_or_default();
+    let source_canonical = std::fs::canonicalize(&source).expect("canonical source");
+    assert_eq!(
+        marker_source,
+        source_canonical.display().to_string(),
+        "checkout's marker must carry the canonical source_repo the release \
+         transaction requires; marker was: {marker:?}"
+    );
+
+    remove_origin(&source);
+    finish_task(&home, "task-roundtrip");
+
+    let released =
+        super::handle_release_repo(&home, &json!({ "path": worktree_path }), "roundtrip-agent");
+    assert_eq!(
+        released["error"],
+        serde_json::Value::Null,
+        "public repo release must succeed for a worktree public repo checkout \
+         created: {released}"
+    );
+    assert_eq!(
+        released["released"].as_bool(),
+        Some(true),
+        "release must report success: {released}"
+    );
+    assert_eq!(
+        released["delegated_to_canonical"].as_bool(),
+        Some(true),
+        "a daemon-managed path must route through the canonical transaction, not \
+         the unmanaged fallback: {released}"
+    );
+    assert_eq!(
+        released["worktree_removed"].as_bool(),
+        Some(true),
+        "{released}"
+    );
+    assert_eq!(
+        released["binding_removed"].as_bool(),
+        Some(true),
+        "{released}"
+    );
+    assert_eq!(
+        released["branch_deleted"].as_bool(),
+        Some(true),
+        "a terminal disposable-review branch must be deleted: {released}"
+    );
+    assert!(
+        !std::path::Path::new(&worktree_path).exists(),
+        "the worktree directory must be gone: {released}"
+    );
+    assert!(
+        crate::binding::read(&home, "roundtrip-agent").is_none(),
+        "the binding must be gone: {released}"
+    );
+    assert!(
+        !crate::git_helpers::git_ok(&source, &["rev-parse", "--verify", "review/roundtrip"]),
+        "the disposable review branch must be deleted: {released}"
+    );
 
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&parent).ok();
@@ -1379,7 +1558,7 @@ fn checkout_disposable_review_reuse_cannot_bypass_new_branch_gate() {
     let home = tmp_home("disposable-review-reuse-gate");
     let parent = tmp_home("disposable-review-reuse-gate-src");
     let source = setup_source_repo(&parent, "seed");
-    remove_origin(&source);
+    configure_local_github_origin(&source, &parent);
     let expected = get_sha(&source, "main");
     seed_origin_view(&source, "main", &expected);
     let branch = "review/disposable-reuse-gate";
@@ -1511,8 +1690,7 @@ fn checkout_disposable_review_binding_failure_rolls_back_worktree() {
     let parent = tmp_home("disposable-review-atomic-src");
     let source = setup_source_repo(&parent, "seed");
     let expected = get_sha(&source, "main");
-    remove_origin(&source);
-    seed_origin_view(&source, "main", &expected);
+    configure_local_github_origin(&source, &parent);
     let agent = "disposable-atomic-agent";
     let binding_path = crate::paths::binding_path(&home, agent);
     crate::store::fail_next_atomic_write_for_test(&binding_path);

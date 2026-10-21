@@ -39,6 +39,32 @@ pub(crate) fn tool_timeout(tool: &str) -> Duration {
     }
 }
 
+/// #3694: soft deadline after which a still-running `release_worktree` returns
+/// the daemon-owned `release_in_flight` ticket, *before* its 60s SLOW hard
+/// budget elapses.
+///
+/// `release_worktree` is the one tool whose real upper bound (`git worktree
+/// remove --force`, bounded by `git_helpers::LOCAL_GIT_TIMEOUT` = 60s, plus the
+/// bounded pre-removal cache sweep) matches its proxy band. Returning the
+/// ticket at the hard cut is legal (the worker is never joined/killed — see
+/// `handle_mcp_tool_counted`) but reads to the caller as a bare transport
+/// timeout for a tool that advertises `release_in_flight`. Emitting the ticket
+/// at this deadline makes the advertised "returns `release_in_flight` before
+/// the proxy timeout" (`tools.rs`) true while still giving normal releases the
+/// full window to finish synchronously. Strictly below `SLOW_TOOL_TIMEOUT`.
+pub(crate) const RELEASE_IN_FLIGHT_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// #3694: the proxy wait for a tool call. For `release_worktree` only, clamp to
+/// [`RELEASE_IN_FLIGHT_TIMEOUT`] so a long release yields its in-flight ticket
+/// before the hard SLOW budget; every other tool keeps its full band.
+pub(crate) fn effective_wait_budget(tool: &str, timeout: Duration) -> Duration {
+    if tool == "release_worktree" {
+        timeout.min(RELEASE_IN_FLIGHT_TIMEOUT)
+    } else {
+        timeout
+    }
+}
+
 /// R3#1 candidate 2 (timeout-IN_PROGRESS): does a TIMEOUT on this tool need to
 /// be hidden from the agent as "accepted, completing in background" rather than
 /// surfaced as a retryable error?
@@ -73,7 +99,11 @@ fn is_side_effect_tool(tool: &str, action: Option<&str>) -> bool {
 /// have been launched with a fleet override that is not `$AGEND_HOME/fleet.yaml`;
 /// disk resolution here would therefore consult the wrong fleet. A restart is
 /// allowed only for an exact live handle name (or its exact UUID key).
-fn live_requester_id(
+///
+/// The API cookie authenticates access to the local daemon, not the asserted
+/// `instance` field. This is the same claimed-identity boundary used by the role
+/// gate above; ambiguity fails closed, but a caller can name another live peer.
+pub(crate) fn live_requester_id(
     registry: &crate::agent::AgentRegistry,
     instance: &str,
 ) -> Option<crate::types::InstanceId> {
@@ -131,6 +161,15 @@ fn timeout_response(
         }
     );
     if side_effect {
+        if tool == "release_worktree" {
+            return json!({
+                "ok": true,
+                "status": "accepted_in_progress",
+                "accepted": true,
+                "release_in_flight": true,
+                "note": "release_worktree is still running in the daemon; do not retry. Inspect binding_state for progress."
+            });
+        }
         json!({
             "ok": true,
             "status": "accepted_in_progress",
@@ -147,16 +186,54 @@ fn timeout_response(
 /// Handle `mcp_tool` API method: proxy a tool call through the daemon
 /// where process-global state (ACTIVE_CHANNEL, heartbeat_pair, etc.)
 /// is available. Applies per-tool timeout.
+#[cfg(test)]
 pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
+    handle_mcp_tool_with_operator_authority(params, ctx, false)
+}
+
+/// Dispatch an MCP call with authenticated transport authority carried
+/// separately from the spoofable `params["instance"]` identity. The API
+/// socket passes `true` only for the boot-minted operator principal after the
+/// capability gate has accepted the request.
+pub(crate) fn handle_mcp_tool_with_operator_authority(
+    params: &Value,
+    ctx: &HandlerCtx,
+    trusted_operator: bool,
+) -> Value {
     let tool = match params["tool"].as_str() {
         Some(t) if !t.is_empty() => t,
         _ => return json!({"ok": false, "error": "missing 'tool' parameter"}),
     };
+    // #3411 Phase 0a: the CLI rides the existing MCP tool handler, but its
+    // transport is an explicitly fenced experimental surface.  Check the
+    // daemon-owned flag before role resolution or handler dispatch so the
+    // default-off path has no tool side effects.
+    if params.get("transport").and_then(Value::as_str) == Some("cli")
+        && !crate::runtime_config::get().experimental.tool_cli_enabled
+    {
+        return json!({
+            "ok": false,
+            "error": "tool CLI disabled: experimental.tool_cli_enabled is false"
+        });
+    }
     let args = params["arguments"].clone();
     let action = args
         .get("action")
         .and_then(|v| v.as_str())
         .map(String::from);
+    if tool == "task"
+        && matches!(
+            action.as_deref(),
+            Some("orphan_reconcile_preview" | "orphan_reconcile_apply")
+        )
+        && !trusted_operator
+    {
+        return json!({
+            "ok": false,
+            "error": "task orphan reconciliation is operator-only and requires the authenticated operator transport",
+            "code": "operator_only",
+        });
+    }
     let instance = params["instance"].as_str().unwrap_or("").to_string();
     let role_kind = match role_kind_for_instance(ctx.home, &instance, "tool call") {
         Ok(role_kind) => role_kind,
@@ -170,11 +247,13 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
             ),
         });
     }
-    let requester_id = if tool == "restart_daemon"
-        && ctx.capability == crate::api::RestartCapability::App
-        && !instance.is_empty()
-    {
-        match live_requester_id(ctx.registry, &instance) {
+    let requester_id = match (tool, action.as_deref(), ctx.capability, instance.is_empty()) {
+        (
+            "restart_daemon",
+            _,
+            crate::api::RestartCapability::App | crate::api::RestartCapability::Daemon,
+            false,
+        ) => match live_requester_id(ctx.registry, &instance) {
             Some(id) => Some(id),
             None => {
                 return json!({
@@ -182,9 +261,17 @@ pub(crate) fn handle_mcp_tool(params: &Value, ctx: &HandlerCtx) -> Value {
                     "error": "restart_daemon requires the managed caller's stable InstanceId from a live handle; fleet intact — no restart"
                 })
             }
-        }
-    } else {
-        None
+        },
+        ("team", Some("update"), _, false) => match live_requester_id(ctx.registry, &instance) {
+            Some(id) => Some(id),
+            None => {
+                return json!({
+                    "ok": false,
+                    "error": "team update requires an unambiguous live managed caller"
+                })
+            }
+        },
+        _ => None,
     };
     let timeout = tool_timeout(tool);
     let runtime = crate::mcp::handlers::dispatch::RuntimeContext {
@@ -289,13 +376,13 @@ fn handle_mcp_tool_counted(
         });
 
     match handle {
-        Ok(_) => match rx.recv_timeout(timeout) {
+        Ok(_) => match rx.recv_timeout(effective_wait_budget(tool, timeout)) {
             Ok(result) => json!({"ok": true, "result": result}),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 timeout_response(tool, action.as_deref(), timeout, key)
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                json!({"ok": false, "error": format!("tool '{tool}' thread panicked")})
+                json!({"ok": false, "status": "handler_errored", "error": format!("tool '{tool}' thread panicked")})
             }
         },
         Err(e) => {
@@ -309,7 +396,7 @@ fn handle_mcp_tool_counted(
 /// the calling agent's role (#2300 P0).
 ///
 /// The bridge passes the caller's `instance` in params (mirroring the tool-call
-/// path); we resolve its fleet `role` and subset the surface via
+/// path); we resolve its fleet `role_kind` and subset the surface via
 /// [`crate::mcp::tools::tool_definitions_for_role`]. Default-all-open:
 /// no instance (old bridge / non-agent caller), unknown instance, or a role not
 /// in the capability registry (dev / lead / orchestrator / …) → the full surface.
@@ -380,13 +467,72 @@ fn role_kind_for_instance(
     }
 }
 
+#[cfg(all(test, unix))]
+#[path = "set_model_success_3573.rs"]
+mod set_model_success_3573;
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn normalize_source_line_endings(source: &str) -> String {
+        source.replace("\r\n", "\n")
+    }
+
+    #[test]
+    fn source_line_ending_normalization_handles_lf_and_crlf_2454() {
+        let lf = "#[cfg(test)]\nmod tests;";
+        let crlf = "#[cfg(test)]\r\nmod tests;";
+        assert_eq!(normalize_source_line_endings(lf), lf);
+        assert_eq!(normalize_source_line_endings(crlf), lf);
+    }
+
+    fn release_fixture(tag: &str) -> (std::path::PathBuf, crate::worktree_pool::WorktreeLease) {
+        let root = std::env::temp_dir().join(format!(
+            "agend-mcp-proxy-release-{}-{tag}",
+            std::process::id()
+        ));
+        let home = root.join("home");
+        let repo = root.join("repo");
+        std::fs::create_dir_all(&home).expect("create home");
+        std::fs::create_dir_all(&repo).expect("create repo");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repo)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .expect("run git fixture command");
+            assert!(output.status.success(), "git {args:?}: {output:?}");
+        };
+        git(&["init", "-b", "main"]);
+        git(&[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=test@example.invalid",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ]);
+        let lease = crate::worktree_pool::lease(&home, &repo, "slow-release", "feat/slow")
+            .expect("lease worktree");
+        crate::binding::bind_full(
+            &home,
+            "slow-release",
+            "T-slow",
+            "feat/slow",
+            &lease.path,
+            &repo,
+            false,
+        )
+        .expect("bind worktree");
+        (home, lease)
+    }
+
     #[test]
     fn fast_tools_get_short_timeout() {
-        assert_eq!(tool_timeout("inbox"), Duration::from_secs(5));
         assert_eq!(tool_timeout("list_instances"), Duration::from_secs(5));
         assert_eq!(tool_timeout("health"), Duration::from_secs(5));
     }
@@ -400,10 +546,47 @@ mod tests {
         assert_eq!(tool_timeout("deployment"), Duration::from_secs(60));
         assert_eq!(tool_timeout("ci"), Duration::from_secs(60));
         assert_eq!(tool_timeout("repo"), Duration::from_secs(60));
+        // #3694: release_worktree's real work is `git worktree remove --force`,
+        // bounded by LOCAL_GIT_TIMEOUT (60s). It sat in the FAST 5s band, which
+        // false-timed out every oversized release and stranded marker-less
+        // orphans (#3692). Deliberately reclassified to SLOW — this assertion
+        // move is the fix, not a relaxation.
+        assert_eq!(tool_timeout("release_worktree"), Duration::from_secs(60));
+    }
+
+    /// #3694: a still-running release yields its `release_in_flight` ticket at
+    /// the soft deadline, strictly before the 60s SLOW hard budget, while every
+    /// other tool keeps its full band.
+    #[test]
+    fn release_wait_budget_clamps_to_in_flight_deadline() {
+        // Couple the reclassification (#3694 item 1) to the early-return (item
+        // 2): the band `release_worktree` now resolves to is the 60s SLOW band,
+        // and the proxy clamps it down to the in-flight deadline.
+        assert_eq!(tool_timeout("release_worktree"), SLOW_TOOL_TIMEOUT);
+        assert_eq!(
+            effective_wait_budget("release_worktree", tool_timeout("release_worktree")),
+            RELEASE_IN_FLIGHT_TIMEOUT
+        );
+        assert!(
+            RELEASE_IN_FLIGHT_TIMEOUT < tool_timeout("release_worktree"),
+            "the in-flight ticket must fire before the hard budget"
+        );
+        // A caller-supplied shorter budget (tests, future per-call bounds) is
+        // never widened by the clamp.
+        assert_eq!(
+            effective_wait_budget("release_worktree", Duration::from_millis(100)),
+            Duration::from_millis(100)
+        );
+        // Non-release tools are untouched.
+        assert_eq!(
+            effective_wait_budget("repo", SLOW_TOOL_TIMEOUT),
+            SLOW_TOOL_TIMEOUT
+        );
     }
 
     #[test]
     fn default_tools_get_30s() {
+        assert_eq!(tool_timeout("inbox"), Duration::from_secs(30));
         assert_eq!(tool_timeout("send"), Duration::from_secs(30));
         assert_eq!(tool_timeout("task"), Duration::from_secs(30));
         assert_eq!(tool_timeout("unknown_tool"), Duration::from_secs(30));
@@ -479,7 +662,9 @@ mod tests {
             "restart_instance",
             "start_instance",
             "repo",
+            "release_worktree",
             "restart_daemon",
+            "inbox",
         ] {
             assert!(
                 is_side_effect_tool(t, None),
@@ -488,7 +673,6 @@ mod tests {
         }
         // Read / idempotent tools → false (keep retryable error).
         for t in [
-            "inbox",
             "list_instances",
             "pane_snapshot",
             "binding_state",
@@ -497,7 +681,6 @@ mod tests {
             "set_metadata",
             "health",
             "bind_self",
-            "release_worktree",
             "ci",
         ] {
             assert!(!is_side_effect_tool(t, None), "{t} must stay retry-safe");
@@ -566,6 +749,99 @@ mod tests {
         );
     }
 
+    /// #3613 RED: release is already running in the daemon-owned worker when
+    /// the proxy stops waiting. The caller must receive a non-retryable,
+    /// release-specific in-flight envelope while that worker survives.
+    #[test]
+    fn release_timeout_reports_in_flight_and_worker_survives_disconnect() {
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let release = move |_: &str, _: &Value, _: &str| {
+            entered_tx.send(()).expect("announce release entry");
+            resume_rx.recv().expect("release resume signal");
+            completed_tx.send(()).expect("announce release completion");
+            json!({"released": true})
+        };
+
+        let response = handle_mcp_tool_inner(
+            "release_worktree",
+            json!({"instance": "slow-release"}),
+            "caller".to_string(),
+            Duration::from_millis(100),
+            None,
+            release,
+        );
+
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("release worker must have entered before the proxy returns");
+        assert_eq!(response["ok"], true, "{response}");
+        assert_eq!(response["accepted"], true, "{response}");
+        assert_eq!(response["release_in_flight"], true, "{response}");
+        assert_eq!(response["status"], "accepted_in_progress", "{response}");
+        assert!(
+            completed_rx.try_recv().is_err(),
+            "blocked release must still be in flight when the response returns"
+        );
+
+        drop(response); // models the client disconnecting after the response
+        resume_tx.send(()).expect("resume background release");
+        completed_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("daemon worker must survive the disconnected caller");
+    }
+
+    #[test]
+    fn slow_release_keeps_binding_until_background_transaction_finishes() {
+        let (home, lease) = release_fixture("transaction");
+        let worker_home = home.clone();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+        let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+        let release = move |_: &str, args: &Value, _: &str| {
+            let _hook = crate::worktree_pool::release_test_seam::install(move |phase| {
+                if phase == crate::worktree_pool::ReleaseTestPhase::BeforeWorktreeRemove {
+                    entered_tx.send(()).expect("announce remove stage");
+                    resume_rx.recv().expect("resume release transaction");
+                }
+            });
+            let result = crate::mcp::handlers::worktree_test_release(&worker_home, args);
+            completed_tx
+                .send(result.clone())
+                .expect("announce release completion");
+            result
+        };
+
+        let response = handle_mcp_tool_inner(
+            "release_worktree",
+            json!({"instance": "slow-release"}),
+            "caller".to_string(),
+            Duration::from_millis(100),
+            None,
+            release,
+        );
+        entered_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("release must reach the blocked remove stage");
+        assert_eq!(response["release_in_flight"], true, "{response}");
+        assert!(lease.path.exists(), "blocked target must still exist");
+        assert!(
+            crate::binding::read(&home, "slow-release").is_some(),
+            "binding must remain authoritative while removal is blocked"
+        );
+
+        drop(response); // caller disconnects after receiving the in-flight ticket
+        resume_tx.send(()).expect("resume release");
+        let completed = completed_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("background release must finish after disconnect");
+        assert_eq!(completed["released"], true, "{completed}");
+        assert!(!lease.path.exists(), "completed target must be removed");
+        assert!(crate::binding::read(&home, "slow-release").is_none());
+        std::fs::remove_dir_all(home.parent().expect("fixture root")).ok();
+    }
+
     /// §3.9: a read/idempotent tool that times out keeps the retryable `error`
     /// (the agent needs the real result and a repeat is harmless).
     #[test]
@@ -575,7 +851,7 @@ mod tests {
             json!({})
         };
         let resp = handle_mcp_tool_inner(
-            "inbox",
+            "pane_snapshot",
             json!({}),
             "caller".to_string(),
             Duration::from_millis(20),
@@ -589,6 +865,60 @@ mod tests {
         assert!(
             resp["error"].as_str().unwrap_or("").contains("timed out"),
             "got {resp}"
+        );
+    }
+
+    /// A worker can enter the handler and then panic before sending a result.
+    /// The resulting disconnected envelope is therefore indeterminate, not a
+    /// refusal that invites the caller to assume the tool never ran.
+    #[test]
+    fn handler_panic_disconnect_is_indeterminate() {
+        let resp = handle_mcp_tool_inner(
+            "task",
+            json!({"action": "get", "id": "panic-probe"}),
+            "caller".to_string(),
+            Duration::from_secs(1),
+            Some("get".to_string()),
+            |_, _, _| -> Value { panic!("handler panic probe") },
+        );
+        assert_eq!(
+            crate::mcp_wire::classify_response(&resp),
+            crate::mcp_wire::ResponseClass::Indeterminate,
+            "a handler panic after worker entry must not classify as refused: {resp}"
+        );
+        assert_eq!(
+            resp["status"], "handler_errored",
+            "disconnected handler errors need an explicit indeterminate status: {resp}"
+        );
+    }
+
+    /// #3395: inbox drain persists delivery state before returning its payload.
+    /// A proxy timeout therefore must not look retry-safe: the background drain
+    /// may already have consumed the unread row, and an immediate retry cannot
+    /// recover the payload. The persisted `delivering_at` row is recovered by
+    /// the existing reclaim TTL instead.
+    #[test]
+    fn inbox_drain_timeout_returns_accepted_in_progress_3395() {
+        let slow = |_: &str, _: &Value, _: &str| {
+            std::thread::sleep(Duration::from_millis(300));
+            json!({"messages": []})
+        };
+        let resp = handle_mcp_tool_inner(
+            "inbox",
+            json!({}),
+            "caller".to_string(),
+            Duration::from_millis(20),
+            None,
+            slow,
+        );
+        assert_eq!(
+            resp["ok"], true,
+            "inbox timeout must not look retryable: {resp}"
+        );
+        assert_eq!(resp["status"], "accepted_in_progress", "got {resp}");
+        assert!(
+            resp.get("error").is_none(),
+            "no error field means the agent will not resend the drain: {resp}"
         );
     }
 
@@ -721,6 +1051,54 @@ mod tests {
         assert!(
             err.contains("create_instance") && err.contains("Reviewer"),
             "denial should name the denied tool and typed role, got: {err}"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn orphan_reconciliation_requires_authenticated_operator_transport_3584() {
+        let dir = toollist_ctx_home("orphan-auth");
+        std::fs::create_dir_all(&dir).expect("mkdir");
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let ctx = HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+            home: &dir,
+            capability: crate::api::RestartCapability::Unsupported,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: None,
+        };
+        let params = json!({
+            "instance": "operator",
+            "tool": "task",
+            "arguments": {
+                "action": "orphan_reconcile_preview",
+                "mappings": []
+            }
+        });
+
+        let forged = handle_mcp_tool_with_operator_authority(&params, &ctx, false);
+        assert_eq!(forged["ok"], false, "forged agent call must fail: {forged}");
+        assert_eq!(forged["code"], "operator_only", "got {forged}");
+
+        let trusted = handle_mcp_tool_with_operator_authority(&params, &ctx, true);
+        assert_eq!(
+            trusted["ok"], true,
+            "trusted transport reaches the handler: {trusted}"
+        );
+        let trusted_code = trusted["result"]["code"].as_str().unwrap_or("");
+        assert!(
+            matches!(
+                trusted_code,
+                "invalid_request" | "owner_authority_unavailable"
+            ),
+            "trusted path must reach the reconciliation handler: {trusted}"
         );
 
         std::fs::remove_dir_all(&dir).ok();
@@ -1409,14 +1787,15 @@ mod tests {
     /// real-ingress characterization above free of a flaky PTY seam.
     #[test]
     fn restart_instance_runtime_spawn_is_not_socket_fallback_2454() {
-        let source = include_str!("../../mcp/handlers/instance_state/mod.rs");
+        let source =
+            normalize_source_line_endings(include_str!("../../mcp/handlers/instance_state/mod.rs"));
         let restart_start = source
             .find("pub(super) fn handle_restart_instance_with_runtime(")
             .expect("runtime-aware restart handler");
         let restart_end = source[restart_start..]
-            .find("/// #t-777-3")
+            .find("#[cfg(test)]\nmod tests;")
             .map(|offset| restart_start + offset)
-            .expect("restart handler end marker");
+            .expect("restart handler test-module boundary");
         let restart_region = &source[restart_start..restart_end];
         let spawn_start = restart_region
             .find("let spawn_result")
@@ -1428,6 +1807,78 @@ mod tests {
                 !trimmed.starts_with("//") && line.contains("crate::api::call")
             }),
             "D8 runtime-present SPAWN must use the shared runtime service, not crate::api::call"
+        );
+    }
+
+    /// #3572 RED: the real MCP set_model ingress must preserve RuntimeContext
+    /// into its restart:true path. The runtime spawn boundary records the
+    /// request even when the deliberate shared-workspace collision rejects the
+    /// replacement; the unfixed adapter drops RuntimeContext and falls back to
+    /// the unavailable loopback API, leaving this boundary unobserved.
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn set_model_restart_real_entry_uses_runtime_spawn_without_listener_3572() {
+        use crate::mcp::handlers::instance_state::spawn::LAST_SPAWN_ARGS;
+
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let home = std::env::temp_dir().join(format!(
+            "agend-s11-mcp-set-model-{0}-{1}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        let shared_work_dir = home.join("shared-workdir");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            format!(
+                "instances:\n  restart-target:\n    backend: claude\n    working_directory: {}\n  restart-collider:\n    backend: claude\n    working_directory: {}\n",
+                shared_work_dir.display(),
+                shared_work_dir.display()
+            ),
+        )
+        .unwrap();
+        let previous_home = std::env::var_os("AGEND_HOME");
+        std::env::set_var("AGEND_HOME", &home);
+        *LAST_SPAWN_ARGS.lock() = None;
+
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        let response = invoke_runtime_mcp_tool(
+            &home,
+            &registry,
+            &configs,
+            &externals,
+            "set_model",
+            "restart-target",
+            json!({
+                "instance": "restart-target",
+                "model": "claude-opus-5",
+                "restart": true
+            }),
+        );
+        let spawn_args = LAST_SPAWN_ARGS.lock().clone();
+
+        match previous_home {
+            Some(value) => std::env::set_var("AGEND_HOME", value),
+            None => std::env::remove_var("AGEND_HOME"),
+        }
+        std::fs::remove_dir_all(&home).ok();
+
+        assert_eq!(
+            response["ok"], true,
+            "MCP set_model must return a response: {response}"
+        );
+        assert_eq!(
+            response["result"]["restart_ok"], false,
+            "the collision should reject the replacement spawn, not hide the runtime result: {response}"
+        );
+        assert!(
+            spawn_args.is_some(),
+            "set_model restart:true must reach the runtime-owned SPAWN service without an API listener: {response}"
         );
     }
 
@@ -1533,7 +1984,7 @@ mod tests {
         assert!(
             !fleet_has_victim
                 && !config_present
-                && matches!(events.as_slice(), [ApiEvent::InstanceDeleted { name }] if name == "victim"),
+                && matches!(events.as_slice(), [ApiEvent::InstanceDeleted { name, .. }] if name == "victim"),
             "managed delete must remove fleet/config state and emit InstanceDeleted; got \
              fleet_has_victim={fleet_has_victim}, config_present={config_present}, \
              events={events:?}, response={response}"
@@ -1559,9 +2010,13 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&home).unwrap();
+        let operator_id = crate::types::InstanceId::new();
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  operator:\n    role_kind: orchestrator\n",
+            format!(
+                "instances:\n  operator:\n    id: {}\n    role_kind: orchestrator\n",
+                operator_id.full()
+            ),
         )
         .unwrap();
 
@@ -1576,6 +2031,10 @@ mod tests {
         crate::daemon::RESTART_PENDING.store(false, Ordering::Release);
         let shutdown = Arc::new(AtomicBool::new(false));
         let registry: crate::agent::AgentRegistry = Default::default();
+        registry.lock().insert(
+            operator_id,
+            crate::agent::mk_test_handle("operator", operator_id),
+        );
         let configs: crate::api::ConfigRegistry = Default::default();
         let externals: crate::agent::ExternalRegistry = Default::default();
         let ctx = HandlerCtx {
@@ -1643,9 +2102,13 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir_all(&home).unwrap();
+        let operator_id = crate::types::InstanceId::new();
         std::fs::write(
             crate::fleet::fleet_yaml_path(&home),
-            "instances:\n  operator:\n    role_kind: orchestrator\n",
+            format!(
+                "instances:\n  operator:\n    id: {}\n    role_kind: orchestrator\n",
+                operator_id.full()
+            ),
         )
         .unwrap();
 
@@ -1659,6 +2122,10 @@ mod tests {
         let previous_restart_pending = crate::daemon::RESTART_PENDING.load(Ordering::Acquire);
         crate::daemon::RESTART_PENDING.store(false, Ordering::Release);
         let registry: crate::agent::AgentRegistry = Default::default();
+        registry.lock().insert(
+            operator_id,
+            crate::agent::mk_test_handle("operator", operator_id),
+        );
         let configs: crate::api::ConfigRegistry = Default::default();
         let externals: crate::agent::ExternalRegistry = Default::default();
         let ctx = HandlerCtx {
@@ -1713,6 +2180,73 @@ mod tests {
         assert!(
             !marker_exists,
             "missing authority must not write restart-requested"
+        );
+    }
+
+    #[test]
+    #[allow(clippy::unwrap_used)]
+    fn restart_daemon_external_requester_without_stable_id_fails_closed() {
+        use std::sync::atomic::AtomicBool;
+        use std::sync::Arc;
+
+        let _guard = crate::mcp::handlers::fleet_test_guard();
+        let home = std::env::temp_dir().join(format!(
+            "agend-mcp-restart-unresolved-requester-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  operator:\n    role_kind: orchestrator\n",
+        )
+        .unwrap();
+
+        let registry: crate::agent::AgentRegistry = Default::default();
+        let configs: crate::api::ConfigRegistry = Default::default();
+        let externals: crate::agent::ExternalRegistry = Default::default();
+        externals.lock().insert(
+            "operator".to_string(),
+            crate::agent::ExternalAgentHandle {
+                backend_command: "external-test".to_string(),
+                pid: std::process::id(),
+            },
+        );
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let ctx = HandlerCtx {
+            registry: &registry,
+            configs: &configs,
+            externals: &externals,
+            notifier: None,
+            home: &home,
+            capability: crate::api::RestartCapability::Daemon,
+            app_restart: None,
+            post_flush: crate::api::app_restart::PostFlushSlot::new(),
+            shutdown: Some(shutdown),
+        };
+        let response = handle_mcp_tool(
+            &json!({
+                "tool": "restart_daemon",
+                "instance": "operator",
+                "arguments": {}
+            }),
+            &ctx,
+        );
+        std::fs::remove_dir_all(&home).ok();
+
+        assert_eq!(
+            response["ok"], false,
+            "external caller without stable InstanceId must fail: {response}"
+        );
+        assert!(
+            response["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("live handle"),
+            "failure must identify the missing live requester identity: {response}"
         );
     }
 
@@ -1812,3 +2346,8 @@ mod tests {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "mcp_proxy_2454_tests.rs"]
 mod mcp_proxy_2454_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+#[path = "mcp_proxy_team_authority_tests.rs"]
+mod mcp_proxy_team_authority_tests;

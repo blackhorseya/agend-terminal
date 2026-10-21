@@ -44,9 +44,19 @@ const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(1);
 pub struct BridgeClient {
     writer: TcpStream,
     reader: Option<TcpStream>,
+    instance_ref: Option<crate::types::InstanceRef>,
 }
 
 impl BridgeClient {
+    #[cfg(test)]
+    pub(crate) fn from_stream_for_test(stream: TcpStream) -> Self {
+        Self {
+            writer: stream.try_clone().expect("clone test bridge stream"),
+            reader: Some(stream),
+            instance_ref: None,
+        }
+    }
+
     /// Connect to `name` on the local daemon, send the cookie, verify the
     /// protocol version, and send the initial resize frame.
     ///
@@ -83,6 +93,14 @@ impl BridgeClient {
         }
         framing::write_resize(&mut stream, cols, rows).context("send initial resize")?;
 
+        let (tag, identity) =
+            framing::read_tagged_frame(&mut stream).context("read bridge instance identity")?;
+        if tag != framing::TAG_IDENTITY {
+            anyhow::bail!("bridge greeting missing instance identity");
+        }
+        let instance_ref =
+            serde_json::from_slice(&identity).context("decode bridge instance identity")?;
+
         // Handshake done — restore BLOCKING for the streaming phase. The parked
         // reader (clone shares the socket) and the input writer must block, not
         // time out, for the lifetime of the pane.
@@ -96,6 +114,7 @@ impl BridgeClient {
         Ok(Self {
             writer,
             reader: Some(reader),
+            instance_ref: Some(instance_ref),
         })
     }
 
@@ -103,6 +122,11 @@ impl BridgeClient {
     /// calls return `None` — a single bridge has a single reader.
     pub fn take_reader(&mut self) -> Option<TcpStream> {
         self.reader.take()
+    }
+
+    /// Exact identity authenticated by the daemon's bridge greeting.
+    pub fn instance_ref(&self) -> Option<crate::types::InstanceRef> {
+        self.instance_ref
     }
 
     /// Send a framed data payload (keystrokes, paste text, …) to the agent.
@@ -223,6 +247,7 @@ mod tests {
         let mut client = BridgeClient {
             writer: stream,
             reader: Some(reader),
+            instance_ref: None,
         };
         let mut fwd_reader = client.take_reader().unwrap();
 

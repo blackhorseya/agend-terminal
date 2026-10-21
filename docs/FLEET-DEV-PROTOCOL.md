@@ -86,6 +86,14 @@ gh pr checks <PR#>
 - If any check is `pending`, wait and re-check
 - If any check is `fail`, block merge and report to implementer
 
+**GitHub review fields are not fleet authority.** Every fleet agent authenticates
+to GitHub as the shared `suzuke` account, which is also the PR author. GitHub
+therefore cannot record a distinct approving reviewer: `reviewDecision` remains
+`REVIEW_REQUIRED`, and `mergeStateStatus: BLOCKED` is expected. Do not wait for
+those fields to change. The fleet's typed review receipt and exact-head review
+threshold are the authoritative review state; GitHub receives the verdict mirror
+for human visibility.
+
 **Flake declarations require CI-log evidence.** Calling a CI failure a "flake" (to rerun instead of fix) MUST cite the real failing test name from the FAILING run's log:
 
 ```
@@ -100,6 +108,11 @@ gh run view <run-id> --log-failed
 
 ### 3.4 Re-review (r1+) Dispatch
 Every re-review dispatch must enumerate all findings from the previous round with status: fixed / deferred / withdrawn. Missing or incomplete mapping → reviewer repeats the complete original scope (`full_review`) rather than reviewing only the claimed fixes.
+
+When a reviewer rejects a test and the test is rewritten, the rewritten test
+must first exist in its own immutable RED commit and demonstrably fail against
+the unfixed implementation. Only then may the implementation fix be committed.
+The rejected test's earlier RED commit does not prove the rewritten test.
 
 ### 3.5 Multi-reviewer
 - Default: single primary reviewer
@@ -150,14 +163,15 @@ Feature/fix PRs must be test-first: failing test commit BEFORE impl commit.
 ### 3.12 Verdict Externalization (was §3.5.13)
 Fleet-internal verdict MUST mirror to the PR through the active SCM provider (`gh pr comment` on GitHub). Apply the §3.5 merge-authority matrix: author/implementer self-merge requires dual VERIFIED; orchestrator merge uses the task's review class; the §3.6 operator docs-only exception remains explicit. CI green + the required verdict mirror are always required.
 
-**Canonical merge step: `repo({action:"merge", pr:<N>, repository:"<owner/repo>"})`** (the MCP `repo` tool → `handle_merge_repo`, `src/mcp/handlers/ci/mod.rs`). It issues the **byte-identical** merge a raw `gh` call would (`gh pr merge <N> --repo R --admin --squash --delete-branch`, pinned by `scm::tests::pr_merge_args_match_existing_gh_call`) but wraps it in three safety nets the raw command lacks:
+**Canonical merge step: `repo({action:"merge", pr:<N>, repository:"<owner/repo>"})`** (the MCP `repo` tool → `handle_merge_repo`, `src/mcp/handlers/ci/mod.rs`). It issues the **byte-identical** merge a raw `gh` call would (`gh pr merge <N> --repo R --admin --squash --delete-branch`, pinned by `scm::tests::pr_merge_args_match_existing_gh_call`) but wraps it in four safety nets the raw command lacks:
 1. **Safe repo-resolution (#1619)** — resolves the target `owner/repo` via `resolve_repo_or_error`; a detection miss ERRORS instead of silently merging against a hardcoded/maintainer repo.
 2. **CI fail-closed gate** — runs `pr checks` (via `ScmProvider`) first; ANY non-`SUCCESS`/`SKIPPED` check OR an undeterminable result REFUSES the merge. Bypass only with `force=true` + a non-empty `force_reason` (audit-logged to `fleet_events.jsonl`).
 3. **`verify_merge_landed` (#1467)** — `gh pr merge` exit-0 is necessary but NOT sufficient (merge-queue / eventual-consistency can exit-0 without landing); it re-`view`s the PR and reports `merged:false, pending:true` rather than a false success, so the caller re-queries instead of blindly re-merging.
+4. **Exact-head review-threshold gate (#3419)** — after the non-force CI, base-drift, and freshness gates accept the exact acquired head, it loads the persisted `PrState` subject for that same repo/PR/branch/head and refuses with typed `MergeDeficit` results when review linkage, class/assignment authority, or current-head VERIFIED receipts do not satisfy the threshold. `force=true` with a non-empty `force_reason` is the sole audited bypass for this review gate; exact head/base acquisition and the pre-merge identity recheck remain non-bypassable.
 
 It also routes through `ScmProvider` (platform-agnostic — not hardwired to `gh`).
 
-⚠ **Scope of the gate:** `repo action=merge` gates **CI fail-closed**, NOT the review verdict. The dual-VERIFIED requirement above stays a **fleet convention** the orchestrator enforces (dispatch reviewer → await `VERIFIED` → THEN run `repo action=merge`) — this change does NOT make review a hard precondition of the merge primitive.
+⚠ **Scope of the gate:** A canonical non-force `repo action=merge` is gated by CI fail-closed, base-drift/freshness, and the exact-head review threshold; review is a hard precondition, not merely a fleet convention. The `force=true` + non-empty `force_reason` path is the audited review-threshold bypass described above. The raw `gh` fallback remains outside this daemon review gate and is therefore not review-gated by this primitive; use it only under the documented emergency/branch-protection rules below.
 
 **Fallback (emergency / MCP unavailable):** raw `gh pr merge <N>` — the `--auto --squash --delete-branch` form (§3.12.1, server-side queue; needs strict branch protection) or the synchronous `--admin --squash --delete-branch` form (queue-contention recovery / admin-bypass, per #985/#988 deviation precedent). Prefer the MCP primitive; drop to raw `gh` only when the MCP path can't run.
 
@@ -769,7 +783,7 @@ A PR that resolves a tracked issue MUST carry a closing keyword (`Closes #N` / `
 
 `↳ 緣由 A-§12.7`
 
-## §13. `AGEND_GIT_BYPASS=1` Usage
+## §13. `AGENTIC_GIT_BYPASS=1` Usage
 
 **TL;DR:** agents use normal git inside their daemon-managed worktree and never bypass a shim denial. Bypass is reserved for daemon internals and explicitly operator-authorized repair/bootstrapping exceptions.
 
@@ -783,7 +797,7 @@ git add / commit / fetch
 git push origin <your-branch>     # any branch except main
 ```
 
-Do not preemptively prefix `AGEND_GIT_BYPASS=1`. If the shim denies an action, stop and follow the daemon-managed remediation or ask the lead/operator; the denial is not permission to retry beneath the guard.
+Do not preemptively prefix `AGENTIC_GIT_BYPASS=1`. If the shim denies an action, stop and follow the daemon-managed remediation or ask the lead/operator; the denial is not permission to retry beneath the guard. The legacy `AGEND_GIT_BYPASS=1` spelling is also accepted by the shim.
 
 ### 13.2 Authorized bypass scopes
 
@@ -795,6 +809,12 @@ The allowed scopes are narrow:
 - A repository-owned test wrapper may set bypass internally for a tool whose own nested git probes would otherwise recurse (for example a configured `nextest` wrapper). Agents do not add the prefix ad hoc.
 
 Raw worktree lifecycle, switching protected branches, and pushing to main are not agent bypass scopes. Use `repo`, `bind_self`, `release_worktree`, and the PR/merge workflow.
+
+An agent's standing authorization also does not authorize mutating protected
+canonical local refs. In particular, `git merge --ff-only @{u}` from a
+canonical checkout remains protected-branch mutation even when it neither
+switches branches nor pushes. Canonical sync must use the daemon-managed
+repo/release/merge workflow or a separately authorized daemon-managed action.
 
 ### 13.3 Why bypass is costly
 
@@ -814,7 +834,7 @@ Any one of these can invalidate review or strand operator state; treat bypass as
 3. Follow a daemon-managed remediation (`repo`, `bind_self`, `release_worktree`) when offered.
 4. If the only proposed remediation is bypass, an agent pauses and requests lead/operator direction. Only the operator or an explicitly authorized procedure may approve the exact one-command scope.
 
-`AGEND_GIT_BYPASS_UNTIL=<epoch>` is for audited, time-bounded operator interventions; it is not an agent convenience flag.
+`AGENTIC_GIT_BYPASS_UNTIL=<epoch>` is for audited, time-bounded operator interventions; it is not an agent convenience flag. The legacy `AGEND_GIT_BYPASS_UNTIL=<epoch>` spelling is also accepted by the shim.
 
 ### 13.5 Bug-Blocks-Its-Own-Fix Exception (Sprint 62)
 

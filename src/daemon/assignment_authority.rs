@@ -43,6 +43,10 @@ pub(crate) const SCHEMA_VERSION: u32 = 2;
 /// repair, so two ticks inside one interval produce at most one repair.
 const FIXED_INTERVAL: Duration = Duration::from_secs(60);
 
+/// Short retry lease used when an actionable-unread wake is fenced or queue-full
+/// (#3504). Bounded (5s) so a failed wake is retried quickly without flooding.
+const SHORT_RETRY_INTERVAL: Duration = Duration::from_secs(5);
+
 /// Outbox row lifecycle. `Pending` = the record is persisted but no durable inbox
 /// row is confirmed yet (crash-before-enqueue window); `Persisted` = a row
 /// carrying the current nonce is durably enqueued.
@@ -269,6 +273,17 @@ fn markers_file(home: &Path, repo: &str, branch: &str) -> PathBuf {
     branch_dir(home, repo, branch).join("markers.json")
 }
 
+fn terminal_retirements_file(home: &Path, repo: &str, branch: &str) -> PathBuf {
+    branch_dir(home, repo, branch).join("terminal_retirements.json")
+}
+
+fn is_metadata_json(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("markers.json" | "terminal_retirements.json")
+    )
+}
+
 /// The per-`(repo,branch)` assignment lock sidecar. A `.lock` (not `.json`) so it
 /// is excluded from `list_active`; a SEPARATE file from any record so the atomic
 /// tmp→rename of a record can't invalidate a flock held on it.
@@ -352,6 +367,29 @@ fn atomic_write_json<T: serde::Serialize>(path: &Path, val: &T) -> std::io::Resu
     std::fs::rename(&tmp, path)?;
     crate::store::fsync_parent_dir(path);
     Ok(())
+}
+
+#[derive(Clone, Debug, serde::Deserialize, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
+struct TerminalRetirementKey {
+    board: String,
+    task_id: String,
+    instance: String,
+    seq: u64,
+}
+
+fn read_terminal_retirements(
+    path: &Path,
+) -> anyhow::Result<std::collections::BTreeSet<TerminalRetirementKey>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map_err(|error| {
+            anyhow::anyhow!(
+                "corrupt terminal retirement ledger {}: {error}",
+                path.display()
+            )
+        }),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
+        Err(error) => Err(error.into()),
+    }
 }
 
 /// Read one authority record. Three-state (B4): `Ok(None)` = genuinely ABSENT
@@ -446,6 +484,82 @@ fn add_interval(now: &str) -> String {
         })
         .map(|t| t.to_rfc3339())
         .unwrap_or_else(|| now.to_string())
+}
+
+/// `now + SHORT_RETRY_INTERVAL` as RFC3339. Used when a wake is fenced or
+/// queue-full (#3504) so the next reconcile retries quickly (5s) without
+/// flooding. Degrades to `now` verbatim on unparseable input.
+fn add_short_interval(now: &str) -> String {
+    parse_ts(now)
+        .and_then(|n| {
+            chrono::Duration::from_std(SHORT_RETRY_INTERVAL)
+                .ok()
+                .and_then(|d| n.checked_add_signed(d))
+        })
+        .map(|t| t.to_rfc3339())
+        .unwrap_or_else(|| now.to_string())
+}
+
+/// Advance the FIXED-interval lease after a successful actionable-unread wake
+/// (#3504). Caller has already proven `assignment_id` still current via
+/// `repair_row`; this re-checks CAS before writing.
+pub(crate) fn advance_lease_after_wake(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    target: &str,
+    now: &str,
+    expected_id: uuid::Uuid,
+) -> anyhow::Result<bool> {
+    let _lock = lock_branch(home, repo, branch)?;
+    let path = record_file(home, repo, branch, target);
+    if let Ok(Some(mut cur)) = read_record(&path) {
+        if cur.assignment_id == expected_id {
+            cur.next_nudge_at = add_interval(now);
+            atomic_write_json(&path, &cur)?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// Set a short retry lease after a fenced / queue-full wake failure (#3504).
+/// Bounded at 5s so the next reconcile retries quickly without advancing the
+/// full 60s invisibly. CAS on `assignment_id`. `reason` is the caller-known
+/// failure class (e.g. "fenced", "queue-full", "stale-teardown",
+/// "adapter-failed") and is emitted verbatim in both tracing and the durable
+/// event_log so the #3504 diagnostic record is trustworthy.
+pub(crate) fn set_short_retry_lease(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    target: &str,
+    now: &str,
+    expected_id: uuid::Uuid,
+    reason: &str,
+) -> anyhow::Result<bool> {
+    let _lock = lock_branch(home, repo, branch)?;
+    let path = record_file(home, repo, branch, target);
+    if let Ok(Some(mut cur)) = read_record(&path) {
+        if cur.assignment_id == expected_id {
+            cur.next_nudge_at = add_short_interval(now);
+            atomic_write_json(&path, &cur)?;
+            tracing::warn!(
+                repo = %repo, branch = %branch, target = %target,
+                next_nudge_at = %cur.next_nudge_at,
+                reason = %reason,
+                "review assignment wake {reason} — short retry lease set"
+            );
+            crate::event_log::log(
+                home,
+                "review_assignment_wake_retry",
+                target,
+                &format!("wake for {repo}@{branch} {reason} at {now}; short retry lease set"),
+            );
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 // ─────────────────────────── message builders ───────────────────────────
@@ -551,7 +665,7 @@ pub(crate) fn list_active(home: &Path, repo: &str, branch: &str) -> Vec<ActiveAs
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
+        if is_metadata_json(&path) {
             continue;
         }
         // Lossy: skip both absent + corrupt (this feeds ack-scan / reconcile-loop /
@@ -603,7 +717,7 @@ fn list_active_checked(
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
+        if is_metadata_json(&path) {
             continue;
         }
         // `Err` (corrupt) propagates ⇒ caller keeps the existing reserved set.
@@ -657,7 +771,7 @@ pub(crate) fn probe_branch_authority(home: &Path, repo: &str, branch: &str) -> B
         if path.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
+        if is_metadata_json(&path) {
             continue;
         }
         match read_record(&path) {
@@ -718,8 +832,7 @@ pub(crate) fn lookup_by_assignment_id_strict(
             let path = row
                 .map_err(|e| anyhow::anyhow!("unreadable assignment row: {e}"))?
                 .path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json")
-                || path.file_name().and_then(|n| n.to_str()) == Some("markers.json")
+            if path.extension().and_then(|e| e.to_str()) != Some("json") || is_metadata_json(&path)
             {
                 continue;
             }
@@ -769,8 +882,7 @@ pub(crate) fn legacy_active_assignments_strict(
             let path = row
                 .map_err(|e| anyhow::anyhow!("unreadable assignment row: {e}"))?
                 .path();
-            if path.extension().and_then(|e| e.to_str()) != Some("json")
-                || path.file_name().and_then(|n| n.to_str()) == Some("markers.json")
+            if path.extension().and_then(|e| e.to_str()) != Some("json") || is_metadata_json(&path)
             {
                 continue;
             }
@@ -842,11 +954,11 @@ pub(crate) fn persist(home: &Path, record: &ActiveAssignment) -> anyhow::Result<
                     &old.delivery_nonce,
                     &successor,
                 );
-                // Mirror the A8 revoke path: a row the reviewer had already READ is not
-                // retracted by the supersede alone — surface a durable revocation notice
-                // for the retired assignment (I21). Clock-injected via the new record's
-                // `created_at` (persist takes no separate `now`).
-                if outcome.was_read {
+                // Mirror the A8 revoke path: surface a durable revocation notice when
+                // the original assignment was already handed to the reviewer (I21).
+                // Clock-injected via the new record's `created_at` (persist takes no
+                // separate `now`).
+                if outcome.was_delivered {
                     let nonce = revocation_nonce(old.assignment_id);
                     if !revocation_nonce_present(home, &record.target, &nonce) {
                         crate::inbox::storage::enqueue(
@@ -943,16 +1055,32 @@ pub(crate) fn repair_row(
     // missing or superseded row proceeds to the append-only repair below.
     // However, an actionable-unread row still needs a wake so the reviewer
     // notices the assignment; read/delivering rows do not wake.
+    //
+    // #3504 fix: for actionable-unread we MUST NOT advance `next_nudge_at`
+    // BEFORE the wake outcome is known. The old code advanced the 60s lease
+    // then swallowed the `wake_review_assignment` result — a fenced/queue-full
+    // wake left the row unread with lease advanced and ledger empty (invisible).
+    // Now `repair_row` leaves the lease untouched for actionable-unread and
+    // lets the caller advance it only after a successful wake, or set a short
+    // 5s retry on fenced/queue-full (bounded, not flooding). Read/delivering
+    // (needs_wake=false) still advances the lease here (no wake needed).
     if crate::inbox::storage::nonce_present_not_superseded(home, target, &record.delivery_nonce) {
         let needs_wake =
             crate::inbox::storage::nonce_present_actionable(home, target, &record.delivery_nonce);
-        if let Ok(Some(mut cur)) = read_record(&path) {
-            if cur.assignment_id == record.assignment_id {
-                cur.next_nudge_at = add_interval(now);
-                atomic_write_json(&path, &cur)?;
+        if !needs_wake {
+            // read/delivering — no wake, but lease still advances (bounded, no flood).
+            if let Ok(Some(mut cur)) = read_record(&path) {
+                if cur.assignment_id == record.assignment_id {
+                    cur.next_nudge_at = add_interval(now);
+                    atomic_write_json(&path, &cur)?;
+                }
             }
+            return Ok(false);
         }
-        return Ok(needs_wake);
+        // actionable-unread — leave lease untouched; the delivery worker will
+        // advance on wake success or set a short retry on failure (#3504). This keeps
+        // the row visibly due for retry instead of silently leased forward.
+        return Ok(true);
     }
     let old_nonce = record.delivery_nonce.clone();
     let new_nonce = uuid::Uuid::new_v4().to_string();
@@ -1014,6 +1142,65 @@ pub(crate) fn revoke(
 /// failure at any point preserves the authority — fail closed. Retry after
 /// interruption converges: supersede is idempotent on an already-superseded
 /// row, so re-running after a crash between supersede and delete is safe.
+fn retire_under_lock(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    target: &str,
+    expected_id: uuid::Uuid,
+    now: &str,
+    cleanup_tasks: &mut Vec<String>,
+) -> anyhow::Result<bool> {
+    let path = record_file(home, repo, branch, target);
+    let record = match read_record(&path)? {
+        Some(record) if record.assignment_id == expected_id => record,
+        _ => return Ok(false),
+    };
+
+    let cancelled = crate::tasks::cancel_review_assignment_task(
+        home,
+        &record.task_id,
+        &record.target,
+        "review assignment authority retired",
+    )?;
+    if cancelled {
+        cleanup_tasks.push(record.task_id.clone());
+    }
+
+    retire_delivery_under_lock(home, &record, now)
+}
+
+fn retire_delivery_under_lock(
+    home: &Path,
+    record: &ActiveAssignment,
+    now: &str,
+) -> anyhow::Result<bool> {
+    let expected_id = record.assignment_id;
+    let target = &record.target;
+    let path = record_file(home, &record.repo, &record.branch, target);
+
+    let successor = format!("retired-{}", expected_id);
+    let outcome = crate::inbox::storage::supersede_by_nonce_strict(
+        home,
+        target,
+        &record.delivery_nonce,
+        &successor,
+    )?;
+
+    if outcome.was_delivered {
+        let nonce = revocation_nonce(expected_id);
+        if !revocation_nonce_present(home, target, &nonce) {
+            crate::inbox::storage::enqueue(
+                home,
+                target,
+                build_revocation_notice(record, now, &nonce),
+            )?;
+        }
+    }
+
+    remove_if_assignment_matches_strict(&path, expected_id)
+}
+
 pub(crate) fn retire_if_id_matches(
     home: &Path,
     repo: &str,
@@ -1022,60 +1209,242 @@ pub(crate) fn retire_if_id_matches(
     expected_id: uuid::Uuid,
     now: &str,
 ) -> anyhow::Result<bool> {
-    let mut cleanup_task = None;
-    let result = (|| {
+    let mut cleanup_tasks = Vec::new();
+    let result = {
         let _lock = lock_branch(home, repo, branch)?;
-        let path = record_file(home, repo, branch, target);
-        let record = match read_record(&path) {
-            Ok(Some(r)) if r.assignment_id == expected_id => r,
-            _ => return Ok(false), // absent, corrupt, or replaced — no-op
-        };
-
-        if crate::tasks::cancel_review_assignment_task(
+        retire_under_lock(
             home,
-            &record.task_id,
-            &record.target,
-            "review assignment authority retired",
-        )? {
-            cleanup_task = Some(record.task_id.clone());
-        }
-
-        // Step 1: durably supersede the stale inbox row. If this fails the
-        // authority stays intact — the reviewer may still pick it up, which is
-        // strictly better than a dangling actionable row with no authority.
-        let successor = format!("retired-{}", expected_id);
-        let outcome = crate::inbox::storage::supersede_by_nonce_strict(
-            home,
+            repo,
+            branch,
             target,
-            &record.delivery_nonce,
-            &successor,
-        )?;
-
-        // Step 2: if the reviewer had already read the assignment, enqueue a
-        // deterministic revocation notice so they learn it was retracted.
-        // Stable nonce + any-state dedup: if a prior attempt already enqueued
-        // the notice (but delete failed), the nonce is already present and we
-        // skip the duplicate append.
-        if outcome.was_read {
-            let nonce = revocation_nonce(expected_id);
-            if !revocation_nonce_present(home, target, &nonce) {
-                crate::inbox::storage::enqueue(
-                    home,
-                    target,
-                    build_revocation_notice(&record, now, &nonce),
-                )?;
-            }
-        }
-
-        // Step 3: NOW safe to delete the authority — the stale inbox state has
-        // been durably superseded (or was already non-actionable).
-        let removed = remove_if_assignment_matches_strict(&path, expected_id)?;
-        Ok(removed)
-    })();
-    if let Some(task_id) = cleanup_task {
+            expected_id,
+            now,
+            &mut cleanup_tasks,
+        )
+    };
+    for task_id in cleanup_tasks {
         crate::tasks::task_terminal_cleanup(home, &task_id);
     }
     result
+}
+
+/// Retire every active reviewer assignment for one exact PR generation. This
+/// is the correction-only bulk operation: the caller supplies the full PR
+/// number and head, so a reused branch or newer generation is never touched.
+/// The branch lock serializes the scan and all CAS removals; task cleanup runs
+/// only after the lock is released. Typed receipt invalidation stays inside
+/// the same branch lock so CI replay cannot select a row while correction is
+/// retiring its matching assignments.
+pub(crate) fn retire_for_review_class_correction(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    pr_number: u64,
+    reviewed_head: &str,
+    now: &str,
+) -> anyhow::Result<(usize, usize)> {
+    let mut cleanup_tasks = Vec::new();
+    let result = (|| {
+        let _lock = lock_branch(home, repo, branch)?;
+        let records = list_active_checked(home, repo, branch)?
+            .into_iter()
+            .filter(|record| {
+                record.pr_number == pr_number
+                    && record.reviewed_head.as_deref() == Some(reviewed_head)
+            })
+            .collect::<Vec<_>>();
+        let mut retired = 0;
+        for record in records {
+            retired += usize::from(retire_under_lock(
+                home,
+                repo,
+                branch,
+                &record.target,
+                record.assignment_id,
+                now,
+                &mut cleanup_tasks,
+            )?);
+        }
+        let invalidated_receipts =
+            crate::daemon::pr_state::verdict_buffer::invalidate_validated_for_subject(
+                home,
+                repo,
+                branch,
+                pr_number,
+                reviewed_head,
+            )?;
+        Ok((retired, invalidated_receipts))
+    })();
+    for task_id in cleanup_tasks {
+        crate::tasks::task_terminal_cleanup(home, &task_id);
+    }
+    result
+}
+
+pub(crate) fn retire_for_terminal_event(
+    home: &Path,
+    board: &str,
+    task_id: &str,
+    instance: &str,
+    seq: u64,
+    now: &str,
+) -> anyhow::Result<usize> {
+    // A terminal event is authority for its own generation, not for whichever
+    // task/assignment currently reuses this ID. This preflight is also needed
+    // when the original cleanup found no assignments and wrote no ledger key.
+    let snapshots = crate::task_events::catalog::for_home(home)
+        .statuses(&[crate::task_events::TaskId(task_id.to_owned())])
+        .map_err(|error| anyhow::anyhow!("terminal cleanup task lookup failed: {error:?}"))?;
+    anyhow::ensure!(
+        snapshots.iter().any(|snapshot| {
+            snapshot.board == board
+                && snapshot.status.is_some_and(|status| status.is_terminal())
+                && snapshot
+                    .terminal_event
+                    .as_ref()
+                    .is_some_and(|(emitter, event_seq)| emitter.0 == instance && *event_seq == seq)
+        }),
+        "stale terminal cleanup generation for {task_id}"
+    );
+    let key = TerminalRetirementKey {
+        board: board.to_string(),
+        task_id: task_id.to_string(),
+        instance: instance.to_string(),
+        seq,
+    };
+    let mut branches = Vec::new();
+    for (repo, branch) in active_branches_checked(home)? {
+        if list_active_checked(home, &repo, &branch)?
+            .iter()
+            .any(|record| record.task_id == task_id)
+        {
+            branches.push((repo, branch));
+        }
+    }
+    let mut retired = 0;
+    let mut cleanup_tasks = Vec::new();
+    for (repo, branch) in branches {
+        let _lock = lock_branch(home, &repo, &branch)?;
+        let ledger_path = terminal_retirements_file(home, &repo, &branch);
+        let mut ledger = read_terminal_retirements(&ledger_path)?;
+        if ledger.contains(&key) {
+            continue;
+        }
+        let records = list_active_checked(home, &repo, &branch)?
+            .into_iter()
+            .filter(|record| record.task_id == task_id)
+            .collect::<Vec<_>>();
+        for record in records {
+            retired += usize::from(retire_under_lock(
+                home,
+                &repo,
+                &branch,
+                &record.target,
+                record.assignment_id,
+                now,
+                &mut cleanup_tasks,
+            )?);
+        }
+        ledger.insert(key.clone());
+        atomic_write_json(&ledger_path, &ledger)?;
+    }
+    for cleanup_task in cleanup_tasks {
+        crate::tasks::task_terminal_cleanup(home, &cleanup_task);
+    }
+    Ok(retired)
+}
+
+/// Top-level cleanup (API/reconciler), never called beneath a task writer lock.
+pub(crate) fn retire_current_terminal_task_checked(
+    home: &Path,
+    board: &str,
+    task_id: &str,
+    now: &str,
+) -> anyhow::Result<usize> {
+    let mut retired = 0;
+    for (repo, branch) in active_branches_checked(home)? {
+        let _branch = lock_branch(home, &repo, &branch)?;
+        crate::tasks::operator_settlement::with_current_terminal_cleanup(
+            home,
+            board,
+            task_id,
+            None,
+            || {
+                for record in list_active_checked(home, &repo, &branch)? {
+                    if record.task_id == task_id {
+                        retired += usize::from(retire_delivery_under_lock(home, &record, now)?);
+                    }
+                }
+                Ok(())
+            },
+        )?;
+    }
+    Ok(retired)
+}
+
+pub(crate) fn retire_terminal_event_checked(
+    home: &Path,
+    board: &str,
+    task_id: &str,
+    instance: &str,
+    seq: u64,
+    now: &str,
+) -> anyhow::Result<usize> {
+    retire_operator_settlement_after_preflight(home, board, task_id, instance, seq, now, || {})
+}
+
+fn retire_operator_settlement_after_preflight(
+    home: &Path,
+    board: &str,
+    task_id: &str,
+    instance: &str,
+    seq: u64,
+    now: &str,
+    after_preflight: impl FnOnce(),
+) -> anyhow::Result<usize> {
+    crate::tasks::operator_settlement::with_terminal_cleanup(
+        home,
+        board,
+        task_id,
+        instance,
+        seq,
+        || Ok(()),
+    )?;
+    after_preflight();
+    let key = TerminalRetirementKey {
+        board: board.into(),
+        task_id: task_id.into(),
+        instance: instance.into(),
+        seq,
+    };
+    let mut retired = 0;
+    for (repo, branch) in active_branches_checked(home)? {
+        let _branch = lock_branch(home, &repo, &branch)?;
+        crate::tasks::operator_settlement::with_terminal_cleanup(
+            home,
+            board,
+            task_id,
+            instance,
+            seq,
+            || {
+                let path = terminal_retirements_file(home, &repo, &branch);
+                let mut ledger = read_terminal_retirements(&path)?;
+                if ledger.contains(&key) {
+                    return Ok(());
+                }
+                for record in list_active_checked(home, &repo, &branch)? {
+                    if record.task_id == task_id {
+                        // The task is already terminal under its writer lock. Do not
+                        // call cancellation, which would re-enter that same lock.
+                        retired += usize::from(retire_delivery_under_lock(home, &record, now)?);
+                    }
+                }
+                ledger.insert(key.clone());
+                Ok(atomic_write_json(&path, &ledger)?)
+            },
+        )?;
+    }
+    Ok(retired)
 }
 
 /// The revoke body WITHOUT acquiring the branch lock — the caller MUST already
@@ -1120,9 +1489,9 @@ fn revoke_under_lock(
         &record.delivery_nonce,
         &successor,
     )?;
-    // A row the reviewer had already READ is not retracted by the supersede alone
-    // (it is already non-actionable) — surface an explicit revocation notice (I21).
-    if outcome.was_read {
+    // Once an assignment has been handed to the reviewer, surface an explicit
+    // revocation notice even if that delivery has not yet been acknowledged (I21).
+    if outcome.was_delivered {
         crate::inbox::storage::enqueue(
             home,
             target,
@@ -1529,7 +1898,7 @@ pub(crate) fn active_branches(home: &Path) -> Vec<(String, String)> {
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
+            if is_metadata_json(&path) {
                 continue;
             }
             if let Some(r) = read_record(&path).ok().flatten() {
@@ -1541,6 +1910,34 @@ pub(crate) fn active_branches(home: &Path) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// Terminal cleanup must distinguish corrupt authority from genuine absence.
+/// Keep the reconciler's best-effort enumeration separate from this strict read.
+fn active_branches_checked(home: &Path) -> anyhow::Result<Vec<(String, String)>> {
+    let entries = match std::fs::read_dir(base_dir(home)) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut branches = std::collections::BTreeSet::new();
+    for entry in entries {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        for record in std::fs::read_dir(entry.path())? {
+            let path = record?.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") || is_metadata_json(&path)
+            {
+                continue;
+            }
+            if let Some(record) = read_record(&path)? {
+                branches.insert((record.repo, record.branch));
+            }
+        }
+    }
+    Ok(branches.into_iter().collect())
 }
 
 // ─────────────────────────── C7: 3-state evidence classifier ───────────────────────────
@@ -1680,7 +2077,7 @@ fn list_active_by_target_task(home: &Path, target: &str, task_id: &str) -> Vec<A
             if path.extension().and_then(|e| e.to_str()) != Some("json") {
                 continue;
             }
-            if path.file_name().and_then(|n| n.to_str()) == Some("markers.json") {
+            if is_metadata_json(&path) {
                 continue;
             }
             if let Some(r) = read_record(&path).ok().flatten() {

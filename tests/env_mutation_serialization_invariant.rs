@@ -20,9 +20,31 @@ const CFG_TEST: &str = "#[cfg(test)]";
 /// key from hiding a newly introduced, unprotected key in the same file.
 const SERIALIZED_PAIRS: &[(&str, &str, &str)] = &[
     (
+        "src/api/handlers/mcp_proxy_team_authority_tests.rs",
+        "AGEND_HOME",
+        "fleet_test_guard serializes the team authority fixtures",
+    ),
+    (
         "src/app/restart_resume_tests.rs",
         "AGEND_HOME",
         "fleet_test_guard serializes the restart ingress fixture",
+    ),
+    (
+        "src/channel/operator_page/tests.rs",
+        "AGEND_HOME",
+        "fleet_test_guard + channel_registry_test_guard serialize the operator-page fixture",
+    ),
+    (
+        "src/channel/operator_page/tests.rs",
+        "AGEND_TELEGRAM_BOT_TOKEN",
+        "the operator-page fixture pins BOTH bot-token names to dummies under \
+         fleet_test_guard + channel_registry_test_guard and restores them in teardown",
+    ),
+    (
+        "src/channel/operator_page/tests.rs",
+        "AGEND_BOT_TOKEN",
+        "the operator-page fixture pins BOTH bot-token names to dummies under \
+         fleet_test_guard + channel_registry_test_guard and restores them in teardown",
     ),
     (
         "src/daemon/ci_watch/poller_tests.rs",
@@ -83,6 +105,11 @@ const SERIALIZED_PAIRS: &[(&str, &str, &str)] = &[
         "src/mcp/handlers/ci/tests.rs",
         "AGEND_HOME",
         "ci_env_test_guard serializes the force-chain fixture",
+    ),
+    (
+        "src/mcp/handlers/ci/review_threshold_merge_tests.rs",
+        "AGEND_HOME",
+        "fleet_test_guard serializes the real merge-entry fixture",
     ),
     (
         "src/mcp/handlers/tests.rs",
@@ -153,7 +180,6 @@ const KNOWN_UNSERIALIZED: &[(&str, &str)] = &[
     ("src/api/handlers/mcp_proxy.rs", "AGEND_RESTART_HANDOFF"),
     ("src/api/handlers/mcp_proxy.rs", "AGEND_SUPERVISED"),
     ("src/api/handlers/mcp_proxy_2454_tests.rs", "AGEND_HOME"),
-    ("src/api/mod.rs", "AGEND_ALLOWED_ROOTS"),
     (
         "tests/agend_git_shim_phase4_stress.rs",
         "AGEND_WORKTREE_ARCHIVE_FALLBACK",

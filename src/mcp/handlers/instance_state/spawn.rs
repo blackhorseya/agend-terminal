@@ -27,6 +27,13 @@ pub(crate) type SpawnRpcFn =
 #[cfg(test)]
 pub(crate) static SPAWN_OVERRIDE: parking_lot::Mutex<Option<(std::path::PathBuf, SpawnRpcFn)>> =
     parking_lot::Mutex::new(None);
+/// #3414 test seam: the `args` string exactly as it reached the SPAWN
+/// boundary. The fresh/resume session contract is a statement about THIS
+/// value, so the regression is asserted where the argv is actually handed
+/// over — not on the pure sanitizer in isolation.
+#[cfg(test)]
+pub(crate) static LAST_SPAWN_ARGS: parking_lot::Mutex<Option<String>> =
+    parking_lot::Mutex::new(None);
 
 /// #2454 S8: synchronous inject routing — the testable core shared by the
 /// fire-and-forget threads. Returns Ok(()) on success or Err(detail) on
@@ -74,6 +81,10 @@ pub(super) fn spawn_runtime_or_legacy(
     let name = params["name"]
         .as_str()
         .ok_or_else(|| anyhow::anyhow!("missing name"))?;
+    #[cfg(test)]
+    {
+        *LAST_SPAWN_ARGS.lock() = params["args"].as_str().map(str::to_string);
+    }
     let env_from_params = params.get("env").and_then(|v| {
         v.as_object().map(|obj| {
             obj.iter()
@@ -102,12 +113,17 @@ pub(super) fn spawn_runtime_or_legacy(
         layout: params["layout"].as_str().unwrap_or("tab"),
         spawner: params["spawner"].as_str().filter(|s| !s.is_empty()),
         target_pane: params["target_pane"].as_str().filter(|s| !s.is_empty()),
+        restart_id: params["restart_id"].as_str().filter(|s| !s.is_empty()),
+        old_instance_ref: params
+            .get("old_instance_ref")
+            .and_then(|value| serde_json::from_value(value.clone()).ok()),
     };
-    let spawn_request = crate::agent_ops::spawn::resolve_spawn_request(home, &spawn_params);
+    let spawn_request = crate::agent_ops::spawn::resolve_spawn_request(home, &spawn_params)?;
     let outcome = crate::agent_ops::spawn::spawn_instance(
         &crate::agent_ops::spawn::SpawnContext {
             home,
             registry: &runtime.registry,
+            configs: &runtime.configs,
             externals: &runtime.externals,
             notifier: runtime.notifier.as_ref(),
         },
@@ -194,6 +210,23 @@ fn spawn_single_instance_impl_inner(
         }
     };
     let name: &str = &name_owned;
+    // Branch-backed creation is a lifecycle actor: hold the same per-agent
+    // authority used by bind/release/delete before any worktree mutation and
+    // through registration plus the SPAWN transaction.
+    let lifecycle_permit = if args.get("branch").and_then(|v| v.as_str()).is_some() {
+        Some(
+            match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+                home,
+                name,
+                crate::mcp::handlers::dispatch_hook::LifecycleOperation::Bind,
+            ) {
+                Ok(permit) => permit,
+                Err(error) => return json!({"error": format!("create refused: {error}")}),
+            },
+        )
+    } else {
+        None
+    };
     let command = args["backend"].as_str().unwrap_or("claude");
     let mut cmd_args = args
         .get("args")
@@ -225,7 +258,7 @@ fn spawn_single_instance_impl_inner(
         {
             return json!({"error": "working_directory must not contain '..'"});
         }
-        if !dir.starts_with('/') {
+        if !std::path::Path::new(dir).is_absolute() {
             return json!({"error": "working_directory must be an absolute path"});
         }
     }
@@ -278,10 +311,24 @@ fn spawn_single_instance_impl_inner(
         // Sprint 57 Wave 4 (#546 Item 4): worktree creation now takes
         // `home` so the canonical external layout
         // `$AGEND_HOME/worktrees/<agent>/<branch>/` resolves correctly.
-        if let Some(info) = crate::worktree::create(home, &wd, name, Some(branch)) {
-            work_dir = info.path.display().to_string();
-            worktree_created_by_attempt =
-                info.provenance == crate::worktree::WorktreeProvenance::CreatedByThisAttempt;
+        // #2755 follow-up A r2: a failed provision is FAIL-CLOSED here. The old
+        // `if let Some(..)` simply skipped the assignment, so `work_dir` kept the
+        // SOURCE REPO and the agent was launched and persisted against the wrong
+        // tree — a silent fallback, not a degradation. The caller asked for a
+        // branch, so there is no "not applicable" case to confuse this with.
+        match crate::worktree::create(home, &wd, name, Some(branch)) {
+            Some(info) => {
+                work_dir = info.path.display().to_string();
+                worktree_created_by_attempt =
+                    info.provenance == crate::worktree::WorktreeProvenance::CreatedByThisAttempt;
+            }
+            None => {
+                return json!({"error": format!(
+                    "worktree provisioning failed for '{name}' on branch '{branch}' — \
+                     refusing to spawn on '{}' (fail-closed)",
+                    wd.display()
+                )});
+            }
         }
     }
 
@@ -370,11 +417,20 @@ fn spawn_single_instance_impl_inner(
         // Only roll back filesystem state that THIS attempt created. A
         // pre-existing dir (reused worktree or occupied workspace) must survive.
         if !work_dir_preexisted {
-            let _ = crate::agent_ops::cleanup_working_dir(
-                home,
-                name,
-                &std::path::PathBuf::from(&work_dir),
-            );
+            if let Some(permit) = lifecycle_permit.as_ref() {
+                let _ = crate::agent_ops::cleanup_working_dir_with_permit(
+                    home,
+                    name,
+                    &std::path::PathBuf::from(&work_dir),
+                    permit,
+                );
+            } else {
+                let _ = crate::agent_ops::cleanup_working_dir(
+                    home,
+                    name,
+                    &std::path::PathBuf::from(&work_dir),
+                );
+            }
         }
         return json!({"error": format!("failed to register instance in fleet.yaml: {e}")});
     }
@@ -438,6 +494,7 @@ fn spawn_single_instance_impl_inner(
                 if run_inline {
                     inject_body();
                 } else {
+                    // fire-and-forget: waits 3s, then one injection attempt; process exit reaps it.
                     std::thread::Builder::new()
                         .name("task_inject".into())
                         .spawn(move || {
@@ -447,6 +504,23 @@ fn spawn_single_instance_impl_inner(
                         .ok();
                 }
             }
+            // #3418: create_instance persists a DURABLE fleet.yaml entry —
+            // including `args`, which shapes every future spawn of this
+            // instance indefinitely (#3414) — yet every neighbouring lifecycle
+            // op logged and this one did not, leaving provenance unanswerable
+            // from daemon state. Emitted HERE, past every
+            // `rollback_fleet_entry_on_failure` arm, so the line only ever
+            // describes an entry that actually survived. Fields are the values
+            // AS PERSISTED, not the raw request: `entry.backend` is the
+            // resolved backend (`command` is the raw argv0) and `entry.args`
+            // the split tokens boot replays.
+            tracing::info!(
+                name = %name,
+                backend = %entry.backend.as_deref().unwrap_or("<unset>"),
+                caller = %entry.created_by.as_deref().unwrap_or("<anonymous>"),
+                args = ?entry.args,
+                "create_instance persisted fleet.yaml entry"
+            );
             let mut result = json!({"name": name, "backend": command});
             if let Some(tid) = topic_id {
                 result["topic_id"] = json!(tid);

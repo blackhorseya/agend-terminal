@@ -74,6 +74,26 @@ pub(crate) fn build_member_entries(
         .collect()
 }
 
+/// #3541: build a team member's spawn argv from its fleet-resolved entry —
+/// model and effort intents both route through the `Backend::push_*`
+/// chokepoints on the DECLARED identity. Pure (no I/O) so the team-member
+/// path is unit-testable without a live registry/spawn.
+pub(crate) fn member_spawn_args(
+    resolved: Option<&crate::fleet::ResolvedInstance>,
+    declared_backend: &crate::backend::Backend,
+    mut member_args: Vec<String>,
+) -> Vec<String> {
+    if let Some(model) = resolved.and_then(|r| r.model.as_deref()) {
+        crate::backend::Backend::push_model_arg(&mut member_args, declared_backend, model);
+    }
+    if let Some(effort) = resolved.and_then(|r| r.effort.as_deref()) {
+        // Same chokepoint as model above (members resolve through fleet, so
+        // defaults.effort inheritance works here too); fail-soft inside.
+        crate::backend::Backend::push_effort_arg(&mut member_args, declared_backend, effort);
+    }
+    member_args
+}
+
 /// Neutral typed CREATE_TEAM entry point.
 ///
 /// Both API and MCP adapters call this after parsing their transport-specific
@@ -85,6 +105,7 @@ pub(crate) fn create(
     home: &Path,
     request: CreateTeamRequest,
     registry: &crate::agent::AgentRegistry,
+    configs: &crate::api::ConfigRegistry,
     notifier: Option<&dyn crate::api::ApiNotifier>,
 ) -> Value {
     // #2855: fail-closed identifier validation before any runtime/spawn/roster
@@ -138,6 +159,24 @@ pub(crate) fn create(
     let mut spawned: Vec<(String, String)> = Vec::new();
     let size = crossterm::terminal::size().unwrap_or((120, 40));
     for (inst_name, backend, work_dir) in &planned {
+        let resolved = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .ok()
+            .map(|fleet| fleet.resolve_instance_checked(inst_name))
+        {
+            Some(Ok(resolved)) => resolved,
+            Some(Err(error)) => {
+                tracing::error!(
+                    team = %team_name,
+                    member = %inst_name,
+                    destination = %error.destination,
+                    source = %error.source,
+                    "team spawn: fleet environment resolution failed — skipping member"
+                );
+                failed.push(format!("{inst_name}: {error}"));
+                continue;
+            }
+            None => None,
+        };
         if let Err(e) =
             crate::agent_ops::spawn::prepare_instructions(home, inst_name, backend, work_dir, None)
         {
@@ -145,9 +184,6 @@ pub(crate) fn create(
                 "team spawn: provisioning refused — skipping member");
             continue;
         }
-        let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-            .ok()
-            .and_then(|f| f.resolve_instance(inst_name));
         let resolved_env = resolved.as_ref().map(|r| r.env.clone());
         let mut member_args = resolved
             .as_ref()
@@ -157,20 +193,39 @@ pub(crate) fn create(
             .as_ref()
             .map(|r| r.backend.clone())
             .unwrap_or_else(|| crate::backend::Backend::parse_str(backend));
-        if let Some(model) = resolved.as_ref().and_then(|r| r.model.as_deref()) {
-            crate::backend::Backend::push_model_arg(&mut member_args, &declared_backend, model);
-        }
-        match crate::agent_ops::spawn_one(
+        member_args = member_spawn_args(resolved.as_ref(), &declared_backend, member_args);
+        // #3417: a team member is spawned through `spawn_one` directly rather
+        // than the SPAWN service, so it needs the same config transaction — a
+        // member absent from the map is invisible to the snapshot writer and
+        // ineligible for crash respawn, exactly like the other surfaces.
+        let recorded = crate::daemon::AgentConfig {
+            name: inst_name.to_string(),
+            backend: Some(declared_backend.clone()),
+            backend_command: backend.to_string(),
+            args: member_args.clone(),
+            env: resolved_env.clone(),
+            working_dir: Some(work_dir.to_path_buf()),
+            submit_key: crate::agent_ops::preset_submit_key(Some(&declared_backend)).to_string(),
+        };
+        match crate::agent_ops::spawn_one_recording_config(
             home,
-            registry,
+            configs,
             inst_name,
-            backend,
-            &member_args,
-            crate::backend::SpawnMode::Fresh,
-            work_dir,
-            size,
-            resolved_env.as_ref(),
-            Some(&declared_backend),
+            recorded,
+            || {
+                crate::agent_ops::spawn_one(
+                    home,
+                    registry,
+                    inst_name,
+                    backend,
+                    &member_args,
+                    crate::backend::SpawnMode::Fresh,
+                    work_dir,
+                    size,
+                    resolved_env.as_ref(),
+                    Some(&declared_backend),
+                )
+            },
         ) {
             Ok(_) => {
                 tracing::info!(team = %team_name, member = %inst_name, backend = %backend, "CREATE_TEAM spawn ok");

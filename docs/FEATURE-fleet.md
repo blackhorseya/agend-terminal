@@ -101,6 +101,7 @@ All instances inherit settings from defaults. Individual instances can override 
 | `args` | [string] | CLI argument list |
 | `model` | string | Concrete model name (e.g., opus, sonnet). Wins over `model_tier` |
 | `model_tier` | string | Symbolic tier from `model_tiers` (e.g., cheap / strong) for role/task cost policy (#2477) |
+| `effort` | string | Reasoning-effort level (`low` / `medium` / `high` / `xhigh` / `max`; per-backend range applies at spawn). Passed as `--effort` (claude/agy) or `-c model_reasoning_effort="…"` (codex); unsupported backends skip it with a warning (#3541) |
 | `ready_pattern` | string | Regex to determine when the agent is ready |
 | `env` | map | Environment variables (key-value pairs) |
 | `cols` | int | Terminal width (default 200) |
@@ -130,6 +131,7 @@ Each key is the agent's name (must match `[a-zA-Z0-9_-]`); the value is its conf
 | `git_branch` | string | Custom worktree branch name (alias: `worktree_source`) |
 | `model` | string | Concrete model override; wins over `model_tier` |
 | `model_tier` | string | Symbolic tier from `model_tiers`. If `model` is absent, resolves to a concrete backend model and is passed as `--model` |
+| `effort` | string | Reasoning-effort override (instance wins over `defaults.effort`; empty string normalizes to unset). See the `defaults` table above for value ranges and backend behavior |
 | `env` | map | Environment variables (merged with defaults; instance takes precedence) |
 | `cols` / `rows` | int | Terminal size override |
 | `ready_pattern` | string | Readiness regex override |
@@ -139,6 +141,8 @@ Each key is the agent's name (must match `[a-zA-Z0-9_-]`); the value is its conf
 | `skills` | [string] | Allowlist of skills this agent can use |
 | `topic_id` | int | Telegram topic ID (auto-managed by daemon; usually not set manually) |
 | `topic_binding_mode` | string | Topic creation mode: `auto` (default) / `skip` / `deferred` |
+
+On **codex**, instance `model` / `args` overrides can break MCP entirely: e.g. `-c model_reasoning_effort=xhigh` with `model: gpt-5.6-luna` on Codex 0.150.x makes Codex refuse every MCP call with `MCP tool call requires approval, but approval policy is never` — the daemon raises a `codex_mcp_refusal` inbox notice to the team orchestrator and a `codex_mcp_refusal_detected` event when it sees that line; remove the overrides and fresh-restart.
 
 #### `channel` — Communication Channel
 
@@ -297,8 +301,24 @@ defaults:
 # Then reference in fleet.yaml only if you need to rename:
 defaults:
   env:
-    SERVICE_KEY_ALIAS: "${MY_SERVICE_API_KEY}"
+    SERVICE_KEY_ALIAS:
+      from_env: MY_SERVICE_API_KEY
 ```
+
+`from_env` is a whole-value reference read from the daemon process environment
+when the instance is resolved. If the source variable is unset or is not valid
+Unicode, AgEnD refuses to start the instance and reports the source variable
+name. Literal strings are never interpolated, so `"${NAME}"` remains exactly
+`"${NAME}"`.
+The referenced value is never written back to `fleet.yaml` or included in this
+error or its logs. An instance name that is not present in `fleet.yaml` still
+uses the existing unmanaged/default resolution path; it is distinct from a
+configured instance whose `from_env` source cannot be resolved.
+
+The sensitive-variable policy is still applied to the destination key
+(`SERVICE_KEY_ALIAS` above), including the existing backend-credential
+exception. The source variable name and value do not bypass that policy.
+`passthrough_env` is unchanged and continues to pass through same-name keys.
 
 **Per-instance overrides:**
 

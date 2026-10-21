@@ -266,6 +266,23 @@ pub fn format_notification_for_inject(
     }
 }
 
+// #3324: there is deliberately NO `channel_origin_from_notification` here.
+//
+// The first cut of this change recovered the origin by reverse-parsing the
+// `[{source}]` prefix that `format_notification_for_inject` writes. That made a
+// SECURITY classification a function of operator- and sender-authored free
+// text: the display name is written verbatim (the telegram inbound path falls
+// back to the configured allowlist name when a sender has no public @username),
+// so a name containing the header's own `]` shifted the parse, produced `None`
+// — the PERMISSIVE side of the reply guard — and let an external delivery be
+// answered into the bridge's own journal, which is the loss this change exists
+// to stop. Anchoring the parser on the ` via <kind>]` terminator moved the
+// hole without closing it: a name containing a terminator still mislabels.
+//
+// The origin now travels as a typed value from `NotifySource::external_channel`
+// through the delivery path into `DeliveryEnvelope`, so no rendering is ever
+// consulted. Do not reintroduce a parser here.
+
 pub fn notify_agent(home: &Path, agent_name: &str, source: &NotifySource<'_>, text: &str) {
     notify_agent_with_attachments(home, agent_name, source, text, &[]);
 }
@@ -288,7 +305,9 @@ pub fn notify_agent_with_attachments(
     });
     let notification =
         format_notification_for_inject(pointer_only_inject(), source, text, attachments);
-    compose_aware_inject(home, agent_name, &notification);
+    // #3324: take the provenance from the TYPED source, here, where it is still
+    // typed — not by reverse-parsing the header we just rendered.
+    compose_aware_inject_with_origin(home, agent_name, &notification, source.external_channel());
     // #836: record the (agent, msg_id) tuple in the dedup ledger
     if let Some(msg_id) =
         crate::daemon::notification_dedup::extract_msg_id_from_header(&notification)
@@ -321,10 +340,31 @@ pub fn compose_aware_inject(home: &Path, agent_name: &str, notification: &str) {
     let _ = compose_aware_inject_result(home, agent_name, notification);
 }
 
+/// #3324: inject while carrying typed external-channel provenance. Only the
+/// inbound notification path has an origin; every internal caller keeps using
+/// [`compose_aware_inject`], which passes `None`.
+pub(crate) fn compose_aware_inject_with_origin(
+    home: &Path,
+    agent_name: &str,
+    notification: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
+) {
+    let _ = compose_aware_inject_result_with_origin(home, agent_name, notification, channel_origin);
+}
+
 pub(crate) fn compose_aware_inject_result(
     home: &Path,
     agent_name: &str,
     notification: &str,
+) -> ComposeInjectOutcome {
+    compose_aware_inject_result_with_origin(home, agent_name, notification, None)
+}
+
+pub(crate) fn compose_aware_inject_result_with_origin(
+    home: &Path,
+    agent_name: &str,
+    notification: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
 ) -> ComposeInjectOutcome {
     // #911 dedup gate
     if should_suppress_911_reinject_with_ledger(
@@ -347,11 +387,12 @@ pub(crate) fn compose_aware_inject_result(
         crate::snapshot::agent_state_of(home, agent_name).as_deref(),
         actionable,
     ) {
-        return match crate::notification_queue::enqueue_classified(
+        return match crate::notification_queue::enqueue_classified_with_origin(
             home,
             agent_name,
             notification,
             actionable,
+            channel_origin,
         ) {
             Ok(()) => ComposeInjectOutcome::Deferred,
             Err(error) => {
@@ -368,7 +409,12 @@ pub(crate) fn compose_aware_inject_result(
     // the PTY regardless of an operator DRAFT — only the busy/typing gate above
     // defers it. Ambient stays behind the #1457 draft gate in route_notification.
     if actionable {
-        return match inject_with_submit_admitted(home, agent_name, notification) {
+        return match inject_with_submit_admitted_with_origin(
+            home,
+            agent_name,
+            notification,
+            channel_origin,
+        ) {
             Ok(epoch) => {
                 // #2044: arm delivery-verification only after admission succeeds,
                 // and linearize it against delete/transition on the captured
@@ -383,6 +429,7 @@ pub(crate) fn compose_aware_inject_result(
                     agent_name,
                     epoch,
                     notification,
+                    channel_origin,
                 ) {
                     tracing::debug!(
                         agent = %agent_name,
@@ -403,8 +450,8 @@ pub(crate) fn compose_aware_inject_result(
     }
     let deferred = crate::notification_queue::draft_state(home, agent_name)
         != crate::notification_queue::DraftState::None;
-    match route_notification(home, agent_name, notification, |msg| {
-        inject_with_submit(home, agent_name, msg)
+    match route_notification(home, agent_name, notification, channel_origin, |msg| {
+        inject_with_submit_with_origin(home, agent_name, msg, channel_origin)
     }) {
         Ok(()) if deferred => ComposeInjectOutcome::Deferred,
         Ok(()) => ComposeInjectOutcome::TransportAccepted,
@@ -603,15 +650,31 @@ pub(crate) fn renudge_actionable_unread(
     }
 }
 
-/// t-…-17 A3: best-effort self-IPC WAKE pointer nudging `target` to drain a
-/// reviewer-assignment inbox row that the durable outbox store already enqueued
-/// (A1/A2 or an A4 repair). A pure PTY wake — OFFLOADED to the delivery worker via
-/// [`inject_with_submit`], so the caller thread never blocks — and NEVER a new inbox
-/// row (the durable row is the store's, keyed by its `delivery_nonce`). MUST be
-/// called OUTSIDE every daemon lock (dispatch A3 / reconciler A3 both collect the
-/// target set under no lock and fire here after releasing); best-effort — a full
-/// queue / absent worker is swallowed.
-pub(crate) fn wake_review_assignment(home: &Path, target: &str) {
+/// A3 wake variant carrying the assignment identity through the worker. Lease
+/// advancement is deferred until the worker has a durable adapter outcome.
+pub(crate) fn wake_review_assignment_result_for_assignment(
+    home: &Path,
+    target: &str,
+    repo: &str,
+    branch: &str,
+    assignment_id: uuid::Uuid,
+    lease_now: &str,
+) -> Result<u64, crate::daemon::delivery_worker::TransportEnqueueError> {
+    let assignment_wake = crate::daemon::delivery_worker::AssignmentWakeContext {
+        repo: repo.to_string(),
+        branch: branch.to_string(),
+        target: target.to_string(),
+        assignment_id,
+        lease_now: lease_now.to_string(),
+    };
+    wake_review_assignment_result_with_context(home, target, assignment_wake)
+}
+
+fn wake_review_assignment_result_with_context(
+    home: &Path,
+    target: &str,
+    assignment_wake: crate::daemon::delivery_worker::AssignmentWakeContext,
+) -> Result<u64, crate::daemon::delivery_worker::TransportEnqueueError> {
     let (inbox_count, _) = storage::unread_count(home, target);
     let now_field = operator_now_field();
     let pointer = build_pending_pointer(
@@ -621,8 +684,42 @@ pub(crate) fn wake_review_assignment(home: &Path, target: &str) {
         inbox_count,
         &now_field,
     );
-    if let Err(e) = inject_with_submit(home, target, &pointer) {
-        tracing::debug!(%target, error = %e, "wake_review_assignment: best-effort inject failed");
+    let admission = crate::daemon::delivery_worker::
+        enqueue_transport_delivery_with_epoch_and_origin_and_assignment(
+            home,
+            target,
+            &pointer,
+            None,
+            Some(assignment_wake),
+        );
+    match admission {
+        Ok(epoch) => {
+            // Admission succeeded — the transport worker owns the delivery from
+            // here; no durable receipt needed for the happy path.
+            Ok(epoch)
+        }
+        Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { epoch }) => {
+            let reason = "bounded transport delivery queue full; delivery was not attempted";
+            #[cfg(test)]
+            crate::daemon::delivery_worker::test_support::run_queue_full_before_record_hook(
+                home, target, epoch,
+            );
+            // Best-effort durable trace, same semantics as the generic
+            // `finish_transport_admission` path — stale generation suppresses.
+            let _ = crate::daemon::delivery_worker::record_queue_full_drop_if_current(
+                home, target, &pointer, epoch, reason,
+            );
+            tracing::debug!(%target, epoch, "wake_review_assignment: queue full (durable drop recorded)");
+            Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { epoch })
+        }
+        Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced { epoch }) => {
+            let reason = "fenced during generation transition";
+            let _ = crate::daemon::delivery_worker::record_fenced_drop_if_current(
+                home, target, &pointer, epoch, reason,
+            );
+            tracing::debug!(%target, epoch, "wake_review_assignment: fenced (durable drop recorded)");
+            Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced { epoch })
+        }
     }
 }
 
@@ -671,6 +768,107 @@ pub fn notify_system(
         msg.task_id = Some(tid.to_owned());
     }
     enqueue_with_idle_hint(home, target, msg)
+}
+
+/// PR #3495: [`notify_system`] with EXACTLY-ONCE semantics for a producer that
+/// may legitimately replay the same logical notice.
+///
+/// `idempotency_key` is stamped on the row and checked against the target
+/// inbox under that inbox's per-agent flock (see
+/// [`crate::inbox::idempotent`]), so a replay after a crash — or after a
+/// failed enqueue — cannot deliver the notice twice. Returns `true` when this
+/// call appended the row and `false` when an existing row already carried the
+/// key; BOTH mean "the notice is durably in the recipient's inbox", and only
+/// `Err` means it is not.
+///
+/// No `task_id` parameter (unlike [`notify_system`]): no exactly-once producer
+/// needs one yet, and adding it would put this past the argument-count lint. A
+/// future caller that does can build the [`InboxMessage`] itself and call
+/// [`enqueue_once_with_idle_hint`].
+pub fn notify_system_once(
+    home: &Path,
+    target: &str,
+    source: &str,
+    kind: &str,
+    body: impl Into<String>,
+    correlation_id: Option<&str>,
+    idempotency_key: &str,
+) -> anyhow::Result<bool> {
+    #[cfg(test)]
+    if NOTIFY_ONCE_FAILURE.with(std::cell::Cell::get) {
+        anyhow::bail!("notify_system_once: injected failure (test hook)");
+    }
+    let mut msg = InboxMessage::new_system(source, kind, body)
+        .with_delivery_mode("inbox_fallback")
+        .with_idempotency_key(idempotency_key);
+    if let Some(cid) = correlation_id {
+        msg = msg.with_correlation_id(cid);
+    }
+    enqueue_once_with_idle_hint(home, target, msg, idempotency_key)
+}
+
+// Test-only failure injection for the notice ENQUEUE path, so the durable
+// outbox's retry contract can be exercised without a real disk fault.
+// Thread-local: the per-tick handler under test runs synchronously on the
+// test's own thread, so this cannot leak into a parallel test.
+#[cfg(test)]
+thread_local! {
+    static NOTIFY_ONCE_FAILURE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Make the next [`notify_system_once`] calls on THIS thread fail. Returns the
+/// previous setting.
+#[cfg(test)]
+pub(crate) fn set_notify_once_failure_for_test(fail: bool) -> bool {
+    NOTIFY_ONCE_FAILURE.with(|cell| cell.replace(fail))
+}
+
+/// [`enqueue_with_idle_hint`] with the PR #3495 exactly-once enqueue. The wake
+/// hint is emitted ONLY for a row this call actually appended — a suppressed
+/// duplicate must not re-nudge the recipient.
+pub(crate) fn enqueue_once_with_idle_hint(
+    home: &Path,
+    target: &str,
+    msg: InboxMessage,
+    idempotency_key: &str,
+) -> anyhow::Result<bool> {
+    // #1492: same self-IPC guard as `enqueue_with_idle_hint` — the emitter
+    // below reaches `api::call` over the loopback socket.
+    crate::sync_audit::assert_no_registry_lock_for_self_ipc("enqueue_with_idle_hint")?;
+    enqueue_once_with_idle_hint_with_emitter(home, target, msg, idempotency_key, |hint| {
+        compose_aware_inject(home, target, hint);
+    })
+}
+
+fn enqueue_once_with_idle_hint_with_emitter<F>(
+    home: &Path,
+    target: &str,
+    mut msg: InboxMessage,
+    idempotency_key: &str,
+    emit_hint: F,
+) -> anyhow::Result<bool>
+where
+    F: FnOnce(&str),
+{
+    storage::ensure_msg_id(&mut msg);
+    let id = msg.id.clone().unwrap_or_default();
+    let from = msg.from.clone();
+    let kind = msg.kind.clone();
+    let msg_text = msg.text.clone();
+
+    let Some(pending) =
+        super::idempotent::enqueue_once_returning_unread_count(home, target, msg, idempotency_key)?
+    else {
+        return Ok(false);
+    };
+    emit_hint(&idle_hint_line(
+        &id,
+        &from,
+        kind.as_deref(),
+        &msg_text,
+        pending,
+    ));
+    Ok(true)
 }
 
 /// #1493: single source of truth for the `[AGEND-MSG-PENDING]` pointer line.
@@ -811,8 +1009,28 @@ where
 
     // Single lock scope: enqueue + count in one read, avoiding double I/O.
     let pending = storage::enqueue_returning_unread_count(home, target, msg)?;
-    let from_short = from.strip_prefix("from:").unwrap_or(&from);
-    let kind_str = kind.as_deref().unwrap_or("");
+    emit_hint(&idle_hint_line(
+        &id,
+        &from,
+        kind.as_deref(),
+        &msg_text,
+        pending,
+    ));
+    Ok(())
+}
+
+/// The wake hint for one just-enqueued row. Extracted so the idempotent
+/// (PR #3495) enqueue emits the byte-identical pointer — a second spelling of
+/// this block is exactly the drift #1493 closed.
+fn idle_hint_line(
+    id: &str,
+    from: &str,
+    kind: Option<&str>,
+    msg_text: &str,
+    pending: usize,
+) -> String {
+    let from_short = from.strip_prefix("from:").unwrap_or(from);
+    let kind_str = kind.unwrap_or("");
     // #1134: ci-watch messages whose headline is a CI conclusion
     // (pass/fail/ended) get a friendly inline format instead of the
     // generic AGEND-MSG-PENDING pointer, reducing dual-delivery feel.
@@ -823,16 +1041,14 @@ where
     // #1487: `now=<operator-TZ timestamp>` so the agent sees fresh, correctly-
     // zoned time on the wake hint too (space-free value — see operator_now_field).
     let now_field = operator_now_field();
-    let hint = if is_ci_conclusion {
-        let first_line = msg_text.lines().next().unwrap_or(&msg_text);
+    if is_ci_conclusion {
+        let first_line = msg_text.lines().next().unwrap_or(msg_text);
         format!("{} (inbox={}) {}", first_line, pending, now_field)
     } else {
         // #1493: build via the shared `build_pending_pointer` so the consumer
         // tests exercise this exact shape (no hand-crafted drift).
-        build_pending_pointer(&id, kind_str, from_short, pending, &now_field)
-    };
-    emit_hint(&hint);
-    Ok(())
+        build_pending_pointer(id, kind_str, from_short, pending, &now_field)
+    }
 }
 
 /// AUDIT2-006: the selected transport delivery is offloaded to the bounded
@@ -852,12 +1068,26 @@ fn inject_with_submit_admitted(
     agent_name: &str,
     message: &str,
 ) -> anyhow::Result<u64> {
+    inject_with_submit_admitted_with_origin(home, agent_name, message, None)
+}
+
+/// #3324: the admission primitive, carrying typed external-channel provenance
+/// through to the envelope the transport builds.
+fn inject_with_submit_admitted_with_origin(
+    home: &Path,
+    agent_name: &str,
+    message: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
+) -> anyhow::Result<u64> {
     finish_transport_admission(
         home,
         agent_name,
         message,
-        crate::daemon::delivery_worker::enqueue_transport_delivery_with_epoch(
-            home, agent_name, message,
+        crate::daemon::delivery_worker::enqueue_transport_delivery_with_epoch_and_origin(
+            home,
+            agent_name,
+            message,
+            channel_origin,
         ),
     )
 }
@@ -871,6 +1101,7 @@ pub(crate) fn inject_notification_with_submit_at_epoch(
     agent_name: &str,
     notification: &str,
     expected_epoch: u64,
+    channel_origin: Option<crate::channel::ChannelKind>,
 ) -> anyhow::Result<()> {
     finish_transport_admission(
         home,
@@ -881,6 +1112,7 @@ pub(crate) fn inject_notification_with_submit_at_epoch(
             agent_name,
             notification,
             expected_epoch,
+            channel_origin,
         ),
     )
     .map(|_| ())
@@ -912,14 +1144,27 @@ fn finish_transport_admission(
                 "delivery queue full — transport delivery dropped"
             ))
         }
-        Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced) => Err(anyhow::anyhow!(
-            "transport delivery fenced during teardown or generation transition"
-        )),
+        // Fencing is a lifecycle boundary for ordinary notifications. The
+        // assignment wake path records its own durable failure because it has
+        // the assignment identity needed to retain a short retry lease.
+        Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced { .. }) => Err(
+            anyhow::anyhow!("transport delivery fenced during teardown or generation transition"),
+        ),
     }
 }
 
 fn inject_with_submit(home: &Path, agent_name: &str, message: &str) -> anyhow::Result<()> {
     inject_with_submit_admitted(home, agent_name, message).map(|_| ())
+}
+
+/// #3324: same, carrying typed external-channel provenance to the envelope.
+fn inject_with_submit_with_origin(
+    home: &Path,
+    agent_name: &str,
+    message: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
+) -> anyhow::Result<()> {
+    inject_with_submit_admitted_with_origin(home, agent_name, message, channel_origin).map(|_| ())
 }
 
 /// The physical submit-aware inject primitive: a self-IPC `api::call(INJECT)`
@@ -952,10 +1197,16 @@ pub(crate) fn inject_with_submit_direct(
 
 /// #982 RC: submit-aware notification inject for the
 /// `notification_queue` flush path.
+///
+/// #3324: `channel_origin` is the typed provenance the queued row preserved
+/// across the durable defer hop. Required rather than defaulted — see
+/// [`crate::transport::deliver_notification`] for why the permissive value must
+/// be stated, not inherited.
 pub fn inject_notification_with_submit(
     home: &Path,
     agent_name: &str,
     notification: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
 ) -> anyhow::Result<()> {
     let deferred_rearm = crate::daemon::notification_dedup::extract_msg_id_from_header(
         notification,
@@ -964,9 +1215,9 @@ pub fn inject_notification_with_submit(
         crate::daemon::inject_delivery::take_deferred_rearm_for_flush(home, agent_name, &row_id)
     });
     let Some(reservation) = deferred_rearm else {
-        return inject_with_submit(home, agent_name, notification);
+        return inject_with_submit_with_origin(home, agent_name, notification, channel_origin);
     };
-    match inject_with_submit_admitted(home, agent_name, notification) {
+    match inject_with_submit_admitted_with_origin(home, agent_name, notification, channel_origin) {
         Ok(epoch) => {
             #[cfg(test)]
             crate::daemon::delivery_worker::test_support::run_transport_accepted_before_arm_hook(
@@ -977,6 +1228,7 @@ pub fn inject_notification_with_submit(
                 agent_name,
                 epoch,
                 notification,
+                channel_origin,
             ) {
                 let _ = crate::daemon::inject_delivery::rollback_rearm_after_reclaim(
                     home,
@@ -1063,7 +1315,7 @@ pub(crate) fn flush_release(
 /// is mid-keystroke, bounded by the MAX_DEFER anti-starvation caps.
 pub(crate) fn flush_agent_queue<F>(home: &Path, agent_name: &str, injector: F)
 where
-    F: FnMut(&str) -> anyhow::Result<()>,
+    F: FnMut(&str, Option<crate::channel::ChannelKind>) -> anyhow::Result<()>,
 {
     // Raw draft state only: the #1944/#1948 input-box probe needs the rendered
     // pane (TUI-owned vterm), so the headless caller conservatively honors the
@@ -1079,20 +1331,25 @@ where
 /// None drains through the busy/typing holds + MAX_DEFER anti-starvation
 /// caps (`flush_release`). The caller supplies the (possibly probe-refined)
 /// draft state.
+/// #3324: the injector receives the queued row's TYPED channel provenance
+/// alongside its text. The durable defer hop is the one place a notification
+/// stops being a live call frame, so the origin has to travel with the row —
+/// re-deriving it from the rendered text on the way out is exactly the
+/// body-content inference this change exists to remove.
 pub(crate) fn flush_agent_queue_with_state<F>(
     home: &Path,
     agent_name: &str,
     draft_state: crate::notification_queue::DraftState,
     mut injector: F,
 ) where
-    F: FnMut(&str) -> anyhow::Result<()>,
+    F: FnMut(&str, Option<crate::channel::ChannelKind>) -> anyhow::Result<()>,
 {
     use crate::notification_queue::{self, DraftState};
     match draft_state {
         DraftState::Drafting => {}
         DraftState::Abandoned => {
             if let Some(notification) = notification_queue::drain_one(home, agent_name) {
-                if injector(&notification.text).is_err() {
+                if injector(&notification.text, notification.channel_origin).is_err() {
                     notification_queue::requeue_all(home, agent_name, &[notification]);
                 }
             }
@@ -1126,7 +1383,7 @@ pub(crate) fn flush_agent_queue_with_state<F>(
                 if inject_failed || !flush_release(&notification, agent_busy, typing_recent, now_ms)
                 {
                     keep.push(notification);
-                } else if injector(&notification.text).is_err() {
+                } else if injector(&notification.text, notification.channel_origin).is_err() {
                     inject_failed = true;
                     keep.push(notification);
                 }
@@ -1138,10 +1395,17 @@ pub(crate) fn flush_agent_queue_with_state<F>(
     }
 }
 
+/// #3324: `channel_origin` is the typed provenance of THIS notification. The
+/// defer branch writes a durable queue row, and that row is what the drain
+/// later injects — so the ambient path has to persist the origin for the same
+/// reason the actionable path does. This is the branch a channel message
+/// normally takes: an inbound user message carries no `kind=` token, so it is
+/// not an actionable wake, and a live operator draft sends it here.
 pub(super) fn route_notification<F>(
     home: &Path,
     agent_name: &str,
     notification: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
     mut injector: F,
 ) -> anyhow::Result<()>
 where
@@ -1153,7 +1417,13 @@ where
     // directly only when the buffer is clean (all typed input was submitted).
     use crate::notification_queue::DraftState;
     if crate::notification_queue::draft_state(home, agent_name) != DraftState::None {
-        crate::notification_queue::enqueue(home, agent_name, notification)?;
+        crate::notification_queue::enqueue_classified_with_origin(
+            home,
+            agent_name,
+            notification,
+            false,
+            channel_origin,
+        )?;
         return Ok(());
     }
     injector(notification)
@@ -1169,6 +1439,7 @@ mod flush_release_tests_1513 {
             text: "x".into(),
             timestamp: String::new(),
             actionable,
+            channel_origin: None,
             deferred_since_ms,
         }
     }
@@ -1556,6 +1827,146 @@ mod should_defer_inject_tests_1513 {
             "#1675: a paused (3s) live operator draft must defer actionable, not force-submit it"
         );
     }
+
+    // #3663: type-then-clear — stale typed>submit PLUS a newer TUI-observed
+    // empty box must NOT defer an actionable wake (inject now, not ~5min later).
+    #[test]
+    fn actionable_injects_when_box_cleared_after_typing_3663() {
+        let h = tmp_home("cleared-inject");
+        let now = chrono::Utc::now().timestamp_millis();
+        std::fs::create_dir_all(h.join("metadata")).unwrap();
+        std::fs::write(
+            h.join("metadata").join("a.json"),
+            format!(
+                "{{\"last_input_epoch_ms\":{},\"last_submit_epoch_ms\":{},\"last_cleared_epoch_ms\":{}}}",
+                now - 30_000,
+                now - 60_000,
+                now - 5_000
+            ),
+        )
+        .unwrap();
+        assert!(
+            !should_defer_inject(&h, "a", Some("idle"), true),
+            "#3663: cleared-newer-than-typed must inject now, not defer ~5min"
+        );
+        std::fs::remove_dir_all(&h).ok();
+    }
+
+    // #3663 guard: cleared OLDER than the last keystroke must still defer —
+    // the operator typed after the empty observation (a live draft).
+    #[test]
+    fn actionable_defers_when_cleared_before_typing_3663() {
+        let h = tmp_home("cleared-stale");
+        let now = chrono::Utc::now().timestamp_millis();
+        std::fs::create_dir_all(h.join("metadata")).unwrap();
+        std::fs::write(
+            h.join("metadata").join("a.json"),
+            format!(
+                "{{\"last_input_epoch_ms\":{},\"last_submit_epoch_ms\":{},\"last_cleared_epoch_ms\":{}}}",
+                now - 5_000,
+                now - 60_000,
+                now - 30_000
+            ),
+        )
+        .unwrap();
+        assert!(
+            should_defer_inject(&h, "a", Some("idle"), true),
+            "#3663: a stale cleared observation must not lift a live draft"
+        );
+        std::fs::remove_dir_all(&h).ok();
+    }
+
+    // #3663: end-to-end cleared path — seeded stale draft defers; then a
+    // flushed cleared observation lifts the defer (no sleeps: seeded stale).
+    // Writes the key literally (RED-compatible: compiles against base).
+    #[test]
+    fn cleared_record_flush_round_trip_lifts_defer_3663() {
+        let h = tmp_home("cleared-roundtrip");
+        let now = chrono::Utc::now().timestamp_millis();
+        crate::agent_ops::save_metadata(
+            &h,
+            "a",
+            "last_input_epoch_ms",
+            serde_json::json!(now - 30_000),
+        );
+        crate::agent_ops::save_metadata(
+            &h,
+            "a",
+            "last_submit_epoch_ms",
+            serde_json::json!(now - 60_000),
+        );
+        assert!(
+            should_defer_inject(&h, "a", Some("idle"), true),
+            "setup: the seeded stale draft must defer before clearing"
+        );
+        crate::agent_ops::save_metadata(
+            &h,
+            "a",
+            "last_cleared_epoch_ms",
+            serde_json::json!(now - 5_000),
+        );
+        assert!(
+            !should_defer_inject(&h, "a", Some("idle"), true),
+            "#3663: a flushed cleared observation must lift the defer"
+        );
+        std::fs::remove_dir_all(&h).ok();
+    }
+
+    // #3663 GREEN: the same round-trip through the production record API
+    // (`record_cleared_activity` + batch flush) — pins the buffered publish
+    // path the TUI uses, not just the metadata key reading.
+    #[test]
+    fn cleared_record_api_flush_round_trip_lifts_defer_3663() {
+        let h = tmp_home("cleared-record-api");
+        let now = chrono::Utc::now().timestamp_millis();
+        crate::agent_ops::save_metadata(
+            &h,
+            "a",
+            "last_input_epoch_ms",
+            serde_json::json!(now - 30_000),
+        );
+        crate::agent_ops::save_metadata(
+            &h,
+            "a",
+            "last_submit_epoch_ms",
+            serde_json::json!(now - 60_000),
+        );
+        assert!(
+            should_defer_inject(&h, "a", Some("idle"), true),
+            "setup: the seeded stale draft must defer before clearing"
+        );
+        crate::notification_queue::record_cleared_activity(&h, "a");
+        crate::notification_queue::flush_pending_input_activity(&h);
+        assert!(
+            !should_defer_inject(&h, "a", Some("idle"), true),
+            "#3663: a flushed cleared observation must lift the defer"
+        );
+        std::fs::remove_dir_all(&h).ok();
+    }
+
+    // #3663 review F1: a FUTURE cleared observation must NOT lift the defer —
+    // fail closed toward draft protection.
+    #[test]
+    fn actionable_defers_when_cleared_in_future_3663() {
+        let h = tmp_home("cleared-future");
+        let now = chrono::Utc::now().timestamp_millis();
+        std::fs::create_dir_all(h.join("metadata")).unwrap();
+        std::fs::write(
+            h.join("metadata").join("a.json"),
+            format!(
+                "{{\"last_input_epoch_ms\":{},\"last_submit_epoch_ms\":{},\"last_cleared_epoch_ms\":{}}}",
+                now - 30_000,
+                now - 60_000,
+                now + 60_000
+            ),
+        )
+        .unwrap();
+        assert!(
+            should_defer_inject(&h, "a", Some("idle"), true),
+            "#3663 F1: future cleared must fail closed (keep deferring)"
+        );
+        std::fs::remove_dir_all(&h).ok();
+    }
 }
 
 #[cfg(test)]
@@ -1715,7 +2126,7 @@ mod structured_transport_delivery_tests {
         let home = tmp_home("nonblocking");
         let _guard = crate::daemon::delivery_worker::test_support::force_full_guard();
         let started = std::time::Instant::now();
-        let result = inject_notification_with_submit(&home, "codex-agent", "ping");
+        let result = inject_notification_with_submit(&home, "codex-agent", "ping", None);
         assert!(result.is_ok(), "worker enqueue should succeed: {result:?}");
         assert!(
             started.elapsed() < std::time::Duration::from_millis(500),
@@ -1751,7 +2162,7 @@ mod structured_transport_delivery_tests {
         });
         let _guard = crate::daemon::delivery_worker::test_support::force_full_guard();
         let started = std::time::Instant::now();
-        let result = inject_notification_with_submit(&home, "codex-agent", "ping");
+        let result = inject_notification_with_submit(&home, "codex-agent", "ping", None);
         assert!(result.is_ok(), "worker enqueue should succeed: {result:?}");
         assert!(
             started.elapsed() < std::time::Duration::from_millis(500),
@@ -1767,7 +2178,7 @@ mod structured_transport_delivery_tests {
         let home = tmp_home("queue-full");
         let _guard = crate::daemon::delivery_worker::test_support::force_full_guard();
         crate::daemon::delivery_worker::test_support::set_force_full(true);
-        let result = inject_notification_with_submit(&home, "codex-agent", "ping");
+        let result = inject_notification_with_submit(&home, "codex-agent", "ping", None);
         crate::daemon::delivery_worker::test_support::set_force_full(false);
 
         assert!(result.is_err(), "full queue must report a durable drop");

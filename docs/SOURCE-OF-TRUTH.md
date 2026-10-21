@@ -2,6 +2,11 @@
 
 # Source-of-Truth Matrix
 
+> **Status:** Active engineering norm
+> **Audience:** Reviewers and maintainers
+> **Authority:** Protected-main source, tests, and this matrix
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
 **Status**: ACTIVE — engineering norm. New state, new storage, or a new
 reader of existing state must be classified here before merge.
 
@@ -14,9 +19,11 @@ post-#994 `topics.json` single-source rule and the `binding.json` truth-source
 fix were each established case-by-case. This doc systematizes them.
 
 **Revalidated**: named stores, writers, and readers below were checked against
-`main@1d83b423` (2026-07-16). Function/type names are the stable anchors;
+`main@62b28f36` (2026-09-22). Function/type names are the stable anchors;
 `path:line` suffixes are navigation hints and may move as files are split. When
 you touch a listed entry point, update the anchor and its line hint here.
+
+**STOP:** An unrefreshed matrix is not proof of current behavior.
 
 ---
 
@@ -110,18 +117,17 @@ persisted.
 
 ### Task state — Source: task event log
 `src/task_events.rs:3-4` — "Source-of-truth storage for task board state."
-- **Write**: `src/task_events.rs:1062` `append`; `:1093` `append_batch_at`
-  (actual disk write).
-- **Read / projection**: `src/tasks/mod.rs:383-388` `list_all_at` →
-  `task_events::replay_at` (`src/task_events.rs:1636`). The rendered task list
-  is a replay projection.
+- **Write**: every compatibility append API delegates to
+  `task_events::catalog::commit_at`, which durably appends the event and updates
+  the catalog under the same writer lock.
+- **Read / projection authority**: `src/task_events/catalog.rs`. Task queries read
+  the bounded in-memory catalog (restored from its checkpoint and caught up from
+  the hot log); they do not replay history on demand. The append-only event log
+  remains the durable source and audit trail.
 - **Anti-bypass invariant** (enforced): `tests/task_events_invariant.rs:5-7`
-  — only `src/task_events.rs` may reference the `task_events.jsonl`
-  string; every other production caller must go through the `append` /
-  `append_batch` public API. Many modules *do* call `append*` directly
-  (e.g. `src/schedules.rs:931`, `src/daemon/idle_watchdog.rs:976`,
-  `src/api/handlers/messaging.rs:206`) — that is allowed; direct *file* access
-  is not.
+  — only the `src/task_events` module may reference the `task_events.jsonl`
+  string; every production mutation reaches catalog commit and production
+  authority reads cannot call legacy replay or task-index paths.
 
 ### Inbox state — Source: inbox storage
 `src/inbox/mod.rs:1-3` — append-only JSONL, one file per agent

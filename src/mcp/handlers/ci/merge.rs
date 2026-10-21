@@ -1,3 +1,4 @@
+use super::merge_ci_truth::{load_exact_merge_state, refresh_ci_truth};
 use super::watch::handle_watch_ci;
 use serde_json::{json, Value};
 use std::path::Path;
@@ -10,6 +11,13 @@ use std::path::Path;
 /// `pr_branch`: the PR's source branch (headRefName). Used to find the
 /// task assignee whose binding matches this branch — NOT the merge caller,
 /// because the merge caller is typically the orchestrator (unbound).
+///
+/// `task_id`: optional explicit task-board id passed by the merge caller
+/// (`repo(action=merge, ..., task_id)`). When present it SHORT-CIRCUITS the
+/// binding scan entirely: zero search, zero ambiguity — the task's own
+/// `assignee` is read via a single strict-routed lookup, and a missing /
+/// terminal / assignee-less task fails closed with a reason. Absent → the
+/// legacy stage-1 live-binding scan runs unchanged.
 pub(crate) fn post_merge_receipt_and_watch(
     home: &Path,
     repo: &str,
@@ -17,12 +25,19 @@ pub(crate) fn post_merge_receipt_and_watch(
     pr: u64,
     pr_branch: &str,
     merge_authority: &str,
+    task_id: Option<&str>,
 ) -> Value {
-    let Some((assignee, task_id)) = resolve_task_assignee_for_branch(home, repo, pr_branch) else {
-        return json!({"skipped": "no task-linked binding for PR branch"});
+    let (assignee, task_id) = match resolve_task_assignee(home, repo, pr_branch, task_id) {
+        Ok(pair) => pair,
+        // The Err already carries the SPECIFIC reason (explicit-id failures name
+        // the task and the failed check; the legacy scan keeps its generic
+        // binding wording) — surface it verbatim so the operator sees the cause
+        // without digging through the daemon log.
+        Err(reason) => return json!({"skipped": reason}),
     };
-    let expiry =
-        chrono::Utc::now() + chrono::TimeDelta::try_hours(1).unwrap_or(chrono::TimeDelta::zero());
+    let expiry = chrono::Utc::now()
+        + chrono::TimeDelta::try_hours(crate::merge_receipt::RECEIPT_TTL_HOURS)
+            .unwrap_or(chrono::TimeDelta::zero());
     let receipt = crate::merge_receipt::MergeReceipt {
         repo: repo.to_string(),
         merge_sha: merge_commit.to_string(),
@@ -73,6 +88,69 @@ pub(crate) fn post_merge_receipt_and_watch(
             "watch": "armed",
         })
     }
+}
+
+/// Two-stage resolve entry: an explicit `task_id` (from the merge caller)
+/// short-circuits to a single strict-routed task lookup; `None` falls through
+/// to the legacy live-binding scan, byte-identical to main. Parameter order
+/// `(home, repo, branch, task_id)` matches `resolve_task_assignee_for_branch`
+/// so the two adjacent `&str`s can't be transposed at call sites.
+///
+/// On failure returns `Err(reason)` — for the explicit-id path that reason is
+/// SPECIFIC (names the task and the failed check) and is surfaced verbatim in
+/// the MCP response; a caller passing `task_id` and getting skipped has a bug,
+/// and #3341's original symptom was exactly this skip being opaque. The
+/// legacy-scan path keeps its single generic reason.
+fn resolve_task_assignee(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    task_id: Option<&str>,
+) -> Result<(String, String), String> {
+    if let Some(id) = task_id.map(str::trim).filter(|s| !s.is_empty()) {
+        return resolve_task_assignee_by_id(home, id, branch);
+    }
+    resolve_task_assignee_for_branch(home, repo, branch)
+        .ok_or_else(|| "no task-linked binding for PR branch".to_string())
+}
+
+/// Direct lookup path: read the task by id via the strict router
+/// (`tasks::load_routed` — fail-closed on duplicate/unreadable boards) and
+/// return `(assignee, task_id)`. The passed-in id is VERIFIED, not trusted:
+/// the task's own `branch` must equal the branch being merged, else Err —
+/// a mismatched hint means the CALLER is buggy and silently switching to the
+/// binding scan would only hide that. Every failure returns a SPECIFIC reason
+/// (Err) so the MCP response can show the operator which check failed.
+///
+/// Catalog migration registry (DESIGN-task-catalog-projection Appendix A):
+/// this `load_routed` call site converts 1:1 to `catalog.route(task_id)` at
+/// the P2 authority cutover — same fail-closed error set
+/// (NotFound/Ambiguous/Unreadable), signature already matches.
+fn resolve_task_assignee_by_id(
+    home: &Path,
+    task_id: &str,
+    branch: &str,
+) -> Result<(String, String), String> {
+    let routed = crate::tasks::load_routed(home, task_id)
+        .map_err(|_| format!("task_id '{task_id}' not found"))?;
+    let task = routed.task;
+    if task.branch.as_deref() != Some(branch) {
+        tracing::warn!(%task_id, %branch, task_branch = ?task.branch,
+            "post-merge watch resolve: task_id does not name the branch being merged");
+        return Err(format!(
+            "task_id '{task_id}' names branch '{}', not '{branch}'",
+            task.branch.as_deref().unwrap_or("<none>")
+        ));
+    }
+    if task.status.is_terminal() {
+        tracing::warn!(%task_id, status = %task.status, "post-merge watch resolve: task is terminal");
+        return Err(format!("task_id '{task_id}' is terminal ({})", task.status));
+    }
+    let assignee = task
+        .assignee
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| format!("task_id '{task_id}' has no assignee"))?;
+    Ok((assignee, task_id.to_string()))
 }
 
 /// Resolve the task assignee for a PR branch by scanning all bindings.
@@ -248,6 +326,96 @@ fn acquire_head_base(
     Some((head, base, branch, s.merge_state_status))
 }
 
+fn review_deficit_response(deficit: crate::daemon::pr_state::MergeDeficit) -> Value {
+    use crate::daemon::pr_state::MergeDeficit as D;
+    let code = deficit.code();
+    // #3588: error text follows the deficit kind so a caller reading only the
+    // text takes the right action (retro #739: `ci_not_green` was misread as a
+    // review problem). `code` is unchanged — callers key on it.
+    let error = match deficit {
+        D::NoLinkage => "no merge-authority record for this head — merge refused",
+        D::AuthorityUnknown => "reviewer assignment authority unreadable — merge refused",
+        D::ReservedAssignments { .. } => "reviewer assignment still pending — merge refused",
+        D::UnresolvedClass => "review class unresolved — merge refused",
+        D::Draft => "PR is still a draft — merge refused",
+        D::CiNotGreen => "CI has not reported green for this head — merge refused",
+        D::CiHeadMismatch => "CI green is for a different head — merge refused",
+        D::NonVerifiedReceipt { .. } => "review receipt is not VERIFIED — merge refused",
+        D::InsufficientVerified { .. } => "review threshold not satisfied — merge refused",
+        D::StaleHead { .. } => "review receipt pinned to an older head — merge refused",
+    };
+    let mut response = json!({
+        "error": error,
+        "code": code,
+    });
+    if let Some(object) = response.as_object_mut() {
+        match deficit {
+            crate::daemon::pr_state::MergeDeficit::InsufficientVerified { have, need } => {
+                object.insert("verified_count".into(), json!(have));
+                object.insert("required_verified_count".into(), json!(need));
+            }
+            crate::daemon::pr_state::MergeDeficit::StaleHead { receipt_heads } => {
+                object.insert("receipt_heads".into(), json!(receipt_heads));
+            }
+            crate::daemon::pr_state::MergeDeficit::ReservedAssignments { count } => {
+                object.insert("reserved_assignment_count".into(), json!(count));
+            }
+            crate::daemon::pr_state::MergeDeficit::NonVerifiedReceipt { reviewers } => {
+                object.insert("non_verified_reviewers".into(), json!(reviewers));
+            }
+            _ => {}
+        }
+    }
+    response
+}
+
+fn review_audit_fields(state: Option<&crate::daemon::pr_state::PrState>) -> Value {
+    let Some(state) = state else {
+        return json!({
+            "review_class": "unlinked",
+            "verified_count": 0,
+            "required_verified_count": 0,
+            "reviewer_identities": [],
+            "reviewer_instance_ids": [],
+            "reviewer_assignment_ids": [],
+            "receipt_heads": [],
+        });
+    };
+    let verified = state.validated_review_receipts.iter().filter(|receipt| {
+        receipt.repo == state.repo
+            && receipt.pr_number == state.pr_number
+            && receipt.branch == state.branch
+            && receipt.review_class == state.review_class
+            && matches!(
+                receipt.verdict,
+                crate::review_receipt::ReviewVerdict::Verified
+            )
+    });
+    let mut reviewer_identities = Vec::new();
+    let mut reviewer_instance_ids = Vec::new();
+    let mut reviewer_assignment_ids = Vec::new();
+    let mut receipt_heads = Vec::new();
+    let mut seen_reviewers = std::collections::HashSet::new();
+    for receipt in verified {
+        if !seen_reviewers.insert(receipt.reviewer_instance_id) {
+            continue;
+        }
+        reviewer_identities.push(receipt.reviewer_name.clone());
+        reviewer_instance_ids.push(receipt.reviewer_instance_id.full());
+        reviewer_assignment_ids.push(receipt.assignment_id.to_string());
+        receipt_heads.push(receipt.reviewed_head.clone());
+    }
+    json!({
+        "review_class": state.review_class.as_token(),
+        "verified_count": reviewer_identities.len(),
+        "required_verified_count": state.review_class.required_verified_count(),
+        "reviewer_identities": reviewer_identities,
+        "reviewer_instance_ids": reviewer_instance_ids,
+        "reviewer_assignment_ids": reviewer_assignment_ids,
+        "receipt_heads": receipt_heads,
+    })
+}
+
 pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) -> Value {
     let pr = match args["pr"].as_u64() {
         Some(n) => n,
@@ -262,6 +430,10 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
     };
     let force = args["force"].as_bool().unwrap_or(false);
     let force_reason = args["force_reason"].as_str().unwrap_or("");
+    // Task-id passthrough: an explicit task-board id lets the merge caller
+    // hand the post-merge watch its linkage directly — zero binding/board
+    // search, zero ambiguity. Optional; absent → legacy resolve unchanged.
+    let explicit_task_id = args["task_id"].as_str();
 
     if force && force_reason.is_empty() {
         return json!({"error": "force=true requires non-empty force_reason"});
@@ -284,6 +456,17 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
             });
         }
     };
+
+    if let Some(response) = crate::mcp::handlers::review_class_correction::merge_fence_response(
+        home,
+        &repo,
+        &pr_branch,
+        pr,
+        &gated_head,
+        false,
+    ) {
+        return response;
+    }
 
     if !force {
         // #PR-D site 2: `gh pr checks` via ScmProvider. argv byte-identical
@@ -361,8 +544,19 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         }
     }
 
+    // Canonical merge authority: after the non-force CI/base/freshness policy
+    // gates have accepted the exact acquired head, require the persisted
+    // PrState subject and its typed review evidence to match that same head.
+    // Force is the explicit policy bypass below; exact head/base acquisition
+    // and recheck remain non-bypassable.
+    let initial_review_state = load_exact_merge_state(home, &repo, pr, &pr_branch, &gated_head);
+    if !force && initial_review_state.is_none() {
+        return review_deficit_response(crate::daemon::pr_state::MergeDeficit::NoLinkage);
+    }
+
     if force {
-        let event = serde_json::json!({
+        let review_evidence = review_audit_fields(initial_review_state.as_ref());
+        let mut event = serde_json::json!({
             "kind": "merge_force_bypass",
             "agent": instance_name,
             "pr": pr,
@@ -370,20 +564,31 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
             "force_reason": force_reason,
             "timestamp": chrono::Utc::now().to_rfc3339(),
         });
-        let events_path = home.join("fleet_events.jsonl");
-        let audit_written = (|| -> std::io::Result<()> {
-            use std::io::Write;
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(events_path)?;
-            writeln!(f, "{event}")?;
-            Ok(())
-        })();
-        if let Err(e) = audit_written {
+        if let (Some(event), Some(review_evidence)) =
+            (event.as_object_mut(), review_evidence.as_object())
+        {
+            event.extend(
+                review_evidence
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+        }
+        // #3416: goes through the one serialized appender. This is a destructive
+        // fail-closed gate, so it uses bounded retry and then refuses — never an
+        // unlocked fallback. `Err` means no TRUSTWORTHY record exists, which is why
+        // the bypass must not proceed: previously an interleaved-but-`Ok` write let
+        // this gate report a force-merge as audited while the record on disk was
+        // unparseable. Note `Err` does not always mean nothing was written — a
+        // `Write` failure can leave a partial line — so the message below reports
+        // the error's own wording rather than asserting the file is untouched.
+        if let Err(e) = agentic_audit_append::append_audit_line_bounded(
+            home,
+            &event,
+            agentic_audit_append::DEFAULT_BOUNDED_BUDGET,
+        ) {
             return json!({
-                "error": format!("force-merge refused: audit log write failed: {e}"),
-                "hint": "fix fleet_events.jsonl permissions or disk space, then retry"
+                "error": format!("force-merge refused: {e}"),
+                "hint": "another writer holds the audit lock, or the audit log is unwritable (permissions/disk); retry"
             });
         }
     }
@@ -426,6 +631,25 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
         });
     }
 
+    // Re-check the durable correction fence after the final provider snapshot
+    // and immediately before the sole provider write. This closes the
+    // correction/merge interval without holding a filesystem lock across the
+    // arbitrary network call below.
+    if let Some(response) = crate::mcp::handlers::review_class_correction::merge_fence_response(
+        home, &repo, &pr_branch, pr, &head_now, true,
+    ) {
+        return response;
+    }
+
+    if !force {
+        let Some(state) = refresh_ci_truth(home, &repo, pr, &pr_branch, &gated_head) else {
+            return review_deficit_response(crate::daemon::pr_state::MergeDeficit::NoLinkage);
+        };
+        if let Err(deficit) = crate::daemon::pr_state::merge_readiness(&state) {
+            return review_deficit_response(deficit);
+        }
+    }
+
     // #PR-Z site 3: the ONLY write — `gh pr merge` via ScmProvider. argv now adds
     // `--match-head-commit <gated_head>` (P0 pin) to the byte-identical
     // `pr merge <pr> --repo R --admin --squash --delete-branch`.
@@ -464,6 +688,7 @@ pub(crate) fn handle_merge_repo(home: &Path, args: &Value, instance_name: &str) 
                     pr,
                     &pr_branch,
                     instance_name,
+                    explicit_task_id,
                 );
                 if let Some(obj) = resp.as_object_mut() {
                     obj.insert("post_merge".into(), diag);

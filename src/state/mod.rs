@@ -309,6 +309,12 @@ pub struct StateTracker {
     /// (capture group 1 = the backend's self-reported context usage percent).
     /// `None` for backends that display no usable percent.
     context_regex: Option<regex::Regex>,
+    /// t-…-82348-36: what the scraped figure MEANS
+    /// (`BackendProfile::context_meaning`) — `"window_fill"` for Claude,
+    /// `"context_gauge"` for kiro, `None` when nothing is scraped. Carried so
+    /// consumers (LIST, the alert/handoff wording) can name the number instead
+    /// of letting a reader assume "remaining session budget".
+    context_meaning: Option<&'static str>,
     /// Latest pattern-extracted context% reading + its capture instant. Kept
     /// (not cleared) when the pattern stops matching — a narrow pane can
     /// truncate the statusline mid-session; the timestamp lets consumers
@@ -788,6 +794,10 @@ const THROTTLE_HINT_TOKENS: &[&str] = &[
     // limit" / ServiceQuotaExceeded), and the credit-balance forms.
     "hit your",
     "reached the limit",
+    // The model-tier wall says "reached your <model> limit" — neither of the
+    // two tokens above covers it, so a stuck model-tier pane (static screen,
+    // unchanged hash) never got re-detected.
+    "reached your",
     "ServiceQuotaExceeded",
     "Credit balance",
     "credit_balance_too_low",
@@ -1042,6 +1052,9 @@ impl StateTracker {
                 .map(crate::backend_profile::profile)
                 .and_then(|p| p.context_pattern)
                 .and_then(|p| regex::Regex::new(p).ok()),
+            context_meaning: backend
+                .map(crate::backend_profile::profile)
+                .and_then(|p| p.context_meaning),
             context_pct: None,
             interactive_prompt_pending_notice: false,
             prompt_episode: None,
@@ -1153,6 +1166,20 @@ impl StateTracker {
         self.blocked_notice_sent = true;
     }
 
+    /// Test-only/state-local escape hatch for arming the one-shot recovery
+    /// notice with a chosen episode, in the spirit of [`Self::set_restarting`].
+    ///
+    /// Production arms this on a PTY-driven leaving-block transition, which
+    /// stamps `block_duration` from the private `blocked_since` `Instant`. A
+    /// test therefore cannot reach the actionable threshold
+    /// (`RECOVERY_NOTICE_MIN_BLOCK`, 30s) without actually waiting — so the
+    /// deterministic supervisor test needs this seam rather than a sleep.
+    #[cfg(test)]
+    pub(crate) fn arm_recovery_notice_for_test(&mut self, episode: RecoveryEpisode) {
+        self.interactive_recovery_pending_notice = true;
+        self.recovery_episode = Some(episode);
+    }
+
     /// If detected state is `PermissionPrompt` but a fresh heartbeat exists,
     /// override to `Active` — the agent is alive and the PTY pattern is a
     /// false positive (A5 fix, design §4.3).
@@ -1221,6 +1248,15 @@ impl StateTracker {
             }
         }
         None
+    }
+
+    /// t-…-82348-36: what this tracker's scraped context figure MEANS — see
+    /// `BackendProfile::context_meaning`. `Some("window_fill")` for Claude
+    /// (context-WINDOW fill of an auto-compacted window, NOT remaining session
+    /// budget), `Some("context_gauge")` for kiro, `None` when the backend
+    /// scrapes no figure.
+    pub fn context_meaning(&self) -> Option<&'static str> {
+        self.context_meaning
     }
 
     /// The backend's context-telemetry capability for the LIST `context_provider`

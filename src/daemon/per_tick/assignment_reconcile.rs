@@ -1,14 +1,14 @@
 //! t-…-17 C12: per-tick reconciler for the durable reviewer-assignment authority
 //! ([`crate::daemon::assignment_authority`]).
 //!
-//! Every tick (cadence `new(1)` = one 10 s base tick) this converges the store
+//! At boot and every 60 base ticks this converges the store
 //! against reality for each active `(repo,branch)`:
 //!   - **A10a** terminal restart-repair: CAS-tombstone any record whose stored
 //!     `pr_number` is already in the RETAINED terminal-marker set (catches the A7
 //!     crash-gap and old-generation replays — I18/I19).
 //!   - **A2** row recovery: `durable_enqueue` any `Pending` record (idempotent).
 //!   - **A3/A4** nudge + repair: a record classifying `Unengaged` whose FIXED-
-//!     interval lease is due gets an append-only row repair (A4) and a best-effort
+//!     interval lease is due gets an append-only row repair (A4) and a queued
 //!     self-IPC WAKE pointer (A3), emitted OUTSIDE all flocks. `Satisfied` /
 //!     `EngagedUnsatisfied` is a TRUE stop — never nudged. Generic correlated
 //!     ACK state is not code-review evidence.
@@ -34,8 +34,8 @@ use crate::daemon::assignment_authority as store;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-/// C12 per-tick handler. `new(1)` runs every tick (~10 s); a larger cadence divides
-/// that down. Registered in [`crate::daemon::per_tick::build_default_handlers`].
+/// C12 per-tick handler. `new(60)` runs at boot and then at a low-frequency
+/// safety cadence. Registered in [`crate::daemon::per_tick::build_default_handlers`].
 pub(crate) struct AssignmentReconcileHandler {
     cadence: u64,
     tick: AtomicU64,
@@ -103,11 +103,45 @@ fn log_legacy_cutover_census(home: &Path) {
 }
 
 /// Reconcile every active branch, then fire the collected A3 WAKE pointers OUTSIDE
-/// all flocks (self-IPC nudge; best-effort). Production entry.
+/// all flocks through the delivery worker. Production entry.
+///
+/// #3504 fix: wakes for actionable-unread are now observable — a fenced or
+/// queue-full admission writes a durable `Failed` receipt (via
+/// `wake_review_assignment_result`) and the lease is shortened to 5s instead of
+/// silently advancing 60s with ledger empty.
 pub(crate) fn reconcile_all(home: &Path, now: &str) {
     let wakes = reconcile_all_collect_wakes(home, now);
-    for target in wakes.assignment_targets {
-        crate::inbox::notify::wake_review_assignment(home, &target);
+    for detail in &wakes.assignment_wake_details {
+        let result = crate::inbox::notify::wake_review_assignment_result_for_assignment(
+            home,
+            &detail.target,
+            &detail.repo,
+            &detail.branch,
+            detail.assignment_id,
+            now,
+        );
+        let reason = match &result {
+            Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { .. }) => {
+                Some("queue-full")
+            }
+            Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced { .. }) => {
+                Some("fenced")
+            }
+            _ => None,
+        };
+        if let Some(reason) = reason {
+            // Admission failure is known synchronously; retain the row and let
+            // the bounded retry make the failure visible to the next tick.
+            let _ = store::set_short_retry_lease(
+                home,
+                &detail.repo,
+                &detail.branch,
+                &detail.target,
+                now,
+                detail.assignment_id,
+                reason,
+            );
+        }
     }
     for wake in wakes.continuations {
         if let Err(error) = crate::inbox::wake_persisted_pointer(
@@ -127,17 +161,30 @@ pub(crate) fn reconcile_all(home: &Path, now: &str) {
 }
 
 /// Deterministic tested core: reconcile every active branch and RETURN the set of
-/// targets to WAKE (A3), so the caller emits the self-IPC pointers lock-free. Takes
-/// `now` injected — no unmockable clock inside.
+/// targets to WAKE (A3), so the production caller emits the self-IPC pointers
+/// lock-free and owns their transport outcome. Takes `now` injected — no
+/// unmockable clock inside.
 #[cfg(test)]
 pub(crate) fn reconcile_all_collect(home: &Path, now: &str) -> Vec<String> {
-    reconcile_all_collect_wakes(home, now).assignment_targets
+    let wakes = reconcile_all_collect_wakes(home, now);
+    // This collector intentionally does not apply the wake outcome. The
+    // production entry point owns transport admission and lease advancement;
+    // tests that assert that contract must drive `reconcile_all` itself.
+    wakes.assignment_targets
 }
 
 #[derive(Default)]
 struct ReconcileWakes {
     assignment_targets: Vec<String>,
+    assignment_wake_details: Vec<AssignmentWakeInfo>,
     continuations: Vec<ContinuationWake>,
+}
+
+struct AssignmentWakeInfo {
+    target: String,
+    repo: String,
+    branch: String,
+    assignment_id: uuid::Uuid,
 }
 
 struct ContinuationWake {
@@ -146,6 +193,14 @@ struct ContinuationWake {
 }
 
 fn reconcile_all_collect_wakes(home: &Path, now: &str) -> ReconcileWakes {
+    reconcile_all_collect_wakes_after_snapshot(home, now, || {})
+}
+
+fn reconcile_all_collect_wakes_after_snapshot(
+    home: &Path,
+    now: &str,
+    after_snapshot: impl FnOnce(),
+) -> ReconcileWakes {
     // Workset = dedup UNION of two `(repo,branch)` identity sources (codex m-…-416):
     //   (a) `store::active_branches` — branches discovered via a PARSEABLE authority
     //       record. It reads the FIRST parseable record to name a branch, so a branch
@@ -164,20 +219,82 @@ fn reconcile_all_collect_wakes(home: &Path, now: &str) -> ReconcileWakes {
     workset.extend(store::active_branches(home));
     workset.extend(crate::daemon::pr_state::list_state_identities(home));
 
+    let task_ids = workset
+        .iter()
+        .flat_map(|(repo, branch)| store::list_active(home, repo, branch))
+        .map(|record| crate::task_events::TaskId(record.task_id))
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>();
+    let statuses = crate::task_events::catalog::for_home(home).statuses(&task_ids);
+    after_snapshot();
+    let terminal_tasks = match statuses {
+        Ok(statuses) => statuses
+            .into_iter()
+            .filter(|snapshot| snapshot.status.is_some_and(|status| status.is_terminal()))
+            .map(|snapshot| {
+                if let Some((instance, seq)) = snapshot.terminal_event {
+                    if let Err(error) = store::retire_terminal_event_checked(
+                        home,
+                        &snapshot.board,
+                        &snapshot.task_id.0,
+                        &instance.0,
+                        seq,
+                        now,
+                    ) {
+                        tracing::error!(
+                            task_id = %snapshot.task_id,
+                            %error,
+                            "terminal assignment safety retirement failed"
+                        );
+                    }
+                } else if let Err(error) = store::retire_current_terminal_task_checked(
+                    home,
+                    &snapshot.board,
+                    &snapshot.task_id.0,
+                    now,
+                ) {
+                    tracing::error!(task_id = %snapshot.task_id, %error,
+                        "cascaded terminal assignment retirement failed");
+                }
+                snapshot.task_id.0
+            })
+            .collect::<std::collections::HashSet<_>>(),
+        Err(error) => {
+            tracing::error!(
+                ?error,
+                "assignment safety sweep could not read task catalog"
+            );
+            std::collections::HashSet::new()
+        }
+    };
+
     let mut wakes = ReconcileWakes::default();
     for (repo, branch) in workset {
-        let branch_wakes = reconcile_branch(home, &repo, &branch, now);
+        let branch_wakes = reconcile_branch(home, &repo, &branch, now, &terminal_tasks);
         wakes
             .assignment_targets
             .extend(branch_wakes.assignment_targets);
+        wakes
+            .assignment_wake_details
+            .extend(branch_wakes.assignment_wake_details);
         wakes.continuations.extend(branch_wakes.continuations);
+    }
+    if let Err(error) = crate::tasks::operator_settlement::retry_committed_cleanups(home) {
+        tracing::error!(%error, "operator settlement cleanup retry incomplete");
     }
     wakes
 }
 
 /// One branch. Returns the targets to WAKE (A3). No lock is held across the calls
 /// below — each store op locks internally, so they never nest (no re-lock deadlock).
-fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> ReconcileWakes {
+fn reconcile_branch(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    now: &str,
+    terminal_tasks: &std::collections::HashSet<String>,
+) -> ReconcileWakes {
     // A10a: terminal restart-repair FIRST — tombstoned records are then excluded
     // from the A2/A3/A4 sweep (the `list_active` read below runs after).
     store::tombstone_terminal_matches(home, repo, branch);
@@ -186,6 +303,12 @@ fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> Reconci
     // Load PrState ONCE per branch (shared across all records on this branch).
     let raw_prstate = crate::daemon::pr_state::load(home, repo, branch);
     for record in store::list_active(home, repo, branch) {
+        // The checked terminal pass owns retirement. Its snapshot may already
+        // be stale (task reopened), or cleanup may have failed. Never fall back
+        // to unguarded cancellation or recreate its delivery here. Re-read next tick.
+        if terminal_tasks.contains(&record.task_id) {
+            continue;
+        }
         // A2: recover a Pending row (idempotent; nonce-dedup handles a crash-window
         // duplicate). Unconditional — even an acked record's row must be durable.
         if record.row == store::RowState::Pending {
@@ -225,32 +348,6 @@ fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> Reconci
                 continue;
             }
         }
-        // Task-terminal gate (#2878-16): a cancelled/done task cannot produce a
-        // valid review — retire the assignment instead of re-nudging it.
-        // Fail-closed: route error or unknown task_id → preserve.
-        if let Ok(routed) = crate::tasks::load_routed(home, &record.task_id) {
-            if routed.task.status.is_terminal() {
-                if store::retire_if_id_matches(
-                    home,
-                    repo,
-                    branch,
-                    &record.target,
-                    record.assignment_id,
-                    now,
-                )
-                .unwrap_or(false)
-                {
-                    tracing::info!(
-                        assignment_id = %record.assignment_id,
-                        target = %record.target,
-                        task_id = %record.task_id,
-                        task_status = %routed.task.status,
-                        "assignment retired: owning task is terminal"
-                    );
-                }
-                continue;
-            }
-        }
         // Classify against the LIVE pr_state for THIS record's generation (its
         // pr_number). A pr_state for a different generation, or none, ⇒ Unengaged.
         let prstate = raw_prstate
@@ -265,10 +362,25 @@ fn reconcile_branch(home: &Path, repo: &str, branch: &str, now: &str) -> Reconci
         // the FIXED-interval lease (returns false when not due) and advances it, so
         // two ticks in one interval fire at most once (I12). Wake fires on an
         // actionable-unread row (pure wake) or a missing/superseded row (repair).
+        //
+        // #3504: for actionable-unread `repair_row` no longer advances the lease
+        // before the wake outcome is known — the reconciler advances on success
+        // or sets a 5s short retry on fenced/queue-full (bounded). Missing/
+        // superseded repair already created a durable row and advanced 60s.
         if store::classify_assignment(&record, prstate) == store::AssignmentEvidence::Unengaged
             && store::repair_row(home, repo, branch, &record.target, now).unwrap_or(false)
         {
+            // Both healthy actionable rows and append-only repaired rows use
+            // the typed worker path. For a repaired row, `repair_row` has
+            // already set the normal lease; a worker failure still replaces
+            // it with the bounded short retry.
             wakes.assignment_targets.push(record.target.clone());
+            wakes.assignment_wake_details.push(AssignmentWakeInfo {
+                target: record.target.clone(),
+                repo: repo.to_string(),
+                branch: branch.to_string(),
+                assignment_id: record.assignment_id,
+            });
         }
     }
 
@@ -406,6 +518,9 @@ mod tests {
     use crate::task_events::{InstanceName, TaskEvent, TaskId};
     use std::path::{Path, PathBuf};
 
+    #[path = "assignment_reconcile_3504.rs"]
+    mod issue_3504_tests;
+
     fn tmp_home(tag: &str) -> PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static C: AtomicU32 = AtomicU32::new(0);
@@ -418,6 +533,26 @@ mod tests {
         ));
         std::fs::create_dir_all(&p).unwrap();
         p
+    }
+
+    #[test]
+    fn reconcile_uses_one_catalog_status_batch_per_pass() {
+        let home = tmp_home("one-status-batch");
+        seed_open_task(&home, "t-rev-1");
+
+        let a = mk("o/r", "feat/a", "reviewer-a", 41, "2026-08-27T00:00:00Z");
+        let b = mk("o/r", "feat/b", "reviewer-b", 42, "2026-08-27T00:00:00Z");
+        store::persist(&home, &a).unwrap();
+        store::persist(&home, &b).unwrap();
+
+        crate::task_events::catalog::reset_status_batch_queries_for_test();
+        let _ = reconcile_all_collect(&home, "2026-08-27T00:01:00Z");
+        assert_eq!(
+            crate::task_events::catalog::status_batch_queries_for_test(),
+            1,
+            "one safety pass must issue exactly one catalog batch query"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 
     fn mk(repo: &str, branch: &str, target: &str, pr: u64, created: &str) -> ActiveAssignment {
@@ -463,13 +598,15 @@ mod tests {
                 eta_secs: None,
                 tags: Vec::new(),
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
         )
         .unwrap();
     }
 
     fn task_status(home: &Path, task_id: &str) -> crate::task_events::TaskStatus {
-        crate::task_events::replay(home)
+        crate::task_events::projected_state(home)
             .unwrap()
             .tasks
             .get(&TaskId::from(task_id))
@@ -794,10 +931,12 @@ mod tests {
             vec!["reviewer".to_string()],
             "actionable-unread row triggers pure wake (no rotation)"
         );
-        // The lease still advanced (a full interval away) so the guard is bounded.
-        assert_ne!(
+        // The collector does not own transport admission, so it must not mutate
+        // the lease. The production `reconcile_all` advances it after the wake
+        // outcome is known.
+        assert_eq!(
             after.next_nudge_at, rec.next_nudge_at,
-            "next_nudge_at advanced past created_at even though no repair fired"
+            "collector must not advance the lease before transport admission"
         );
         std::fs::remove_dir_all(&home).ok();
     }
@@ -959,7 +1098,7 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
-    /// T28 — the reconciler handler is registered at cadence `new(1)` and its `run`
+    /// T28 — the reconciler handler is registered at low-frequency cadence and its `run`
     /// actually drives the reconcile when the cadence permits (a lease-due Unengaged
     /// record is repaired). Cross-checked by a source-pin on the registration.
     #[test]
@@ -968,13 +1107,13 @@ mod tests {
             AssignmentReconcileHandler::new(1).name(),
             "assignment_reconcile"
         );
-        // Source-pin: registered in build_default_handlers at new(1) (~10s).
+        // Source-pin: registered in build_default_handlers at new(60) (~10m).
         let src = std::fs::read_to_string("src/daemon/per_tick/mod.rs")
             .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/per_tick/mod.rs"))
             .expect("per_tick/mod.rs readable");
         assert!(
-            src.contains("AssignmentReconcileHandler::new(1)"),
-            "reconciler must be registered at new(1) cadence in build_default_handlers"
+            src.contains("AssignmentReconcileHandler::new(60)"),
+            "reconciler must be registered at new(60) cadence in build_default_handlers"
         );
 
         // Functional: run() reconciles when the cadence gate opens (new(1) = always).
@@ -1679,7 +1818,7 @@ mod tests {
     }
 
     /// D4: revocation notice is deterministic and idempotent. When the
-    /// reviewer has already read the assignment inbox row, a revocation
+    /// assignment has already been delivered to the reviewer, a revocation
     /// notice is enqueued exactly once per retire cycle. A second reconcile
     /// tick (after convergence deletes the authority) enqueues no duplicate.
     #[test]
@@ -1695,12 +1834,14 @@ mod tests {
         );
         store::persist(&home, &rec).unwrap();
         store::durable_enqueue(&home, "o/r", "feat/x", "reviewer", "2026-07-13T00:00:00Z").unwrap();
-        // Mark the inbox row as READ so the retire path enqueues a revocation notice.
-        mark_row_read(
-            &home,
-            "reviewer",
-            &rec.delivery_nonce,
-            "2026-07-13T00:00:30Z",
+        // Drain without acknowledging: the row is in flight (`delivering_at`
+        // set, `read_at` absent) when the head advance revokes it.
+        let delivered = crate::inbox::storage::drain(&home, "reviewer");
+        assert_eq!(delivered.len(), 1, "assignment must be delivered once");
+        assert_eq!(
+            crate::inbox::storage::requeue_delivering_for_session_reset(&home, "reviewer"),
+            1,
+            "fresh restart must requeue the unacknowledged assignment"
         );
 
         open_prstate(&home, "o/r", "feat/x", 7, "sha-new");
@@ -1953,6 +2094,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Cancelled {
                     task_id: tid,
@@ -1962,6 +2105,125 @@ mod tests {
             ],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn operator_settlement_recovers_dispatch_without_assignment() {
+        let home = tmp_home("3553-dispatch-recovery");
+        let task_id = "t-3553-dispatch-only";
+        let created = serde_json::from_value(serde_json::json!({
+            "kind":"Created", "task_id":task_id, "title":"dispatch only",
+            "description":"", "priority":"normal", "owner":null
+        }))
+        .unwrap();
+        crate::task_events::append(&home, &"fixture".into(), created).unwrap();
+        crate::dispatch_tracking::track_dispatch(
+            &home,
+            crate::dispatch_tracking::DispatchEntry {
+                task_id: Some(task_id.into()),
+                from: "lead".into(),
+                to: "reviewer".into(),
+                delegated_at: "2026-07-22T00:00:00Z".into(),
+                status: "pending".into(),
+                ..Default::default()
+            },
+        );
+        crate::task_events::append(
+            &home,
+            &"operator".into(),
+            TaskEvent::OperatorSettled {
+                task_id: task_id.into(),
+                proof: crate::task_events::OperatorSettlement {
+                    operation_id: "dispatch-only".into(),
+                    preview_digest: "digest".into(),
+                    by: "operator".into(),
+                    holder_instance: None,
+                    target: crate::task_events::OperatorSettlementTarget::Done,
+                    result: "done".into(),
+                },
+            },
+        )
+        .unwrap();
+        assert!(store::active_branches(&home).is_empty());
+        assert!(crate::dispatch_tracking::has_for_instance(
+            &home, "reviewer"
+        ));
+        crate::task_events::catalog::rebuild_for_test(&home);
+        let before = serde_json::to_value(crate::task_events::replay(&home).unwrap()).unwrap();
+        reconcile_all_collect(&home, "2026-07-22T00:00:02Z");
+        let residue = crate::dispatch_tracking::has_for_instance(&home, "reviewer");
+        let after = serde_json::to_value(crate::task_events::replay(&home).unwrap()).unwrap();
+        std::fs::remove_dir_all(&home).unwrap();
+        assert!(
+            !residue,
+            "committed cleanup must be discovered without an assignment"
+        );
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn operator_settlement_reconcile_stale_snapshot_preserves_reopened_assignment() {
+        let home = tmp_home("3553-reconcile-race");
+        let task_id = "t-3553-reconcile";
+        seed_and_cancel_task(&home, task_id);
+        crate::task_events::append_batch_at(
+            &home,
+            &"operator".into(),
+            vec![
+                TaskEvent::Reopened {
+                    task_id: task_id.into(),
+                    reason: "fixture".into(),
+                    source_evidence: String::new(),
+                },
+                TaskEvent::OperatorSettled {
+                    task_id: task_id.into(),
+                    proof: crate::task_events::OperatorSettlement {
+                        operation_id: "reconcile-operation".into(),
+                        preview_digest: "digest".into(),
+                        by: "operator".into(),
+                        holder_instance: None,
+                        target: crate::task_events::OperatorSettlementTarget::Done,
+                        result: "done".into(),
+                    },
+                },
+            ],
+        )
+        .unwrap();
+        let rec = ActiveAssignment::new_pending(
+            "o/r",
+            "feat/operator",
+            "reviewer",
+            7,
+            "lead",
+            task_id,
+            ReviewClass::Single,
+            ReviewAuthor::External("octocat".into()),
+            "Review",
+            None,
+            None,
+            "2026-07-22T00:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+        let mut expected = None;
+        reconcile_all_collect_wakes_after_snapshot(&home, "2026-07-22T00:00:02Z", || {
+            crate::task_events::append(
+                &home,
+                &"fixture".into(),
+                TaskEvent::Reopened {
+                    task_id: task_id.into(),
+                    reason: "new work".into(),
+                    source_evidence: "operator".into(),
+                },
+            )
+            .unwrap();
+            expected =
+                Some(serde_json::to_value(crate::task_events::replay(&home).unwrap()).unwrap());
+        });
+        let actual = serde_json::to_value(crate::task_events::replay(&home).unwrap()).unwrap();
+        let remaining = store::get(&home, "o/r", "feat/operator", "reviewer");
+        std::fs::remove_dir_all(&home).unwrap();
+        assert_eq!(expected.unwrap(), actual);
+        assert_eq!(remaining.unwrap().assignment_id, rec.assignment_id);
     }
 
     #[test]
@@ -2045,6 +2307,112 @@ mod tests {
         std::fs::remove_dir_all(&home).ok();
     }
 
+    #[test]
+    fn cascade_cancelled_child_assignment_is_retired() {
+        let home = tmp_home("cascade-cancel-retire");
+        let parent = TaskId::from("t-parent-cancel-1");
+        let child = TaskId::from("t-child-cancel-1");
+        let inst = InstanceName::from("orchestrator");
+        crate::task_events::append_batch_at(
+            &home,
+            &inst,
+            vec![
+                TaskEvent::Created {
+                    task_id: parent.clone(),
+                    title: "parent".into(),
+                    description: String::new(),
+                    priority: "high".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: vec![],
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
+                },
+                TaskEvent::Created {
+                    task_id: child.clone(),
+                    title: "child review".into(),
+                    description: String::new(),
+                    priority: "high".into(),
+                    owner: None,
+                    due_at: None,
+                    depends_on: vec![],
+                    routed_to: None,
+                    branch: None,
+                    bind: None,
+                    eta_secs: None,
+                    tags: vec![],
+                    parent_id: Some(parent.clone()),
+                    governing_decision_id: None,
+                    review_class: None,
+                },
+                TaskEvent::Cancelled {
+                    task_id: parent,
+                    by: inst.clone(),
+                    reason: "parent cancelled".into(),
+                },
+            ],
+        )
+        .unwrap();
+
+        let rec = ActiveAssignment::new_pending(
+            "o/r",
+            "feat/cascade",
+            "reviewer-child",
+            10,
+            "lead",
+            &child.0,
+            ReviewClass::Single,
+            ReviewAuthor::External("octocat".into()),
+            "Please review child",
+            None,
+            None,
+            "2026-07-22T02:00:00Z",
+        );
+        store::persist(&home, &rec).unwrap();
+
+        let wakes = reconcile_all_collect(&home, "2026-07-22T02:00:01Z");
+        assert!(wakes.is_empty());
+        assert!(
+            store::get(&home, "o/r", "feat/cascade", "reviewer-child").is_none(),
+            "a child cancelled by parent cascade must not strand its assignment"
+        );
+        // A subsequent snapshot is not authority to delete a reopened child.
+        let mut successor = rec.clone();
+        successor.assignment_id = uuid::Uuid::new_v4();
+        store::persist(&home, &successor).unwrap();
+        reconcile_all_collect_wakes_after_snapshot(&home, "2026-07-22T02:00:02Z", || {
+            crate::task_events::append(
+                &home,
+                &"fixture".into(),
+                TaskEvent::Reopened {
+                    task_id: child.clone(),
+                    reason: "new child work".into(),
+                    source_evidence: "operator".into(),
+                },
+            )
+            .unwrap();
+        });
+        assert_eq!(
+            store::get(&home, "o/r", "feat/cascade", "reviewer-child")
+                .unwrap()
+                .assignment_id,
+            successor.assignment_id
+        );
+        assert_eq!(
+            crate::task_events::replay(&home).unwrap().tasks[&child]
+                .status
+                .to_string(),
+            "open"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
     /// Actionable-unread row: lease-due reconciliation fires exactly one wake
     /// without nonce rotation or supersede. A second tick within 60s is bounded.
     #[test]
@@ -2069,9 +2437,15 @@ mod tests {
             .delivery_nonce;
         assert_eq!(nonce_0, nonce_1, "pure wake: nonce not rotated");
 
-        // Second tick within 60s → lease not due → no wake.
+        // The collector intentionally does not apply transport admission, so it
+        // has no lease outcome to apply; production `reconcile_all` owns that
+        // post-admission transition.
         let wakes = reconcile_all_collect(&home, "2026-07-13T00:00:30Z");
-        assert!(wakes.is_empty(), "second tick within lease ⇒ no wake");
+        assert_eq!(
+            wakes,
+            vec!["reviewer".to_string()],
+            "collector must not pretend the wake succeeded"
+        );
 
         std::fs::remove_dir_all(&home).ok();
     }

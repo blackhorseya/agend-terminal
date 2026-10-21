@@ -25,10 +25,11 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// `DaemonHandle` carries the child's PID (read from `.daemon` after it
 /// publishes its run dir) so the caller can surface it to the user.
 ///
-/// On Unix the child is placed in its own process group via
-/// `CommandExt::process_group(0)` — this detaches it from the parent terminal
-/// so Ctrl+C in the parent doesn't also kill the daemon. stdio is redirected
-/// to `{home}/daemon.log` (appending, so repeated starts keep history).
+/// On Unix the child calls `libc::setsid()` (via `pre_exec`) to start a new
+/// session and process group — this detaches it from the parent's
+/// controlling terminal entirely (#3499), so neither Ctrl+C nor closing the
+/// launching terminal reaches the daemon. stdio is redirected to
+/// `{home}/daemon.log` (appending, so repeated starts keep history).
 ///
 /// On Windows the child gets `CREATE_NEW_PROCESS_GROUP` + `DETACHED_PROCESS`
 /// for the equivalent behavior.
@@ -77,7 +78,33 @@ pub fn spawn_detached(home: &Path, fleet_path: Option<&Path>) -> Result<DaemonHa
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        cmd.process_group(0);
+        // #3499: `setsid()` SUPERSEDES `process_group(0)` — it creates a new
+        // session AND a new process group in one call, so `pgid == pid` still
+        // holds and `crate::process::kill_process_tree`'s
+        // `getpgid(pid) != pid` refusal guard still passes for the daemon.
+        // `process_group(0)` alone only detached the process GROUP; the
+        // daemon kept its parent's controlling terminal, so closing that
+        // terminal delivered SIGHUP to it. `setsid()` detaches the
+        // controlling terminal entirely — with none, terminal close cannot
+        // deliver SIGHUP at all.
+        //
+        // The two calls MUST NOT be combined: `setsid()` returns EPERM when
+        // the caller is already a process-group leader, which is exactly
+        // what `process_group(0)` makes it — so a `process_group(0)`
+        // followed by `setsid()` would fail, silently leaving the daemon
+        // still attached to the terminal while looking fixed. Failure is
+        // therefore checked and turned into a loud `io::Error` in the child
+        // rather than ignored (this closure runs in the child, post-fork,
+        // pre-exec — it is `unsafe` because only async-signal-safe calls are
+        // sound there; `setsid()` qualifies).
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
     #[cfg(windows)]
     {
@@ -158,7 +185,11 @@ pub struct SuccessorHandle {
 /// predecessor to exit) or aborts (kills this successor). The child inherits
 /// the predecessor's env (incl. `AGEND_RESTART_HANDOFF=1`), so the successor will
 /// itself self-respawn on a later restart.
-pub fn spawn_successor_handoff(home: &Path, handoff_value: &str) -> Result<SuccessorHandle> {
+pub fn spawn_successor_handoff(
+    home: &Path,
+    handoff_value: &str,
+    requester_id: Option<crate::types::InstanceId>,
+) -> Result<SuccessorHandle> {
     let exe = std::env::current_exe().context("resolve current_exe for successor spawn")?;
     std::fs::create_dir_all(home).with_context(|| format!("create home {}", home.display()))?;
 
@@ -167,6 +198,14 @@ pub fn spawn_successor_handoff(home: &Path, handoff_value: &str) -> Result<Succe
     // Explicit set OVERRIDES any inherited stale value (the predecessor may
     // itself have been a successor carrying an old AGEND_SUCCESSOR_HANDOFF).
     cmd.env(crate::daemon::restart::SUCCESSOR_HANDOFF_ENV, handoff_value);
+    match requester_id {
+        Some(id) => {
+            cmd.env(crate::daemon::restart::SUCCESSOR_REQUESTER_ENV, id.full());
+        }
+        None => {
+            cmd.env_remove(crate::daemon::restart::SUCCESSOR_REQUESTER_ENV);
+        }
+    }
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
@@ -174,6 +213,14 @@ pub fn spawn_successor_handoff(home: &Path, handoff_value: &str) -> Result<Succe
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
+        // #3499: deliberately `process_group(0)` and NOT `setsid()`, unlike
+        // `spawn_detached` above. A successor is spawned BY a running daemon,
+        // which `spawn_detached` already left sessionless, so the successor
+        // inherits "no controlling terminal" and terminal close cannot reach
+        // it either way. The remaining case — a `start --foreground` daemon
+        // self-respawning — legitimately keeps the terminal it was launched
+        // in. And `bootstrap::signals::install` runs in the successor too, so
+        // its SIGHUP handling is the same regardless of session.
         cmd.process_group(0);
     }
     #[cfg(windows)]

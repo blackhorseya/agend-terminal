@@ -88,7 +88,23 @@ struct TransportDelivery {
     home: PathBuf,
     agent: String,
     notification: String,
+    /// #3324: typed external-channel provenance, carried from the inbound
+    /// construction so the envelope can record it without re-reading the header.
+    channel_origin: Option<crate::channel::ChannelKind>,
+    assignment_wake: Option<AssignmentWakeContext>,
     epoch: u64,
+}
+
+/// Context carried with a reviewer-assignment wake until the adapter reports
+/// its outcome. The lease must be updated by the worker, not by queue
+/// admission, because a queued job can still fail before reaching the bridge.
+#[derive(Debug, Clone)]
+pub(crate) struct AssignmentWakeContext {
+    pub repo: String,
+    pub branch: String,
+    pub target: String,
+    pub assignment_id: uuid::Uuid,
+    pub lease_now: String,
 }
 
 struct TransportScheduler {
@@ -108,7 +124,7 @@ struct TransportSchedulerQueue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportEnqueueError {
     QueueFull { epoch: u64 },
-    Fenced,
+    Fenced { epoch: u64 },
 }
 
 static TRANSPORT_SCHEDULER: OnceLock<TransportScheduler> = OnceLock::new();
@@ -272,7 +288,9 @@ fn transport_epoch_for_enqueue(home: &Path, agent: &str) -> Result<u64, Transpor
     // not teardown and must not silently drop a healthy wake.
     let snapshot = state.admission_snapshot.load(Ordering::Acquire);
     if snapshot & CLEANUP_SNAPSHOT_BIT != 0 {
-        return Err(TransportEnqueueError::Fenced);
+        return Err(TransportEnqueueError::Fenced {
+            epoch: snapshot & EPOCH_SNAPSHOT_MASK,
+        });
     }
     Ok(snapshot & EPOCH_SNAPSHOT_MASK)
 }
@@ -292,6 +310,40 @@ pub(crate) struct TransportGenerationGuard {
     _key: (PathBuf, String),
     state: Arc<TransportEpochEntry>,
     cleanup: bool,
+}
+
+/// Exclusive lane admission without changing delivery epochs or pending wakes.
+pub(crate) struct TransportAdmissionGuard {
+    serial: TransportLaneGuard,
+    key: (PathBuf, String),
+    state: Arc<TransportEpochEntry>,
+}
+
+impl TransportAdmissionGuard {
+    pub(crate) fn into_cleanup(self) -> TransportGenerationGuard {
+        {
+            let mut state_guard = self.state.state.lock();
+            state_guard.cleanup_active = true;
+            state_guard.epoch = state_guard.epoch.saturating_add(1);
+            self.state.publish_admission_snapshot(&state_guard);
+        }
+        TransportGenerationGuard {
+            _serial: self.serial,
+            _key: self.key,
+            state: self.state,
+            cleanup: true,
+        }
+    }
+}
+
+pub(crate) fn begin_transport_admission(home: &Path, agent: &str) -> TransportAdmissionGuard {
+    #[cfg(test)]
+    test_support::run_cleanup_before_lane_acquire_hook(home, agent);
+    TransportAdmissionGuard {
+        serial: TransportLaneGuard::acquire(home, agent),
+        key: (home.to_path_buf(), agent.to_string()),
+        state: transport_epoch_state(home, agent),
+    }
 }
 
 struct TransportLaneGuard {
@@ -478,6 +530,8 @@ fn dispatch_transport(
         home,
         agent,
         notification,
+        channel_origin,
+        assignment_wake,
         epoch,
     } = job;
     if crate::agent::deleting::is_deleting(&home, &agent) || transport_epoch(&home, &agent) != epoch
@@ -488,18 +542,74 @@ fn dispatch_transport(
             agent = %agent,
             "delivery_worker: discarded stale transport delivery during teardown"
         );
+        if let Some(context) = assignment_wake.as_ref() {
+            let _ = crate::daemon::assignment_authority::set_short_retry_lease(
+                &home,
+                &context.repo,
+                &context.branch,
+                &context.target,
+                &context.lease_now,
+                context.assignment_id,
+                "stale-teardown",
+            );
+        }
         return;
     }
     let result = crate::transport::deliver_notification(
         &home,
         &agent,
         &notification,
+        channel_origin,
         |home, agent, text| {
             #[cfg(test)]
             test_support::note_legacy_wake(agent);
             crate::inbox::notify::inject_with_submit_direct(home, agent, text)
         },
     );
+    if let Some(context) = assignment_wake.as_ref() {
+        // #3504 R1: LegacyPty's successful write is Ambiguous (unproven
+        // acceptance) — it must not be treated as fenced/queue-full. ChannelBridge
+        // never returns Ambiguous on success (ProtocolAccepted), so only
+        // LegacyPty's Ambiguous is the successful-but-unproven case.
+        let is_legacy_pty = crate::transport::mode_for_instance(&home, &agent)
+            == crate::transport::TransportMode::LegacyPty;
+        let successful = match result.as_ref() {
+            Ok(receipt) if receipt.state == crate::transport::DeliveryState::Failed => false,
+            Ok(receipt) if receipt.state == crate::transport::DeliveryState::Ambiguous => {
+                // LegacyPty success is Ambiguous; other transports' Ambiguous is failure.
+                is_legacy_pty
+            }
+            Ok(_) => true,
+            Err(_) => false,
+        };
+        let lease_result = if successful {
+            crate::daemon::assignment_authority::advance_lease_after_wake(
+                &home,
+                &context.repo,
+                &context.branch,
+                &context.target,
+                &context.lease_now,
+                context.assignment_id,
+            )
+        } else {
+            crate::daemon::assignment_authority::set_short_retry_lease(
+                &home,
+                &context.repo,
+                &context.branch,
+                &context.target,
+                &context.lease_now,
+                context.assignment_id,
+                "adapter-failed",
+            )
+        };
+        if let Err(error) = lease_result {
+            tracing::warn!(
+                error = %error,
+                target = %context.target,
+                "review assignment wake outcome could not update its lease"
+            );
+        }
+    }
     if let Err(error) = result {
         // #3307 Fix B: a structured (ChannelBridge / NativeShared) delivery that
         // fails is a terminal routed outcome — raising it above `debug` makes it
@@ -548,11 +658,39 @@ pub(crate) fn enqueue_transport_delivery_with_epoch(
     agent: &str,
     notification: &str,
 ) -> Result<u64, TransportEnqueueError> {
+    enqueue_transport_delivery_with_epoch_and_origin(home, agent, notification, None)
+}
+
+/// #3324: same, carrying the typed external-channel provenance to the envelope.
+pub(crate) fn enqueue_transport_delivery_with_epoch_and_origin(
+    home: &Path,
+    agent: &str,
+    notification: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
+) -> Result<u64, TransportEnqueueError> {
+    enqueue_transport_delivery_with_epoch_and_origin_and_assignment(
+        home,
+        agent,
+        notification,
+        channel_origin,
+        None,
+    )
+}
+
+pub(crate) fn enqueue_transport_delivery_with_epoch_and_origin_and_assignment(
+    home: &Path,
+    agent: &str,
+    notification: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
+    assignment_wake: Option<AssignmentWakeContext>,
+) -> Result<u64, TransportEnqueueError> {
     let epoch = transport_epoch_for_enqueue(home, agent)?;
     schedule_transport_delivery(TransportDelivery {
         home: home.to_path_buf(),
         agent: agent.to_string(),
         notification: notification.to_string(),
+        channel_origin,
+        assignment_wake,
         epoch,
     })?;
     Ok(epoch)
@@ -567,15 +705,25 @@ pub(crate) fn enqueue_transport_delivery_at_epoch(
     agent: &str,
     notification: &str,
     expected_epoch: u64,
+    channel_origin: Option<crate::channel::ChannelKind>,
 ) -> Result<u64, TransportEnqueueError> {
     let epoch = transport_epoch_for_enqueue(home, agent)?;
     if epoch != expected_epoch {
-        return Err(TransportEnqueueError::Fenced);
+        return Err(TransportEnqueueError::Fenced { epoch });
     }
     schedule_transport_delivery(TransportDelivery {
         home: home.to_path_buf(),
         agent: agent.to_string(),
         notification: notification.to_string(),
+        // #3324: a #2044 re-delivery is the SAME logical delivery as the wake
+        // that was armed, so it carries the origin recorded at arm time rather
+        // than re-deriving one. It is NOT `None`: the actionable classifier
+        // (`notification_is_actionable_wake`) matches on the notification TEXT,
+        // and the inline inbound rendering embeds the sender's own words — so a
+        // channel message containing `kind=task ` is armed like any other
+        // actionable wake and reaches this path.
+        channel_origin,
+        assignment_wake: None,
         epoch: expected_epoch,
     })?;
     Ok(expected_epoch)
@@ -621,6 +769,31 @@ pub(crate) fn record_queue_full_drop_if_current(
     Ok(true)
 }
 
+/// Serialize a fenced durable failure with the captured transport epoch.
+/// Mirrors `record_queue_full_drop_if_current` — same epoch-competition
+/// semantics: a fenced enqueue that raced past its generation transition
+/// must not leave a stale receipt. Fenced drops are durable `Failed`
+/// receipts so a lease advance is not invisible (the fix for #3504).
+pub(crate) fn record_fenced_drop_if_current(
+    home: &Path,
+    agent: &str,
+    notification: &str,
+    epoch: u64,
+    reason: &str,
+) -> anyhow::Result<bool> {
+    let state = transport_epoch_state(home, agent);
+    let state_guard = state.state.lock();
+    if state_guard.epoch != epoch {
+        return Ok(false);
+    }
+    // Fenced means `cleanup_active` was observed at admission — the receipt
+    // is still the correct durable trace for that generation; do not gate
+    // on `cleanup_active` alone. The epoch check above already suppresses a
+    // stale generation.
+    crate::transport::record_delivery_drop(home, agent, notification, reason)?;
+    Ok(true)
+}
+
 /// Arm actionable delivery verification only while the accepted enqueue's
 /// epoch is still current. Filesystem/configuration reads happen before the
 /// per-key state mutex; only the epoch check and memory-only commit are inside
@@ -631,11 +804,17 @@ pub(crate) fn arm_transport_verification_if_current(
     agent: &str,
     epoch: u64,
     notification: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
 ) -> bool {
     let mode = crate::transport::mode_for_instance(home, agent);
-    let Some(prepared) =
-        crate::daemon::inject_delivery::prepare_arm(home, agent, notification, mode, epoch)
-    else {
+    let Some(prepared) = crate::daemon::inject_delivery::prepare_arm(
+        home,
+        agent,
+        notification,
+        mode,
+        epoch,
+        channel_origin,
+    ) else {
         return false;
     };
     let committed = {
@@ -1288,6 +1467,8 @@ mod tests {
             home: home.clone(),
             agent: "legacy-agent".to_string(),
             notification: "one logical wake".to_string(),
+            channel_origin: None,
+            assignment_wake: None,
             epoch: transport_epoch(&home, "legacy-agent"),
         })
         .expect("transport scheduler accepts test delivery");
@@ -1545,6 +1726,8 @@ mod tests {
             home: home.clone(),
             agent: agent.to_string(),
             notification: "stale teardown wake".to_string(),
+            channel_origin: None,
+            assignment_wake: None,
             epoch: stale_epoch,
         })
         .is_ok());
@@ -1638,6 +1821,8 @@ mod tests {
             home: home.clone(),
             agent: agent.to_string(),
             notification: "stale cleanup tail wake".to_string(),
+            channel_origin: None,
+            assignment_wake: None,
             epoch: stale_epoch,
         })
         .is_ok());
@@ -1658,11 +1843,11 @@ mod tests {
         crate::transport::remove_instance_delivery_state(&home, agent).expect("cleanup");
         drop(cleanup);
 
-        assert_eq!(
-            result_rx
-                .recv_timeout(std::time::Duration::from_secs(1))
-                .expect("cleanup tail hook must run"),
-            Err(TransportEnqueueError::Fenced),
+        let tail_result = result_rx
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("cleanup tail hook must run");
+        assert!(
+            matches!(tail_result, Err(TransportEnqueueError::Fenced { .. })),
             "an enqueue in the final bump/release tail must be rejected"
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
@@ -1750,9 +1935,8 @@ mod tests {
         let (a_result, b_result) = tail_rx
             .recv_timeout(std::time::Duration::from_secs(1))
             .expect("A cleanup tail hook must run");
-        assert_eq!(
-            a_result,
-            Err(TransportEnqueueError::Fenced),
+        assert!(
+            matches!(a_result, Err(TransportEnqueueError::Fenced { .. })),
             "A remains stale through finalization"
         );
         assert_eq!(b_result, Ok(()), "B enqueue must not see A's state lock");
@@ -1786,6 +1970,8 @@ mod tests {
             home: home.clone(),
             agent: agent.to_string(),
             notification: "queued before spawn transition".to_string(),
+            channel_origin: None,
+            assignment_wake: None,
             epoch: before_epoch,
         })
         .is_ok());
@@ -1793,6 +1979,8 @@ mod tests {
             home: home.clone(),
             agent: agent.to_string(),
             notification: "queued during spawn transition".to_string(),
+            channel_origin: None,
+            assignment_wake: None,
             epoch: during_epoch,
         })
         .is_ok());

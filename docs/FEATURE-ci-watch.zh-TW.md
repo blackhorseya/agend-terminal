@@ -2,6 +2,11 @@
 
 # CI Watch — 自動 PR CI 監看
 
+> **Status：** 目前 workflow 指南
+> **Audience：** Agent 與 operator
+> **Authority：** CI MCP schema 與 daemon watch state
+> **Last verified：** 2026-09-22，`main@62b28f36`
+
 CI Watch 會針對 repository 與 branch 輪詢 forge CI provider、記錄 PR／CI 狀態，並把終態結果送給 subscribers 與可選的後續 agents。
 
 ## 使用情境
@@ -71,6 +76,26 @@ CI Watch 會評估 selected head 所回傳的所有最新 CI runs。MCP schema �
 
 釋放 worktree 不會隱式取消 CI Watch。Watch 的生命週期由 terminal state、TTL、明確 `unwatch` 與自身 cleanup 規則管理。
 
+## Defer 與確認 handoff
+
+當 terminal task 應在稍後喚醒 CI track 時，使用 `defer`：
+
+```json
+{"tool":"ci","action":"defer","repository":"owner/repo","episode":"episode-...","wake_task_id":"t-...","reason":"waiting for task","defer_secs":600}
+```
+
+使用 `ack_handoff` 確認單一 pickup，但不移除 watch：
+
+```json
+{"tool":"ci","action":"ack_handoff","repository":"owner/repo","branch":"feat/my-feature","episode":"episode-..."}
+```
+
+`episode` 是 `ci action=status` 回傳的精確 identity。**STOP：**
+`defer_secs` 必須是 60–3600；protected exact-head watch 仍必須符合下方的
+完整 SHA、task、授權與 continuation 條件。
+
+完整 CI schema 請見 [MCP 工具](MCP-TOOLS.zh-TW.md)。
+
 ## Dispatch 自動啟用
 
 真正帶有 feature `branch` 的 `send` task dispatch，會在建立 dispatch lease 時自動啟用 CI Watch。`next_after_ci` 可省略：省略時 subscriber 仍收到 informational CI result，但系統不會依名稱或 role 猜測額外 handoff target。
@@ -139,7 +164,7 @@ Repository-level rate-limit/provider skip 連續三次後，subscriber 會收到
 - Subscriber 同時不存在於 runtime registry 與 fleet roster 時會跳過投遞。
 - 適用時，同一 delivery class 較新的 branch notification 會 supersede 較舊 pending row。
 - `next_after_ci` 產生 action handoff；一般 subscriber 收到 informational CI event。
-- Terminal exact-head watch 在 pinned run 到達終態後移除。
+- Exact-head watch 只在 pinned SHA 的 aggregate success 時移除。Failed、cancelled、timed-out attempt 會維持 armed，等待同一 SHA 後續成功的 attempt，並受下方生命週期清理限制。
 
 `send` 的 `triaged:{head,job,reason?}` 目前會記錄 durable triage ledger entry，且 `head` 與 `job` 必須同時提供。該 ledger 現階段是 audit／data-layer surface；尚未承諾所有重複 notification path 都會被 suppression。
 
@@ -155,6 +180,17 @@ Repository-level rate-limit/provider skip 連續三次後，subscriber 會收到
 - Startup sweep 會移除 daemon 停止期間已過期的 watch。
 - Terminal PR／CI path 可能更早移除 watch。
 - 明確 `unwatch` 只移除 caller；最後一位 subscriber 被移除後會留下不 polling 的 opt-out tombstone，直到 terminal cleanup、re-watch 或 tombstone age backstop。
+
+## 恢復已取消的合併後 CI run
+
+取消不是成功。較新的綠燈 `main` SHA 不符合較早 merge 的 exact-head 結案條件。未改變的 cancelled 結果不會刷新 terminal inactivity，也不會反覆宣告新結果；polling 維持 armed 是為了觀察明確重跑。僅憑 `cancelled` 結論不能認定原因是較新的 push。
+
+1. 檢查 `ci(action="status", repository="OWNER/REPO", branch="main")` 與 merge receipt／task，記錄完整 target SHA 和 provider run ID。Status 僅顯示 caller 訂閱範圍，不是全 fleet 清單。
+2. 經授權重跑前，先執行 `gh run view RUN_ID --repo OWNER/REPO --json headSha,status,conclusion,attempt`，確認 `headSha` 等於記錄的 merge SHA，再以 `gh run rerun RUN_ID --repo OWNER/REPO` 要求該 run 的另一個 attempt。檢查 pinned SHA 的所有必要 workflow，不是只看一個成功 job。若 provider 已不允許重跑，記錄阻擋，不得替換成其他 SHA。
+3. 保留 exact-head watch；若已過期或解除，使用原完整 SHA、task linkage 和經授權 continuation 明確重新建立。只有觀察到該 SHA 的 aggregate success 才符合合併後 CI 條件；這不單獨證明目前 `main` 健康，也不會自動將 task 標成 done。
+4. 若經授權的 operator／orchestrator 明確決定停止等待，使用 `ci(action="unwatch", repository="OWNER/REPO", branch="main", head_sha="FULL_MERGE_SHA")`。系統會檢查該 exact watch 的完整解除權限；沒有該權限的 merge-receipt assignee 只能移除自己的訂閱。確認回應的 `disarmed`／`watching` 欄位。完整解除會留下不 polling 的 opt-out tombstone，不會產生成功 CI receipt。
+
+Unwatch 和 TTL 到期只是停止監控，不會結案或驗證 merge。保留未解決 task、負責人、原因及下一個恢復步驟。較新的 main run 可另記為目前主線證據，不能替代此 merge 的成功證據。
 
 ## Provider 與 Credential 規則
 

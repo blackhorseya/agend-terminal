@@ -961,6 +961,54 @@ instances:
 }
 
 #[test]
+fn env_from_env_missing_source_refuses_instance_resolution_3540() {
+    let yaml = r#"
+instances:
+  worker:
+    backend: claude
+    env:
+      SERVICE_TOKEN: { from_env: AGEND_TEST_3540_MISSING_SOURCE }
+"#;
+    let config: FleetConfig = serde_yaml_ng::from_str(yaml).expect("structured env reference");
+    assert!(
+        config.resolve_instance("worker").is_none(),
+        "an unset source variable must reject resolution instead of injecting an empty value"
+    );
+    let error = config
+        .resolve_instance_checked("worker")
+        .expect_err("a configured instance must expose its resolution failure");
+    assert_eq!(error.instance, "worker");
+    assert_eq!(error.destination, "SERVICE_TOKEN");
+    assert_eq!(error.source, "AGEND_TEST_3540_MISSING_SOURCE");
+    assert!(
+        config
+            .resolve_instance_checked("not-configured")
+            .expect("absence is not a resolution error")
+            .is_none(),
+        "an absent fleet entry must remain distinct from an env resolution failure"
+    );
+}
+
+#[test]
+fn env_from_env_does_not_change_passthrough_resolution_3540() {
+    let yaml = r#"
+passthrough_env: [FLEET_PASS]
+instances:
+  worker:
+    backend: claude
+    passthrough_env: [INSTANCE_PASS]
+    env:
+      SERVICE_TOKEN: { from_env: AGEND_TEST_3540_UNUSED_SOURCE }
+"#;
+    let config: FleetConfig = serde_yaml_ng::from_str(yaml).expect("structured env reference");
+    assert_eq!(
+        config.resolve_passthrough_env("worker"),
+        vec!["FLEET_PASS".to_string(), "INSTANCE_PASS".to_string()],
+        "env value indirection must not alter same-name passthrough semantics"
+    );
+}
+
+#[test]
 fn test_teams_parsing() {
     let dir = std::env::temp_dir().join(format!("agend-fleet-teams-{}", std::process::id()));
     let path = write_fleet(
@@ -2500,4 +2548,78 @@ instances:
         "conflict message must name the field: {err_msg}"
     );
     fs::remove_dir_all(&dir).ok();
+}
+
+/// #3541: `resolve_effort` precedence — instance > defaults > None, and
+/// empty strings normalize to None on both levels.
+#[test]
+fn resolve_effort_precedence_and_empty_normalization_3541() {
+    let dir = std::env::temp_dir().join(format!(
+        "agend-fleet-effort-main-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path = write_fleet(
+        &dir,
+        r#"
+defaults:
+  backend: claude
+  effort: medium
+instances:
+  pinned:
+    effort: high
+  inherits:
+    backend: codex
+  cleared:
+    effort: ""
+  bare:
+    backend: claude
+"#,
+    );
+    let config = FleetConfig::load(&path).expect("load");
+
+    // Instance wins over defaults.
+    assert_eq!(
+        config.resolve_instance("pinned").expect("resolve").effort,
+        Some("high".to_string())
+    );
+    // No instance value → defaults.
+    assert_eq!(
+        config.resolve_instance("inherits").expect("resolve").effort,
+        Some("medium".to_string())
+    );
+    // Empty instance string normalizes to "unset", so resolution falls
+    // through to defaults — consistent with `set_model`'s clear semantics
+    // (which REMOVES the instance key, exposing the default again).
+    assert_eq!(
+        config.resolve_instance("cleared").expect("resolve").effort,
+        Some("medium".to_string())
+    );
+
+    // No effort anywhere → None.
+    let dir2 = std::env::temp_dir().join(format!(
+        "agend-fleet-effort-bare-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    let path2 = write_fleet(&dir2, "instances:\n  bare:\n    backend: claude\n");
+    let config2 = FleetConfig::load(&path2).expect("load");
+    assert_eq!(
+        config2.resolve_instance("bare").expect("resolve").effort,
+        None
+    );
+    // Struct-level parse: effort deserializes on all three config types.
+    assert_eq!(config.defaults.effort, Some("medium".to_string()));
+    assert_eq!(
+        config.instances.get("pinned").unwrap().effort,
+        Some("high".to_string())
+    );
+    fs::remove_dir_all(&dir).ok();
+    fs::remove_dir_all(&dir2).ok();
 }

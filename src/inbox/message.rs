@@ -58,10 +58,31 @@ impl fmt::Display for NotifySource<'_> {
 }
 
 impl NotifySource<'_> {
+    /// #3324: the EXTERNAL channel this notification came from, if any.
+    ///
+    /// Read off the typed variant — never re-derived from the rendered header.
+    /// A display name is operator-authored free text and can contain the `]`
+    /// that closes the header, so reverse-parsing the human rendering makes an
+    /// external delivery look internal, and internal is the permissive side of
+    /// the reply guard.
+    pub(crate) fn external_channel(&self) -> Option<crate::channel::ChannelKind> {
+        match self {
+            Self::Channel(_, kind) => Some(*kind),
+            #[cfg(test)]
+            Self::Agent(_) => None,
+            Self::System(_) => None,
+        }
+    }
+
     pub(crate) fn reply_hint(&self) -> Cow<'static, str> {
         match self {
+            // #3324: name the EXACT tool. Two tools are called `reply` in a
+            // ChannelBridge environment and the bridge's own one acknowledges
+            // without delivering, so "the reply tool" is what sent an agent's
+            // answer into a journal while the operator waited.
             Self::Channel(_, _) => {
-                "\n(Reply using the reply tool — do NOT respond with direct text)".into()
+                "\n(Reply using the mcp__agend-terminal__reply tool — do NOT respond with direct text)"
+                    .into()
             }
             #[cfg(test)]
             Self::Agent(sender) => {
@@ -237,6 +258,15 @@ pub struct InboxMessage {
         deserialize_with = "deserialize_settlement_lenient"
     )]
     pub ci_handoff_settlement: Option<CiHandoffSettlement>,
+    /// PR #3495: exactly-once enqueue key. A producer that may legitimately
+    /// retry the same logical notice (a durable outbox intent replayed after a
+    /// crash or a failed enqueue) stamps a deterministic key here;
+    /// `crate::inbox::idempotent::enqueue_once_returning_unread_count` refuses
+    /// to append a second row carrying a key already present in the target
+    /// inbox. Absent on every other row — `#[serde(default,
+    /// skip_serializing_if)]` keeps legacy rows byte-identical.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotency_key: Option<String>,
 }
 
 /// Delivery history projected into a live inbox response. This is derived
@@ -312,6 +342,13 @@ impl InboxMessage {
             timestamp: chrono::Utc::now().to_rfc3339(),
             ..Default::default()
         }
+    }
+
+    /// PR #3495: stamp the exactly-once enqueue key (see
+    /// [`InboxMessage::idempotency_key`]).
+    pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
+        self.idempotency_key = Some(key.into());
+        self
     }
 
     pub fn with_correlation_id(mut self, id: impl Into<String>) -> Self {

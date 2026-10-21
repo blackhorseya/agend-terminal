@@ -11,6 +11,29 @@ use legacy_release::{
     require_clean_legacy_target,
 };
 
+mod branch_cleanup;
+use branch_cleanup::resolve_branch_cleanup;
+pub(crate) use branch_cleanup::{
+    record_retention_obligation, retention_key, retention_lane_key, RETENTION_TAG,
+};
+
+// #3694: the pre-removal ignored-cache sweep is deadline-bounded (extracted to
+// keep this anti-monolith file under its 2500-LOC ceiling).
+mod build_cache;
+use build_cache::clean_ignored_build_cache;
+
+mod release_recovery;
+pub(crate) use release_recovery::prepare_release_journal;
+use release_recovery::{
+    clear_binding_state, clear_release_recovery_journal, mark_release_recovery_required,
+    record_binding_removal, stale_release_after_snapshot,
+};
+
+mod target_identity;
+#[allow(unused_imports)]
+pub use target_identity::{is_pinned, pin, reconcile_orphan_leases, unpin};
+use target_identity::{marker_branch, marker_source_repo, target_source_repo_matches};
+
 pub(crate) struct NestedDirtDiscard<'a> {
     pub expected_digest: &'a str,
     pub audit_reason: &'a str,
@@ -21,6 +44,7 @@ pub(crate) struct NestedDirtDiscard<'a> {
 pub(crate) enum ReleaseTestPhase {
     AfterBindingSnapshot,
     BeforeWorktreeRemove,
+    AfterWorktreeRemoveBeforeBindingClear,
     BeforeNoticeEmit,
     CheckoutBoundBeforeCommit,
 }
@@ -128,6 +152,43 @@ pub(crate) fn sync_marker_contents(path: &Path) -> std::io::Result<()> {
         .sync_all()
 }
 
+/// Write the canonical managed-worktree identity marker and make its contents
+/// durable. Reuse uses the same format as lease, but only after its binding,
+/// source, and pool-path checks prove that the target is daemon-owned.
+pub(crate) fn write_managed_marker(
+    path: &Path,
+    agent: &str,
+    branch: &str,
+    source_repo: &Path,
+) -> std::io::Result<()> {
+    #[cfg(test)]
+    if FAIL_MANAGED_MARKER_WRITE.with(std::cell::Cell::get) {
+        return Err(std::io::Error::other(
+            "test seam: forced managed marker write failure",
+        ));
+    }
+    std::fs::write(
+        path,
+        format!(
+            "agent={agent}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
+            source_repo.display(),
+            chrono::Utc::now().to_rfc3339()
+        ),
+    )
+    .and_then(|()| sync_marker_contents(path))
+}
+
+#[cfg(test)]
+thread_local! {
+    static FAIL_MANAGED_MARKER_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Test-only: force the canonical managed-marker write helper to fail.
+#[cfg(test)]
+pub(crate) fn set_fail_managed_marker_write(fail: bool) {
+    FAIL_MANAGED_MARKER_WRITE.with(|c| c.set(fail));
+}
+
 pub fn lease(
     home: &Path,
     source_repo: &Path,
@@ -160,16 +221,7 @@ pub fn lease(
     // would refuse. The (possibly reused) worktree is deliberately NOT
     // deleted: it may hold WIP; abort-only is the safe arm.
     let marker = info.path.join(MANAGED_MARKER);
-    std::fs::write(
-        &marker,
-        format!(
-            "agent={agent}\nbranch={branch}\nsource_repo={}\nleased_at={}\n",
-            info.source_repo.display(),
-            chrono::Utc::now().to_rfc3339()
-        ),
-    )
-    .and_then(|()| sync_marker_contents(&marker))
-    .map_err(|e| {
+    write_managed_marker(&marker, agent, branch, &info.source_repo).map_err(|e| {
         LeaseError::CreateFailed(format!(
             "managed-marker write/sync failed for {agent}@{branch}: {e}"
         ))
@@ -233,6 +285,14 @@ pub struct ReleaseOutcome {
     pub dry_run_preview: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub code: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stage: Option<&'static str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bytes_remaining: Option<u64>,
     /// Internal exact-CAS signal for auto-release. Not part of the MCP response.
     #[serde(skip)]
     pub(crate) stale_fingerprint: bool,
@@ -379,6 +439,7 @@ fn cleanup_merged_branch(
     // a dry-run release must be observation-only. The non-dry-run path keeps the
     // fresh fetch so `is_merged` / `squash` below are accurate; the dry-run
     // preview falls back to the existing local refs (best-effort "would delete").
+    let mut fetched = false;
     if !dry_run {
         let remote = crate::git_helpers::primary_remote(source_repo);
         // #2004: fail-direction is safe (stale remote refs → `is_merged`/`squash`
@@ -402,19 +463,44 @@ fn cleanup_merged_branch(
                     "fetch --prune could not run during merged-branch cleanup — merge/gone checks run on possibly-stale local refs (branch kept = safe direction)"
                 );
             }
-            Ok(_) => {}
+            Ok(_) => fetched = true,
         }
     }
 
     let default = crate::git_helpers::default_branch(source_repo);
+    // t-…-43938-5 (d-20260901132326253721-16): the fetch above refreshes
+    // `refs/remotes/<remote>/*` and NEVER `refs/heads/<default>`, so judging
+    // ancestry against the LOCAL default asks a stale question — every daemon
+    // worktree is provisioned at the CURRENT protected head, at or ahead of that
+    // lagging ref, so a branch whose work is already in the fetched default was
+    // reported "not merged" and kept forever. Judge against the ref the fetch
+    // just refreshed. A repo with no remote-tracking default keeps the local ref
+    // (there it IS the authority, and a remote-less repo must stay reapable); a
+    // repo that HAS one but could not refresh it judges nothing, so `is_merged`
+    // stays false and the branch is preserved fail-closed.
+    let remote_default = format!(
+        "refs/remotes/{}/{default}",
+        crate::git_helpers::primary_remote(source_repo)
+    );
+    let has_remote_default = crate::git_helpers::git_ok(
+        source_repo,
+        &["rev-parse", "--verify", "--quiet", &remote_default],
+    );
+    let merge_target = match (has_remote_default, fetched || dry_run) {
+        (true, true) => Some(remote_default.as_str()),
+        (true, false) => None,
+        (false, _) => Some(default.as_str()),
+    };
     // W6: converged onto git_helpers::git_ok — byte-identical to the prior
     // git_bypass(...).map(|o| o.status.success()).unwrap_or(false) idiom this
     // absorbs (worktree_cleanup.rs's is_branch_merged already used it; this
     // was the one remaining manual call site).
-    let is_merged = crate::git_helpers::git_ok(
-        source_repo,
-        &["merge-base", "--is-ancestor", branch, &default],
-    );
+    let is_merged = merge_target.is_some_and(|target| {
+        crate::git_helpers::git_ok(
+            source_repo,
+            &["merge-base", "--is-ancestor", branch, target],
+        )
+    });
 
     // #P3 (branch-residue): an authoritative PR-merge (a merged PR whose head
     // SHA == this branch tip, or the tip is an ancestor of it) is MONOTONIC
@@ -501,15 +587,45 @@ fn cleanup_merged_branch(
 /// cleanup failure WITH a binding present still returns `released: false` +
 /// `error` (idempotent success applies only to the nothing-to-do path).
 ///
-/// Partial cleanup: if the worktree path is missing or `git worktree remove`
-/// fails, the binding is still cleared so the agent is not stuck in a
-/// half-released state.
+/// Transactional cleanup: a missing worktree may clear its stale binding, but
+/// a build-cache or worktree-removal failure retains the binding so the daemon
+/// never advertises an unbound target that still occupies disk/registry state.
 /// Result of worktree directory removal attempt.
 enum WorktreeRemoval {
     Removed,
     AlreadyAbsent,
     Unmanaged(String),
     Failed(String),
+}
+
+fn remaining_bytes(path: &Path) -> u64 {
+    let Ok(metadata) = std::fs::symlink_metadata(path) else {
+        return 0;
+    };
+    if !metadata.is_dir() {
+        return metadata.len();
+    }
+    std::fs::read_dir(path)
+        .map(|entries| {
+            entries
+                .flatten()
+                .map(|entry| remaining_bytes(&entry.path()))
+                .fold(0_u64, u64::saturating_add)
+        })
+        .unwrap_or(0)
+}
+
+fn mark_release_incomplete(
+    out: &mut ReleaseOutcome,
+    stage: &'static str,
+    path: &Path,
+    error: String,
+) {
+    out.error = Some(error);
+    out.code = Some("release_incomplete");
+    out.stage = Some(stage);
+    out.path = Some(path.display().to_string());
+    out.bytes_remaining = Some(remaining_bytes(path));
 }
 
 fn source_repo_from_binding(binding: &serde_json::Value, wt_path: &Path) -> PathBuf {
@@ -615,33 +731,6 @@ pub(crate) use workspace::{
     worktree_common_dir_matches,
 };
 
-fn clear_binding_state(
-    home: &Path,
-    agent: &str,
-    permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
-) -> crate::binding::BindingRemoval {
-    crate::binding::unbind_with_permit(home, agent, permit)
-}
-
-fn record_binding_removal(out: &mut ReleaseOutcome, removal: crate::binding::BindingRemoval) {
-    match removal {
-        crate::binding::BindingRemoval::Removed => out.binding_removed = true,
-        crate::binding::BindingRemoval::Absent => {
-            if out.error.is_none() {
-                out.error = Some("binding disappeared before removal".to_string());
-            }
-        }
-        crate::binding::BindingRemoval::Failed(error) => {
-            if let Some(existing) = &mut out.error {
-                existing.push_str("; binding removal failed: ");
-                existing.push_str(&error);
-            } else {
-                out.error = Some(format!("binding removal failed: {error}"));
-            }
-        }
-    }
-}
-
 fn task_active_for_branch(home: &Path, task_id: &str, branch: &str) -> Option<bool> {
     if task_id.is_empty() {
         return Some(false);
@@ -671,202 +760,6 @@ fn task_active_for_branch(home: &Path, task_id: &str, branch: &str) -> Option<bo
         Err(crate::tasks::TaskRouteError::NotFound) => Some(false),
         Err(crate::tasks::TaskRouteError::Unreadable { .. })
         | Err(crate::tasks::TaskRouteError::Ambiguous { .. }) => None,
-    }
-}
-
-fn disposable_review_provisioned_head(
-    binding: &serde_json::Value,
-) -> Result<Option<&str>, &'static str> {
-    let has_disposable_field = binding.get("checkout_purpose").is_some()
-        || binding.get("provenance").is_some()
-        || binding.get("provisioned_head").is_some();
-    if !has_disposable_field {
-        return Ok(None);
-    }
-    if binding.get("checkout_purpose").and_then(|v| v.as_str()) != Some("disposable_review")
-        || binding.get("provenance").and_then(|v| v.as_str()) != Some("DaemonProvisionedReview")
-    {
-        return Err("invalid disposable review provenance");
-    }
-    let head = binding
-        .get("provisioned_head")
-        .and_then(|v| v.as_str())
-        .filter(|head| {
-            (head.len() == 40 || head.len() == 64) && head.chars().all(|c| c.is_ascii_hexdigit())
-        })
-        .ok_or("missing or invalid disposable review provisioned_head")?;
-    Ok(Some(head))
-}
-
-fn disposable_review_task_terminal(home: &Path, task_id: &str) -> Option<bool> {
-    if task_id.is_empty() {
-        return None;
-    }
-    match crate::tasks::load_routed(home, task_id) {
-        Ok(routed) => Some(
-            routed.task.status.is_terminal()
-                || routed.task.status == crate::task_events::TaskStatus::Verified,
-        ),
-        Err(crate::tasks::TaskRouteError::NotFound)
-        | Err(crate::tasks::TaskRouteError::Unreadable { .. })
-        | Err(crate::tasks::TaskRouteError::Ambiguous { .. }) => None,
-    }
-}
-
-fn resolve_branch_cleanup(
-    home: &Path,
-    binding: &serde_json::Value,
-    managed_verified: bool,
-    worktree_absent: bool,
-    dry_run: bool,
-    was_dirty: bool,
-    out: &mut ReleaseOutcome,
-) {
-    let branch = binding["branch"].as_str().unwrap_or("");
-    let sr_str = binding["source_repo"].as_str().unwrap_or("");
-    let task_id = binding["task_id"].as_str().unwrap_or("");
-    let disposable_head = match disposable_review_provisioned_head(binding) {
-        Ok(head) => head,
-        Err(reason) => {
-            out.branch_cleanup_skipped_reason = Some(format!(
-                "disposable review provenance {reason} — preserved (fail-closed)"
-            ));
-            return;
-        }
-    };
-    if !managed_verified && !worktree_absent {
-        out.branch_cleanup_skipped_reason =
-            Some("cannot verify .agend-managed marker — skipping branch cleanup".to_string());
-    } else if !branch.is_empty() && !sr_str.is_empty() {
-        // Authority-proven review lease: lease_kind + review_assignment_id + expected_head
-        // all present → eligible for immediate delete with expected-head CAS. A
-        // daemon-provisioned disposable review uses the same strict lifecycle
-        // classifier, but its provenance is independent of assignment_authority.
-        // Dirty work → never auto-delete regardless of provenance.
-        let authority_proven_head = if was_dirty {
-            None
-        } else {
-            binding
-                .get("lease_kind")
-                .and_then(|v| v.as_str())
-                .filter(|&k| k == "review")
-                .and(
-                    binding
-                        .get("review_assignment_id")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty()),
-                )
-                .and(
-                    binding
-                        .get("expected_head")
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty()),
-                )
-        };
-        let review_head = disposable_head.or(authority_proven_head);
-        if was_dirty
-            && (disposable_head.is_some()
-                || binding
-                    .get("lease_kind")
-                    .and_then(|v| v.as_str())
-                    .is_some_and(|k| k == "review"))
-        {
-            out.branch_cleanup_skipped_reason = Some(format!(
-                "authority-proven review lease on '{branch}' had dirty work — branch preserved"
-            ));
-            return;
-        }
-        if let Some(expected) = review_head {
-            let default = crate::git_helpers::default_branch(Path::new(sr_str));
-            let task_active = if disposable_head.is_some() {
-                disposable_review_task_terminal(home, task_id).map(|terminal| !terminal)
-            } else {
-                task_active_for_branch(home, task_id, branch)
-            };
-            let open_pr =
-                match crate::branch_sweep::open_pr_status(Path::new(sr_str), &default, branch) {
-                    crate::branch_sweep::OpenPrStatus::Open => Some(true),
-                    crate::branch_sweep::OpenPrStatus::NotOpen => Some(false),
-                    crate::branch_sweep::OpenPrStatus::Unknown => None,
-                };
-            let unique_unpreserved_work =
-                crate::git_helpers::git_cmd(Path::new(sr_str), &["rev-parse", branch])
-                    .ok()
-                    .map(|tip| tip.trim() != expected);
-            let active_holder = crate::worktree_cleanup::branch_has_other_active_binding(
-                home,
-                Path::new(sr_str),
-                branch,
-                binding["worktree"].as_str(),
-            );
-            let lifecycle = crate::worktree::disposition::branch_lifecycle_disposition(
-                &crate::worktree::disposition::BranchLifecycleInput {
-                    provenance: crate::worktree::disposition::BranchProvenance::ManagedReview,
-                    terminal: true,
-                    active_holder,
-                    task_active,
-                    open_pr,
-                    unique_unpreserved_work,
-                },
-            );
-            if !matches!(
-                lifecycle,
-                crate::worktree::disposition::BranchLifecycleDisposition::Delete
-            ) {
-                // #3090: a LIVE task is a temporary blocker — this is managed
-                // review residue that becomes reapable the moment the task goes
-                // terminal, and the release attempt is the only automatic one,
-                // firing at the one moment the evidence cannot yet be terminal.
-                // Record the intent so the existing terminal-review reconcile
-                // sweep gets that second chance. Every other blocker still
-                // preserves with no intent, exactly as before.
-                if task_active == Some(true) && !dry_run {
-                    out.intent_persist_error = crate::cleanup_intents::persist_release_intent(
-                        home, sr_str, branch, task_id,
-                    );
-                }
-                out.branch_cleanup_skipped_reason = Some(format!(
-                    "authority-proven review branch '{branch}' lifecycle evidence is not terminal — preserved (fail-closed)"
-                ));
-                return;
-            }
-            if !dry_run {
-                if let Err(error) = crate::branch_sweep::prepare_branch_recovery(
-                    Some(home),
-                    Path::new(sr_str),
-                    branch,
-                    expected,
-                    "authority-proven review release",
-                ) {
-                    out.branch_cleanup_skipped_reason = Some(error);
-                    return;
-                }
-            }
-        }
-        let (deleted, skip_reason) = cleanup_merged_branch(
-            Path::new(sr_str),
-            branch,
-            dry_run,
-            // A daemon-provisioned disposable review has the same strict
-            // expected-head CAS as an assignment-authority review lease. Once
-            // its lifecycle gates pass, pass that provenance head through to
-            // the deletion primitive so the branch is reaped without a PR
-            // merge signal (review scaffolding is intentionally unmerged).
-            review_head,
-        );
-        out.branch_deleted = deleted;
-        out.branch_cleanup_skipped_reason = skip_reason.clone();
-        // Cleanup intent: clean feature branch released pre-merge → persist
-        // intent so it can be settled on pr-merged event or periodic sweep.
-        // Dirty branches get no intent (preserved permanently).
-        if !deleted && !was_dirty && !dry_run {
-            out.intent_persist_error =
-                crate::cleanup_intents::persist_release_intent(home, sr_str, branch, task_id);
-        }
-    } else if branch.is_empty() {
-        out.branch_cleanup_skipped_reason = Some("no branch in binding".to_string());
-    } else {
-        out.branch_cleanup_skipped_reason = Some("no source_repo in binding".to_string());
     }
 }
 
@@ -962,6 +855,7 @@ fn release_known_locked(
             // `remove_worktree` would actually delete — the workspace-teardown
             // callers of `remove_worktree` are intentionally left untouched.
             if is_daemon_managed(wt_path) {
+                permit.set_stage("preserve_wip");
                 let branch = binding["branch"].as_str().unwrap_or("");
                 // No caller identity on the background pool-sweep path → None
                 // routes the WIP-preserved notice to the agent's team orchestrator
@@ -993,7 +887,29 @@ fn release_known_locked(
                         was_dirty,
                     };
                 }
+                permit.set_stage("clean_build_cache");
+                if let Err((path, error)) = clean_ignored_build_cache(wt_path) {
+                    mark_release_incomplete(
+                        &mut out,
+                        "build_cache_cleanup",
+                        &path,
+                        format!(
+                            "release incomplete: could not remove ignored build cache at {}: {error}",
+                            path.display()
+                        ),
+                    );
+                    return LockedRelease {
+                        out,
+                        notices,
+                        clear_refusal_marker,
+                        finish_full_release: false,
+                        managed_verified,
+                        worktree_absent,
+                        was_dirty,
+                    };
+                }
             }
+            permit.set_stage("worktree_remove");
             #[cfg(test)]
             release_test_seam::hit(ReleaseTestPhase::BeforeWorktreeRemove);
             match remove_worktree(agent, wt_path, &source_repo) {
@@ -1005,21 +921,54 @@ fn release_known_locked(
                     // it (+ its lock) so a future re-lease of this path re-notifies
                     // from a clean slate. Best-effort.
                     clear_refusal_marker = Some(wt_path.to_path_buf());
+                    if let Err(error) = mark_release_recovery_required(home, agent) {
+                        mark_release_incomplete(
+                            &mut out,
+                            "release_journal",
+                            wt_path,
+                            format!(
+                                "release removed the worktree but could not persist recovery state: {error}"
+                            ),
+                        );
+                        return LockedRelease {
+                            out,
+                            notices,
+                            clear_refusal_marker,
+                            finish_full_release: false,
+                            managed_verified,
+                            worktree_absent,
+                            was_dirty,
+                        };
+                    }
+                    #[cfg(test)]
+                    release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
                 }
                 WorktreeRemoval::AlreadyAbsent => {
                     worktree_absent = true;
+                    if let Err(error) = mark_release_recovery_required(home, agent) {
+                        mark_release_incomplete(
+                            &mut out,
+                            "release_journal",
+                            wt_path,
+                            format!(
+                                "release found the worktree absent but could not persist recovery state: {error}"
+                            ),
+                        );
+                        return LockedRelease {
+                            out,
+                            notices,
+                            clear_refusal_marker,
+                            finish_full_release: false,
+                            managed_verified,
+                            worktree_absent,
+                            was_dirty,
+                        };
+                    }
+                    #[cfg(test)]
+                    release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
                 }
                 WorktreeRemoval::Unmanaged(err) => {
-                    out.error = Some(err);
-                    // #1879 (WT-LEAK-2): refusing to delete an UNMANAGED
-                    // (operator-created) worktree protects operator data, but the
-                    // daemon's stale binding to it must STILL be cleared — leaving
-                    // it leaks the binding + blocks a same-agent re-bind. The
-                    // worktree-protection refusal must not also skip binding
-                    // cleanup. (This arm is already the non-dry_run path; the
-                    // dry_run classifier above mutates nothing.)
-                    let removal = clear_binding_state(home, agent, permit);
-                    record_binding_removal(&mut out, removal);
+                    mark_release_incomplete(&mut out, "worktree_remove", wt_path, err);
                     return LockedRelease {
                         out,
                         notices,
@@ -1032,7 +981,16 @@ fn release_known_locked(
                 }
                 WorktreeRemoval::Failed(err) => {
                     managed_verified = true;
-                    out.error = Some(err);
+                    mark_release_incomplete(&mut out, "worktree_remove", wt_path, err);
+                    return LockedRelease {
+                        out,
+                        notices,
+                        clear_refusal_marker,
+                        finish_full_release: false,
+                        managed_verified,
+                        worktree_absent,
+                        was_dirty,
+                    };
                 }
             }
         }
@@ -1054,6 +1012,7 @@ fn release_known_locked(
         ));
         out.released = true;
     } else {
+        permit.set_stage("binding_remove");
         let removal = clear_binding_state(home, agent, permit);
         record_binding_removal(&mut out, removal);
         // #1465 guardrail: only report `released` when no cleanup step failed.
@@ -1103,8 +1062,10 @@ fn release_full_guarded(
         Ok(GuardedBinding::Opaque(reason)) => return opaque_release(reason),
         Ok(GuardedBinding::Known { value, fingerprint }) => (value, fingerprint),
     };
-    if expected.is_some_and(|expected| expected != &fingerprint) {
-        return stale_release();
+    if let Some(expected) = expected {
+        if expected != &fingerprint {
+            return stale_release_after_snapshot(home, agent, expected);
+        }
     }
     #[cfg(test)]
     release_test_seam::hit(ReleaseTestPhase::AfterBindingSnapshot);
@@ -1121,6 +1082,22 @@ fn release_full_guarded(
             Ok(lock) => lock,
             Err(e) => return opaque_release(format!("branch lease lock failed: {e}")),
         };
+    // t-…-87866-27: every other lock here is keyed by BRANCH (above) or by AGENT
+    // (below), so a DIFFERENT agent mutating the SAME worktree path sees none of
+    // them. `checkout_txn::acquire_path_lock` is the canonical shared domain for a
+    // path — `ci/checkout.rs` provisions under it and its doc names repo-release as
+    // the next consumer — so take it here and hold it (RAII) across the teardown.
+    // Fleet order preserved: branch lease → this per-path flock → per-agent binding
+    // lock. No caller of this function holds the path lock, so it cannot re-enter.
+    let _path_lock = if wt.is_empty() {
+        None
+    } else {
+        match crate::mcp::handlers::ci::checkout_txn::acquire_path_lock(home, Path::new(wt), agent)
+        {
+            Ok(guard) => Some(guard),
+            Err(e) => return opaque_release(format!("worktree path lock failed: {e}")),
+        }
+    };
     let _agent_lock = match crate::binding::acquire_agent_mutation_lock(home, agent) {
         Ok(lock) => lock,
         Err(e) => return opaque_release(e),
@@ -1136,7 +1113,9 @@ fn release_full_guarded(
             value,
             fingerprint: live,
         } if live == fingerprint => value,
-        GuardedBinding::Known { .. } => return stale_release(),
+        GuardedBinding::Known { .. } => {
+            return stale_release_after_snapshot(home, agent, &fingerprint)
+        }
     };
     let wt_path = current["worktree"].as_str().unwrap_or("");
     let wt_exists = !wt_path.is_empty() && Path::new(wt_path).exists();
@@ -1274,12 +1253,38 @@ fn release_full_guarded(
             };
         }
     }
+    if !dry_run && !matches!(provenance, ReleaseProvenance::Delete) {
+        if let Err(error) = prepare_release_journal(home, agent) {
+            return ReleaseOutcome {
+                error: Some(error),
+                code: Some("release_incomplete"),
+                stage: Some("release_journal"),
+                path: (!wt.is_empty()).then(|| wt.to_string()),
+                ..ReleaseOutcome::default()
+            };
+        }
+    }
     let mut locked = release_known_locked(home, agent, &current, dry_run, permit);
     // Explicit drops document the lock boundary: no notice, marker cleanup,
     // branch cleanup, or release event runs with a flock held.
     drop(_binding_lock);
     drop(_agent_lock);
+    // Inner→outer, mirroring the acquisition order (branch → path → agent →
+    // binding): the per-path flock drops with the other transaction locks so the
+    // S1 invariant holds — notice dispatch still begins with NO flock held.
+    drop(_path_lock);
     drop(_branch_lock);
+
+    if !dry_run && !matches!(provenance, ReleaseProvenance::Delete) && locked.out.released {
+        if let Err(error) = clear_release_recovery_journal(home, agent) {
+            locked.out.error = Some(format!(
+                "release completed but recovery journal could not be cleared: {error}"
+            ));
+            locked.out.code = Some("release_incomplete");
+            locked.out.stage = Some("release_journal");
+            locked.out.released = false;
+        }
+    }
 
     for notice in locked.notices.drain(..) {
         notice.emit(home);
@@ -1395,7 +1400,6 @@ fn release_bound_target_exact_impl(
     target: &Path,
     source_repo: &Path,
     caller_holds_branch_lease: bool,
-    clear_binding_on_remove_failure: bool,
     require_force_identity: bool,
     sender: Option<&str>,
     permit: &crate::mcp::handlers::dispatch_hook::LifecyclePermit,
@@ -1483,6 +1487,16 @@ fn release_bound_target_exact_impl(
         }
     }
 
+    if let Err(error) = prepare_release_journal(home, agent) {
+        return ReleaseOutcome {
+            error: Some(error),
+            code: Some("release_incomplete"),
+            stage: Some("release_journal"),
+            path: Some(target.display().to_string()),
+            ..ReleaseOutcome::default()
+        };
+    }
+
     if require_force_identity
         && matches!(
             force_target_state,
@@ -1522,6 +1536,16 @@ fn release_bound_target_exact_impl(
         let removal = clear_binding_state(home, agent, permit);
         record_binding_removal(&mut out, removal);
         out.released = out.error.is_none() && out.binding_removed;
+        if out.released {
+            if let Err(error) = clear_release_recovery_journal(home, agent) {
+                out.released = false;
+                out.error = Some(format!(
+                    "release completed but recovery journal could not be cleared: {error}"
+                ));
+                out.code = Some("release_incomplete");
+                out.stage = Some("release_journal");
+            }
+        }
         drop(_binding_lock);
         drop(_agent_lock);
         drop(branch_lock);
@@ -1537,6 +1561,7 @@ fn release_bound_target_exact_impl(
             Some(crate::mcp::handlers::TargetState::Present)
         )
     {
+        permit.set_stage("preserve_wip");
         let (preservation, collected) = crate::worktree::preserve_dirty_worktree_collect(
             home,
             agent,
@@ -1559,7 +1584,28 @@ fn release_bound_target_exact_impl(
                 ..ReleaseOutcome::default()
             };
         }
+        permit.set_stage("clean_build_cache");
+        if let Err((path, error)) = clean_ignored_build_cache(target) {
+            let mut out = ReleaseOutcome::default();
+            mark_release_incomplete(
+                &mut out,
+                "build_cache_cleanup",
+                &path,
+                format!(
+                    "release incomplete: could not remove ignored build cache at {}: {error}",
+                    path.display()
+                ),
+            );
+            drop(_binding_lock);
+            drop(_agent_lock);
+            drop(branch_lock);
+            for notice in notices {
+                notice.emit(home);
+            }
+            return out;
+        }
     }
+    permit.set_stage("worktree_remove");
     let mut out = ReleaseOutcome::default();
     let mut clear_marker = false;
     let remove = remove_worktree(agent, target, source_repo);
@@ -1567,22 +1613,72 @@ fn release_bound_target_exact_impl(
         WorktreeRemoval::Removed => {
             out.worktree_removed = true;
             clear_marker = true;
+            if let Err(error) = mark_release_recovery_required(home, agent) {
+                mark_release_incomplete(
+                    &mut out,
+                    "release_journal",
+                    target,
+                    format!(
+                        "release removed the worktree but could not persist recovery state: {error}"
+                    ),
+                );
+                drop(_binding_lock);
+                drop(_agent_lock);
+                drop(branch_lock);
+                return out;
+            }
+            #[cfg(test)]
+            release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
             let removal = clear_binding_state(home, agent, permit);
             record_binding_removal(&mut out, removal);
             out.released = out.error.is_none() && out.binding_removed;
+            if out.released {
+                if let Err(error) = clear_release_recovery_journal(home, agent) {
+                    out.released = false;
+                    out.error = Some(format!(
+                        "release completed but recovery journal could not be cleared: {error}"
+                    ));
+                    out.code = Some("release_incomplete");
+                    out.stage = Some("release_journal");
+                }
+            }
         }
         WorktreeRemoval::AlreadyAbsent => {
+            if let Err(error) = mark_release_recovery_required(home, agent) {
+                mark_release_incomplete(
+                    &mut out,
+                    "release_journal",
+                    target,
+                    format!(
+                        "release found the worktree absent but could not persist recovery state: {error}"
+                    ),
+                );
+                drop(_binding_lock);
+                drop(_agent_lock);
+                drop(branch_lock);
+                return out;
+            }
+            #[cfg(test)]
+            release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
             let removal = clear_binding_state(home, agent, permit);
             record_binding_removal(&mut out, removal);
             out.released = out.error.is_none() && out.binding_removed;
-        }
-        WorktreeRemoval::Unmanaged(error) => out.error = Some(error),
-        WorktreeRemoval::Failed(error) => {
-            out.error = Some(error);
-            if clear_binding_on_remove_failure {
-                let removal = clear_binding_state(home, agent, permit);
-                record_binding_removal(&mut out, removal);
+            if out.released {
+                if let Err(error) = clear_release_recovery_journal(home, agent) {
+                    out.released = false;
+                    out.error = Some(format!(
+                        "release completed but recovery journal could not be cleared: {error}"
+                    ));
+                    out.code = Some("release_incomplete");
+                    out.stage = Some("release_journal");
+                }
             }
+        }
+        WorktreeRemoval::Unmanaged(error) => {
+            mark_release_incomplete(&mut out, "worktree_remove", target, error)
+        }
+        WorktreeRemoval::Failed(error) => {
+            mark_release_incomplete(&mut out, "worktree_remove", target, error);
         }
     }
     drop(_binding_lock);
@@ -1627,7 +1723,6 @@ pub(crate) fn release_bound_target_exact(
         source_repo,
         false,
         false,
-        false,
         None,
         &permit,
     )
@@ -1651,15 +1746,13 @@ pub(crate) fn release_bound_target_exact_with_permit(
         source_repo,
         false,
         false,
-        false,
         None,
         permit,
     )
 }
 
 /// Exact Known-target release for checkout rollback, whose caller already holds
-/// L(repo,branch). Preserves the rollback path's historical partial-unbind
-/// behavior if the worktree removal itself fails.
+/// L(repo,branch). A failed removal retains the binding for guarded recovery.
 pub(crate) fn release_bound_target_exact_under_branch_lock(
     home: &Path,
     agent: &str,
@@ -1687,7 +1780,6 @@ pub(crate) fn release_bound_target_exact_under_branch_lock(
         target,
         source_repo,
         true,
-        true,
         false,
         None,
         &permit,
@@ -1710,7 +1802,6 @@ pub(crate) fn release_bound_target_exact_under_branch_lock_with_permit(
         expected,
         target,
         source_repo,
-        true,
         true,
         false,
         None,
@@ -1737,7 +1828,6 @@ pub(crate) fn release_bound_target_exact_under_branch_lock_for_force(
         target,
         source_repo,
         true,
-        false,
         true,
         sender,
         permit,
@@ -1958,6 +2048,7 @@ fn release_absent_target_impl(
     }
     let mut discard_audit_detail: Option<String> = None;
     if matches!(target_state, crate::mcp::handlers::TargetState::Present) {
+        permit.set_stage("preserve_wip");
         let mk_branch = marker_branch(target);
         let branch_for_preserve = mk_branch.as_deref().unwrap_or("");
         let (preservation, collected) = crate::worktree::preserve_dirty_worktree_collect(
@@ -2308,7 +2399,26 @@ fn release_absent_target_impl(
                 };
             }
         }
+        permit.set_stage("clean_build_cache");
+        if let Err((path, error)) = clean_ignored_build_cache(target) {
+            mark_release_incomplete(
+                &mut out,
+                "build_cache_cleanup",
+                &path,
+                format!(
+                    "release incomplete: could not remove ignored build cache at {}: {error}",
+                    path.display()
+                ),
+            );
+            drop(_binding_lock);
+            drop(_agent_lock);
+            for notice in notices {
+                notice.emit(home);
+            }
+            return out;
+        }
     }
+    permit.set_stage("worktree_remove");
     match remove_worktree(agent, target, source_repo) {
         WorktreeRemoval::Removed => {
             if let Some(detail) = &discard_audit_detail {
@@ -2317,6 +2427,8 @@ fn release_absent_target_impl(
             out.released = true;
             out.already_released = true;
             out.worktree_removed = true;
+            #[cfg(test)]
+            release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
         }
         WorktreeRemoval::AlreadyAbsent => {
             if let Some(detail) = &discard_audit_detail {
@@ -2324,6 +2436,8 @@ fn release_absent_target_impl(
             }
             out.released = true;
             out.already_released = true;
+            #[cfg(test)]
+            release_test_seam::hit(ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear);
         }
         WorktreeRemoval::Unmanaged(error) | WorktreeRemoval::Failed(error) => {
             if let Some(detail) = &discard_audit_detail {
@@ -2334,7 +2448,7 @@ fn release_absent_target_impl(
                     &format!("{detail} abort_reason=release_failed"),
                 );
             }
-            out.error = Some(error)
+            mark_release_incomplete(&mut out, "worktree_remove", target, error)
         }
     }
     drop(_binding_lock);
@@ -2343,86 +2457,6 @@ fn release_absent_target_impl(
         notice.emit(home);
     }
     out
-}
-
-fn marker_branch(worktree: &Path) -> Option<String> {
-    std::fs::read_to_string(worktree.join(MANAGED_MARKER))
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("branch="))
-        .map(|s| s.trim().to_string())
-}
-
-fn marker_source_repo(worktree: &Path) -> Option<PathBuf> {
-    std::fs::read_to_string(worktree.join(MANAGED_MARKER))
-        .ok()?
-        .lines()
-        .find_map(|line| line.strip_prefix("source_repo="))
-        .map(|s| PathBuf::from(s.trim()))
-}
-
-fn git_pointer_source_repo(worktree: &Path) -> Option<PathBuf> {
-    let content = std::fs::read_to_string(worktree.join(".git")).ok()?;
-    let gitdir = content
-        .lines()
-        .find_map(|line| line.strip_prefix("gitdir:").map(str::trim))?;
-    let gitdir = PathBuf::from(gitdir);
-    let gitdir = if gitdir.is_absolute() {
-        gitdir
-    } else {
-        worktree.join(gitdir)
-    };
-    let canonical = gitdir.canonicalize().ok()?;
-    let worktrees = canonical.parent()?;
-    if worktrees.file_name().and_then(|n| n.to_str()) != Some("worktrees") {
-        return None;
-    }
-    Some(worktrees.parent()?.parent()?.to_path_buf())
-}
-
-fn target_source_repo_matches(worktree: &Path, source_repo: &Path) -> bool {
-    let source = source_repo.canonicalize().ok();
-    let Some(source) = source else { return false };
-    let marker = marker_source_repo(worktree).and_then(|p| p.canonicalize().ok());
-    let pointer = git_pointer_source_repo(worktree).and_then(|p| p.canonicalize().ok());
-    match (marker, pointer) {
-        (Some(marker), Some(pointer)) => marker == source && pointer == source,
-        (Some(marker), None) => marker == source,
-        (None, Some(pointer)) => pointer == source,
-        (None, None) => false,
-    }
-}
-
-/// Pin a worktree (operator override — prevents GC in Phase 4).
-pub fn pin(worktree_path: &Path) {
-    let pin_file = worktree_path.join(".agend-pinned");
-    let _ = std::fs::write(&pin_file, chrono::Utc::now().to_rfc3339());
-}
-
-/// Unpin a worktree (allow GC again).
-pub fn unpin(worktree_path: &Path) {
-    let pin_file = worktree_path.join(".agend-pinned");
-    let _ = std::fs::remove_file(pin_file);
-}
-
-/// Check if a worktree is pinned.
-pub fn is_pinned(worktree_path: &Path) -> bool {
-    worktree_path.join(".agend-pinned").exists()
-}
-
-/// Reconcile orphan leases at daemon startup (log only, no delete in Phase 3).
-pub fn reconcile_orphan_leases(home: &Path) {
-    for (agent_name, v) in crate::binding::binding_scan_all(home) {
-        if let Some(wt_path) = v["worktree"].as_str() {
-            if !Path::new(wt_path).exists() {
-                tracing::warn!(
-                    agent = agent_name.as_str(),
-                    worktree = wt_path,
-                    "orphan lease: worktree path missing"
-                );
-            }
-        }
-    }
 }
 
 // ── Phase 4: GC scan + dry-run + cutover ────────────────────────────────

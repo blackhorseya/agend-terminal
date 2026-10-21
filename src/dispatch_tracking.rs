@@ -54,6 +54,13 @@ pub fn track_dispatch(home: &Path, entry: DispatchEntry) {
 
 /// Reporter-scoped settlement: remove only the entry whose `to` matches
 /// `reporter`. Empty reporter matches nothing (fail-closed).
+///
+/// #3536: removal is the LAST moment this task is visible to `sweep_stuck` — the
+/// entry is deleted outright, never flipped to `"completed"` and kept (see
+/// `test_report_result_marks_dispatch_completed`). If the task itself is still
+/// open, nothing else would ever notice it again, so hand the task board a
+/// settlement stamp on the way out. Only a removal stamps: an unsolicited report
+/// with no dispatch outstanding leaves no trace.
 pub fn mark_completed(home: &Path, correlation_id: Option<&str>, reporter: &str) {
     let cid = match correlation_id {
         Some(c) if !c.is_empty() => c,
@@ -62,15 +69,21 @@ pub fn mark_completed(home: &Path, correlation_id: Option<&str>, reporter: &str)
     if reporter.is_empty() {
         return;
     }
+    let mut removed = false;
     persist_or_log!(
         crate::store::mutate_versioned(&store_path(home), |store: &mut DispatchStore| {
+            let before = store.entries.len();
             store
                 .entries
                 .retain(|e| e.task_id.as_deref() != Some(cid) || e.to != reporter);
+            removed = store.entries.len() < before;
             Ok(())
         }),
         "dispatch_mark_completed"
     );
+    if removed {
+        crate::tasks::note_dispatch_settled(home, cid);
+    }
 }
 
 /// Task-wide cleanup: remove ALL entries for a task_id regardless of
@@ -89,6 +102,29 @@ pub fn remove_all_for_task(home: &Path, task_id: &str) {
         }),
         "dispatch_remove_all_for_task"
     );
+}
+
+/// Settlement must retain unreadable state and report cleanup pending.
+pub(crate) fn remove_all_for_task_checked(home: &Path, task_id: &str) -> anyhow::Result<()> {
+    let path = store_path(home);
+    let Some(parent) = path.parent() else {
+        anyhow::bail!("dispatch tracking path has no parent");
+    };
+    std::fs::create_dir_all(parent)?;
+    let _lock = crate::store::acquire_file_lock(&path.with_extension("lock"))?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error.into()),
+    };
+    let mut data: DispatchStore = serde_json::from_slice(&bytes)?;
+    anyhow::ensure!(
+        data.schema_version == 1,
+        "unsupported dispatch tracking schema"
+    );
+    data.entries
+        .retain(|entry| entry.task_id.as_deref() != Some(task_id));
+    crate::store::save_atomic(&path, &data)
 }
 
 /// #1923 G3: on task reassignment, re-point the dispatch-tracking entry for this

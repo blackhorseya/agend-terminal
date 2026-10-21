@@ -30,6 +30,10 @@ pub(super) fn handle_list_decisions(home: &Path, args: &Value) -> Value {
     crate::decisions::list(home, args)
 }
 
+pub(super) fn handle_get_decision(home: &Path, args: &Value) -> Value {
+    crate::decisions::get(home, args)
+}
+
 pub(super) fn handle_update_decision(home: &Path, args: &Value, instance_name: &str) -> Value {
     crate::decisions::update(home, instance_name, args)
 }
@@ -136,6 +140,7 @@ pub(super) fn handle_create_team(
             accept_from,
         },
         &rt.registry,
+        &rt.configs,
         rt.notifier.as_deref(),
     )
 }
@@ -173,8 +178,31 @@ pub(super) fn handle_update_team(
     args: &Value,
     runtime: Option<&RuntimeContext>,
 ) -> Value {
+    handle_update_team_as(home, args, runtime, None)
+}
+
+pub(super) fn handle_update_team_as(
+    home: &Path,
+    args: &Value,
+    runtime: Option<&RuntimeContext>,
+    requester: Option<&str>,
+) -> Value {
     let team_name = args["name"].as_str().unwrap_or("");
-    let outcome = crate::teams::update_with_diff(home, args);
+    let outcome = match requester {
+        Some(requester) => crate::teams::update_with_diff_authorized(
+            home,
+            args,
+            crate::teams::TeamUpdateCaller::Managed(requester),
+        ),
+        None => {
+            if args.get("orchestrator").is_some() {
+                return serde_json::json!({
+                    "error": "team orchestrator update requires a live managed requester"
+                });
+            }
+            crate::teams::update_with_diff(home, args)
+        }
+    };
     if outcome.result.get("error").is_none() {
         if let Some(notifier) = runtime.and_then(|runtime| runtime.notifier.as_ref()) {
             if !outcome.added.is_empty() || !outcome.removed.is_empty() {
@@ -182,6 +210,11 @@ pub(super) fn handle_update_team(
                     name: team_name.to_string(),
                     added: outcome.added.clone(),
                     removed: outcome.removed.clone(),
+                });
+            }
+            if outcome.config_changed && outcome.added.is_empty() && outcome.removed.is_empty() {
+                notifier.notify(crate::api::ApiEvent::ConfigChanged {
+                    name: team_name.to_string(),
                 });
             }
         }

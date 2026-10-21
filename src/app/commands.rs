@@ -19,6 +19,16 @@ pub(super) struct CommandCtx<'a> {
     pub home: &'a Path,
     pub wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
+    pub restart_tx: Option<&'a crossbeam_channel::Sender<RemoteRestartRequest>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RemoteRestartRequest {
+    pub restart_id: String,
+    pub old_instance_ref: Option<crate::types::InstanceRef>,
+    pub tab_index: usize,
+    pub pane_id: usize,
+    pub name: String,
 }
 
 /// The dynamic source feeding a command-argument position, declared per token in
@@ -94,6 +104,12 @@ pub(crate) const COMMAND_SPECS: &[CommandSpec] = &[
         usage: "layout [preset]",
         desc: "Apply a layout preset (cycles if omitted)",
         args: &[ArgSource::Preset],
+    },
+    CommandSpec {
+        keyword: "arrange",
+        usage: "arrange [current|<team>|all|undo]",
+        desc: "Team Organizer: preview/apply team tabs (undo reverts)",
+        args: &[ArgSource::Free],
     },
     CommandSpec {
         keyword: "send",
@@ -336,6 +352,30 @@ pub(crate) fn tab_complete(
 /// completion list) — `command_specs_match_execute_arms_bidirectional` asserts the
 /// two sets are exactly equal (both directions).
 pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
+    execute_with_restart(cmd, ctx, super::rpc::restart_instance)
+}
+
+/// Return whether a palette command is the explicit operator restart path.
+/// Keeping this predicate at the command boundary lets the overlay place the
+/// confirmation before any destructive work while leaving all other commands
+/// on their existing execution path.
+pub(super) fn is_restart_command(cmd: &str) -> bool {
+    cmd.split_whitespace().next() == Some("restart")
+}
+
+/// #3631: whether the palette line opens the Team Organizer. The Organizer is a
+/// modal preview (`arrange` / `arrange all` / `arrange <team>`) or an immediate
+/// transaction revert (`arrange undo`); it is intercepted by the command-palette
+/// overlay BEFORE the generic execute path, which is why the arm below is a
+/// deliberate no-op (the Organizer must not run headlessly).
+pub(super) fn is_arrange_command(cmd: &str) -> bool {
+    cmd.split_whitespace().next() == Some("arrange")
+}
+
+fn execute_with_restart<F>(cmd: &str, ctx: &mut CommandCtx<'_>, restart_instance: F) -> bool
+where
+    F: Fn(&Path, &str) -> Result<(), String>,
+{
     let parts: Vec<&str> = cmd.trim().splitn(3, ' ').collect();
     if parts.is_empty() {
         return false;
@@ -368,10 +408,11 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                 tracing::warn!(name = %inst_name, error = %e, "failed to write fleet.yaml");
             }
             let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
-            let pane_result = if let Some(resolved) =
-                fleet.as_ref().and_then(|f| f.resolve_instance(&inst_name))
+            let pane_result = match fleet
+                .as_ref()
+                .map(|f| f.resolve_instance_checked(&inst_name))
             {
-                super::pane_factory::create_pane_from_resolved(
+                Some(Ok(Some(resolved))) => super::pane_factory::create_pane_from_resolved(
                     &inst_name,
                     &resolved,
                     ctx.layout,
@@ -382,26 +423,28 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     ctx.wakeup_tx,
                     ctx.name_counter,
                     crate::backend::SpawnMode::Fresh,
-                )
-            } else {
-                let (command, submit_key) = super::pane_factory::resolve_backend(backend_name);
-                super::pane_factory::create_pane(
-                    ctx.layout,
-                    ctx.registry,
-                    ctx.home,
-                    &inst_name,
-                    &command,
-                    &[],
-                    crate::backend::SpawnMode::Fresh,
-                    None,
-                    &HashMap::new(),
-                    &submit_key,
-                    pc,
-                    pr,
-                    ctx.wakeup_tx,
-                    ctx.name_counter,
-                    super::pane_factory::SpawnIdentity::Managed,
-                )
+                ),
+                Some(Err(error)) => Err(anyhow::Error::new(error)),
+                Some(Ok(None)) | None => {
+                    let (command, submit_key) = super::pane_factory::resolve_backend(backend_name);
+                    super::pane_factory::create_pane(
+                        ctx.layout,
+                        ctx.registry,
+                        ctx.home,
+                        &inst_name,
+                        &command,
+                        &[],
+                        crate::backend::SpawnMode::Fresh,
+                        None,
+                        &HashMap::new(),
+                        &submit_key,
+                        pc,
+                        pr,
+                        ctx.wakeup_tx,
+                        ctx.name_counter,
+                        super::pane_factory::SpawnIdentity::Managed,
+                    )
+                }
             };
             match pane_result {
                 Ok(pane) => {
@@ -441,7 +484,7 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     let _ = crate::fleet::remove_instance_from_yaml(ctx.home, &fleet_name);
                 }
                 super::kill_agent(ctx.home, ctx.registry, name);
-                super::tui_events::remove_agent_pane(name, ctx.layout);
+                remove_agent_pane(name, ctx.layout);
                 return true;
             }
         }
@@ -456,18 +499,23 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                 // Single pass: find pane info, fleet name, and location
                 #[allow(clippy::type_complexity)]
                 let mut pane_info: Option<(
-                    String,
+                    Option<String>,
                     Option<PathBuf>,
                     Option<String>,
                     Option<String>,
+                    bool,
+                    Option<crate::types::InstanceRef>,
                 )> = None;
                 let mut pane_loc: Option<(usize, usize)> = None;
                 'outer: for (ti, tab) in ctx.layout.tabs.iter().enumerate() {
                     for id in tab.root().pane_ids() {
                         if let Some(p) = tab.root().find_pane(id) {
                             if p.agent_name.as_str() == name {
+                                let is_remote =
+                                    matches!(&p.source, crate::layout::PaneSource::Remote(_, _));
                                 let cmd = match &p.backend {
-                                    Some(b) => b.preset().command.to_string(),
+                                    Some(b) => Some(b.preset().command.to_string()),
+                                    None if is_remote => None,
                                     None => {
                                         tracing::warn!(agent = name, "cannot restart shell pane");
                                         break 'outer;
@@ -478,6 +526,8 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                                     p.working_dir.clone(),
                                     p.display_name.clone(),
                                     p.fleet_instance_name.clone(),
+                                    is_remote,
+                                    p.instance_ref,
                                 ));
                                 pane_loc = Some((ti, id));
                                 break 'outer;
@@ -486,7 +536,57 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                     }
                 }
 
-                if let Some((backend_cmd, work_dir, display_name, fleet_name)) = pane_info {
+                if let Some((backend_cmd, work_dir, display_name, fleet_name, is_remote, old_ref)) =
+                    pane_info
+                {
+                    if is_remote {
+                        let Some(fleet_name) = fleet_name.as_deref() else {
+                            tracing::warn!(
+                                agent = name,
+                                "cannot restart remote pane without fleet instance identity"
+                            );
+                            return false;
+                        };
+                        if let Some(restart_tx) = ctx.restart_tx {
+                            let request = RemoteRestartRequest {
+                                restart_id: crate::types::InstanceId::new().full(),
+                                old_instance_ref: old_ref,
+                                tab_index: pane_loc.map(|(tab_idx, _)| tab_idx).unwrap_or(0),
+                                pane_id: pane_loc.map(|(_, pane_id)| pane_id).unwrap_or(0),
+                                name: fleet_name.to_string(),
+                            };
+                            if restart_tx.try_send(request).is_err() {
+                                tracing::warn!(
+                                    agent = name,
+                                    fleet_instance = fleet_name,
+                                    "remote restart queue is full or stopped"
+                                );
+                            }
+                        } else {
+                            match restart_instance(ctx.home, fleet_name) {
+                                Ok(()) => {
+                                    tracing::info!(
+                                        agent = name,
+                                        fleet_instance = fleet_name,
+                                        "requested daemon-owned remote restart"
+                                    );
+                                }
+                                Err(error) => {
+                                    tracing::error!(
+                                        agent = name,
+                                        fleet_instance = fleet_name,
+                                        error = %error,
+                                        "daemon-owned remote restart failed"
+                                    );
+                                }
+                            }
+                        }
+                        return false;
+                    }
+
+                    let Some(backend_cmd) = backend_cmd else {
+                        return false;
+                    };
                     super::kill_agent(ctx.home, ctx.registry, &name);
 
                     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
@@ -498,43 +598,45 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
                         // Fleet agent — resolve from fleet.yaml (full config)
                         let fleet_path = crate::fleet::fleet_yaml_path(ctx.home);
                         let fleet = crate::fleet::FleetConfig::load(&fleet_path).ok();
-                        if let Some(resolved) =
-                            fleet.as_ref().and_then(|f| f.resolve_instance(fname))
-                        {
-                            super::pane_factory::create_pane_from_resolved(
-                                fname,
-                                &resolved,
-                                ctx.layout,
-                                ctx.registry,
-                                ctx.home,
-                                pc,
-                                pr,
-                                ctx.wakeup_tx,
-                                ctx.name_counter,
-                                crate::backend::SpawnMode::Resume,
-                            )
-                        } else {
-                            let (command, submit_key) =
-                                super::pane_factory::resolve_backend(&backend_cmd);
-                            super::pane_factory::create_pane(
-                                ctx.layout,
-                                ctx.registry,
-                                ctx.home,
-                                &name,
-                                &command,
-                                &[],
-                                // Fleet resolve failed — no resume metadata,
-                                // so start fresh rather than guess.
-                                crate::backend::SpawnMode::Fresh,
-                                work_dir.as_deref(),
-                                &HashMap::new(),
-                                &submit_key,
-                                pc,
-                                pr,
-                                ctx.wakeup_tx,
-                                ctx.name_counter,
-                                super::pane_factory::SpawnIdentity::Managed,
-                            )
+                        match fleet.as_ref().map(|f| f.resolve_instance_checked(fname)) {
+                            Some(Ok(Some(resolved))) => {
+                                super::pane_factory::create_pane_from_resolved(
+                                    fname,
+                                    &resolved,
+                                    ctx.layout,
+                                    ctx.registry,
+                                    ctx.home,
+                                    pc,
+                                    pr,
+                                    ctx.wakeup_tx,
+                                    ctx.name_counter,
+                                    crate::backend::SpawnMode::Resume,
+                                )
+                            }
+                            Some(Err(error)) => Err(anyhow::Error::new(error)),
+                            Some(Ok(None)) | None => {
+                                let (command, submit_key) =
+                                    super::pane_factory::resolve_backend(&backend_cmd);
+                                super::pane_factory::create_pane(
+                                    ctx.layout,
+                                    ctx.registry,
+                                    ctx.home,
+                                    &name,
+                                    &command,
+                                    &[],
+                                    // Fleet resolve failed — no resume metadata,
+                                    // so start fresh rather than guess.
+                                    crate::backend::SpawnMode::Fresh,
+                                    work_dir.as_deref(),
+                                    &HashMap::new(),
+                                    &submit_key,
+                                    pc,
+                                    pr,
+                                    ctx.wakeup_tx,
+                                    ctx.name_counter,
+                                    super::pane_factory::SpawnIdentity::Managed,
+                                )
+                            }
                         }
                     } else {
                         let (command, submit_key) =
@@ -603,6 +705,10 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
             tab.apply_layout(preset);
             return true;
         }
+        // #3631: handled by the command-palette overlay (`is_arrange_command`)
+        // so the Organizer preview/undo runs against live TUI state. Reaching
+        // here headlessly is a no-op — never mutate the layout without a preview.
+        "arrange" => return false,
         "send" => {
             if parts.len() >= 3
                 && !agent::send_to_registry(ctx.registry, ctx.home, "user", parts[1], parts[2])
@@ -631,6 +737,24 @@ pub(super) fn execute(cmd: &str, ctx: &mut CommandCtx<'_>) -> bool {
         }
     }
     false
+}
+
+fn remove_agent_pane(name: &str, layout: &mut Layout) {
+    loop {
+        let target = layout.tabs.iter().enumerate().find_map(|(tab_idx, tab)| {
+            tab.root()
+                .find_pane_id_by_agent(name)
+                .map(|pane_id| (tab_idx, pane_id))
+        });
+        let Some((tab_idx, pane_id)) = target else {
+            break;
+        };
+        if layout.tabs[tab_idx].root().pane_count() <= 1 {
+            layout.close_tab(tab_idx);
+        } else {
+            layout.tabs[tab_idx].close_pane_by_id(pane_id);
+        }
+    }
 }
 
 /// Handle `:config get <key>` / `:config set <key> <value>` / `:config list`.
@@ -708,12 +832,14 @@ mod tests {
         Pane {
             agent_name: agent.into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: fleet_name.map(String::from),
@@ -725,6 +851,112 @@ mod tests {
             offthread: None,
             _fwd_cancel: None,
         }
+    }
+
+    fn remote_test_pane(id: usize, agent: &str, fleet_name: &str) -> (Pane, std::net::TcpStream) {
+        use std::net::{TcpListener, TcpStream};
+        let listener = TcpListener::bind((crate::ipc::LOOPBACK, 0)).expect("bind test bridge");
+        let client_stream = TcpStream::connect(listener.local_addr().expect("listener addr"))
+            .expect("connect test bridge");
+        let (server_stream, _) = listener.accept().expect("accept test bridge");
+        let client = crate::bridge_client::BridgeClient::from_stream_for_test(client_stream);
+        let mut pane = test_pane(id, agent, Some(fleet_name));
+        pane.source = PaneSource::Remote(
+            std::sync::Arc::new(parking_lot::Mutex::new(client)),
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        );
+        (pane, server_stream)
+    }
+
+    /// RED for #3642: the real command dispatcher must hand a daemon-owned
+    /// Remote pane to the daemon, even when the local pane has no backend.
+    #[test]
+    fn tui_restart_remote_real_command_entry_uses_daemon_authority() {
+        let registry = empty_registry();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut layout = Layout::new();
+        let (remote, _server) = remote_test_pane(7, "agent", "fleet-agent");
+        layout.add_tab(Tab::new("agent".to_string(), remote));
+        let mut name_counter = HashMap::new();
+        let mut ctx = CommandCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: Path::new("/home"),
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            restart_tx: None,
+        };
+        let calls = std::sync::Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let calls_for_restart = std::sync::Arc::clone(&calls);
+
+        let resized = execute_with_restart("restart agent", &mut ctx, move |_home, name| {
+            calls_for_restart.lock().push(name.to_string());
+            Ok(())
+        });
+
+        assert!(
+            !resized,
+            "daemon restart does not replace the layout locally"
+        );
+        assert_eq!(&*calls.lock(), &["fleet-agent"]);
+        assert_eq!(layout.tabs.len(), 1);
+        let pane = layout.tabs[0]
+            .root()
+            .find_pane(7)
+            .expect("remote pane retained until daemon roster refresh");
+        assert!(matches!(pane.source, PaneSource::Remote(_, _)));
+    }
+
+    #[test]
+    fn tui_restart_remote_rpc_failure_keeps_existing_pane() {
+        let registry = empty_registry();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut layout = Layout::new();
+        let (remote, _server) = remote_test_pane(8, "agent", "fleet-agent");
+        layout.add_tab(Tab::new("agent".to_string(), remote));
+        let mut name_counter = HashMap::new();
+        let mut ctx = CommandCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: Path::new("/home"),
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            restart_tx: None,
+        };
+
+        let resized = execute_with_restart("restart agent", &mut ctx, |_home, _name| {
+            Err("daemon unavailable".to_string())
+        });
+
+        assert!(!resized);
+        assert_eq!(layout.tabs.len(), 1);
+        assert!(layout.tabs[0].root().find_pane(8).is_some());
+        assert!(layout.tabs[0]
+            .root()
+            .find_pane(8)
+            .is_some_and(|pane| matches!(pane.source, PaneSource::Remote(_, _))));
+    }
+
+    #[test]
+    fn remove_agent_pane_closes_single_pane_tab() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("opencode".into(), test_pane(1, "opencode", None)));
+        layout.add_tab(Tab::new("kiro".into(), test_pane(2, "kiro", None)));
+
+        remove_agent_pane("opencode", &mut layout);
+
+        assert_eq!(layout.tabs.len(), 1, "single-pane tab should be removed");
+        assert_eq!(layout.tabs[0].name, "kiro");
+    }
+
+    #[test]
+    fn remove_agent_pane_noop_when_agent_missing() {
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("kiro".into(), test_pane(1, "kiro", None)));
+
+        remove_agent_pane("ghost", &mut layout);
+
+        assert_eq!(layout.tabs.len(), 1);
     }
 
     #[test]
@@ -755,6 +987,76 @@ mod tests {
         let mut layout = Layout::new();
         layout.add_tab(Tab::new("t".to_string(), test_pane(1, "dev", None)));
         assert_eq!(lookup_fleet_name(&layout, "dev"), None);
+    }
+
+    #[test]
+    fn palette_spawn_missing_default_env_source_does_not_create_pane_3540_r2() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-command-missing-env-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "defaults:\n  env:\n    DESTINATION_TOKEN:\n      from_env: AGEND_TEST_MISSING_COMMAND_ENV_3540_R2\ninstances: {}\n",
+        )
+        .expect("fleet");
+        let mut layout = Layout::new();
+        let registry = empty_registry();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let mut ctx = CommandCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            restart_tx: None,
+        };
+
+        assert!(!execute(
+            "spawn blocked agend-test-missing-command-3540-r2",
+            &mut ctx
+        ));
+        assert!(layout.tabs.is_empty());
+        assert!(crate::agent::lock_registry(&registry).is_empty());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn tui_restart_remote_command_entry_enqueues_correlated_request_3649() {
+        let registry = empty_registry();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let (restart_tx, restart_rx) = crossbeam_channel::bounded(1);
+        let mut layout = Layout::new();
+        let (mut remote, _server) = remote_test_pane(9, "agent", "fleet-agent");
+        remote.instance_ref = Some(crate::types::InstanceRef::new(
+            crate::types::InstanceId::new(),
+            7,
+        ));
+        layout.add_tab(Tab::new("agent".to_string(), remote));
+        let mut name_counter = HashMap::new();
+        let mut ctx = CommandCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: Path::new("/home"),
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            restart_tx: Some(&restart_tx),
+        };
+
+        assert!(!execute("restart agent", &mut ctx));
+        let request = restart_rx
+            .recv_timeout(std::time::Duration::from_millis(50))
+            .expect("remote restart must be handed to the owned worker");
+        assert_eq!(request.name, "fleet-agent");
+        assert!(!request.restart_id.is_empty());
+        assert_eq!(request.old_instance_ref.map(|r| r.generation), Some(7));
+        assert_eq!((request.tab_index, request.pane_id), (0, 9));
     }
 
     #[test]
@@ -852,9 +1154,10 @@ mod tests {
     /// Source-scan, NOT live `execute` calls (`spawn`/`restart` fork real PTY
     /// processes); pure + cross-platform. Two precision measures vs a naive
     /// substring scan:
-    /// 1. Bound to the `execute` fn body (`fn execute(` → next top-level `fn`), so
-    ///    `handle_config_command`'s `Some("get")`/`Some("set")` sub-arms and the
-    ///    test module don't leak in.
+    /// 1. Bound to the command-dispatch helper's body (`fn execute_with_restart(`
+    ///    → next top-level `fn`), so the thin production entry wrapper and
+    ///    `handle_config_command`'s `Some("get")`/`Some("set")` sub-arms don't
+    ///    leak in.
     /// 2. Match a quoted keyword ONLY when immediately followed by `|` (group arm)
     ///    or `=>` (arm body). This excludes non-arm literals like
     ///    `unwrap_or(&"agent")` and `Some("get")` (both followed by `)`), which a
@@ -863,10 +1166,14 @@ mod tests {
     fn command_specs_match_execute_arms_bidirectional() {
         use std::collections::BTreeSet;
         let src = include_str!("commands.rs");
+        assert!(
+            src.contains("execute_with_restart(cmd, ctx, super::rpc::restart_instance)"),
+            "execute must delegate to the production restart authority"
+        );
         let from_execute = src
-            .split_once("fn execute(cmd:")
+            .split_once("fn execute_with_restart<")
             .map(|(_, rest)| rest)
-            .expect("execute fn must exist");
+            .expect("execute_with_restart fn must exist");
         let exec_body = from_execute
             .split_once("\nfn ")
             .map(|(body, _)| body)
@@ -906,6 +1213,7 @@ mod tests {
             ("kill", &[Agent]),
             ("restart", &[Agent]),
             ("layout", &[Preset]),
+            ("arrange", &[Free]),
             ("send", &[Agent, Free]),
             ("broadcast", &[Free]),
             ("status", &[]),

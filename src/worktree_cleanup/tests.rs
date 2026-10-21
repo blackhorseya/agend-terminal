@@ -90,6 +90,33 @@ fn write_source_repo_binding(home: &Path, agent: &str, source_repo: &Path) {
     .unwrap();
 }
 
+fn write_managed_marker(worktree: &Path, agent: &str, branch: &str) {
+    let common_dir = Command::new("git")
+        .args(["rev-parse", "--git-common-dir"])
+        .current_dir(worktree)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git common dir")
+        .stdout;
+    let common_dir = PathBuf::from(String::from_utf8_lossy(&common_dir).trim());
+    let common_dir = if common_dir.is_absolute() {
+        common_dir
+    } else {
+        worktree.join(common_dir)
+    };
+    let exclude = common_dir.join("info").join("exclude");
+    std::fs::create_dir_all(exclude.parent().unwrap()).unwrap();
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if !existing.lines().any(|line| line == ".agend-managed") {
+        std::fs::write(&exclude, format!("{existing}\n.agend-managed\n")).unwrap();
+    }
+    std::fs::write(
+        worktree.join(crate::worktree_pool::MANAGED_MARKER),
+        format!("agent={agent}\nbranch={branch}\n"),
+    )
+    .unwrap();
+}
+
 #[test]
 fn test_flag_disabled_default() {
     let _lock = ENV_LOCK.lock();
@@ -213,6 +240,35 @@ fn test_sweep_noop_when_flag_disabled() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// t-…-315 Step 2: workspace/review clones are not branch-sweep roots, while
+/// a formal repository outside the daemon home keeps the existing path.
+#[test]
+fn sweep_root_scope_excludes_daemon_workspace_and_worktrees() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("sweep-root-scope");
+    let workspace = crate::paths::workspace_dir(&home).join("agent");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let managed_worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
+        .join("agent")
+        .join("review");
+    std::fs::create_dir_all(&managed_worktree).unwrap();
+
+    assert_eq!(
+        super::sweep_root_exclusion(&home, &workspace),
+        Some("agent_workspace_or_review_clone")
+    );
+    assert_eq!(
+        super::sweep_root_exclusion(&home, &managed_worktree),
+        Some("daemon_managed_review_worktree")
+    );
+
+    let formal_repo = setup_test_repo("sweep-root-formal");
+    assert_eq!(super::sweep_root_exclusion(&home, &formal_repo), None);
+
+    std::fs::remove_dir_all(&formal_repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// PR-D6 re-target of `test_sweep_dry_run_by_default_identifies_but_does_not_delete`
 /// (a #2695 prune_live-gate test). Old contract: `PRUNE_LIVE=0` forced dry-run,
 /// so the merged worktree was REPORTED but NOT removed. New contract: the
@@ -234,6 +290,7 @@ fn sweep_ignores_retired_prune_live_and_runs_live_d6() {
         &["worktree", "add", wt.to_str().unwrap(), "feat/done"],
     );
     git_in(&repo, &["merge", "feat/done"]);
+    write_managed_marker(&wt, "done-agent", "feat/done");
 
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
     // Retired var set to its old "dry-run" value — must have NO effect now.
@@ -306,6 +363,7 @@ fn test_v2_merged_worktree_removed() {
         &["worktree", "add", wt.to_str().unwrap(), "feat/done"],
     );
     git_in(&repo, &["merge", "feat/done"]);
+    write_managed_marker(&wt, "done-agent", "feat/done");
 
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
     std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1"); // exercise real deletion
@@ -554,6 +612,7 @@ fn sweep_still_removes_when_no_binding_json_exists_at_all() {
         &["worktree", "add", wt.to_str().unwrap(), "feat/done"],
     );
     git_in(&repo, &["merge", "feat/done"]);
+    write_managed_marker(&wt, "done-agent", "feat/done");
 
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
     std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
@@ -813,6 +872,7 @@ fn test_v2_remote_gone_worktree_removed() {
         &repo,
         &["worktree", "add", wt.to_str().unwrap(), "feat/squashed"],
     );
+    write_managed_marker(&wt, "squashed-agent", "feat/squashed");
 
     // Simulate: remote branch deleted (squash-merged on GitHub)
     git_in(&remote_dir, &["branch", "-D", "feat/squashed"]);
@@ -1211,6 +1271,8 @@ fn prune_keeps_stale_idle_branch_with_active_task() {
             owner: None,
             depends_on: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
             branch: Some(branch.into()),
             due_at: None,
             routed_to: None,
@@ -1501,6 +1563,7 @@ fn remove_failure_upserts_hygiene_task_v1() {
         &["worktree", "add", wt.to_str().unwrap(), "feat/done"],
     );
     git_in(&repo, &["merge", "feat/done"]);
+    write_managed_marker(&wt, "done-agent", "feat/done");
     // Sabotage: strip write permission so the eligible worktree cannot be
     // removed (children can't be unlinked from a non-writable dir).
     std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o555)).unwrap();
@@ -1759,4 +1822,233 @@ fn terminal_candidate_still_probes_freshly_3011() {
 
     std::fs::remove_dir_all(&repo).ok();
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3583: a legacy worktree registration left behind after an agent
+/// rebind must not be mistaken for a live binding. The branch remains
+/// preserved while Git still reports it checked out, but the attempted delete
+/// must produce the explicit retained/retry hygiene reason.
+#[test]
+fn registered_legacy_worktree_without_binding_reports_delete_retry_3583() {
+    let _lock = ENV_LOCK.lock();
+    let repo = setup_test_repo("3583-rebind-legacy");
+    let branch = "feat/rebind-legacy";
+    make_old_dated_branch(&repo, branch, "2024-01-01T00:00:00 +0000");
+    git_in(&repo, &["merge", branch]);
+
+    let legacy = repo
+        .parent()
+        .unwrap()
+        .join(format!("legacy-rebind-{}", std::process::id()));
+    git_in(
+        &repo,
+        &["worktree", "add", legacy.to_str().unwrap(), branch],
+    );
+    let stale_registration = repo
+        .parent()
+        .unwrap()
+        .join(format!("legacy-rebind-gone-{}", std::process::id()));
+    std::fs::rename(&legacy, &stale_registration).expect("simulate stale registered path");
+
+    let home = tmp_home("3583-rebind-legacy");
+    let rebound = home.join("workspace").join("new-agent");
+    write_full_binding(&home, "new-agent", "feat/new", &repo, &rebound);
+    let pruned = prune_orphaned_branches_with_home(Some(&home), &repo, false);
+
+    assert!(
+        pruned.iter().all(|(name, _)| name != branch),
+        "stale registered branch must remain for retry: {pruned:?}"
+    );
+    assert!(branch_exists(&repo, branch), "branch must remain for retry");
+    let key = format!("residue-delete-failed:{}:{branch}", repo.display());
+    let tasks = hygiene_tasks(&home);
+    let (_, evidence) = tasks
+        .iter()
+        .find(|(task_key, _)| task_key == &key)
+        .unwrap_or_else(|| panic!("retained delete failure must be observable: {tasks:?}"));
+    let reason = evidence["reason"].as_str().unwrap_or("");
+    assert!(
+        reason.contains("used by worktree") || reason.contains("checked out"),
+        "retry reason must name Git's worktree registration refusal: {evidence}"
+    );
+
+    git_in(&repo, &["worktree", "prune"]);
+    let retried = prune_orphaned_branches_with_home(Some(&home), &repo, false);
+    assert!(
+        retried
+            .iter()
+            .any(|(name, reason)| { name == branch && *reason == "merged" }),
+        "the next bounded retry must converge after metadata prune: {retried:?}"
+    );
+    assert!(
+        !branch_exists(&repo, branch),
+        "retry must delete the merged branch"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ---------------------------------------------------------------------------
+// t-…-241: an episode is re-observed every sweep tick forever, so the sweep
+// must first ask whether its subject still exists. Measured on the fleet board
+// before this landed: 335 live episodes, 59 pointing at a repo or branch that
+// was gone, one counter at 4,411.
+// ---------------------------------------------------------------------------
+
+fn hygiene_key_for(repo: &Path, branch: &str) -> String {
+    format!("residue-lifecycle-blocked:{}:{branch}", repo.display())
+}
+
+fn seed_episode(home: &Path, key: &str) -> crate::task_events::TaskId {
+    crate::daemon::hygiene_task::upsert_system_hygiene_task(
+        home,
+        key,
+        "[hygiene] fixture",
+        serde_json::json!({"fixture": true}),
+    )
+    .unwrap()
+    .task_id()
+    .clone()
+}
+
+fn episode_is_open(home: &Path, task_id: &crate::task_events::TaskId) -> bool {
+    !crate::task_events::projected_state(home)
+        .unwrap()
+        .tasks
+        .get(task_id)
+        .expect("episode task must still be on the board")
+        .status
+        .is_terminal()
+}
+
+fn run_sweep(home: &Path) {
+    std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+    sweep_from_registry(home, &HashMap::new(), &[]);
+    std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+}
+
+/// RED: the branch is gone, so nobody can ever resolve this episode — close it
+/// instead of counting it again.
+#[test]
+fn hygiene_episode_closes_when_its_branch_is_gone_241() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-branch-gone");
+    let repo = setup_test_repo("hyg-branch-gone");
+    let task = seed_episode(&home, &hygiene_key_for(&repo, "feat/never-existed"));
+
+    run_sweep(&home);
+
+    assert!(
+        !episode_is_open(&home, &task),
+        "an episode whose branch no longer exists must be closed"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The reverse, and the one that matters most: 203 of the 250 live branch
+/// episodes on the fleet board point at a branch that DOES exist. Closing
+/// those would retire real, un-actioned problems in silence — strictly worse
+/// than the board noise this change is fixing.
+#[test]
+fn hygiene_episode_survives_when_its_branch_still_exists_241() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-branch-live");
+    let repo = setup_test_repo("hyg-branch-live");
+    std::process::Command::new("git")
+        .args(["-C", &repo.display().to_string(), "branch", "feat/live"])
+        .output()
+        .unwrap();
+    let task = seed_episode(&home, &hygiene_key_for(&repo, "feat/live"));
+
+    run_sweep(&home);
+
+    assert!(
+        episode_is_open(&home, &task),
+        "an episode whose branch still exists must NOT be closed"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// "Could not ask" is not "is not there". The path exists but is not a git
+/// repo, so the branch listing fails; the episode must survive. This is the
+/// exact confusion that produced the wrong diagnosis for this task — an error
+/// swallowed by `2>/dev/null`, and `wc -l` reporting 0 branches.
+#[test]
+fn hygiene_episode_survives_when_the_branch_listing_fails_241() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-unaskable");
+    let not_a_repo = tmp_home("hyg-not-a-repo");
+    std::fs::create_dir_all(&not_a_repo).unwrap();
+    let task = seed_episode(&home, &hygiene_key_for(&not_a_repo, "feat/unknowable"));
+
+    run_sweep(&home);
+
+    assert!(
+        episode_is_open(&home, &task),
+        "a branch listing that FAILED proves nothing about the branch — the \
+         episode must survive"
+    );
+    std::fs::remove_dir_all(&not_a_repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The fetch-degraded family: its subject is the repository itself, and 12 of
+/// the 14 live ones pointed at a deleted temp dir, each still re-counting
+/// every tick because `fetch --prune` fails on a path that is not there.
+#[test]
+fn hygiene_episode_closes_when_its_repository_is_gone_241() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-repo-gone");
+    let gone = tmp_home("hyg-repo-deleted");
+    std::fs::remove_dir_all(&gone).ok();
+    let task = seed_episode(&home, &format!("residue-fetch-degraded:{}", gone.display()));
+
+    run_sweep(&home);
+
+    assert!(
+        !episode_is_open(&home, &task),
+        "an episode whose repository path is gone must be closed"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// R1 F1: `Path::exists()` coerces errors to false, so a live repo behind an
+/// unreadable parent directory looked exactly like a deleted one and its
+/// episode was cancelled. `try_exists()` reports `Err` there, and only
+/// `Ok(false)` may close. Unix-only (the mode bits are the mechanism) and
+/// self-validating: if the process can still stat the path — running as root,
+/// or a filesystem that ignores mode — the premise does not hold on this
+/// machine and there is nothing to assert.
+#[cfg(unix)]
+#[test]
+fn hygiene_episode_survives_when_the_path_cannot_be_stat_ed_241() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-eacces-home");
+    let parent = tmp_home("hyg-eacces-parent");
+    let repo = parent.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let premise_holds = Path::new(&repo).try_exists().is_err();
+    if premise_holds {
+        let task = seed_episode(&home, &hygiene_key_for(&repo, "feat/unstattable"));
+        run_sweep(&home);
+        assert!(
+            episode_is_open(&home, &task),
+            "a path we could not stat proves nothing — the episode must survive"
+        );
+    }
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).ok();
+    std::fs::remove_dir_all(&parent).ok();
+    std::fs::remove_dir_all(&home).ok();
+    assert!(
+        premise_holds,
+        "setup could not produce an unstattable path (root? permissive fs?) — \
+         this machine cannot exercise the guard"
+    );
 }

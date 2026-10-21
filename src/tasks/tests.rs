@@ -1,7 +1,8 @@
 use super::acl::{can_mutate_task, is_system_identity};
 use super::orphan::{
-    build_health_response, classify_owner, release_inprogress_orphans_with_live,
-    scan_inprogress_orphans, scan_orphan_candidates, OwnerClassification,
+    build_health_response, classify_owner, plan_strict_in_review_ghosts,
+    release_inprogress_orphans_with_live, scan_inprogress_orphans, scan_orphan_candidates,
+    OwnerClassification,
 };
 use super::sweep;
 use super::*;
@@ -18,6 +19,23 @@ fn tmp_home(name: &str) -> std::path::PathBuf {
     ));
     std::fs::create_dir_all(&dir).ok();
     dir
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn fleet_list_reports_unreadable_catalog_instead_of_an_empty_board() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let home = tmp_home("fleet-list-unreadable");
+    let invalid = std::ffi::OsString::from_vec(vec![b'b', 0xff]);
+    std::fs::create_dir_all(home.join("boards").join(invalid)).unwrap();
+
+    let response = handle(
+        &home,
+        "agent",
+        &serde_json::json!({"action": "list", "scope": "fleet"}),
+    );
+    assert_eq!(response["code"], "task_catalog_unreadable");
 }
 
 /// #78445-2 (d): the central `task_terminal_cleanup` seam clears BOTH obligation
@@ -135,6 +153,7 @@ fn make_record(
         routed_to: None,
         result: None,
         superseded_by: None,
+        last_operator_settlement: None,
         branch: None,
         bind: None,
         started_at: None,
@@ -236,8 +255,8 @@ fn make_record_with_age_days(
     r
 }
 
-/// #830: status counts roll up across all 4 active states +
-/// Done/Cancelled terminals. Totals stay consistent
+/// #3584: status counts cover all statuses, including Superseded as
+/// terminal and Verified as non-terminal. Totals stay consistent
 /// (`all = non_terminal + terminal`).
 #[test]
 fn build_health_response_reports_status_counts_correctly() {
@@ -250,21 +269,47 @@ fn build_health_response_reports_status_counts_correctly() {
         make_record("t-5", TaskStatus::Blocked, None),
         make_record("t-6", TaskStatus::Done, Some("alpha")),
         make_record("t-7", TaskStatus::Cancelled, None),
+        make_record("t-8", TaskStatus::Backlog, None),
+        make_record("t-9", TaskStatus::InReview, None),
+        make_record("t-10", TaskStatus::Verified, None),
+        make_record("t-11", TaskStatus::Superseded, None),
     ]);
     let live = make_set(&["alpha"]);
     let fleet = make_set(&["alpha"]);
 
     let resp = build_health_response(&state, Some(&live), &fleet);
 
-    assert_eq!(resp["totals"]["all"], 7);
-    assert_eq!(resp["totals"]["non_terminal"], 5);
-    assert_eq!(resp["totals"]["terminal"], 2);
+    assert_eq!(resp["totals"]["all"], 11);
+    assert_eq!(resp["totals"]["non_terminal"], 8);
+    assert_eq!(resp["totals"]["terminal"], 3);
     assert_eq!(resp["by_status"]["open"], 2);
     assert_eq!(resp["by_status"]["claimed"], 1);
     assert_eq!(resp["by_status"]["in_progress"], 1);
     assert_eq!(resp["by_status"]["blocked"], 1);
     assert_eq!(resp["by_status"]["done"], 1);
     assert_eq!(resp["by_status"]["cancelled"], 1);
+    assert_eq!(resp["by_status"]["backlog"], 1);
+    assert_eq!(resp["by_status"]["in_review"], 1);
+    assert_eq!(resp["by_status"]["verified"], 1);
+    assert_eq!(resp["by_status"]["superseded"], 1);
+}
+
+#[test]
+fn build_health_response_age_excludes_superseded_but_includes_verified() {
+    use crate::task_events::TaskStatus;
+    let state = make_state(vec![
+        make_record_with_age_days("old-superseded", TaskStatus::Superseded, None, 120),
+        make_record_with_age_days("pending-verified", TaskStatus::Verified, None, 45),
+    ]);
+    let fleet = make_set(&[]);
+    let resp = build_health_response(&state, Some(&fleet), &fleet);
+
+    assert_eq!(resp["totals"]["terminal"], 1);
+    assert_eq!(resp["totals"]["non_terminal"], 1);
+    assert_eq!(resp["age"]["oldest_non_terminal_days"], 45);
+    assert_eq!(resp["age"]["median_non_terminal_days"], 45);
+    assert_eq!(resp["age"]["over_30d_count"], 1);
+    assert_eq!(resp["age"]["over_90d_count"], 0);
 }
 
 /// #830: a clean board (no ghosts, no stale claims, low age,
@@ -458,6 +503,8 @@ fn reconcile_orphan_owners_with_live_empty_set_orphans_strict_ghost() {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         }],
     )
     .expect("seed Created event");
@@ -490,6 +537,138 @@ fn reconcile_orphan_owners_with_live_empty_set_orphans_strict_ghost() {
     );
 
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3584 regression: boot ghost-owner recovery covers every authoritative
+/// board, not only the default board. The pre-fix entrypoint read and wrote
+/// through the home-default task-event wrappers, so a strict ghost on an
+/// explicit project board survived despite the aggregate health scan seeing it.
+#[test]
+fn reconcile_orphan_owners_with_live_covers_explicit_board() {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let home = tmp_home("reconcile_explicit_board");
+    let board = crate::task_events::board_root(&home, "owner/repo");
+    let emitter = InstanceName::from("test:seed");
+    let tid = TaskId("t-ghost-explicit-board".into());
+    crate::task_events::append_batch_at(
+        &board,
+        &emitter,
+        vec![TaskEvent::Created {
+            task_id: tid.clone(),
+            title: "ghost-owned explicit-board task".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: Some(InstanceName::from("gone-explicit-owner")),
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: None,
+            bind: None,
+            eta_secs: None,
+            tags: vec![],
+            parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
+        }],
+    )
+    .expect("seed explicit-board task");
+
+    reconcile_orphan_owners_with_live(&home, &std::collections::HashSet::new());
+
+    let post = crate::task_events::projected_state_at(&board).expect("explicit board replay");
+    assert!(
+        post.tasks
+            .get(&tid)
+            .and_then(|record| record.owner.as_ref())
+            .is_none(),
+        "strict ghost owner on explicit board must be cleared (got {:?})",
+        post.tasks
+            .get(&tid)
+            .and_then(|record| record.owner.as_ref())
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn reconcile_mixed_owner_does_not_orphan_in_review_task() {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let home = tmp_home("reconcile_mixed_owner_in_review");
+    let owner = InstanceName::from("ghost-mixed");
+    let review_id = TaskId("t-review-mixed".into());
+    let open_id = TaskId("t-open-mixed".into());
+    let created = |task_id: TaskId| TaskEvent::Created {
+        task_id,
+        title: "mixed owner task".into(),
+        description: String::new(),
+        priority: "normal".into(),
+        owner: Some(owner.clone()),
+        due_at: None,
+        depends_on: Vec::new(),
+        routed_to: None,
+        branch: None,
+        bind: None,
+        eta_secs: None,
+        tags: vec![],
+        parent_id: None,
+        governing_decision_id: None,
+        review_class: None,
+    };
+    crate::task_events::append_batch(
+        &home,
+        &InstanceName::from("test:mixed_owner"),
+        vec![
+            created(review_id.clone()),
+            created(open_id.clone()),
+            TaskEvent::MovedToReview {
+                task_id: review_id.clone(),
+            },
+        ],
+    )
+    .expect("seed mixed-owner tasks");
+
+    let state = crate::task_events::replay(&home).expect("replay mixed-owner tasks");
+    let scan = scan_orphan_candidates(
+        &state,
+        &std::collections::HashSet::new(),
+        &std::collections::HashSet::new(),
+    );
+    assert_eq!(
+        scan.strict.get(owner.0.as_str()),
+        Some(&vec![open_id.clone()]),
+        "InReview ghost-owner candidates must stay report-only and out of auto-orphan input"
+    );
+
+    reconcile_orphan_owners_with_live(&home, &std::collections::HashSet::new());
+
+    let state = crate::task_events::replay(&home).expect("replay mixed-owner tasks");
+    assert!(state.tasks[&review_id].owner.is_some());
+    assert!(state.tasks[&open_id].owner.is_none());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn strict_in_review_ghost_planner_is_report_only_and_fresh() {
+    use crate::task_events::TaskStatus;
+    let state = make_state(vec![
+        make_record("t-review", TaskStatus::InReview, Some("ghost-h2")),
+        make_record("t-open", TaskStatus::Open, Some("ghost-h2")),
+    ]);
+    let live = make_set(&[]);
+    let fleet = make_set(&[]);
+    let none = std::collections::HashSet::new();
+
+    let report = plan_strict_in_review_ghosts(&state, &live, &fleet, false, &none, "");
+    assert_eq!(report["dry_run"], true);
+    assert_eq!(report["candidate_ids"], serde_json::json!(["t-review"]));
+    assert_eq!(report["total_candidates"], 1);
+
+    let mut confirmed = std::collections::HashSet::new();
+    confirmed.insert("t-review".to_string());
+    let rejected =
+        plan_strict_in_review_ghosts(&state, &live, &fleet, true, &confirmed, "operator review");
+    assert_eq!(rejected["code"], "report_only_policy");
+    assert_eq!(rejected["mutation"], "none");
 }
 
 // ── Boot orphan sweep (task t-20260526155509233515-8) ──
@@ -586,6 +765,8 @@ fn release_inprogress_orphans_releases_to_open_and_clears_owner() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             TaskEvent::Claimed {
                 task_id: tid.clone(),
@@ -662,6 +843,8 @@ fn release_inprogress_orphans_preserves_exact_signed_binding() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             TaskEvent::Claimed {
                 task_id: tid.clone(),
@@ -1322,7 +1505,7 @@ fn test_concurrent_creates_unique_ids() {
         .into_iter()
         .map(|h| {
             let r = h.join().expect("thread");
-            assert_eq!(r["status"], "created");
+            assert_eq!(r["status"], "created", "unexpected create response: {r}");
             r["id"].as_str().expect("id").to_string()
         })
         .collect();
@@ -1335,6 +1518,90 @@ fn test_concurrent_creates_unique_ids() {
     let tasks = list_all(&home);
     assert_eq!(tasks.len(), 20);
     std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3716 regression: a durable append must not become visible to a concurrent
+/// catalog commit before the writer has applied that same envelope in memory.
+/// The test-only seam drops the event-log lock after fsync and pauses the first
+/// writer. The unfixed path lets the second writer append from a stale catalog
+/// ordering snapshot, then the first writer fails its catalog apply as
+/// `OutOfOrder`.
+#[test]
+fn concurrent_creates_serialize_catalog_apply_after_durable_append_3716() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    let home = tmp_home("concurrent-catalog-order-key");
+    let first_durable = mpsc::channel();
+    let release_first = mpsc::channel();
+    let second_durable = mpsc::channel();
+    let hook_count = std::sync::Arc::new(AtomicUsize::new(0));
+    let hook_count_for_hook = std::sync::Arc::clone(&hook_count);
+    let (first_durable_tx, first_durable_rx) = first_durable;
+    let (release_first_tx, release_first_rx) = release_first;
+    let (second_durable_tx, second_durable_rx) = second_durable;
+    let release_first_rx = std::sync::Arc::new(std::sync::Mutex::new(release_first_rx));
+    let release_first_rx_for_hook = std::sync::Arc::clone(&release_first_rx);
+    crate::task_events::catalog::install_after_durable_append_hook_for_test(&home, move |_| {
+        if hook_count_for_hook.fetch_add(1, Ordering::SeqCst) == 0 {
+            first_durable_tx
+                .send(())
+                .expect("first durable append observer");
+            release_first_rx_for_hook
+                .lock()
+                .unwrap()
+                .recv()
+                .expect("release first writer");
+        } else {
+            second_durable_tx
+                .send(())
+                .expect("second durable append observer");
+        }
+    });
+
+    let home_a = home.clone();
+    let first = std::thread::spawn(move || {
+        handle(
+            &home_a,
+            "agent-a",
+            &serde_json::json!({"action": "create", "title": "first"}),
+        )
+    });
+    first_durable_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("first writer must pause after durable append");
+
+    let home_b = home.clone();
+    let second = std::thread::spawn(move || {
+        handle(
+            &home_b,
+            "agent-b",
+            &serde_json::json!({"action": "create", "title": "second"}),
+        )
+    });
+    let second_reached_durable_before_first_applied = second_durable_rx
+        .recv_timeout(Duration::from_millis(250))
+        .is_ok();
+
+    release_first_tx.send(()).expect("release first writer");
+    let first_result = first.join().expect("first create");
+    let second_result = second.join().expect("second create");
+
+    assert!(
+        !second_reached_durable_before_first_applied,
+        "second writer reached durable append while first catalog apply was paused: first={first_result} second={second_result}"
+    );
+    assert_eq!(
+        first_result["status"], "created",
+        "first create: {first_result}"
+    );
+    assert_eq!(
+        second_result["status"], "created",
+        "second create: {second_result}"
+    );
+    assert_eq!(list_all(&home).len(), 2);
+    std::fs::remove_dir_all(home).ok();
 }
 
 #[test]
@@ -1667,6 +1934,8 @@ fn d63_legacy_migration_blocked_survives_satisfied_deps() {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -1746,6 +2015,8 @@ fn d63_non_open_statuses_with_unmet_dep_pass_through() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
         )
         .unwrap();
@@ -2440,6 +2711,8 @@ fn test_circular_dep_no_infinite_loop() {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -2460,6 +2733,8 @@ fn test_circular_dep_no_infinite_loop() {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -3135,6 +3410,385 @@ fn fleet_read_failure_denies_mutation_fail_closed_2117_p3a() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3511: assignment crosses boards; settlement did not. A row created on board
+/// A and assigned to an agent whose project is board B was closable by NOBODY —
+/// the assignee cleared the ownership ACL but was stopped by board isolation,
+/// while everyone on board A cleared board isolation but was stopped by the
+/// ownership ACL. Each gate is right on its own; their intersection is a
+/// deadlock that only the operator could break. A row that NAMES you is your
+/// own tail to collect, wherever it lives.
+#[test]
+fn owner_settles_own_cross_board_row_3511() {
+    let home = tmp_home("3511-owner-settles");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"
+instances:
+  devA:
+    backend: claude
+  devB:
+    backend: claude
+teams:
+  teamA:
+    members:
+      - devA
+    source_repo: /repos/orgA/projA
+  teamB:
+    members:
+      - devB
+    source_repo: /repos/orgB/projB
+"#,
+    )
+    .unwrap();
+
+    // devA (projA) creates the row on ITS OWN board and assigns it across — the
+    // shape every cross-board dispatch has.
+    let t = handle(
+        &home,
+        "devA",
+        &serde_json::json!({
+            "action": "create", "title": "cross-board dispatch", "assignee": "devB"
+        }),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(
+        super::list_all_at(&home, &crate::task_events::board_root(&home, "orgA_projA"))
+            .into_iter()
+            .any(|x| x.id == t),
+        "precondition: the row must live on the CREATOR's board (projA), not the owner's"
+    );
+
+    // The other half of the deadlock, asserted so it stays closed: the creator
+    // is ON the row's board but is NOT its owner, so the ownership ACL refuses.
+    // #3511 does not touch that gate.
+    let creator_denied = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "update", "id": &t, "status": "cancelled"}),
+    );
+    assert!(
+        creator_denied["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not authorized"),
+        "creator is not the owner — ownership ACL must still refuse: {creator_denied}"
+    );
+
+    // RED before the fix: the owner acts on board B, so board isolation denied
+    // it and the row could never reach a terminal status.
+    let settled = handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "update", "id": &t, "status": "cancelled"}),
+    );
+    assert!(
+        settled.get("error").is_none(),
+        "the row's own assignee must be able to settle it across boards: {settled}"
+    );
+    assert_eq!(
+        super::list_all_at(&home, &crate::task_events::board_root(&home, "orgA_projA"))
+            .into_iter()
+            .find(|x| x.id == t)
+            .unwrap()
+            .status,
+        crate::task_events::TaskStatus::Cancelled,
+        "settlement must actually land on the row's own board"
+    );
+
+    // The same must hold for `done`, the other settlement verb. A second row,
+    // because a task can only be settled once.
+    let t2 = handle(
+        &home,
+        "devA",
+        &serde_json::json!({
+            "action": "create", "title": "second cross-board dispatch", "assignee": "devB"
+        }),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let done = handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "done", "id": &t2, "result": "settled by its owner"}),
+    );
+    assert!(
+        done.get("error").is_none(),
+        "the row's own assignee must be able to `done` it across boards: {done}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3511 negative control — the exception is EXACTLY "the caller is this row's
+/// own assignee", not a relaxation of board isolation. A cross-board third party
+/// who is neither owner nor creator must still be refused on every mutation
+/// path, and an UNASSIGNED row must stay unreachable from another board (no
+/// owner ⇒ no exception ⇒ the boundary is the only authority). Without this,
+/// #3511 trades a deadlock for a hole.
+#[test]
+fn cross_board_third_party_still_denied_3511() {
+    let home = tmp_home("3511-third-party-denied");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"
+instances:
+  devA:
+    backend: claude
+  devB:
+    backend: claude
+  devC:
+    backend: claude
+teams:
+  teamA:
+    members:
+      - devA
+    source_repo: /repos/orgA/projA
+  teamB:
+    members:
+      - devB
+    source_repo: /repos/orgB/projB
+  teamC:
+    members:
+      - devC
+    source_repo: /repos/orgC/projC
+"#,
+    )
+    .unwrap();
+
+    // A row on board A that names devA — someone else's work, from B and C's
+    // point of view.
+    let owned_by_a = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "create", "title": "A's own work", "assignee": "devA"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A row on board A that names nobody.
+    let unassigned = handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "create", "title": "nobody's work"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    for caller in ["devB", "devC"] {
+        for action in ["done", "update", "claim"] {
+            for id in [&owned_by_a, &unassigned] {
+                let denied = handle(
+                    &home,
+                    caller,
+                    &serde_json::json!({"action": action, "id": id, "status": "blocked"}),
+                );
+                assert!(
+                    denied["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("cross-board mutation denied"),
+                    "{caller} is neither owner nor creator of {id} — {action} must stay \
+                     denied cross-board (#3511 must not widen board isolation): {denied}"
+                );
+            }
+        }
+    }
+
+    // Nothing moved: both rows are still Open on board A.
+    let board_a = super::list_all_at(&home, &crate::task_events::board_root(&home, "orgA_projA"));
+    for id in [&owned_by_a, &unassigned] {
+        assert_eq!(
+            board_a.iter().find(|x| &x.id == id).unwrap().status,
+            crate::task_events::TaskStatus::Open,
+            "a denied cross-board mutation must not change the row ({id})"
+        );
+    }
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3511 — the exception is SETTLEMENT-only, not general write authority.
+///
+/// This mirrors the review probe that rejected the first version of the fix: a
+/// cross-board owner sent `update` with nothing but `priority=urgent` and it
+/// went through, changing the authoritative record on a board the caller does
+/// not act on. `update` is the general mutation verb — priority, assignee,
+/// description, tags and result all ride the same call — so handing it the owner
+/// unconditionally turned "close your own tail" into a write channel into
+/// another board. `assignee` is the sharper case: it hands the work away.
+///
+/// A pure `status=cancelled` must still pass, and a cancellation carrying ANY
+/// other field must not — otherwise a real mutation rides along with a genuine
+/// settlement.
+#[test]
+fn cross_board_owner_cannot_make_general_updates_3511() {
+    let home = tmp_home("3511-settlement-only");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        r#"
+instances:
+  devA:
+    backend: claude
+  devB:
+    backend: claude
+  devC:
+    backend: claude
+teams:
+  teamA:
+    members:
+      - devA
+    source_repo: /repos/orgA/projA
+  teamB:
+    members:
+      - devB
+    source_repo: /repos/orgB/projB
+  teamC:
+    members:
+      - devC
+    source_repo: /repos/orgC/projC
+"#,
+    )
+    .unwrap();
+
+    let make_row = |title: &str| {
+        handle(
+            &home,
+            "devA",
+            &serde_json::json!({"action": "create", "title": title, "assignee": "devB"}),
+        )["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let row = make_row("owned across the boundary");
+
+    // Every one of these is a general mutation, not a settlement. devB owns the
+    // row, so the ownership ACL would accept it — board isolation is the only
+    // thing standing between a cross-board owner and someone else's board.
+    let general_updates = [
+        serde_json::json!({"action": "update", "id": &row, "priority": "urgent"}),
+        serde_json::json!({"action": "update", "id": &row, "assignee": "devC"}),
+        serde_json::json!({"action": "update", "id": &row, "description": "rewritten"}),
+        serde_json::json!({"action": "update", "id": &row, "tags": ["hijacked"]}),
+        serde_json::json!({"action": "update", "id": &row, "result": "not settled"}),
+        serde_json::json!({"action": "update", "id": &row, "status": "in_progress"}),
+        // A real mutation smuggled alongside a genuine cancellation.
+        serde_json::json!({
+            "action": "update", "id": &row, "status": "cancelled", "priority": "urgent"
+        }),
+    ];
+    for args in &general_updates {
+        let denied = handle(&home, "devB", args);
+        assert!(
+            denied["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cross-board mutation denied"),
+            "a cross-board owner must not make general updates on another board's row \
+             ({args}): {denied}"
+        );
+    }
+
+    // Nothing leaked through: the authoritative record on board A is untouched.
+    let after = super::list_all_at(&home, &crate::task_events::board_root(&home, "orgA_projA"))
+        .into_iter()
+        .find(|x| x.id == row)
+        .unwrap();
+    assert_eq!(
+        after.priority,
+        crate::task_events::TaskPriority::Normal,
+        "the review probe's exact case: priority must not have changed"
+    );
+    assert_eq!(
+        after.assignee.as_deref(),
+        Some("devB"),
+        "the row must not have been handed to a third party"
+    );
+    assert_eq!(
+        after.status,
+        crate::task_events::TaskStatus::Open,
+        "no denied update may move the row"
+    );
+
+    // The settlement the exception exists for still works, alone.
+    let settled = handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "update", "id": &row, "status": "cancelled"}),
+    );
+    assert!(
+        settled.get("error").is_none(),
+        "a pure cancellation by the row's own assignee must still pass: {settled}"
+    );
+
+    // …and so does `done`, which is terminal by construction.
+    let row2 = make_row("second row");
+    let done = handle(
+        &home,
+        "devB",
+        &serde_json::json!({"action": "done", "id": &row2, "result": "settled by its owner"}),
+    );
+    assert!(
+        done.get("error").is_none(),
+        "`done` by the row's own assignee must still pass: {done}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3511 fail-closed pin. `can_mutate_on_board` returns `false` for two very
+/// different states: a resolved cross-board mismatch, and a HARD fleet.yaml read
+/// failure where the caller's authority is simply unknown (#2133's deliberate
+/// fail-CLOSED hardening). The owner exception may override the first and must
+/// never override the second. The caller here is the row's OWN assignee — the
+/// exact identity the exception serves — so this is the sharpest place it could
+/// leak. `fleet_read_failure_denies_mutation_fail_closed_2117_p3a` also covers
+/// this incidentally; this one says so by name, so nobody unpins it by editing
+/// that test for #2133 reasons.
+#[test]
+fn owner_exception_does_not_bypass_fail_closed_3511() {
+    let home = tmp_home("3511-fail-closed-pin");
+    write_fleet_yaml(&home, &["dev"]);
+    let t = handle(
+        &home,
+        "dev",
+        &serde_json::json!({"action": "create", "title": "t", "assignee": "dev"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // File PRESENT but unparseable → `try_load_fleet` = Err, not the missing-file
+    // Ok(default) path, so the caller's project cannot be resolved at all.
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "{{{ not: : valid yaml ][",
+    )
+    .unwrap();
+
+    for action in ["done", "update"] {
+        let denied = handle(
+            &home,
+            "dev",
+            &serde_json::json!({"action": action, "id": &t, "status": "cancelled"}),
+        );
+        assert!(
+            denied["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("cross-board mutation denied"),
+            "the #3511 owner exception must not fire while the fleet is unreadable \
+             ({action}): {denied}"
+        );
+    }
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 fn test_claim_unknown_instance_rejected() {
     let home = tmp_home("claim-unknown");
@@ -3555,32 +4209,8 @@ fn test_list_done_filter_returns_all() {
         &serde_json::json!({"action": "done", "id": id2, "result": "ok"}),
     );
 
-    // #1608b: backdate id1 on the REAL event-sourced path. The `list` handler
-    // reads `updated_at` from `task_events::replay` (the LATEST envelope's
-    // timestamp), NOT `tasks.json` (which no read path consults) — so the old
-    // `mutate_versioned(tasks.json)` backdate had zero effect and this test
-    // could not fail for the regression it guards (#1614 fiction-test class).
-    // Rewrite id1's envelopes in `task_events.jsonl` with a 15-day-old timestamp.
-    {
-        let path = home.join("task_events.jsonl");
-        let content = std::fs::read_to_string(&path).unwrap();
-        let old = (chrono::Utc::now() - chrono::Duration::days(15)).to_rfc3339();
-        let rewritten = content
-            .lines()
-            .map(|line| {
-                let mut v: serde_json::Value = serde_json::from_str(line).unwrap();
-                if v["event"]["task_id"] == serde_json::json!(id1) {
-                    v["timestamp"] = serde_json::json!(old);
-                }
-                serde_json::to_string(&v).unwrap()
-            })
-            .collect::<Vec<_>>()
-            .join("\n");
-        std::fs::write(&path, format!("{rewritten}\n")).unwrap();
-    }
-
-    // Explicit filter_status=done returns ALL done tasks regardless of age (id1
-    // is now genuinely aged past the 14-day done-TTL on the replay path).
+    // Explicit filter_status=done returns all done tasks. The age boundary needs
+    // hand-crafted envelopes before catalog bootstrap; see the cutover note above.
     let listed = handle(
         &home,
         "a",
@@ -3882,20 +4512,20 @@ fn task_done_accepts_clean_squash_merged_branch_but_rejects_real_work() {
 
     let runtime = crate::paths::runtime_dir(&home).join("dev");
     std::fs::create_dir_all(&runtime).unwrap();
-    std::fs::write(
-        runtime.join("binding.json"),
-        serde_json::to_vec(&serde_json::json!({
-            "version": 1,
-            "agent": "dev",
-            "task_id": task_id,
-            "branch": branch,
-            "worktree": repo,
-            "source_repo": repo,
-            "issued_at": "2026-07-30T00:00:00Z",
-        }))
-        .unwrap(),
-    )
+    let binding_body = serde_json::to_vec(&serde_json::json!({
+        "version": 1,
+        "agent": "dev",
+        "task_id": task_id,
+        "branch": branch,
+        "worktree": repo,
+        "source_repo": repo,
+        "issued_at": "2026-07-30T00:00:00Z",
+    }))
     .unwrap();
+    std::fs::write(runtime.join("binding.json"), &binding_body).unwrap();
+    let binding_signature =
+        agentic_git_core::integrity_core::sign_binding(&home, &binding_body).unwrap();
+    std::fs::write(runtime.join("binding.json.sig"), binding_signature).unwrap();
 
     let ahead = {
         let _scm = crate::scm::set_test_scm_provider(crate::scm::MockScmProvider::with_pr_list(
@@ -4251,16 +4881,114 @@ fn task_done_cleans_post_lease_empty_init_commits() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-// ── #808 ghost-owner ACL deadlock: auto-orphan + force flag tests ──
+// ── Public task force denial (#808 cleanup) ──
+
+fn protected_force_store_bytes(home: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut paths = vec![
+        (
+            "task_events.jsonl".to_string(),
+            home.join("task_events.jsonl"),
+        ),
+        (
+            "task_events_seq.json".to_string(),
+            home.join("task_events_seq.json"),
+        ),
+        ("event-log.jsonl".to_string(), home.join("event-log.jsonl")),
+        (
+            "dispatch_tracking.json".to_string(),
+            crate::store::store_path(home, "dispatch_tracking.json"),
+        ),
+    ];
+    if let Ok(entries) = std::fs::read_dir(home.join("dispatch_idle")) {
+        paths.extend(entries.flatten().filter_map(|entry| {
+            let path = entry.path();
+            path.is_file()
+                .then(|| (path.strip_prefix(home).unwrap().display().to_string(), path))
+        }));
+    }
+    paths.sort_by(|(left, _), (right, _)| left.cmp(right));
+    paths
+        .into_iter()
+        .filter_map(|(label, path)| std::fs::read(path).ok().map(|bytes| (label, bytes)))
+        .collect()
+}
+
+fn seed_protected_force_stores(home: &std::path::Path) {
+    std::fs::create_dir_all(home.join("dispatch_idle")).unwrap();
+    for (path, contents) in [
+        ("task_events.jsonl", b"task-event-sentinel\n".as_slice()),
+        ("task_events_seq.json", b"task-seq-sentinel\n".as_slice()),
+        ("event-log.jsonl", b"audit-sentinel\n".as_slice()),
+        ("dispatch_tracking.json", b"dispatch-sentinel\n".as_slice()),
+        (
+            "dispatch_idle/pending.json",
+            b"dispatch-idle-sentinel\n".as_slice(),
+        ),
+    ] {
+        std::fs::write(home.join(path), contents).unwrap();
+    }
+}
 
 #[test]
-fn test_ghost_owner_update_without_force_errors_with_acl() {
-    // Baseline regression: today operator cannot cancel a task
-    // whose owner is no longer in the fleet (ghost-owner ACL
-    // deadlock the issue describes). The #808 force flag must NOT
-    // change this behavior when force=false / absent — the ACL
-    // gate stays load-bearing so accidental cancels still require
-    // an explicit force opt-in.
+fn test_public_force_rejected_before_route_or_protected_write() {
+    let home = tmp_home("public-force-boundary");
+    seed_protected_force_stores(&home);
+    let before = protected_force_store_bytes(&home);
+
+    for action in ["update", "done"] {
+        let r = handle(
+            &home,
+            "forged-operator",
+            &serde_json::json!({
+                "action": action,
+                "id": "t-does-not-exist",
+                "status": "cancelled",
+                "force": true,
+                "force_reason": "public boundary probe",
+            }),
+        );
+        assert_eq!(
+            r["code"], "force_not_supported",
+            "{action} force must be rejected at the public boundary: {r}"
+        );
+        assert!(
+            !r["error"].as_str().unwrap_or("").contains("not found"),
+            "force denial must precede task route/existence lookup: {r}"
+        );
+    }
+    assert_eq!(
+        protected_force_store_bytes(&home),
+        before,
+        "repeated public force denial must leave protected stores byte-identical"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_public_force_denial_is_identity_independent() {
+    let home = tmp_home("public-force-identities");
+    for caller in ["owner", "creator", "orchestrator", "forged-operator", ""] {
+        let r = handle(
+            &home,
+            caller,
+            &serde_json::json!({
+                "action": "update",
+                "id": "t-does-not-exist",
+                "status": "cancelled",
+                "force": true,
+                "force_reason": "identity probe",
+            }),
+        );
+        assert_eq!(
+            r["code"], "force_not_supported",
+            "caller identity must not authorize public force: {caller:?} → {r}"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_force_false_preserves_ghost_owner_acl() {
     let home = tmp_home("ghost_acl_baseline");
     write_fleet_yaml(&home, &["operator"]);
     let r = handle(
@@ -4280,6 +5008,7 @@ fn test_ghost_owner_update_without_force_errors_with_acl() {
             "action": "update",
             "id": id,
             "status": "cancelled",
+            "force": false,
         }),
     );
     assert!(
@@ -4293,53 +5022,27 @@ fn test_ghost_owner_update_without_force_errors_with_acl() {
 }
 
 #[test]
-fn test_force_update_true_without_force_reason_rejected() {
-    // Force-flag contract (mirrors comms.rs:200-218): force=true
-    // without a non-empty force_reason must surface a validator
-    // error, NOT fall through to ACL or succeed silently. The
-    // grammar match is "force_reason" (the validator message names
-    // the missing field) — pre-fix the handler ignores force and
-    // returns the regular ACL error, so this test is RED until C2
-    // ships.
+fn test_public_force_update_without_reason_rejected() {
     let home = tmp_home("force_no_reason");
-    write_fleet_yaml(&home, &["operator"]);
-    let r = handle(
-        &home,
-        "operator",
-        &serde_json::json!({
-            "action": "create",
-            "title": "stuck",
-            "assignee": "ghost-instance",
-        }),
-    );
-    let id = r["id"].as_str().expect("id").to_string();
     let r = handle(
         &home,
         "operator",
         &serde_json::json!({
             "action": "update",
-            "id": id,
+            "id": "t-does-not-exist",
             "status": "cancelled",
             "force": true,
         }),
     );
-    assert!(
-        r["error"]
-            .as_str()
-            .map(|e| e.contains("force_reason"))
-            .unwrap_or(false),
-        "force=true without force_reason must surface validator error, got: {r}"
+    assert_eq!(
+        r["code"], "force_not_supported",
+        "force=true is denied regardless of force_reason: {r}"
     );
     std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]
-fn test_force_update_with_reason_cancels_ghost_and_logs_audit() {
-    // GREEN test 1: force=true + non-empty force_reason on
-    // `action=update status=cancelled` bypasses the ACL gate AND
-    // pushes a `task_force_update` entry into event-log.jsonl
-    // (cross-board audit) AND embeds the force_reason into the
-    // per-task event's reason field (per-task replay audit).
+fn test_public_force_update_with_reason_is_rejected() {
     let home = tmp_home("force_cancel_ghost");
     write_fleet_yaml(&home, &["operator"]);
     let r = handle(
@@ -4352,6 +5055,7 @@ fn test_force_update_with_reason_cancels_ghost_and_logs_audit() {
         }),
     );
     let id = r["id"].as_str().expect("id").to_string();
+    let before = protected_force_store_bytes(&home);
     let r = handle(
         &home,
         "operator",
@@ -4364,45 +5068,24 @@ fn test_force_update_with_reason_cancels_ghost_and_logs_audit() {
         }),
     );
     assert_eq!(
-        r["status"], "updated",
-        "force=true + force_reason must succeed despite ghost owner, got: {r}"
+        r["code"], "force_not_supported",
+        "public force=true + force_reason must be rejected: {r}"
     );
-    let tasks = list_all(&home);
-    let t = tasks
-        .iter()
-        .find(|t| t.id == id)
-        .expect("task still present");
     assert_eq!(
-        t.status,
-        crate::task_events::TaskStatus::Cancelled,
-        "task must be cancelled"
+        protected_force_store_bytes(&home),
+        before,
+        "rejected public force must not write audit or protected stores"
     );
-    // Cross-board audit: event-log.jsonl records the force action.
-    let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
-    assert!(
-        log.contains("task_force_update"),
-        "event-log.jsonl must record task_force_update entry, got: {log}"
-    );
-    assert!(
-        log.contains("post-#808 board hygiene"),
-        "event-log.jsonl must capture the force_reason, got: {log}"
-    );
-    // Per-task replay audit: the Cancelled event's reason field
-    // carries the forced marker.
-    let task_log = std::fs::read_to_string(home.join("task_events.jsonl")).unwrap_or_default();
-    assert!(
-        task_log.contains("forced by 'operator'"),
-        "Cancelled event reason must carry forced marker, got: {task_log}"
-    );
+    let task = list_all(&home)
+        .into_iter()
+        .find(|task| task.id == id)
+        .expect("task still present");
+    assert_eq!(task.status, crate::task_events::TaskStatus::Open);
     std::fs::remove_dir_all(&home).ok();
 }
 
 #[test]
-fn test_force_done_with_reason_succeeds_on_done_arm() {
-    // BONUS test (mandatory per dispatch spec): force flag must
-    // also gate the `action=done` arm — operators sometimes close
-    // ghost-owned tasks as Done rather than Cancelled when the
-    // work was effectively completed before the owner disbanded.
+fn test_public_force_done_with_reason_is_rejected() {
     let home = tmp_home("force_done_ghost");
     write_fleet_yaml(&home, &["operator"]);
     let r = handle(
@@ -4415,21 +5098,7 @@ fn test_force_done_with_reason_succeeds_on_done_arm() {
         }),
     );
     let id = r["id"].as_str().expect("id").to_string();
-    // Without force, the done arm rejects (mirrors RED1 behavior).
-    let r_blocked = handle(
-        &home,
-        "operator",
-        &serde_json::json!({"action": "done", "id": id}),
-    );
-    assert!(
-        r_blocked["error"]
-            .as_str()
-            .map(|e| e.contains("not authorized"))
-            .unwrap_or(false),
-        "done arm without force must reject ghost-owned task, got: {r_blocked}"
-    );
-    // With force + reason, the done arm proceeds and event-log
-    // records the cross-board audit (task_force_done).
+    let before = protected_force_store_bytes(&home);
     let r = handle(
         &home,
         "operator",
@@ -4442,13 +5111,21 @@ fn test_force_done_with_reason_succeeds_on_done_arm() {
         }),
     );
     assert_eq!(
-        r["status"], "done",
-        "force=true done must succeed, got: {r}"
+        r["code"], "force_not_supported",
+        "public force=true done must be rejected: {r}"
     );
-    let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
     assert!(
-        log.contains("task_force_done"),
-        "event-log.jsonl must record task_force_done entry, got: {log}"
+        list_all(&home)
+            .into_iter()
+            .find(|task| task.id == id)
+            .map(|task| task.status == crate::task_events::TaskStatus::Open)
+            .unwrap_or(false),
+        "rejected force done must leave task open"
+    );
+    assert_eq!(
+        protected_force_store_bytes(&home),
+        before,
+        "rejected public force done must not write audit or protected stores"
     );
     std::fs::remove_dir_all(&home).ok();
 }
@@ -4654,6 +5331,42 @@ fn stub_issue_lookup(repo: &str, num: u32) -> Result<sweep::IssueState, String> 
 }
 
 #[test]
+fn task_sweep_fails_closed_for_incomplete_board_enumeration() {
+    let home = tmp_home("sweep-incomplete-board-enumeration");
+    // A path occupying `boards/` makes the authoritative board enumeration
+    // fail before any board can be proven absent. The checked route must
+    // expose that error; the sweep must not turn it into an empty plan.
+    std::fs::write(home.join("boards"), "not a directory").unwrap();
+    assert!(
+        crate::tasks::board_router::list_all_boards_checked(&home).is_err(),
+        "fixture must make checked board enumeration fail"
+    );
+
+    let live = std::collections::HashSet::new();
+    for args in [
+        serde_json::json!({"action": "sweep"}),
+        serde_json::json!({
+            "action": "sweep",
+            "apply": true,
+            "confirm_ids": ["t-not-proven"],
+            "audit_reason": "fail-closed board enumeration regression",
+        }),
+    ] {
+        let response = handle_with_live_instances(&home, "agent", &args, &live);
+        assert_eq!(
+            response["code"], "task_catalog_unreadable",
+            "incomplete board enumeration must fail closed for {args}, got {response}"
+        );
+        assert_ne!(
+            response["dry_run"], true,
+            "unreadable board enumeration must never produce a successful dry-run"
+        );
+    }
+    std::fs::remove_file(home.join("boards")).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn test_sweep_scan_identifies_team_disbanded_category() {
     // GREEN 2: scan_categories puts tasks owned by instances NOT
     // in live_instances AND aged > 30d into the team_disbanded
@@ -4670,7 +5383,8 @@ fn test_sweep_scan_identifies_team_disbanded_category() {
     let task_id = r["id"].as_str().expect("id").to_string();
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(60);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     assert_eq!(
         cats.team_disbanded.len(),
         1,
@@ -4682,6 +5396,394 @@ fn test_sweep_scan_identifies_team_disbanded_category() {
     assert!(cats.shipped.is_empty());
     assert!(cats.superseded.is_empty());
     assert!(cats.validation_leftovers.is_empty());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_public_handler_fails_closed_when_live_authority_unavailable() {
+    let home = tmp_home("sweep_owner_authority_unavailable");
+    write_fleet_yaml(&home, &["alive"]);
+    let created = handle(
+        &home,
+        "alive",
+        &serde_json::json!({
+            "action": "create",
+            "title": "old ghost work",
+            "assignee": "ghost"
+        }),
+    );
+    let id = created["id"].as_str().expect("id").to_string();
+    let response = handle(&home, "alive", &serde_json::json!({"action": "sweep"}));
+    assert_eq!(
+        response["dry_run"], true,
+        "sweep should still report non-owner categories"
+    );
+    assert_eq!(
+        response["owner_authority"]["available"], false,
+        "authority outage must be explicit"
+    );
+    assert!(
+        !response["candidate_ids"]
+            .as_array()
+            .expect("candidate ids")
+            .iter()
+            .any(|candidate| candidate.as_str() == Some(&id)),
+        "unavailable authority must never admit owner-derived candidates: {response}"
+    );
+    assert!(
+        response["categories"]["team_disbanded"]
+            .as_array()
+            .expect("team_disbanded")
+            .is_empty(),
+        "unavailable authority must not populate team_disbanded: {response}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_runtime_entry_configured_offline_is_report_only() {
+    let home = tmp_home("sweep_configured_offline");
+    write_fleet_yaml(&home, &["alive", "ghost"]);
+    let created = handle(
+        &home,
+        "alive",
+        &serde_json::json!({
+            "action": "create",
+            "title": "configured but offline work",
+            "assignee": "ghost"
+        }),
+    );
+    let id = created["id"].as_str().expect("id").to_string();
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let response = handle_with_live_instances(
+        &home,
+        "alive",
+        &serde_json::json!({"action": "sweep"}),
+        &live,
+    );
+    assert_eq!(
+        response["dry_run"], true,
+        "sweep should return a dry-run plan"
+    );
+    assert!(
+        response["categories"]["team_disbanded"]
+            .as_array()
+            .expect("team_disbanded")
+            .is_empty(),
+        "configured-but-offline owner must not be apply-capable: {response}"
+    );
+    assert!(
+        response["categories"]["owner_report_only"]
+            .as_array()
+            .expect("owner_report_only")
+            .iter()
+            .any(|candidate| candidate["id"].as_str() == Some(&id)),
+        "configured-but-offline owner must remain visible as report-only: {response}"
+    );
+    assert!(
+        !response["candidate_ids"]
+            .as_array()
+            .expect("candidate ids")
+            .iter()
+            .any(|candidate| candidate.as_str() == Some(&id)),
+        "report-only owner must not enter apply ids: {response}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_strict_ghost_with_open_or_unknown_ref_is_report_only() {
+    for (suffix, title) in [
+        ("open", "ghost work PR #100"),
+        ("unknown", "ghost work PR #404"),
+    ] {
+        let home = tmp_home(&format!("sweep_strict_live_ref_{suffix}"));
+        write_fleet_yaml(&home, &["alive"]);
+        let created = handle(
+            &home,
+            "alive",
+            &serde_json::json!({"action": "create", "title": title, "assignee": "ghost"}),
+        );
+        let id = created["id"].as_str().expect("id").to_string();
+        let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+        let authority =
+            sweep::OwnerAuthority::available(live, ["alive".to_string()].into_iter().collect());
+        let now = chrono::Utc::now() + chrono::Duration::days(60);
+        let categories = sweep::scan_categories_with_authority(
+            &home,
+            &authority,
+            &stub_pr_lookup,
+            &stub_issue_lookup,
+            Some("test/repo"),
+            now,
+        )
+        .expect("scan categories");
+        assert!(
+            !categories.all_ids().contains(&id),
+            "strict owner with {suffix} live ref must not be apply-capable: {categories:?}"
+        );
+        assert!(
+            categories
+                .owner_report_only
+                .iter()
+                .any(|candidate| candidate.id == id),
+            "strict owner with {suffix} live ref must remain report-only: {categories:?}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+}
+
+#[test]
+fn test_sweep_strict_ghost_in_review_is_report_only() {
+    let home = tmp_home("sweep_strict_in_review");
+    write_fleet_yaml(&home, &["alive"]);
+    let created = handle(
+        &home,
+        "alive",
+        &serde_json::json!({
+            "action": "create",
+            "title": "ghost review work",
+            "assignee": "ghost"
+        }),
+    );
+    let id = created["id"].as_str().expect("id").to_string();
+    let claimed = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    assert!(
+        claimed.get("error").is_none(),
+        "setup claim failed: {claimed}"
+    );
+    let updated = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action": "update", "id": id, "status": "in_review"}),
+    );
+    assert!(
+        updated.get("error").is_none(),
+        "setup review transition failed: {updated}"
+    );
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let authority =
+        sweep::OwnerAuthority::available(live, ["alive".to_string()].into_iter().collect());
+    let now = chrono::Utc::now() + chrono::Duration::days(60);
+    let categories = sweep::scan_categories_with_authority(
+        &home,
+        &authority,
+        &stub_pr_lookup,
+        &stub_issue_lookup,
+        None,
+        now,
+    )
+    .expect("scan categories");
+    assert!(
+        categories.all_ids().is_empty(),
+        "InReview strict ghost must not be apply-capable: {categories:?}"
+    );
+    assert!(
+        categories
+            .owner_report_only
+            .iter()
+            .any(|candidate| candidate.id == id),
+        "InReview strict ghost must be report-only: {categories:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_in_review_validation_residue_is_report_only() {
+    let home = tmp_home("sweep_in_review_validation");
+    write_fleet_yaml(&home, &["alive"]);
+    let open = handle(
+        &home,
+        "alive",
+        &serde_json::json!({
+            "action": "create",
+            "title": "test/open validation residue"
+        }),
+    );
+    let open_id = open["id"].as_str().expect("open id").to_string();
+    let review = handle(
+        &home,
+        "alive",
+        &serde_json::json!({
+            "action": "create",
+            "title": "test/review validation residue",
+            "assignee": "alive"
+        }),
+    );
+    let review_id = review["id"].as_str().expect("review id").to_string();
+    let claimed = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action": "claim", "id": review_id}),
+    );
+    assert!(
+        claimed.get("error").is_none(),
+        "setup claim failed: {claimed}"
+    );
+    let updated = handle(
+        &home,
+        "alive",
+        &serde_json::json!({"action": "update", "id": review_id, "status": "in_review"}),
+    );
+    assert!(
+        updated.get("error").is_none(),
+        "setup review transition failed: {updated}"
+    );
+
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(60);
+    let categories =
+        sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+            .expect("scan categories");
+
+    assert!(
+        categories
+            .validation_leftovers
+            .iter()
+            .any(|candidate| candidate.id == open_id),
+        "open validation residue should remain an apply-capable validation leftover: {categories:?}"
+    );
+    assert!(
+        !categories
+            .validation_leftovers
+            .iter()
+            .any(|candidate| candidate.id == review_id),
+        "InReview validation residue must not enter validation_leftovers: {categories:?}"
+    );
+    assert!(
+        categories
+            .stale_nonterminal
+            .iter()
+            .any(|candidate| candidate.id == review_id),
+        "InReview validation residue should remain report-only stale residue: {categories:?}"
+    );
+    assert!(
+        !categories.all_ids().contains(&review_id),
+        "InReview validation residue must stay out of apply ids: {categories:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_nondefault_route_residue_is_reported() {
+    let home = tmp_home("sweep_replacement_nondefault_route");
+    cross_board_fleet(&home);
+    let task_id = create_on(&home, "devA", "route residue", &[]);
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "claim", "id": task_id}),
+    );
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "update", "id": task_id, "status": "in_review"}),
+    );
+    let live: std::collections::HashSet<String> = ["devA".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(60);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
+    let report = cats.as_json();
+    let residue = report["stale_nonterminal"]
+        .as_array()
+        .expect("stale_nonterminal report bucket");
+    assert_eq!(residue.len(), 1);
+    assert_eq!(residue[0]["project_route"], "orgA_projA");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_scan_reports_stale_nonterminal_residue_without_apply_ids() {
+    let home = tmp_home("sweep_nonterminal_residue");
+    write_fleet_yaml(&home, &["alive"]);
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let statuses = ["claimed", "in_progress", "in_review", "blocked"];
+    for status in statuses {
+        let created = handle(
+            &home,
+            "alive",
+            &serde_json::json!({
+                "action": "create",
+                "title": format!("residue {status} PR #101"),
+                "assignee": "alive",
+                "branch": "feature/residue",
+                "due_at": "2026-01-01T00:00:00Z"
+            }),
+        );
+        let id = created["id"].as_str().expect("id");
+        handle(
+            &home,
+            "alive",
+            &serde_json::json!({"action":"claim", "id":id}),
+        );
+        if status != "claimed" {
+            handle(
+                &home,
+                "alive",
+                &serde_json::json!({"action":"update", "id":id, "status":status}),
+            );
+        }
+    }
+    let now = chrono::Utc::now() + chrono::Duration::days(60);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
+    assert_eq!(cats.stale_nonterminal.len(), statuses.len());
+    assert!(
+        cats.all_ids().is_empty(),
+        "residue must not enter cancellation IDs"
+    );
+    let candidate = &cats.stale_nonterminal[0];
+    assert_eq!(candidate.owner.as_deref(), Some("alive"));
+    assert_eq!(candidate.branch.as_deref(), Some("feature/residue"));
+    assert_eq!(candidate.project_route.as_deref(), Some("default"));
+    assert_eq!(
+        candidate.due_at.as_deref(),
+        Some("2026-01-01T00:00:00+00:00")
+    );
+    assert_eq!(candidate.refs, vec!["PR #101"]);
+    assert!(!candidate.last_activity.is_empty());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn test_sweep_in_review_closed_pr_stays_report_only_on_nondefault_route() {
+    let home = tmp_home("sweep_in_review_closed_pr_nondefault");
+    cross_board_fleet(&home);
+    let task_id = create_on(&home, "devA", "review residue PR #998", &[]);
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "claim", "id": task_id}),
+    );
+    handle(
+        &home,
+        "devA",
+        &serde_json::json!({"action": "update", "id": task_id, "status": "in_review"}),
+    );
+    let live: std::collections::HashSet<String> = ["devA".to_string()].into_iter().collect();
+    let now = chrono::Utc::now() + chrono::Duration::days(60);
+    let cats = sweep::scan_categories(
+        &home,
+        &live,
+        &stub_pr_lookup,
+        &stub_issue_lookup,
+        Some("test/repo"),
+        now,
+    )
+    .expect("scan categories");
+
+    assert!(cats.superseded.is_empty());
+    assert_eq!(cats.stale_nonterminal.len(), 1);
+    assert_eq!(cats.stale_nonterminal[0].id, task_id);
+    assert_eq!(
+        cats.stale_nonterminal[0].project_route.as_deref(),
+        Some("orgA_projA")
+    );
+    assert!(cats.all_ids().is_empty());
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -4715,7 +5817,8 @@ fn test_sweep_scan_identifies_shipped_via_pr_lookup_stub() {
         &stub_issue_lookup,
         Some("test/repo"),
         now,
-    );
+    )
+    .expect("scan categories");
     assert_eq!(
         cats.shipped.len(),
         1,
@@ -4756,6 +5859,388 @@ fn test_sweep_handler_dry_run_returns_categorized_plan() {
         "shipped slot present"
     );
     assert!(r["candidate_ids"].is_array(), "candidate_ids array present");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+fn write_manual_sweep_provenance(home: &std::path::Path, project: &str, repo: &str) {
+    std::fs::write(
+        home.join("task_sweep_provenance.json"),
+        serde_json::json!({
+            "entries": [{
+                "project_id": project,
+                "repo": repo,
+                "api_base": "https://api.github.com",
+                "observed_at": "2026-01-01T00:00:00Z",
+                "config_generation": 1,
+                "legacy_since": null,
+                "retired_at": null,
+                "retirement_reason": null,
+            }],
+            "next_generation": 1,
+        })
+        .to_string(),
+    )
+    .unwrap();
+}
+
+#[test]
+fn manual_sweep_repository_scope_excludes_foreign_board_candidates_3584() {
+    let home = tmp_home("3584-repository-scope");
+    write_fleet_yaml(&home, &["alive"]);
+    crate::daemon::task_sweep::handle_task_sweep_config(
+        &home,
+        &serde_json::json!({"repository": "test/repo"}),
+    );
+    write_manual_sweep_provenance(&home, "default", "test/repo");
+
+    let default_id = create_open_task(&home, "shipped PR #999");
+    let foreign_id = handle(
+        &home,
+        "alive",
+        &serde_json::json!({
+            "action": "create",
+            "title": "foreign shipped PR #999",
+            "assignee": "alive",
+            "project": "foreign-board"
+        }),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let scope =
+        crate::daemon::task_sweep::resolve_manual_sweep_repository_scope(&home, "test/repo");
+    assert_eq!(scope.projects, vec!["default"]);
+    assert!(scope.diagnostics.is_empty(), "scope: {scope:?}");
+
+    let scoped_projects: std::collections::BTreeSet<String> =
+        scope.projects.iter().cloned().collect();
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let categories = sweep::scan_categories_with_authority_scoped(
+        &home,
+        &sweep::OwnerAuthority::available(live, ["alive".to_string()].into_iter().collect()),
+        &stub_pr_lookup,
+        &stub_issue_lookup,
+        Some("test/repo"),
+        Some(&scoped_projects),
+        chrono::Utc::now() + chrono::Duration::days(60),
+    )
+    .unwrap();
+    assert!(categories.all_ids().contains(&default_id));
+    assert!(!categories.all_ids().contains(&foreign_id));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn manual_sweep_repository_scope_reports_baseline_and_provider_failures_3584() {
+    let home = tmp_home("3584-repository-diagnostics");
+    write_fleet_yaml(&home, &["alive"]);
+    crate::daemon::task_sweep::handle_task_sweep_config(
+        &home,
+        &serde_json::json!({"repository": "test/repo"}),
+    );
+    let _id = create_open_task(&home, "baseline PR #999");
+    let scope =
+        crate::daemon::task_sweep::resolve_manual_sweep_repository_scope(&home, "test/repo");
+    assert_eq!(scope.projects, Vec::<String>::new());
+    assert_eq!(scope.diagnostics[0].code, "BASELINE_UNVERIFIED");
+
+    write_manual_sweep_provenance(&home, "default", "test/repo");
+    let scoped_projects: std::collections::BTreeSet<String> =
+        ["default".to_string()].into_iter().collect();
+    let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
+    let provider_error =
+        |_: &str, _: u32| -> Result<sweep::PrState, String> { Err("provider offline".to_string()) };
+    let categories = sweep::scan_categories_with_authority_scoped(
+        &home,
+        &sweep::OwnerAuthority::available(live, ["alive".to_string()].into_iter().collect()),
+        &provider_error,
+        &stub_issue_lookup,
+        Some("test/repo"),
+        Some(&scoped_projects),
+        chrono::Utc::now() + chrono::Duration::days(60),
+    )
+    .unwrap();
+    assert!(categories.all_ids().is_empty());
+    assert_eq!(categories.diagnostics[0]["code"], "PROVIDER_UNAVAILABLE");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn manual_sweep_repository_scope_reports_named_board_without_mapping_3584() {
+    let home = tmp_home("3584-manual-unmapped");
+    let created = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "create",
+            "title": "named board task",
+            "project": "manual/board"
+        }),
+    );
+    assert!(created["id"].as_str().is_some());
+    let scope =
+        crate::daemon::task_sweep::resolve_manual_sweep_repository_scope(&home, "manual/board");
+    assert!(scope.projects.is_empty());
+    assert_eq!(scope.diagnostics[0].code, "MANUAL_UNMAPPED");
+    assert!(scope.diagnostics[0].repository.is_none());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn manual_sweep_rejects_foreign_confirm_id_before_emit_3584() {
+    let home = tmp_home("3584-foreign-confirm");
+    write_fleet_yaml(&home, &["alive"]);
+    crate::daemon::task_sweep::handle_task_sweep_config(
+        &home,
+        &serde_json::json!({"repository": "test/repo"}),
+    );
+    write_manual_sweep_provenance(&home, "default", "test/repo");
+    let foreign_id = handle(
+        &home,
+        "alive",
+        &serde_json::json!({
+            "action": "create",
+            "title": "foreign task",
+            "assignee": "alive",
+            "project": "foreign-board"
+        }),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let response = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "sweep",
+            "apply": true,
+            "confirm_ids": [foreign_id],
+            "audit_reason": "scope fence fixture"
+        }),
+    );
+    assert_eq!(response["code"], "repository_scope_confirm_id_out_of_scope");
+    assert_eq!(response["foreign_confirm_ids"][0], foreign_id);
+    let foreign = list_all_at(
+        &home,
+        &crate::task_events::board_root(&home, "foreign-board"),
+    )
+    .into_iter()
+    .find(|task| task.id == foreign_id)
+    .unwrap();
+    assert_eq!(foreign.status, crate::task_events::TaskStatus::Open);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+fn backdate_task_event_for_sweep(home: &std::path::Path, task_id: &str, days: i64) {
+    let path = home.join("task_events.jsonl");
+    let past = (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339();
+    let mut changed = false;
+    let rewritten = std::fs::read_to_string(&path)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            let mut value: serde_json::Value = serde_json::from_str(line).unwrap();
+            let event_task_id = value["event"]["task_id"].as_str();
+            if event_task_id == Some(task_id) {
+                value["timestamp"] = serde_json::json!(past);
+                changed = true;
+                serde_json::to_string(&value).unwrap()
+            } else {
+                line.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(changed, "task event fixture must contain {task_id}");
+    std::fs::write(path, format!("{}\n", rewritten)).unwrap();
+    crate::task_events::catalog::rebuild_for_test(home);
+}
+
+#[test]
+fn manual_sweep_rejects_repository_claim_change_before_emit_3584() {
+    let home = tmp_home("3584-scope-toctou");
+    let repo_a = home.join("repo-a");
+    let repo_b = home.join("repo-b");
+    init_git_repo_with_origin(&repo_a, "https://github.com/test/repo.git");
+    init_git_repo_with_origin(&repo_b, "https://github.com/other/repo.git");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  alive:\n    backend: claude\nteams:\n  sweep:\n    members: [alive]\n    source_repo: {}\n    project_id: default\n",
+            repo_a.display()
+        ),
+    )
+    .unwrap();
+    crate::daemon::task_sweep::handle_task_sweep_config(
+        &home,
+        &serde_json::json!({"repository": "test/repo"}),
+    );
+    write_manual_sweep_provenance(&home, "default", "test/repo");
+    let task_id = handle(
+        &home,
+        "operator",
+        &serde_json::json!({"action": "create", "title": "stale unreferenced task"}),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    backdate_task_event_for_sweep(&home, &task_id, 30);
+    let dry = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "sweep",
+            "repository": "test/repo"
+        }),
+    );
+    assert!(
+        dry["candidate_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&task_id))),
+        "stale fixture must be a candidate: {dry}"
+    );
+
+    let repo_b = repo_b.clone();
+    let home_for_hook = home.clone();
+    super::set_before_manual_sweep_repository_scope_hook_for_test(move || {
+        let response = crate::teams::update(
+            &home_for_hook,
+            &serde_json::json!({
+                "name": "sweep",
+                "repository_path": repo_b,
+            }),
+        );
+        assert!(
+            response["error"].is_null(),
+            "claim mutation failed: {response}"
+        );
+    });
+
+    let response = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "sweep",
+            "repository": "test/repo",
+            "apply": true,
+            "confirm_ids": [task_id],
+            "audit_reason": "scope authority TOCTOU regression"
+        }),
+    );
+    assert_eq!(
+        response["code"], "repository_scope_changed",
+        "response: {response}"
+    );
+    let task = list_all_at(&home, &crate::task_events::board_root(&home, "default"))
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .unwrap();
+    assert_eq!(
+        task.status,
+        crate::task_events::TaskStatus::Open,
+        "mapping change must prevent a stale-scope cancellation"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn manual_sweep_stable_repository_claim_can_apply_3584() {
+    let home = tmp_home("3584-scope-stable-apply");
+    let repo = home.join("repo");
+    init_git_repo_with_origin(&repo, "https://github.com/test/repo.git");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  alive:\n    backend: claude\nteams:\n  sweep:\n    members: [alive]\n    source_repo: {}\n    project_id: default\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    crate::daemon::task_sweep::handle_task_sweep_config(
+        &home,
+        &serde_json::json!({"repository": "test/repo"}),
+    );
+    write_manual_sweep_provenance(&home, "default", "test/repo");
+    let task_id = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "create",
+            "title": "stable stale unreferenced task"
+        }),
+    )["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    backdate_task_event_for_sweep(&home, &task_id, 30);
+    let dry = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "sweep",
+            "repository": "test/repo"
+        }),
+    );
+    assert!(
+        dry["candidate_ids"]
+            .as_array()
+            .is_some_and(|ids| ids.iter().any(|id| id.as_str() == Some(&task_id))),
+        "stable stale fixture must be a candidate: {dry}"
+    );
+
+    let response = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "sweep",
+            "repository": "test/repo",
+            "apply": true,
+            "confirm_ids": [task_id],
+            "audit_reason": "stable scope apply regression"
+        }),
+    );
+    assert_eq!(response["applied"], 1, "response: {response}");
+    let task = list_all_at(&home, &crate::task_events::board_root(&home, "default"))
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .unwrap();
+    assert_eq!(task.status, crate::task_events::TaskStatus::Cancelled);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+fn init_git_repo_with_origin(path: &std::path::Path, origin: &str) {
+    std::fs::create_dir_all(path).unwrap();
+    let run = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .unwrap();
+    };
+    run(&["init", "-q", "-b", "main"]);
+    run(&["remote", "add", "origin", origin]);
+}
+
+#[test]
+fn manual_sweep_repository_scope_rejects_ambiguous_claims_3584() {
+    let home = tmp_home("3584-ambiguous-scope");
+    let repo_a = home.join("repo-a");
+    let repo_b = home.join("repo-b");
+    init_git_repo_with_origin(&repo_a, "https://github.com/org/a.git");
+    init_git_repo_with_origin(&repo_b, "https://github.com/org/b.git");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  alive:\n    backend: claude\nteams:\n  team-a:\n    members: [alive]\n    source_repo: {}\n    project_id: shared-board\n  team-b:\n    members: [alive]\n    source_repo: {}\n    project_id: shared-board\n",
+            repo_a.display(),
+            repo_b.display()
+        ),
+    )
+    .unwrap();
+    let scope = crate::daemon::task_sweep::resolve_manual_sweep_repository_scope(&home, "org/a");
+    assert!(scope.projects.is_empty());
+    assert_eq!(scope.diagnostics[0].code, "AMBIGUOUS_REPOSITORY_MAPPING");
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -4816,7 +6301,8 @@ fn test_sweep_apply_emits_cancelled_and_logs_audit() {
     let task_id = r["id"].as_str().expect("id").to_string();
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(60);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     assert_eq!(cats.team_disbanded.len(), 1);
     let confirm: std::collections::HashSet<String> = [task_id.clone()].into_iter().collect();
     let count = sweep::emit_cancelled_batch(&home, &cats, &confirm, "post-#806 sweep test fixture")
@@ -5078,7 +6564,8 @@ fn test_sweep_stale_open_all_refs_terminal_flagged() {
         &stub_issue_lookup,
         Some("test/repo"),
         now,
-    );
+    )
+    .expect("scan categories");
     assert!(
         cats.stale_open.iter().any(|c| c.id == id),
         "task with an all-terminal issue ref must be flagged stale_open, got {cats:?}"
@@ -5102,7 +6589,8 @@ fn test_sweep_stale_open_open_ref_not_flagged() {
         &stub_issue_lookup,
         Some("test/repo"),
         now,
-    );
+    )
+    .expect("scan categories");
     assert!(
         !cats.all_ids().contains(&id),
         "task with an OPEN issue ref must NOT be flagged (in flight), got {cats:?}"
@@ -5119,7 +6607,8 @@ fn test_sweep_stale_open_no_ref_old_flagged() {
     let id = create_open_task(&home, "plain stale task no refs");
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(15);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     assert!(
         cats.stale_open.iter().any(|c| c.id == id),
         "ref-less open task >14d must be flagged stale_open (no repo needed), got {cats:?}"
@@ -5135,7 +6624,8 @@ fn test_sweep_stale_open_no_ref_fresh_not_flagged() {
     let id = create_open_task(&home, "plain fresh task no refs");
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(13);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     assert!(
         !cats.all_ids().contains(&id),
         "ref-less open task <14d must NOT be flagged, got {cats:?}"
@@ -5160,7 +6650,8 @@ fn test_sweep_stale_open_mixed_ref_not_flagged() {
         &stub_issue_lookup,
         Some("test/repo"),
         now,
-    );
+    )
+    .expect("scan categories");
     assert!(
         !cats.all_ids().contains(&id),
         "ANY non-terminal ref must disqualify the whole task, got {cats:?}"
@@ -5184,7 +6675,8 @@ fn test_sweep_stale_open_unknown_ref_not_flagged() {
         &stub_issue_lookup,
         Some("test/repo"),
         now,
-    );
+    )
+    .expect("scan categories");
     assert!(
         !cats.all_ids().contains(&id),
         "an Unknown (unresolvable) ref must NOT be flagged (fail safe), got {cats:?}"
@@ -5202,7 +6694,8 @@ fn test_sweep_stale_open_apply_labels_category() {
     let id = create_open_task(&home, "ref-less stale task to cancel");
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(20);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     assert!(
         cats.stale_open.iter().any(|c| c.id == id),
         "precondition: task must be a stale_open candidate, got {cats:?}"
@@ -5247,7 +6740,8 @@ fn sweep_cancel_settles_dispatch_tracking_78445_2() {
     }
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(20);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     let confirm: std::collections::HashSet<String> = [id.clone()].into_iter().collect();
     sweep::emit_cancelled_batch(&home, &cats, &confirm, "sweep settle test").expect("emit");
 
@@ -5273,7 +6767,8 @@ fn test_sweep_stale_open_overflow_ref_token_not_flagged() {
     let id = create_open_task(&home, "tracking upstream #99999999999999999999");
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(20);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     assert!(
         !cats.all_ids().contains(&id),
         "an unparseable (overflow) #N ref must NOT be age-flagged as ref-less, got {cats:?}"
@@ -5294,7 +6789,8 @@ fn test_sweep_stale_open_url_ref_not_flagged() {
     );
     let live: std::collections::HashSet<String> = ["alive".to_string()].into_iter().collect();
     let now = chrono::Utc::now() + chrono::Duration::days(20);
-    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now);
+    let cats = sweep::scan_categories(&home, &live, &stub_pr_lookup, &stub_issue_lookup, None, now)
+        .expect("scan categories");
     assert!(
         !cats.all_ids().contains(&id),
         "an issue referenced only by URL must NOT be age-flagged as ref-less, got {cats:?}"
@@ -5320,7 +6816,8 @@ fn test_sweep_stale_open_merged_pr_fresh_flagged() {
         &stub_issue_lookup,
         Some("test/repo"),
         now,
-    );
+    )
+    .expect("scan categories");
     assert!(
         cats.shipped.is_empty(),
         "shipped must NOT fire under its 7d grace, got {cats:?}"
@@ -5586,6 +7083,388 @@ fn list_filter_aliases_2037() {
         by_status["tasks"].as_array().expect("array").len(),
         2,
         "status alias filters: {by_status}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ── #3536: a report settles the dispatch entry but not the task ──
+//
+// `dispatch_tracking::mark_completed` DELETES the entry (deliberately —
+// `test_report_result_marks_dispatch_completed` pins "removed outright, not
+// flipped to completed and kept"), so `sweep_stuck` can never see the task
+// again. `sweep_overdue_claimed` only looks at tasks carrying a `due_at`.
+// Between the two, a task whose assignee reported and went idle is invisible
+// to every sweep: the real case sat `claimed` for 40+ hours with zero
+// reminders. These tests pin the trace (`dispatch_completed_at`) and the
+// reminder built on it.
+
+/// Seed a settled dispatch: the entry existed and the assignee reported it.
+fn settle_dispatch(home: &std::path::Path, task_id: &str, from: &str, to: &str) {
+    crate::dispatch_tracking::track_dispatch(
+        home,
+        crate::dispatch_tracking::DispatchEntry {
+            task_id: Some(task_id.to_string()),
+            from: from.to_string(),
+            to: to.to_string(),
+            from_id: None,
+            to_id: None,
+            delegated_at: chrono::Utc::now().to_rfc3339(),
+            status: "pending".into(),
+        },
+    );
+    crate::dispatch_tracking::mark_completed(home, Some(task_id), to);
+}
+
+/// Backdate the settlement trace so the sweep sees it as aged.
+///
+/// Must run as the ASSIGNEE: `can_mutate_task` only admits the owner or an
+/// orchestrator of the owner's team, and these tests configure no team — a
+/// creator-issued write is refused SILENTLY, which would leave the stamp at
+/// "now" and quietly turn every assertion below into a vacuous pass. The
+/// assert is the guard against exactly that.
+fn backdate_settlement(home: &std::path::Path, assignee: &str, id: &str, minutes: i64) {
+    let past = (chrono::Utc::now() - chrono::Duration::minutes(minutes)).to_rfc3339();
+    let r = handle(
+        home,
+        assignee,
+        &serde_json::json!({
+            "action": "metadata_set", "id": id,
+            "metadata_key": "dispatch_completed_at", "metadata_value": past
+        }),
+    );
+    assert_eq!(
+        r["event"], "metadata_set",
+        "backdating must actually land, or the test proves nothing: {r}"
+    );
+}
+
+/// The trace itself: settling a dispatch for a still-live task must leave a
+/// durable, inspectable mark ON THE TASK — the dispatch store cannot hold it
+/// because the entry is gone by design.
+#[test]
+fn mark_completed_records_dispatch_completed_at_on_a_live_task_3536() {
+    let home = tmp_home("3536-trace");
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "discuss the thing"}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+
+    settle_dispatch(&home, &id, "lead", "impl");
+
+    let task = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "get", "id": id}),
+    );
+    let first = task["task"]["metadata"]["dispatch_completed_at"]
+        .as_str()
+        .map(str::to_string);
+    assert!(
+        first
+            .as_deref()
+            .is_some_and(|s| chrono::DateTime::parse_from_rfc3339(s).is_ok()),
+        "settling a dispatch must stamp dispatch_completed_at (RFC3339) on the \
+         still-live task; got {:?}",
+        task["task"]["metadata"]
+    );
+
+    // EVERY report re-stamps, and this assertion is the only thing pinning it.
+    // The re-stamp is what keeps an actively-reporting agent from being
+    // reminded: the 120-minute timer restarts on each report, so only someone
+    // who reported and then went idle ages into a reminder. Nothing else covers
+    // it — the maintenance tests below backdate the stamp by hand, so they
+    // exercise the sweep and never this write. (R1 mutation testing on 5f15d0a2
+    // deleted the re-stamp and left all six tests green.)
+    // The sleep keeps the two stamps distinguishable whatever the clock
+    // resolution, so this can never flake into a false pass.
+    std::thread::sleep(std::time::Duration::from_millis(2));
+    settle_dispatch(&home, &id, "lead", "impl");
+    let task = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "get", "id": id}),
+    );
+    let second = task["task"]["metadata"]["dispatch_completed_at"].as_str();
+    assert!(
+        second.is_some() && second != first.as_deref(),
+        "a second report must RE-STAMP dispatch_completed_at (the timer restarts \
+         on every report); first={first:?} second={second:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// A task that is already closed needs no settlement trace: it is settled. The
+/// stamp is skipped at the SOURCE rather than merely ignored later — the sweep's
+/// status filter would refuse to act on it anyway, so this pins the first of two
+/// independent guards. Without this assertion, deleting the early return costs
+/// stamp pollution that every later replay must carry, and no test notices.
+#[test]
+fn mark_completed_leaves_no_trace_on_an_already_terminal_task_3536() {
+    let home = tmp_home("3536-no-trace-terminal");
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "already closed"}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "done", "id": id, "result": "shipped"}),
+    );
+
+    settle_dispatch(&home, &id, "lead", "impl");
+
+    let task = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "get", "id": id}),
+    );
+    assert!(
+        task["task"]["metadata"]["dispatch_completed_at"].is_null(),
+        "a terminal task must not be stamped at all; got {:?}",
+        task["task"]["metadata"]
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The gap #3536 is about: report in, task still `claimed`, no `due_at` —
+/// every existing sweep is blind to it. Both parties who can resolve it must
+/// be told, and the text must name the two exits (assignee sends a terminal
+/// report / orchestrator closes it), not merely say "stuck".
+#[test]
+fn run_task_maintenance_reminds_when_a_settled_report_left_the_task_unsettled_3536() {
+    let home = tmp_home("3536-remind");
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "unsettled after report"}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    settle_dispatch(&home, &id, "lead", "impl");
+    backdate_settlement(&home, "impl", &id, 121);
+
+    crate::daemon::run_task_maintenance(&home);
+
+    let to_assignee = crate::inbox::drain(&home, "impl");
+    let assignee_text = to_assignee
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        assignee_text.contains(&id),
+        "assignee must be reminded about the unsettled task: {to_assignee:?}"
+    );
+    assert!(
+        assignee_text.contains("terminal"),
+        "the reminder must name the assignee's exit (a terminal report), not just \
+         say stuck: {assignee_text}"
+    );
+
+    let to_creator = crate::inbox::drain(&home, "lead");
+    let creator_text = to_creator
+        .iter()
+        .map(|m| m.text.clone())
+        .collect::<Vec<_>>()
+        .join("\n");
+    assert!(
+        creator_text.contains(&id),
+        "the orchestrator who created the task must be reminded too: {to_creator:?}"
+    );
+    assert!(
+        creator_text.contains("done"),
+        "the reminder must name the orchestrator's exit (task action=done): \
+         {creator_text}"
+    );
+
+    let log = std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default();
+    assert!(
+        log.contains("task_unsettled_after_report"),
+        "the reminder must be auditable in the event log"
+    );
+
+    // The task itself is NEVER auto-closed — the #3526 completion guard owns
+    // settlement; this sweep only reminds.
+    let after = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "get", "id": id}),
+    );
+    assert_eq!(
+        after["task"]["status"], "claimed",
+        "the sweep must not settle or release the task, only remind"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Negative: the assignee reported AND the task was closed. Nothing is
+/// pending, so nobody may be nagged.
+#[test]
+fn run_task_maintenance_stays_silent_for_a_terminal_task_after_report_3536() {
+    let home = tmp_home("3536-terminal");
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "settled properly"}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    settle_dispatch(&home, &id, "lead", "impl");
+    backdate_settlement(&home, "impl", &id, 121);
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "done", "id": id, "result": "shipped"}),
+    );
+
+    crate::daemon::run_task_maintenance(&home);
+
+    for who in ["impl", "lead"] {
+        let msgs = crate::inbox::drain(&home, who);
+        assert!(
+            !msgs.iter().any(|m| m.text.contains(&id)),
+            "a done task must not be reminded about ({who}): {msgs:?}"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Negative, and the reason the predicate is `claimed`/`in_progress` rather
+/// than "any non-terminal": `in_review` is LEGITIMATELY waiting on someone
+/// else. Field evidence — t-…-110 on this very fleet sat `in_review` for 43
+/// hours waiting for a re-review after its head moved; nagging that every
+/// maintenance tick would be pure noise.
+#[test]
+fn run_task_maintenance_stays_silent_for_in_review_after_report_3536() {
+    let home = tmp_home("3536-in-review");
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "awaiting review"}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    settle_dispatch(&home, &id, "lead", "impl");
+    backdate_settlement(&home, "impl", &id, 600);
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "update", "id": id, "status": "in_review"}),
+    );
+
+    crate::daemon::run_task_maintenance(&home);
+
+    for who in ["impl", "lead"] {
+        let msgs = crate::inbox::drain(&home, who);
+        assert!(
+            !msgs.iter().any(|m| m.text.contains(&id)),
+            "in_review is waiting on a reviewer, not stalled ({who}): {msgs:?}"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// One reminder per report, not one per maintenance tick. A fresh report
+/// re-stamps the trace and makes the task eligible again.
+#[test]
+fn run_task_maintenance_reminds_once_per_report_3536() {
+    let home = tmp_home("3536-once");
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "nag once"}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+    settle_dispatch(&home, &id, "lead", "impl");
+    backdate_settlement(&home, "impl", &id, 121);
+
+    crate::daemon::run_task_maintenance(&home);
+    let first = crate::inbox::drain(&home, "impl");
+    assert!(
+        first.iter().any(|m| m.text.contains(&id)),
+        "first tick must remind: {first:?}"
+    );
+
+    crate::daemon::run_task_maintenance(&home);
+    let second = crate::inbox::drain(&home, "impl");
+    assert!(
+        !second.iter().any(|m| m.text.contains(&id)),
+        "the same report must not be nagged twice: {second:?}"
+    );
+
+    // A NEW report re-stamps the trace → eligible again.
+    settle_dispatch(&home, &id, "lead", "impl");
+    backdate_settlement(&home, "impl", &id, 121);
+    crate::daemon::run_task_maintenance(&home);
+    let third = crate::inbox::drain(&home, "impl");
+    assert!(
+        third.iter().any(|m| m.text.contains(&id)),
+        "a fresh report that is again left unsettled must remind again: {third:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Negative control on the pre-existing path: a `due_at` task with no
+/// settlement trace still gets RELEASED by `sweep_overdue_claimed`, and the
+/// new sweep adds no reminder of its own.
+#[test]
+fn run_task_maintenance_leaves_the_due_at_release_path_unchanged_3536() {
+    let home = tmp_home("3536-due-at");
+    let past = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    let r = handle(
+        &home,
+        "lead",
+        &serde_json::json!({"action": "create", "title": "overdue", "due_at": past}),
+    );
+    let id = r["id"].as_str().unwrap().to_string();
+    handle(
+        &home,
+        "impl",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+
+    crate::daemon::run_task_maintenance(&home);
+
+    let listed = handle(&home, "lead", &serde_json::json!({"action": "list"}));
+    assert_eq!(
+        listed["tasks"][0]["status"], "open",
+        "the overdue release path must be untouched"
+    );
+    let msgs = crate::inbox::drain(&home, "impl");
+    assert!(
+        !msgs.iter().any(|m| m.text.contains("task_unsettled")),
+        "no settlement reminder is owed when no report ever settled a dispatch: {msgs:?}"
     );
     std::fs::remove_dir_all(&home).ok();
 }

@@ -19,7 +19,7 @@ CI 會在 `ci.yml` 的前兩個步驟執行這些命令。本機略過它們，�
 scripts/preflight.sh          # 完整 matrix；--quick 會略過 Windows 檢查
 ```
 
-這是 CI `check` job 的一次性鏡像，也是避免 local-green → CI-red 往返的最佳方法。它會執行 `cargo fmt --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo test --tests --features tray`（unit + integration + invariant），以及關鍵的 **Windows cross-check**（`x86_64-pc-windows-msvc`）。Windows-only 程式碼（`libc::getppid`、`/bin/sh` spawn、`UnixStream`）在 Unix 開發機上可以順利編譯，卻會讓 CI 的 `windows-latest` runner 失敗。
+這是 CI `check` job 的一次性鏡像，也是避免 local-green → CI-red 往返的最佳方法。它會執行 `cargo fmt --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo nextest run --features tray`（unit + integration + invariant——CI 用的 runner；只有沒安裝 cargo-nextest 時才用 `cargo test --tests --features tray`），以及關鍵的 **Windows cross-check**（`x86_64-pc-windows-msvc`）。Windows-only 程式碼（`libc::getppid`、`/bin/sh` spawn、`UnixStream`）在 Unix 開發機上可以順利編譯，卻會讓 CI 的 `windows-latest` runner 失敗。
 
 Windows 步驟需要 MSVC C toolchain，因為 transitive C dependency（`ring`）在 macOS/Linux 上缺少它就無法 cross-compile。只需安裝一次：
 
@@ -29,16 +29,22 @@ cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc
 
 若沒有 `cargo-xwin`，Windows 步驟會附提示並 SKIP（絕不 false-fail）；CI 的 `windows-latest` runner 仍是後援。Preflight 刻意*不是* git hook——完整 matrix 需要幾分鐘，請手動執行。
 
-`.git/hooks/pre-commit` 的 pre-commit hook 會自動格式化 staged `.rs` 檔並重新 stage。它不會執行 clippy——clippy 對 pre-commit 路徑而言太慢。`git push` 前請自行執行 clippy。
+**加了過濾的測試也必須建置 `tests/`。** 迭代時用 `cargo nextest run --features tray <filter>`，絕不要用 `cargo test --bin agend-terminal <filter>`：`--bin` 只編譯 binary 自己的 `#[cfg(test)]` 模組，會跳過每一個 `tests/*.rs` invariant（temp-fixture prefix 隔離、env 變更序列化、spawn rationale、檔案大小上限、文件雙語），所以 `--bin` 綠燈不能當作 CI 的證據。只有跑過這個 gate（或 `scripts/preflight.sh --quick`）之後才能說「tests green」。在 daemon 管理的 agent shell 裡請先 `export AGENTIC_GIT_HOME="$AGEND_HOME"`（preflight 會自己做）：否則把 `AGEND_HOME` 限定到暫存目錄再 spawn `git` 的測試會撞上 agentic-git shim 的遞迴防護（#1504）——約 40 個必定失敗的測試，CI 因為 PATH 上沒有 shim 永遠看不到。其餘結果在 agent shell 裡哪些可以信、哪些要先單跑確認，定義在 CONTRIBUTING.zh-TW.md 的「agent worktree 內哪些本地結果可以信」一節。
+
+**哪些 hook 真的會觸發取決於 `core.hooksPath`，而且有兩種 regime。** 在 daemon-managed worktree——以及任何 `core.hooksPath` 指向 `$AGEND_HOME/hooks` 的 clone——中，實際生效的是 daemon 寫在該目錄的自有 hook：`prepare-commit-msg`（以及 `prepare-commit-msg.ps1`）與 `reference-transaction`。下文描述的 tracked `scripts/hooks` 資產（`pre-commit`、`pre-push`、`post-merge`）在該 regime **並未生效**，且 `.git/hooks/*` 會被 `core.hooksPath` 整個遮蔽。以下描述適用於另一種 regime：`core.hooksPath` 指向 `scripts/hooks` 的 clone，也就是 `scripts/install-hooks.sh` 會把 clone 切換過去的那一種。用 `git config --get core.hooksPath` 確認目前屬於哪一種。
+
+在 `scripts/hooks` regime 下，pre-commit hook（`scripts/hooks/pre-commit`）會自動格式化 staged `.rs` 檔並重新 stage。它不會執行 clippy——clippy 對 pre-commit 路徑而言太慢。`git push` 前請自行執行 clippy。
 
 Pre-push hook（`scripts/hooks/pre-push`）會執行**兩道 gate**：
 
-1. **CI-parity**（#t-ci-parity-prepush-guard）——若 push range 觸及 `src/` / `tests/` / `Cargo.*` / `build.rs`，便執行 `scripts/preflight.sh --quick`（與 CI `check` 完全相同的命令：`cargo fmt --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo test --tests --features tray`），並在失敗時**阻擋 push**。這可防止一再發生的遺漏：agent 只執行 `cargo test --bin`——會略過 `tests/` integration target——便宣稱 CI-ready，接著被 CI 拒絕（#1734 stale-string integration test、#1735 block_on invariant）。Docs-only push 會略過 build。`--quick` 不執行 Windows cross-check（由 CI 的 `windows-latest` 後援）。
-2. **claim-verify**——依實際 diff 驗證 `Claim:` trailer。
+1. **CI-parity**（#t-ci-parity-prepush-guard）——若 push range 觸及 `src/` / `tests/` / `Cargo.*` / `build.rs`，便執行 `scripts/preflight.sh --quick`（與 CI `check` 完全相同的命令：`cargo fmt --check`、`cargo clippy --all-targets --features tray -- -D warnings`、`cargo nextest run --features tray`），並在失敗時**阻擋 push**。這可防止一再發生的遺漏：agent 只執行 `cargo test --bin`——會略過 `tests/` integration target——便宣稱 CI-ready，接著被 CI 拒絕（#1734 stale-string integration test、#1735 block_on invariant）。Docs-only push 會略過 build。`--quick` 不執行 Windows cross-check（由 CI 的 `windows-latest` 後援）。
+2. **claim-verify**——這是 best-effort 的本機提醒：每個 push ref 僅檢查
+   最新 commit 的 `Claim:` trailer 是否符合實際 diff。它不是權威的 trust
+   boundary；權威仍是 CI、daemon-side review 與 canonical merge gate。
 
 緊急情況可用 `git push --no-verify` 覆寫任一 gate（daemon-side gate 與 CI 仍會套用，所以 `--no-verify` 不是免死金牌）。
 
-當 `src/` 檔案變更時，post-merge hook 會在背景觸發 `cargo build --release`，完成後顯示桌面通知。它不會自動重啟 daemon——由 operator 決定重啟時機。只有 operator 擁有的獨立 clone 才可用 `git config core.hooksPath /dev/null` 停用，且必須理解這會停用每一個 tracked hook。絕不要在 daemon-managed agent worktree 中變更 `core.hooksPath`；該路徑也承載 provenance 與 pre-push safety hook。
+在 `scripts/hooks` regime 下，當 `src/` 檔案變更時，post-merge hook 會在背景觸發 `cargo build --release`，完成後顯示桌面通知。它不會自動重啟 daemon——由 operator 決定重啟時機。在 `$AGEND_HOME/hooks` regime 下這個 hook 並未安裝，因此不會有任何自動 rebuild。只有 operator 擁有的獨立 clone 才可用 `git config core.hooksPath /dev/null` 停用，且必須理解這會停用每一個 tracked hook。絕不要在 daemon-managed agent worktree 中變更 `core.hooksPath`；該路徑承載 daemon 自有的 provenance hook。
 
 ### 若尚未安裝 hook
 
@@ -48,7 +54,9 @@ Hook 是 per-clone 的。Fresh `git clone` 後請安裝：
 scripts/install-hooks.sh   # idempotent——可安全重複執行
 ```
 
-**與 fleet agent 共存**：daemon 會將每個 managed worktree 的 `core.hooksPath` 設為 `$AGEND_HOME/hooks`（`src/binding.rs::install_hooks`），並只在其中寫入 `prepare-commit-msg`——它*不會*清空目錄。因此 `install-hooks.sh` 會把 tracked `pre-push` *複製*到 `$AGEND_HOME/hooks/pre-push`，讓它共存並在 agent push 時觸發（因所有目前與未來的 worktree 共用該目錄，一份 copy 即可涵蓋全部）。Agent push 確實會執行 hook：active agent git guard 最終呼叫真正的 `git`，而 git 會遵守 `core.hooksPath`。此共存機制仰賴 daemon 不刪除 `$AGEND_HOME/hooks/pre-push`；若行為改變，請重新執行 `install-hooks.sh`。
+**fleet agent 共存與已接受的 trust boundary（#3593）**：daemon 會將每個 managed worktree 的 `core.hooksPath` 設為 `$AGEND_HOME/hooks`（`src/binding.rs::install_hooks`），並只在其中寫入 daemon 自有的 provenance hook——它*不會*清空、安裝或 reconcile tracked `pre-push`。這個共享目錄對 pre-push **不是 daemon 的 trust boundary**。其中若存在 `install-hooks.sh` 複製的 `pre-push`，它只是**由 operator 安裝的便利功能**，不是完整性保證。若檔案不存在或被改名擱置（例如 `pre-push.disabled-*`），這是已接受並明載的限制，不會自動修復；依賴前請用 `ls "$AGEND_HOME/hooks"` 確認。fleet policy 問題（t-20260712073154879622-40783-31）已保守定案：agent push 不要求通過這個本機 hook，且絕不可在共享目錄中靜默啟用會產生變更的 mutation hook。
+
+claim check 同樣只是本機提醒：每個 push ref **僅檢查最新 commit** 的 `Claim:` trailer，且 `git push --no-verify` 可以繞過它。這個 latest-commit 範圍與本機 bypass 都不改變權威的 CI、daemon-side review 或 canonical merge gate。
 
 ## 測試忠實度：將 producer 的真實輸出餵給 consumer（#1493）
 

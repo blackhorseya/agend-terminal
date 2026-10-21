@@ -381,6 +381,8 @@ pub struct BackendPreset {
     pub redraw_after_resize: bool,
 }
 
+/// #3541: effort-capability types re-exported from their anti-monolith home.
+pub use crate::backend_effort::{EffortCapability, EffortInjectionKind};
 /// #2744: model-capability types re-exported from their anti-monolith home.
 pub use crate::backend_model::{ModelCapability, ModelFlagHit};
 
@@ -445,12 +447,15 @@ impl Backend {
                 // destructive blast). Same shape as Agy #995/#997 dismiss.
                 //
                 // `Yes, proceed` deliberately retained on old keystroke
-                // pending empirical verification at follow-up — modal +
-                // default-cursor for that prompt not yet captured.
+                // pending empirical verification — its default cursor is not captured.
                 dismiss_patterns: &[
                     DismissPattern {
                         label: r"(?m)^[^A-Za-z\n]*WARNING: Loading development channels",
                         sequence: b"\r",
+                    },
+                    DismissPattern {
+                        label: r"(?m)^[^A-Za-z\n]{0,8}❯ No, exit",
+                        sequence: b"\x1b[B\r",
                     },
                     DismissPattern {
                         label: r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust",
@@ -515,11 +520,11 @@ impl Backend {
                 // touches the operator's global codex config. Must precede the
                 // `resume` subcommand (`-c` is a global option). Primary fix; the
                 // #1069 dismiss below stays as a fallback (see its comment).
+                // #3398: no global `resume --last` — these args serve the
+                // locator-less spawn, where it would adopt another instance's thread.
                 args: &[
                     "-c",
                     "check_for_update_on_startup=false",
-                    "resume",
-                    "--last",
                     "--dangerously-bypass-approvals-and-sandbox",
                 ],
                 ready_pattern: "OpenAI Codex|›",
@@ -543,31 +548,31 @@ impl Backend {
                 instructions_shared: true,
                 ready_timeout_secs: 20,
                 dismiss_patterns: &[
-                    // Trust directory prompt: "Yes, continue" is pre-selected → Enter.
-                    // CR (\r), not LF — Ink's keyboard reader treats CR as Enter.
-                    // macOS openpty doesn't translate LF→CR on input (ConPTY does),
-                    // so LF here would silently no-op on mac.
-                    // Issue #468: anchored regex (see ClaudeCode comment above).
-                    // #1087: `*` instead of `{0,8}` — TUI centered modals have 40+ char prefix.
-                    DismissPattern {
-                        label: r"(?m)^[^A-Za-z\n]*Do you trust",
-                        sequence: b"\r",
-                    },
+                    // #3317: the trust-directory matcher is DELIBERATELY ABSENT.
+                    // Measured at codex 0.149.0 — the prompt renders even under
+                    // `--dangerously-bypass-approvals-and-sandbox`, and answering it
+                    // makes codex WRITE `[projects."<ws>"] trust_level = "trusted"` into
+                    // the operator's `$CODEX_HOME/config.toml`: one permanent entry per
+                    // instance workspace, forever, i.e. the accumulation `722140bd`
+                    // removed, reauthored by codex. Fleet tools no longer need trust —
+                    // the bridge rides the child argv (`mcp_config::codex_mcp_config_args`).
+                    // Do not re-add; `codex_preset_has_no_trust_dismiss_matcher_3317`
+                    // (src/agent/tests.rs) pins its absence.
                     DismissPattern {
                         label: r"(?m)^[^A-Za-z\n]*Please restart",
                         sequence: b"\r",
                     },
-                    // #1069: version-update modal blocks agent until operator
-                    // selects an option. "2\r" = "Skip" (least invasive).
-                    // #1626 FALLBACK: the `-c check_for_update_on_startup=false`
-                    // flag above normally suppresses this modal entirely, so this
-                    // dismiss never fires in the happy path. Kept as belt-and-
-                    // suspenders: codex silently no-ops unknown `-c` keys, so if
-                    // upstream ever renames the key the flag dormant-fails and this
-                    // dismiss degrades the failure from "blocking hang" to a racy
-                    // (but non-blocking) auto-skip.
+                    // #1069: version-update modal blocks the agent until an
+                    // option is selected; "2\r" = Skip (least invasive). #1626
+                    // was believed to make this dead code — codex 0.150.x shows
+                    // the menu with that flag on the argv (verified on the live
+                    // stranded pid), so this IS the defense. t-…-82348-29 r2: the
+                    // label is the tail-anchored structural const the classifier
+                    // also uses (quoted transcript cannot fire it in ANY scope),
+                    // answered as a deterministic PER-SPAWN one-shot — not "racy
+                    // but non-blocking"; the loop's 10s cooldown is not the bound.
                     DismissPattern {
-                        label: r"(?m)^[^A-Za-z\n]*Update available!",
+                        label: crate::backend_profile::CODEX_UPDATE_MENU_LIVE,
                         sequence: b"2\r",
                     },
                 ],
@@ -791,17 +796,6 @@ impl Backend {
         }
     }
 
-    /// Format a `--model` value for this backend.
-    /// OpenCode requires `provider/model` format — auto-prefixes `anthropic/`
-    /// if the value doesn't already contain a `/`.
-    pub fn format_model_arg(&self, model: &str) -> String {
-        if matches!(self, Backend::OpenCode) && !model.contains('/') {
-            format!("anthropic/{model}")
-        } else {
-            model.to_string()
-        }
-    }
-
     /// #2744 PR-A: the DECLARED backend's model-flag grammar — table and
     /// types live in [`crate::backend_model`] (anti-monolith split); this is
     /// the enum-keyed accessor. Never key off a command string.
@@ -809,55 +803,24 @@ impl Backend {
         crate::backend_model::capability_for(self)
     }
 
-    /// #2038/#2744: apply the fleet-resolved model intent to a spawn argv,
-    /// gated on the DECLARED backend's [`ModelCapability`].
-    ///
-    /// - No capability (Shell/Raw/custom) → warn + skip: `bash --model X`
-    ///   breaks the spawn outright, so unsupported backends fail loud here
-    ///   (and hard-error in `set_model`) instead of guessing.
-    /// - Existing model-flag spellings win (caller args > fleet intent,
-    ///   #2038). Confirmed spellings skip silently — that precedence is by
-    ///   design. Ambiguous glued spellings also skip, but WITH a warning:
-    ///   fleet intent is being suppressed by a token whose parser
-    ///   acceptance is unproven.
-    /// - The flag pair is inserted BEFORE the first bare `--` — everything
-    ///   after the delimiter is payload, not flag territory. Presets never
-    ///   carry `--`, so production argv is unchanged (append position).
-    /// - Formatting goes through [`Backend::format_model_arg`] (OpenCode
-    ///   needs a provider prefix). Empty model is a no-op.
+    /// #3541: the DECLARED backend's effort grammar — table and types live
+    /// in [`crate::backend_effort`] (same anti-monolith split as #2744).
+    /// Never key off a command string.
+    pub fn effort_capability(&self) -> Option<&'static EffortCapability> {
+        crate::backend_effort::capability_for(self)
+    }
+
+    /// #3541: thin wrappers over [`crate::backend_inject`] (anti-monolith
+    /// split — bodies live there; these keep every existing
+    /// `Backend::push_*` call site compiling unchanged).
+    /// #2038/#2744: see [`crate::backend_inject::push_model_arg`].
     pub fn push_model_arg(args: &mut Vec<String>, backend: &Backend, model: &str) {
-        if model.is_empty() {
-            return;
-        }
-        let Some(cap) = backend.model_capability() else {
-            tracing::warn!(
-                backend = %backend.name(),
-                model = %model,
-                "model intent configured for a backend with no declared model \
-                 capability — skipping --model injection (#2744)"
-            );
-            return;
-        };
-        let hits = cap.scan(args);
-        if !hits.is_empty() {
-            if let Some(ModelFlagHit::Ambiguous(tok)) = hits
-                .iter()
-                .find(|h| matches!(h, ModelFlagHit::Ambiguous(_)))
-            {
-                tracing::warn!(
-                    backend = %backend.name(),
-                    token = %tok,
-                    model = %model,
-                    "ambiguous model-flag-like token suppresses fleet model \
-                     injection; move payload after `--` or remove the token (#2744)"
-                );
-            }
-            return;
-        }
-        let model_val = backend.format_model_arg(model);
-        let at = args.iter().position(|a| a == "--").unwrap_or(args.len());
-        args.insert(at, cap.long_flag.to_string());
-        args.insert(at + 1, model_val);
+        crate::backend_inject::push_model_arg(args, backend, model)
+    }
+
+    /// #3541: see [`crate::backend_inject::push_effort_arg`].
+    pub fn push_effort_arg(args: &mut Vec<String>, backend: &Backend, effort: &str) {
+        crate::backend_inject::push_effort_arg(args, backend, effort)
     }
 
     /// Display name matching the CLI command. For [`Backend::Raw`] returns the
@@ -2118,157 +2081,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn format_model_arg_opencode_adds_prefix() {
-        assert_eq!(Backend::OpenCode.format_model_arg("opus"), "anthropic/opus");
-        assert_eq!(
-            Backend::OpenCode.format_model_arg("anthropic/opus"),
-            "anthropic/opus"
-        );
-        assert_eq!(
-            Backend::OpenCode.format_model_arg("openai/gpt-4"),
-            "openai/gpt-4"
-        );
-    }
-
-    #[test]
-    fn format_model_arg_other_backends_passthrough() {
-        assert_eq!(Backend::ClaudeCode.format_model_arg("opus"), "opus");
-        assert_eq!(Backend::Codex.format_model_arg("o3"), "o3");
-    }
-
-    /// #2038: `push_model_arg` appends the formatted flag pair and respects
-    /// an existing caller-supplied `--model` (separate or `=`-glued form).
-    #[test]
-    fn push_model_arg_appends_and_dedupes_2038() {
-        let mut args = vec!["--continue".to_string()];
-        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "claude-opus-4-8");
-        assert_eq!(args, vec!["--continue", "--model", "claude-opus-4-8"]);
-
-        // OpenCode gets the provider prefix via format_model_arg.
-        let mut args = Vec::new();
-        Backend::push_model_arg(&mut args, &Backend::OpenCode, "opus");
-        assert_eq!(args, vec!["--model", "anthropic/opus"]);
-
-        // Caller already passed --model (separate form) — no duplicate.
-        let mut args = vec!["--model".to_string(), "explicit".to_string()];
-        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "from-fleet");
-        assert_eq!(args, vec!["--model", "explicit"]);
-
-        // Glued form counts too.
-        let mut args = vec!["--model=explicit".to_string()];
-        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "from-fleet");
-        assert_eq!(args, vec!["--model=explicit"]);
-
-        // Empty model is a no-op.
-        let mut args = vec!["--continue".to_string()];
-        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "");
-        assert_eq!(args, vec!["--continue"]);
-    }
-
-    /// #2744 PR-A: Shell/Raw (any command without a declared model
-    /// capability) must never receive a blind `--model` injection — `bash
-    /// --model X` fails to spawn, and an arbitrary executable's argv
-    /// semantics are unknown. Reachable today via create_instance's
-    /// unrestricted `model` param.
-    #[test]
-    fn push_model_arg_shell_raw_never_inject_2744() {
-        let mut args: Vec<String> = Vec::new();
-        Backend::push_model_arg(&mut args, &Backend::Shell, "opus");
-        assert!(
-            args.is_empty(),
-            "shell must not receive --model, got {args:?}"
-        );
-
-        let mut args: Vec<String> = Vec::new();
-        Backend::push_model_arg(
-            &mut args,
-            &Backend::Raw("/opt/custom/agent-bin".into()),
-            "opus",
-        );
-        assert!(
-            args.is_empty(),
-            "raw must not receive --model, got {args:?}"
-        );
-    }
-
-    /// #2744 PR-A (B8): dedupe must recognize the short `-m` spelling on
-    /// backends whose CLI help declares it (codex/opencode/grok — see
-    /// tests/fixtures/cli-help/) instead of appending a second model flag.
-    #[test]
-    fn push_model_arg_dedupes_short_m_on_declaring_backends_b8_2744() {
-        for backend in [Backend::Codex, Backend::OpenCode, Backend::Grok] {
-            let mut args = vec!["-m".to_string(), "explicit".to_string()];
-            Backend::push_model_arg(&mut args, &backend, "from-fleet");
-            assert_eq!(
-                args,
-                vec!["-m", "explicit"],
-                "backend {backend:?}: separate -m must dedupe"
-            );
-        }
-    }
-
-    /// #2744 PR-A: claude/kiro-cli/agy help declares NO `-m` short flag — a
-    /// `-m` token there is not a model flag, so fleet injection must still
-    /// happen. Pins the per-backend alias set so the scanner never
-    /// over-matches on long-flag-only backends.
-    #[test]
-    fn push_model_arg_ignores_short_m_on_non_declaring_backends_2744() {
-        for backend in [Backend::ClaudeCode, Backend::KiroCli, Backend::Agy] {
-            let mut args = vec!["-m".to_string(), "unrelated".to_string()];
-            Backend::push_model_arg(&mut args, &backend, "from-fleet");
-            assert_eq!(
-                args,
-                vec!["-m", "unrelated", "--model", "from-fleet"],
-                "backend {backend:?}: undeclared -m must not suppress injection"
-            );
-        }
-    }
-
-    /// #2744 PR-A: `-m=X` / `-mVAL` glued spellings are a CONSERVATIVE
-    /// conflict on -m-declaring backends: the glued-value acceptance is not
-    /// fixture-proven per CLI (clap vs yargs differ), so suppressing
-    /// injection is the fail-loud choice vs risking a double model flag.
-    #[test]
-    fn push_model_arg_conservative_conflict_on_glued_short_m_2744() {
-        for tok in ["-m=explicit", "-mexplicit"] {
-            let mut args = vec![tok.to_string()];
-            Backend::push_model_arg(&mut args, &Backend::Codex, "from-fleet");
-            assert_eq!(
-                args,
-                vec![tok],
-                "glued {tok} must suppress injection (conservative conflict)"
-            );
-        }
-    }
-
-    /// #2744 PR-A: a bare `--` is the end-of-options delimiter. Injection
-    /// must place the flag pair BEFORE it (options territory), and model
-    /// tokens AFTER it are payload — never a dedupe/conflict match.
-    #[test]
-    fn push_model_arg_respects_double_dash_delimiter_2744() {
-        // Inject before the delimiter, not appended into payload.
-        let mut args = vec!["--".to_string(), "some prompt text".to_string()];
-        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "from-fleet");
-        assert_eq!(
-            args,
-            vec!["--model", "from-fleet", "--", "some prompt text"]
-        );
-
-        // `--model` inside payload is prompt text, not a real flag: fleet
-        // injection must still happen (before the delimiter).
-        let mut args = vec![
-            "--".to_string(),
-            "--model".to_string(),
-            "quoted".to_string(),
-        ];
-        Backend::push_model_arg(&mut args, &Backend::ClaudeCode, "from-fleet");
-        assert_eq!(
-            args,
-            vec!["--model", "from-fleet", "--", "--model", "quoted"]
-        );
-    }
-
     fn tmp_dir(tag: &str) -> std::path::PathBuf {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -2386,31 +2198,17 @@ mod tests {
         );
     }
 
-    #[test]
-    fn codex_update_dismiss_anchored_rejects_mid_line() {
-        let codex = Backend::Codex.preset();
-        let pattern = codex
-            .dismiss_patterns
-            .iter()
-            .find(|dp| dp.label.contains("Update available!"))
-            .expect("#1069: codex update dismiss pattern must exist")
-            .label;
-        let re = regex::Regex::new(pattern).expect("pattern must compile");
-        assert!(
-            re.is_match("✨ Update available! 0.132.0 -> 0.133.0"),
-            "line-start match must succeed"
-        );
-        assert!(
-            !re.is_match("User asked: is there an Update available! for the tool?"),
-            "mid-line mention must NOT match (Issue #468 anchoring)"
-        );
-        // #1087: centered TUI modal with 40+ char prefix must match
-        let centered = format!("{}Update available! 1.0 -> 2.0", " ".repeat(45));
-        assert!(
-            re.is_match(&centered),
-            "#1087: centered modal with 45-space prefix must match"
-        );
-    }
+    // t-…-82348-29 r2: `codex_update_dismiss_anchored_rejects_mid_line` was
+    // RE-HOMED (not dropped) to
+    // `agent::dismiss::tests::codex_update_dismiss_matches_only_the_live_centered_menu`.
+    // Its subject changed: the label is no longer a line-anchored TITLE
+    // (`^[^A-Za-z\n]*Update available!`) but the structural, tail-anchored
+    // `backend_profile::CODEX_UPDATE_MENU_LIVE`, whose semantics belong beside
+    // the other codex-update dismiss pins. Both original intents are carried
+    // over and strengthened there — #468 (a mid-line mention must not match)
+    // and #1087 (a 45-space-centered TUI modal must match) — plus two new
+    // negatives the old label could not express: the title line ALONE, and the
+    // same block with codex's composer painted under it (review F2).
 
     /// #1626: the `-c check_for_update_on_startup=false` override must be present
     /// in BOTH spawn modes and, in Resume mode, must come BEFORE the `resume`

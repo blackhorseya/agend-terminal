@@ -13,6 +13,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::handle_binding_state;
+use crate::mcp::handlers::worktree::handle_release_worktree;
 use serde_json::json;
 use std::path::Path;
 
@@ -177,5 +178,129 @@ fn binding_state_worktree_resolves_and_invalid_reason() {
         "{r}"
     );
 
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3546: the two fields that make "is this tree standing on the right base?"
+/// answerable. The flag is the provision-time fact read back from the signed
+/// binding; the count is measured now.
+///
+/// The null case is the load-bearing one. `base_behind_default_by` is computed
+/// against the LOCAL remote-tracking ref with no fetch, so when that ref does
+/// not exist there is no honest number to give — and `0` would be the most
+/// dangerous possible answer, since "0 commits behind" is exactly what a
+/// correctly-based worktree reports. Unknown must stay unknown.
+#[test]
+fn binding_state_exposes_base_freshness_fields_3546() {
+    let home = tmp_home("base-fresh");
+    let canonical = home.join("canonical");
+    std::fs::create_dir_all(&canonical).unwrap();
+    git_init(&canonical);
+    let canonical_str = canonical.to_str().unwrap();
+
+    // ── A binding with no `base_from_stale_view` key (every binding written
+    // before this change) must read as false, not as missing/true.
+    let wt = home.join("wt-legacy");
+    std::fs::create_dir_all(&wt).unwrap();
+    git_init(&wt);
+    write_binding_src(
+        &home,
+        "legacy",
+        "feature/x",
+        wt.to_str().unwrap(),
+        canonical_str,
+    );
+    let r = handle_binding_state(&home, &json!({"instance": "legacy"}), &None);
+    assert_eq!(
+        r["base_from_stale_view"].as_bool(),
+        Some(false),
+        "a binding predating the flag must read false, not absent: {r}"
+    );
+    assert!(
+        r["base_behind_default_by"].is_null(),
+        "no remote-tracking default ref in this fixture ⇒ unknown ⇒ null, never 0: {r}"
+    );
+
+    // ── A binding that recorded the flag must surface it.
+    let dir = crate::paths::runtime_dir(&home).join("stale");
+    std::fs::create_dir_all(&dir).unwrap();
+    let payload = json!({
+        "version": 1,
+        "agent": "stale",
+        "task_id": "t",
+        "branch": "feature/y",
+        "worktree": wt.to_str().unwrap(),
+        "source_repo": canonical_str,
+        "issued_at": "2026-09-07T00:00:00Z",
+        "base_from_stale_view": true,
+    });
+    std::fs::write(
+        dir.join("binding.json"),
+        serde_json::to_string_pretty(&payload).unwrap(),
+    )
+    .unwrap();
+    let r = handle_binding_state(&home, &json!({"instance": "stale"}), &None);
+    assert_eq!(
+        r["base_from_stale_view"].as_bool(),
+        Some(true),
+        "the provision-time fact must survive into the health view: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn binding_state_reports_release_lifecycle_in_flight() {
+    let home = tmp_home("release-in-flight");
+    let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        &home,
+        "release-agent",
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+    )
+    .expect("release permit");
+
+    let active = handle_binding_state(&home, &json!({"instance": "release-agent"}), &None);
+    assert_eq!(active["release_in_flight"], true, "{active}");
+
+    drop(permit);
+    let complete = handle_binding_state(&home, &json!({"instance": "release-agent"}), &None);
+    assert_eq!(complete["release_in_flight"], false, "{complete}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn binding_state_after_release_reports_unbound_clean_state() {
+    let home = tmp_home("post-release");
+    let wt = home.join("wt-x");
+    write_binding_src(
+        &home,
+        "alpha",
+        "feature/x",
+        wt.to_str().unwrap(),
+        "/tmp/source-repo",
+    );
+
+    let pre = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
+    assert_eq!(pre["bound"].as_bool(), Some(true));
+    let _ = handle_release_worktree(&home, &json!({"instance": "alpha"}), &None);
+
+    let post = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
+    assert_eq!(
+        post["bound"].as_bool(),
+        Some(false),
+        "post-release must report unbound: {post}"
+    );
+    assert_eq!(
+        post["bind_in_flight"].as_bool(),
+        Some(false),
+        "in-flight guard cleared post-release: {post}"
+    );
+    assert!(
+        post["ci_watches"].as_array().unwrap().is_empty(),
+        "no leaked watches: {post}"
+    );
+    assert!(
+        post["cross_branch_holders"].as_array().unwrap().is_empty(),
+        "no cross-branch holders: {post}"
+    );
     std::fs::remove_dir_all(&home).ok();
 }

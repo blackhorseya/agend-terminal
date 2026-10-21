@@ -27,6 +27,34 @@ fn tmp_home(tag: &str) -> PathBuf {
 }
 
 #[test]
+fn full_delete_preserves_durable_state_when_termination_is_unconfirmed_3385() {
+    let home = tmp_home("termination_unconfirmed");
+    let run = home.join("run").join(std::process::id().to_string());
+    std::fs::create_dir_all(&run).unwrap();
+    std::fs::write(run.join(".daemon"), format!("{}:0", std::process::id())).unwrap();
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    std::fs::write(&fleet_path, "instances:\n  victim:\n    backend: claude\n").unwrap();
+    let workspace = crate::paths::workspace_dir(&home).join("victim");
+    std::fs::create_dir_all(&workspace).unwrap();
+    std::fs::write(workspace.join("evidence"), "keep").unwrap();
+
+    let error = super::full_delete_instance(&home, "victim").unwrap_err();
+
+    assert!(error.contains("termination request failed"), "{error}");
+    assert!(
+        std::fs::read_to_string(&fleet_path)
+            .unwrap()
+            .contains("victim"),
+        "fleet entry must remain retryable when termination is unconfirmed"
+    );
+    assert!(
+        workspace.join("evidence").exists(),
+        "workspace must not be removed when termination is unconfirmed"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
 fn name_residual_anywhere_clean_home_returns_empty() {
     let home = tmp_home("clean");
     assert!(name_residual_anywhere(&home, "ghost", None).is_empty());
@@ -809,6 +837,145 @@ fn full_delete_shared_external_preserves_all_bytes_2764_slice10a() {
     std::fs::remove_dir_all(shared).ok();
 }
 
+#[test]
+fn full_delete_nested_survivor_preserves_workspace_and_claude_config_3721() {
+    let home = tmp_home("nested-survivor-3721");
+    let outer = crate::paths::workspace_dir(&home).join("victim");
+    let nested = outer.join("survivor-child");
+    cleanup_admission_seed_canaries(&outer);
+    std::fs::write(
+        outer.join(".mcp.json"),
+        br#"{"custom":"keep","mcpServers":{"agend-claude-channel":{"command":"bridge"}}}"#,
+    )
+    .unwrap();
+    let mcp_before = std::fs::read(outer.join(".mcp.json")).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {}\n  survivor:\n    backend: claude\n    working_directory: {}\n",
+            outer.display(),
+            nested.display()
+        ),
+    )
+    .unwrap();
+
+    let _result = super::full_delete_instance(&home, "victim");
+
+    assert!(
+        cleanup_admission_canaries_intact(&outer),
+        "the victim parent is also a survivor's ancestor and must remain intact"
+    );
+    assert_eq!(
+        std::fs::read(outer.join(".mcp.json")).unwrap(),
+        mcp_before,
+        "Claude config mutation must happen only after cleanup admission permits cleanup"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
+#[test]
+fn full_delete_fresh_re_admission_preserves_claude_config_3721() {
+    let home = tmp_home("fresh_readmission_claude_config_3721");
+    let shared = tmp_home("fresh_readmission_shared_claude_config_3721");
+    let sentinel = shared.join("operator-data.txt");
+    std::fs::write(&sentinel, b"keep").unwrap();
+    let mcp_config = shared.join(".mcp.json");
+    std::fs::write(
+        &mcp_config,
+        br#"{"mcpServers":{"agend-claude-channel":{"command":"bridge"}}}"#,
+    )
+    .unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {}\n",
+            shared.display()
+        ),
+    )
+    .unwrap();
+    let hook_home = home.clone();
+    let hook_shared = shared.clone();
+    super::AFTER_FLEET_DELETE_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            crate::fleet::add_instance_to_yaml(
+                &hook_home,
+                "survivor",
+                &crate::fleet::InstanceYamlEntry {
+                    backend: Some("claude".into()),
+                    working_directory: Some(hook_shared.display().to_string()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            // Model backend provisioning after admission but before the
+            // original delete path's shared-config cleanup.
+            std::fs::write(
+                hook_shared.join(".mcp.json"),
+                br#"{"mcpServers":{"agend-claude-channel":{"command":"bridge"}}}"#,
+            )
+            .unwrap();
+        }));
+    });
+
+    let _ = super::full_delete_instance(&home, "victim");
+
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert!(fleet.instances.contains_key("survivor"));
+    assert_eq!(std::fs::read(&sentinel).unwrap(), b"keep");
+    let config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&mcp_config).unwrap()).unwrap();
+    assert!(config["mcpServers"].get("agend-claude-channel").is_some());
+    std::fs::remove_dir_all(home).ok();
+    std::fs::remove_dir_all(shared).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn full_delete_symlinked_parent_overlap_preserves_config_and_files_3721() {
+    use std::os::unix::fs::symlink;
+    let home = tmp_home("symlink-nested-survivor-3721");
+    let real_outer = crate::paths::workspace_dir(&home).join("real-owner");
+    let victim_alias = crate::paths::workspace_dir(&home).join("victim-alias");
+    let survivor = real_outer.join("nested");
+    cleanup_admission_seed_canaries(&real_outer);
+    let mcp_path = real_outer.join(".mcp.json");
+    std::fs::write(
+        &mcp_path,
+        br#"{"mcpServers":{"agend-claude-channel":{"command":"bridge"}}}"#,
+    )
+    .unwrap();
+    let mcp_before = std::fs::read(&mcp_path).unwrap();
+    symlink(&real_outer, &victim_alias).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  victim:\n    backend: claude\n    working_directory: {}\n  survivor:\n    backend: claude\n    working_directory: {}\n",
+            victim_alias.display(),
+            survivor.display()
+        ),
+    )
+    .unwrap();
+
+    let _result = super::full_delete_instance(&home, "victim");
+
+    assert!(
+        cleanup_admission_canaries_intact(&real_outer),
+        "a symlink alias to a workspace ancestor must not mutate the survivor's subtree"
+    );
+    assert_eq!(
+        std::fs::read(&mcp_path).unwrap(),
+        mcp_before,
+        "symlink-resolved cleanup refusal must precede Claude config changes"
+    );
+    assert!(
+        std::fs::symlink_metadata(&victim_alias)
+            .map(|metadata| metadata.file_type().is_symlink())
+            .unwrap_or(false),
+        "the refused alias must remain present"
+    );
+    std::fs::remove_dir_all(home).ok();
+}
+
 #[cfg(unix)]
 #[test]
 fn full_delete_symlink_alias_preserves_target_and_alias_2764_slice10a() {
@@ -997,4 +1164,62 @@ fn full_delete_survivor_canonicalization_ambiguity_preserves_and_errors_2764_sli
         "#2876: victim directory must be actually removed, not just preserved/no-op'd"
     );
     std::fs::remove_dir_all(home).ok();
+}
+
+fn rejected_delete_preserves_transport(identity_rejection: bool) {
+    use std::sync::Arc;
+    let home = tmp_home("refused-transport");
+    let name = format!("refused-{}", crate::types::InstanceId::new().short());
+    crate::fleet::add_instance_to_yaml(
+        &home,
+        &name,
+        &crate::fleet::InstanceYamlEntry {
+            created_by: Some("owner".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    let registry = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let configs = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let externals = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let context = crate::agent_ops::DeleteContext {
+        registry: &registry,
+        configs: &configs,
+        externals: &externals,
+        notifier: None,
+    };
+    crate::daemon::hook_shadow::record_event(&name, "UserPromptSubmit", None);
+    crate::daemon::inject_delivery::arm(&name, "pending legitimate task wake");
+    assert!(crate::daemon::inject_delivery::is_armed_for_test(&name));
+    let epoch = crate::daemon::delivery_worker::current_transport_epoch(&home, &name);
+    let reject = || Err("precondition rejected".to_string());
+    let result = super::full_delete_instance_with_precondition(
+        &home,
+        &name,
+        Some(&context),
+        identity_rejection.then_some(("different-owner", None)),
+        if identity_rejection {
+            None
+        } else {
+            Some(&reject)
+        },
+    );
+    assert!(result.is_err());
+    let same_epoch = crate::daemon::delivery_worker::current_transport_epoch(&home, &name) == epoch;
+    let still_armed = crate::daemon::inject_delivery::is_armed_for_test(&name);
+    crate::daemon::inject_delivery::forget(&name);
+    crate::daemon::hook_shadow::forget(&name);
+    std::fs::remove_dir_all(home).ok();
+    assert!(same_epoch && still_armed,
+        "refused deletion mutated delivery state: same_epoch={same_epoch}, still_armed={still_armed}");
+}
+
+#[test]
+fn rejected_delete_identity_preserves_epoch_and_pending_verification() {
+    rejected_delete_preserves_transport(true);
+}
+
+#[test]
+fn rejected_delete_precondition_preserves_epoch_and_pending_verification() {
+    rejected_delete_preserves_transport(false);
 }

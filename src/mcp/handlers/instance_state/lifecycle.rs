@@ -5,7 +5,7 @@
 //!
 //! Public surface:
 //! - `full_delete_instance` — used by the MCP `delete_instance` handler
-//!   (`super::handle_delete_instance`) and the TUI close
+//!   (`super::handle_delete_instance`) and the TUI's explicit instance-delete
 //!   path (`crate::app::overlay`). Returns `Result<(), String>`; `Err`
 //!   carries the residual-store audit so callers can surface partial
 //!   state instead of letting `auto_start_fleet` resurrect the
@@ -14,10 +14,26 @@
 //!   future callers (e.g. `handle_spawn` rejection-message enrichment)
 //!   that want to surface the divergent-store list to the operator.
 
-use crate::agent_ops::{cleanup_admission, cleanup_working_dir_admitted};
+use crate::agent_ops::cleanup_admission;
 use crate::channel::telegram;
 use serde_json::json;
 use std::path::Path;
+
+mod workspace_cleanup;
+
+#[cfg(test)]
+std::thread_local! {
+    static AFTER_FLEET_DELETE_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_after_fleet_delete_test_hook() {
+    AFTER_FLEET_DELETE_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
 
 /// #1907: remove `dir` and any empty subdirectories bottom-up, stopping at any
 /// non-empty dir. Used to drop a deleted agent's worktree root including the
@@ -44,30 +60,71 @@ pub(crate) fn delete_with_runtime_or_legacy(
     name: &str,
     delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
     skip_exit_wait: bool,
-) {
+) -> Result<(), String> {
+    delete_with_runtime_or_legacy_for_restart(home, name, delete_context, skip_exit_wait, None)
+}
+
+pub(crate) fn delete_with_runtime_or_legacy_for_restart(
+    home: &Path,
+    name: &str,
+    delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
+    skip_exit_wait: bool,
+    restart_id: Option<&str>,
+) -> Result<(), String> {
     if let Some(context) = delete_context {
-        crate::agent_ops::delete_instance_under_guard(home, name, context, skip_exit_wait);
+        let (_, observed_exit) = match restart_id {
+            Some(restart_id) => crate::agent_ops::delete_instance_under_guard_for_restart(
+                home,
+                name,
+                context,
+                skip_exit_wait,
+                Some(restart_id),
+            ),
+            None => {
+                crate::agent_ops::delete_instance_under_guard(home, name, context, skip_exit_wait)
+            }
+        };
+        if !observed_exit {
+            return Err("child exit was not confirmed; durable teardown refused".to_string());
+        }
+    } else if crate::daemon::find_active_run_dir(home).is_none() {
+        // With no daemon transaction available there is no live child whose
+        // exit can be observed; retain the established offline-cleanup path.
+        return Ok(());
     } else {
         let mut params = json!({"name": name});
         if skip_exit_wait {
             params["no_wait"] = json!(true);
         }
-        let _ = crate::api::call(
+        if let Some(restart_id) = restart_id {
+            params["restart_id"] = json!(restart_id);
+        }
+        let response = crate::api::call(
             home,
             &json!({
                 "method": crate::api::method::DELETE,
                 "params": params,
             }),
-        );
+        )
+        .map_err(|error| format!("instance termination request failed: {error}"))?;
+        if response["ok"].as_bool() != Some(true) {
+            return Err(format!(
+                "instance termination was not confirmed: {}",
+                response["error"]
+                    .as_str()
+                    .unwrap_or("unknown daemon response")
+            ));
+        }
     }
+    Ok(())
 }
 
 /// Sprint 53 Smoke 2 r1: shared full single-instance teardown used by both
-/// the MCP `delete_instance` handler and the TUI close path
-/// (`app/overlay.rs::Overlay::ConfirmClose`). Covers everything
+/// the MCP `delete_instance` handler and the TUI explicit instance-delete
+/// path (`app/overlay.rs::Overlay::ConfirmDeleteInstance`). Covers everything
 /// `handle_delete_instance` historically did EXCEPT the channel-singleton
-/// guard, which stays MCP-only — TUI close is operator-driven and we don't
-/// want to refuse a close because of channel routing.
+/// guard, which stays MCP-only — TUI deletion is operator-driven and we don't
+/// want to refuse it because of channel routing.
 ///
 /// Side effects, all expected for both call sites:
 /// - **PTY kill + child-tree reap** via `daemon::lifecycle::delete_transaction`
@@ -93,6 +150,7 @@ pub(crate) fn delete_with_runtime_or_legacy(
 /// state for `auto_start_fleet` to resurrect on next reconcile. `detail`
 /// is a human-readable string listing the residual stores plus any
 /// per-step error captured during cleanup.
+#[cfg(test)]
 pub(crate) fn full_delete_instance(home: &Path, name: &str) -> Result<(), String> {
     full_delete_instance_with_runtime(home, name, None)
 }
@@ -104,6 +162,27 @@ pub(crate) fn full_delete_instance_with_runtime(
     home: &Path,
     name: &str,
     delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
+) -> Result<(), String> {
+    full_delete_instance_with_expected_identity(home, name, delete_context, None)
+}
+
+/// Job teardown validates its durable identity while holding the lifecycle permit.
+pub(crate) fn full_delete_instance_with_expected_identity(
+    home: &Path,
+    name: &str,
+    delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
+    expected: Option<(&str, Option<&str>)>,
+) -> Result<(), String> {
+    full_delete_instance_with_precondition(home, name, delete_context, expected, None)
+}
+
+/// Recheck a caller's deletion precondition after all spawn/delete fences admit.
+pub(crate) fn full_delete_instance_with_precondition(
+    home: &Path,
+    name: &str,
+    delete_context: Option<&crate::agent_ops::DeleteContext<'_>>,
+    expected: Option<(&str, Option<&str>)>,
+    precondition: Option<&dyn Fn() -> Result<(), String>>,
 ) -> Result<(), String> {
     // #2855: reject an invalid (traversal) name BEFORE the lifecycle permit,
     // the deleting-mark, and every name-derived path removal below — this fn
@@ -123,7 +202,42 @@ pub(crate) fn full_delete_instance_with_runtime(
     // early `Err`, panic), so the name is always re-creatable afterwards — a
     // leaked mark would make it un-spawnable for the daemon's lifetime.
     let mut delete_fence =
-        crate::daemon::lifecycle::DeleteFence::new(home, name, delete_context.is_some());
+        crate::daemon::lifecycle::DeleteFence::admit(home, name, delete_context.is_some());
+    if let Some((creator, expected_uuid)) = expected {
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+            .map_err(|error| format!("identity lookup refused: {error}"))?;
+        if let Some(entry) = fleet.instances.get(name) {
+            if entry.created_by.as_deref() != Some(creator)
+                || expected_uuid.is_some_and(|id| entry.id.as_deref() != Some(id))
+            {
+                return Err("delete refused: worker identity changed".into());
+            }
+        } else if let Some(context) = delete_context {
+            let managed = crate::agent::lock_registry(context.registry)
+                .values()
+                .any(|h| h.name.as_str() == name);
+            let external = crate::agent::lock_external(context.externals).contains_key(name);
+            if managed || external {
+                return Err("delete refused: live worker has no durable identity".into());
+            }
+        }
+    }
+    if let Some(check) = precondition {
+        check()?;
+    }
+    // #3696: a bound delete must publish a durable fence before killing the
+    // child or removing fleet state.  The sidecar is outside runtime/<name>/,
+    // so it survives the residual binding and a daemon restart; its presence
+    // also prevents every spawn/reconcile chokepoint from reusing the name.
+    if let Some(existing) = crate::agent::deletion_recovery::read(home, name)? {
+        if existing.state != crate::agent::deletion_recovery::State::Recovered {
+            return Err(format!(
+                "recovery_required: instance '{name}' already has a pending delete tombstone"
+            ));
+        }
+    }
+    let delete_tombstone = crate::agent::deletion_recovery::begin_from_binding(home, name)?;
+    delete_fence.commit_cleanup(name);
     // Fence transport delivery before any teardown side effect. The keyed
     // guard invalidates queued epochs and excludes same-agent I/O for the full
     // delete transaction, including removal of the receipt files below.
@@ -165,11 +279,13 @@ pub(crate) fn full_delete_instance_with_runtime(
     // stores left residual state.
     let mut step_errors: Vec<String> = Vec::new();
 
-    delete_with_runtime_or_legacy(home, name, delete_context, false);
+    delete_with_runtime_or_legacy(home, name, delete_context, false)?;
     if let Err(e) = crate::fleet::remove_instance_from_yaml(home, name) {
         step_errors.push(format!("fleet.yaml removal: {e}"));
         tracing::error!(name, error = %e, "full_delete_instance: fleet.yaml removal failed");
     }
+    #[cfg(test)]
+    run_after_fleet_delete_test_hook();
     if let Some(tid) = topic_id {
         // #3232/#2550: remove the durable record only when the topic is known
         // absent. On failure, preserve its id under a reserved orphan tombstone:
@@ -236,13 +352,13 @@ pub(crate) fn full_delete_instance_with_runtime(
     // corrupt/unreadable identity, or a lock-acquire failure) preserves the
     // foreign tree; surface it as a step error so the delete reports failure
     // instead of a false success while B's directory is (correctly) left intact.
-    if is_claude {
-        if let Err(error) = crate::mcp_config::remove_claude_channel_config(&working_dir) {
-            step_errors.push(format!("Claude ChannelBridge config cleanup: {error}"));
-        }
-    }
-    if let Some(reason) = cleanup_working_dir_admitted(home, name, &working_dir, &cleanup_admission)
-    {
+    if let Some(reason) = workspace_cleanup::cleanup_deleted_workspace(
+        home,
+        name,
+        &working_dir,
+        &cleanup_admission,
+        is_claude,
+    ) {
         step_errors.push(format!("working_dir cleanup refused: {reason}"));
     }
     // #1157: clean id-based metadata. Fleet.yaml is already removed above,
@@ -396,8 +512,14 @@ pub(crate) fn full_delete_instance_with_runtime(
         &lifecycle_permit,
         crate::worktree_pool::ReleaseProvenance::Delete,
     );
+    let release_failed = release.error.is_some();
     if let Some(error) = release.error {
         step_errors.push(format!("worktree release: {error}"));
+        if let Err(tombstone_error) =
+            crate::agent::deletion_recovery::mark_recovery_required(home, name, None)
+        {
+            step_errors.push(format!("delete recovery tombstone: {tombstone_error}"));
+        }
     }
     // release_full removes the leaf worktree `worktrees/<name>/<branch>/`; drop the
     // now-empty agent dir `worktrees/<name>/` too so the audit below reads clean.
@@ -415,17 +537,21 @@ pub(crate) fn full_delete_instance_with_runtime(
     // ran bind_self / repo checkout) without a prior release both leaked the
     // binding (blocking a same-name re-bind) AND tripped the residual audit below
     // → the whole teardown returned Err despite otherwise succeeding.
-    if let crate::binding::BindingRemoval::Failed(error) =
-        crate::binding::unbind_with_permit(home, name, &lifecycle_permit)
-    {
-        step_errors.push(format!("binding removal: {error}"));
+    if !release_failed {
+        if let crate::binding::BindingRemoval::Failed(error) =
+            crate::binding::unbind_with_permit(home, name, &lifecycle_permit)
+        {
+            step_errors.push(format!("binding removal: {error}"));
+        }
     }
     // #1907: `unbind` drops binding.json + its HMAC sidecar but leaves the now-empty
     // `runtime/<name>/` dir + its `.binding.json.lock` flock behind. Remove the whole
     // dir so teardown is fully clean (the residual audit below now checks it). Safe:
     // the agent is dead (api::call(DELETE) waited for exit), so no concurrent bind
     // re-creates it; `runtime/<name>/` holds only this agent's binding artefacts.
-    let _ = std::fs::remove_dir_all(crate::paths::runtime_dir(home).join(name));
+    if !release_failed {
+        let _ = std::fs::remove_dir_all(crate::paths::runtime_dir(home).join(name));
+    }
     // #1935: explicitly remove the per-agent TUI port file `run/<pid>/<name>.port`.
     // The `api::call(DELETE)` stop-path already calls `remove_port` for a live
     // agent, but a boot-spawn that published the port without the agent reaching a
@@ -440,6 +566,9 @@ pub(crate) fn full_delete_instance_with_runtime(
     // exactly the silent-drop class pattern this fix prevents.
     let residual = name_residual_anywhere(home, name, instance_id.as_deref());
     if residual.is_empty() && step_errors.is_empty() {
+        if delete_tombstone.is_some() {
+            crate::agent::deletion_recovery::clear(home, name)?;
+        }
         return Ok(());
     }
     let detail = match (residual.is_empty(), step_errors.is_empty()) {
@@ -457,7 +586,11 @@ pub(crate) fn full_delete_instance_with_runtime(
         step_errors = ?step_errors,
         "full_delete_instance left residual state — silent-drop class pattern blocked"
     );
-    Err(detail)
+    if release_failed {
+        Err(format!("recovery_required: {detail}"))
+    } else {
+        Err(detail)
+    }
 }
 
 /// Sprint 54 P1-B Bug 1: enumerate every fleet store that still holds

@@ -85,6 +85,42 @@ agend-terminal status                                       # alias of `list` (k
 
 Plain (non-JSON) `list` adds a one-line stderr hint when `mode != live` so an operator running the command interactively sees the fallback state without re-running with `--json`.
 
+### `tool` (experimental, Phase 0a)
+
+The hidden `tool` command is a generic Bash front end for the same daemon MCP
+tools used by `agend-mcp-bridge`. The daemon fence is off by default; an
+operator may enable it in an isolated environment with:
+
+```
+agend-terminal admin config-set experimental.tool_cli_enabled true
+```
+
+Use the live role-filtered catalogue and schemas rather than copying tool
+definitions into scripts:
+
+```
+agend-terminal tool list
+agend-terminal tool schema send
+agend-terminal tool task --action get --arg id=t-123
+agend-terminal tool send --json - <<'EOF'
+{"instance":"ane-review","request_kind":"query","message":"..."}
+EOF
+```
+
+`--json` accepts an inline JSON object, `-` for stdin, or `@FILE`. Repeated
+`--arg K=V` values are strings and override the JSON object; `--action` then
+overrides its `action` member. Values containing quotes, newlines, `$`, or
+backticks must use a quoted `--json -` heredoc (`<<'EOF'`).
+
+The command sends the same tool name, arguments, and instance claim as MCP,
+with `transport:"cli"`. Do not mix invocation surfaces within an instance.
+Exit codes are: `0` completed (including `accepted_in_progress`, which must
+not be resent), `1` tool error, `2` refused/not executed, `3` malformed usage,
+and `4` indeterminate (check state with a read-only tool before resending).
+
+For agent automation, allow the command family explicitly, for example
+`Bash(agend-terminal tool:*)`.
+
 ### `admin`
 
 Operator-side housekeeping subcommands. Destructive paths prompt `[y/N]` unless `--yes` is supplied (intended for scripted recovery jobs).
@@ -121,6 +157,24 @@ Exit codes:
 #### `admin cleanup-branches`
 
 Delete local branches whose PRs have been merged (squash-merge safe). Default is dry-run (preview only); `--yes` actually deletes. See `docs/RCA-*` notes for the squash-merge detection heuristic.
+
+#### Exact operator task settlement
+
+With a running daemon, preview one task, inspect the returned subject and reason,
+then explicitly apply its confirmation:
+
+```sh
+agend-terminal admin task-settlement-preview --task-id TASK_ID --target cancelled --result 'Duplicate confirmed after inspection'
+agend-terminal admin task-settlement-apply --confirmation TOKEN_FROM_PREVIEW
+```
+
+Targets are `done` or `cancelled`. An unused confirmation expires after 15 minutes;
+changed task content requires a new preview. These commands use operator authentication,
+not agent MCP authority. Output is JSON; refusal or transport failure exits nonzero.
+Settlement is exact-row, not child cancellation, and does not provide PR/CI evidence
+or perform inline worktree cleanup. `cleanup_status: not_verified` is not proof of
+completed background cleanup. A retry reports the original outcome separately from
+the current task status; it does not close a reopened task again.
 
 #### `admin task-sweep-config` (#2547)
 
@@ -177,11 +231,15 @@ agend-terminal kill <name>
 ```
 
 ### `stop`
-Stop the daemon (also terminates all managed agents).
+Stop the daemon (also terminates all managed agents). By default `stop` waits, with a bound, for the daemon process to exit and then prints the outcome, so `stop && start` no longer races the exiting daemon (#3539).
 
 ```
-agend-terminal stop
+agend-terminal stop                 # wait up to 30 s for the daemon to exit
+agend-terminal stop --timeout 60    # longer bound; exits non-zero if still running
+agend-terminal stop --no-wait       # return on the accepted request only (old behaviour)
 ```
+
+After the daemon has exited, `stop` lists reparented processes that *look* agend-related — a cargo test binary of this crate, a debug-profile daemon, a cwd under `worktrees/` — as `hint=…` rows. They are not daemon-owned and the daemon does not touch them; the same hint column appears in `doctor`, and `doctor orphans preview` starts a manual cleanup.
 
 ### `agend-mcp-bridge` (separate binary)
 

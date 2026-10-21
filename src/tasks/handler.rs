@@ -1,9 +1,16 @@
 use serde_json::Value;
 use std::path::Path;
 
+mod reopened_notify;
+use reopened_notify::notify_reopened_owner;
+
 use super::acl::{can_mutate_record, instance_exists};
 use super::orphan::build_health_response;
 use super::{record_to_task, status_to_legacy_str, Task};
+
+mod create;
+pub(crate) use create::create_schedule_task;
+use create::handle_create;
 
 fn parse_due_at(args: &Value) -> Option<String> {
     let due = args["due_at"].as_str()?;
@@ -25,7 +32,7 @@ pub(super) fn read_task_record_at(
     board: &Path,
     id: &str,
 ) -> Option<crate::task_events::TaskRecord> {
-    let state = crate::task_events::replay_at(board).ok()?;
+    let state = crate::task_events::projected_state_at(board).ok()?;
     state
         .tasks
         .get(&crate::task_events::TaskId(id.to_string()))
@@ -37,6 +44,14 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
         Some(a) => a,
         None => return serde_json::json!({"error": "missing 'action'"}),
     };
+    if matches!(action, "done" | "update")
+        && args.get("force").and_then(Value::as_bool) == Some(true)
+    {
+        return serde_json::json!({
+            "error": "force=true is not supported for public task done/update",
+            "code": "force_not_supported",
+        });
+    }
     let emitter = crate::task_events::InstanceName::from(instance_name);
 
     match action {
@@ -47,6 +62,11 @@ pub fn handle(home: &Path, instance_name: &str, args: &Value) -> Value {
         "done" => handle_done(home, instance_name, emitter, args),
         "update" => handle_update(home, instance_name, emitter, args),
         "sweep" => handle_sweep(home, args),
+        "orphan_reconcile_preview" | "orphan_reconcile_apply" => {
+            super::orphan_reconcile::handle(home, instance_name, args)
+        }
+        "board_sweep" => super::board_sweep::handle(home, args),
+        "board_unretire" => super::board_unretire::handle(home, args),
         "health" => handle_health(home),
         "activity" => handle_activity(home, args),
         "metadata_set" => handle_metadata_set(home, instance_name, emitter, args),
@@ -68,8 +88,39 @@ pub(crate) fn handle_with_live_instances(
 ) -> Value {
     match args["action"].as_str() {
         Some("sweep") => handle_sweep_with_live_instances(home, args, live_instances),
+        Some("orphan_reconcile_preview" | "orphan_reconcile_apply") => {
+            super::orphan_reconcile::handle_with_live_instances(
+                home,
+                instance_name,
+                args,
+                live_instances,
+            )
+        }
+        Some("board_sweep") => super::board_sweep::handle(home, args),
+        Some("board_unretire") => super::board_unretire::handle(home, args),
         Some("health") => handle_health_with_live_instances(home, Some(live_instances)),
         _ => handle(home, instance_name, args),
+    }
+}
+
+pub(crate) fn handle_with_live_instances_and_refresh(
+    home: &Path,
+    instance_name: &str,
+    args: &Value,
+    live_instances: &std::collections::HashSet<String>,
+    live_refresh: &dyn Fn() -> Option<std::collections::HashSet<String>>,
+) -> Value {
+    match args["action"].as_str() {
+        Some("orphan_reconcile_preview" | "orphan_reconcile_apply") => {
+            super::orphan_reconcile::handle_with_live_instances_and_refresh(
+                home,
+                instance_name,
+                args,
+                live_instances,
+                live_refresh,
+            )
+        }
+        _ => handle_with_live_instances(home, instance_name, args, live_instances),
     }
 }
 
@@ -127,279 +178,6 @@ fn parse_assignee_for_update(args: &Value) -> Result<AssigneePatch, Value> {
     }
 }
 
-fn handle_create(home: &Path, emitter: crate::task_events::InstanceName, args: &Value) -> Value {
-    let title = match args["title"].as_str() {
-        Some(t) => t,
-        None => return serde_json::json!({"error": "missing 'title'"}),
-    };
-    // #2249 pre-work alignment gate: validation mirrors second_reviewer_reason
-    // (comms_gates/dispatch.rs:104-109) — N>0 requires a non-empty reason.
-    // 0 (default/absent) leaves plan_ack_required unset, so the in_progress
-    // gate never fires — byte-identical to pre-#2249 behavior.
-    let plan_ack_required = args["plan_ack_required"].as_u64().unwrap_or(0);
-    if plan_ack_required > 0 {
-        let reason = args["plan_ack_reason"].as_str().unwrap_or("");
-        if reason.is_empty() {
-            return serde_json::json!({
-                "error": "plan_ack_required > 0 requires non-empty 'plan_ack_reason'"
-            });
-        }
-    }
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static ID_SEQ: AtomicU64 = AtomicU64::new(0);
-    let ts = chrono::Utc::now().format("%Y%m%d%H%M%S%6f");
-    let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
-    // CR-2026-06-14 (correctness): `tasks::handle` runs in every MCP server
-    // process AND the daemon. ts (microseconds) + ID_SEQ is only PROCESS-unique,
-    // so two processes minting in the same microsecond both produce `t-<ts>-0`
-    // and `apply_created`'s `or_insert_with` silently drops the second Created at
-    // replay. The pid disambiguates across processes. Format is now a THREE-
-    // numeric-segment id `t-<ts>-<pid>-<seq>`; the sweep `Closes`-marker regex,
-    // its strict validator, and the `has_task_id` probe accept both this and the
-    // legacy two-segment form (see src/daemon/task_sweep.rs).
-    let pid = std::process::id();
-    let id = format!("t-{ts}-{pid}-{seq}");
-    let assignee = match parse_assignee_for_create(args) {
-        Ok(a) => a,
-        Err(e) => return e,
-    };
-    let routed_to = if let Some(ref name) = assignee {
-        match crate::teams::resolve_team_orchestrator(home, name) {
-            Ok(Some(orch)) => Some(orch),
-            Ok(None) => None,
-            Err(e) => return serde_json::json!({"error": e}),
-        }
-    } else {
-        None
-    };
-    let depends_on: Vec<String> = args["depends_on"]
-        .as_array()
-        .map(|a| {
-            a.iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default();
-    let event = crate::task_events::TaskEvent::Created {
-        task_id: crate::task_events::TaskId(id.clone()),
-        title: title.to_string(),
-        description: args["description"].as_str().unwrap_or("").to_string(),
-        priority: args["priority"].as_str().unwrap_or("normal").to_string(),
-        owner: assignee
-            .as_ref()
-            .map(|s| crate::task_events::InstanceName(s.clone())),
-        due_at: parse_due_at(args),
-        depends_on: depends_on
-            .iter()
-            .map(|s| crate::task_events::TaskId(s.clone()))
-            .collect(),
-        routed_to: routed_to
-            .as_ref()
-            .map(|s| crate::task_events::InstanceName(s.clone())),
-        branch: args["branch"].as_str().map(String::from),
-        // Sprint 55 P0-C: opt-out flag for daemon auto-bind on
-        // dispatch. None = default auto-bind behavior preserved.
-        bind: args["bind"].as_bool(),
-        // Sprint 59 Wave 1 PR-1 (#9 task stall watchdog):
-        // optional operator-supplied ETA in seconds. None
-        // disables stall detection for the task.
-        eta_secs: args["eta_secs"].as_i64(),
-        tags: args["tags"]
-            .as_array()
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-            .unwrap_or_default(),
-        parent_id: args["parent_id"]
-            .as_str()
-            .map(|s| crate::task_events::TaskId(s.to_string())),
-    };
-    // #2117 P1: route create to the caller's current project board (or an
-    // explicit `project` arg override). Single-project → DEFAULT → board == home
-    // (byte-identical). Record the task→project mapping in the append-only index
-    // so later done/update/claim/activity resolve the board in O(1).
-    //
-    // #2760: canonicalise the project id to its filesystem-safe SLUG — the project
-    // id IS the slug (board_router doc: the board dir name equals the project id).
-    // `resolve_current_project` already returns a slug, but a raw explicit `project`
-    // arg (e.g. `orgA/projA`) is stored raw in the index while `board_root` slugs
-    // the on-disk dir (`orgA_projA`) — so the STRICT router's index-vs-physical
-    // consistency check reads them as a mismatch (Unreadable) and the parent-project
-    // comparison compares slug-vs-raw. Slugging here makes the index entry, the
-    // board dir, and every later strict route agree. Idempotent on an already-safe id.
-    let project = crate::task_events::project_slug(
-        &args["project"]
-            .as_str()
-            .map(String::from)
-            .unwrap_or_else(|| {
-                super::board_router::resolve_current_project(home, emitter.as_str())
-            }),
-    );
-    // #2117 P3a: `parent_id` is subtask COMPOSITION ("A is composed of B/C/D").
-    // DP4 invariant — a subtask MUST live in its parent's project. Cross-project
-    // composition breaks board isolation: `cascade_cancel_children` only replays
-    // the PARENT's board, so a cross-project child would be silently orphaned when
-    // the parent is cancelled. Enforce the invariant at the only write point that
-    // can violate it — reject here, fail-closed, rather than detect it later.
-    // Single-project → `resolve_task_project(parent) == project` always → never
-    // fires → byte-identical. (`depends_on` is execution-order dependency, NOT
-    // composition — cross-board references are allowed there per the epic and are
-    // NOT guarded here.)
-    if let Some(parent_id) = args["parent_id"].as_str() {
-        // #2760: resolve the parent's board via the strict route. A route error
-        // (NotFound / Unreadable / Ambiguous) fails closed — a subtask is never
-        // created against a parent whose board cannot be uniquely proven.
-        let parent_project = match super::load_routed(home, parent_id) {
-            Ok(rt) => rt.board().project().to_string(),
-            Err(e) => {
-                return serde_json::json!({
-                    "error": format!(
-                        "cross-project parent_id rejected: parent {parent_id} could not be \
-                         routed ({e}) — a subtask must live in its parent's uniquely-resolved \
-                         project (board isolation, #2117 P3a / #2760)"
-                    )
-                });
-            }
-        };
-        if parent_project != project {
-            return serde_json::json!({
-                "error": format!(
-                    "cross-project parent_id rejected: parent {parent_id} resolves to project \
-                     '{parent_project}' but this subtask targets project '{project}' — a subtask \
-                     must live in its parent's project (board isolation, #2117 P3a)"
-                )
-            });
-        }
-    }
-    let board = crate::task_events::board_root(home, &project);
-    if let Some(predecessor_id) = args["supersedes"]
-        .as_str()
-        .map(str::trim)
-        .filter(|id| !id.is_empty())
-    {
-        return super::supersession::create_with_supersession(
-            home,
-            &project,
-            &emitter,
-            &id,
-            predecessor_id,
-            event,
-            args,
-        );
-    }
-    // #2760 item 2: create under the per-id router lock. The id routing NOWHERE
-    // (NotFound) is re-proved under the lock BEFORE the Created append + index
-    // record, so two racing creates of the same id (or a create racing a mutation)
-    // can never land a cross-board duplicate — which would make every later route
-    // Ambiguous and un-mutatable. A fresh id is timestamp+pid+seq so this virtually
-    // always holds; it fails closed if the id somehow already exists on a board or
-    // its absence cannot be proven. The lock is held across the pure board-record
-    // writes below (no dispatch side-effects, #1496 → no self-IPC under the flock).
-    let _create_lock = match super::board_router::acquire_task_id_lock(home, &id) {
-        Ok(g) => g,
-        Err(e) => {
-            return serde_json::json!({
-                "error": format!("failed to acquire per-id lock for create of '{id}': {e}")
-            })
-        }
-    };
-    match super::load_routed(home, &id) {
-        // The id is free on every board → safe to create.
-        Err(super::TaskRouteError::NotFound) => {}
-        Ok(_) => {
-            return serde_json::json!({
-                "error": format!("task id '{id}' already exists on a board"),
-                "code": "duplicate_task_id",
-            })
-        }
-        Err(e) => {
-            return serde_json::json!({
-                "error": format!("cannot prove task id '{id}' is unused: {e}"),
-                "code": "task_route_unresolved",
-            })
-        }
-    }
-    match crate::task_events::append_at(&board, &emitter, event) {
-        Ok(_) => {
-            let _ = super::board_router::record_task_project(home, &id, &project);
-            // #2249: seed the plan-ack gate's metadata right after Created.
-            // No new event variant — composes onto the existing MetadataSet
-            // event/action, matching #2249's "reuse existing mechanisms"
-            // design. Absent when plan_ack_required == 0 (the common case),
-            // so `handle_update`'s gate check (which reads this same key)
-            // never fires — byte-identical to pre-#2249 for every task that
-            // doesn't opt in.
-            if plan_ack_required > 0 {
-                let reason = args["plan_ack_reason"].as_str().unwrap_or("");
-                let task_id_typed = crate::task_events::TaskId(id.clone());
-                let _ = crate::task_events::append_at(
-                    &board,
-                    &emitter,
-                    crate::task_events::TaskEvent::MetadataSet {
-                        task_id: task_id_typed.clone(),
-                        by: emitter.clone(),
-                        key: "plan_ack_required".to_string(),
-                        value: serde_json::json!(plan_ack_required),
-                    },
-                );
-                let _ = crate::task_events::append_at(
-                    &board,
-                    &emitter,
-                    crate::task_events::TaskEvent::MetadataSet {
-                        task_id: task_id_typed,
-                        by: emitter.clone(),
-                        key: "plan_ack_reason".to_string(),
-                        value: serde_json::json!(reason),
-                    },
-                );
-            }
-            // #2745 (decision d-…-11): seed the durable `review_class` authority
-            // for a PR-producing task. Stored verbatim; validity ({single,dual})
-            // is enforced fail-closed downstream at dispatch/poll time via
-            // `ReviewClass::parse_fail_closed` (an unknown/typo resolves Unresolved
-            // → refuse-to-arm + diagnostic, never a silent default). Absent → no
-            // key (the common non-PR task), byte-identical to pre-#2745.
-            if let Some(rc) = args["review_class"].as_str().filter(|s| !s.is_empty()) {
-                let _ = crate::task_events::append_at(
-                    &board,
-                    &emitter,
-                    crate::task_events::TaskEvent::MetadataSet {
-                        task_id: crate::task_events::TaskId(id.clone()),
-                        by: emitter.clone(),
-                        key: "review_class".to_string(),
-                        value: serde_json::json!(rc),
-                    },
-                );
-            }
-            let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
-            // #1496 Option 1: `task(action:create)` is a PURE board record
-            // with ZERO dispatch side-effects — no inbox enqueue, no
-            // dispatch_tracking, no PTY notify. Dispatch (notify + worktree
-            // auto-bind) is solely `send(kind=task)`'s job; it auto-creates
-            // the board row when `task_id` is empty (comms.rs), so the
-            // single-step "create + dispatch" use case is fully preserved
-            // via one `send(kind=task)` call.
-            //
-            // The prior auto-notify (#1238) was a second, inferior dispatch
-            // path: a title-only, non-actionable wake carrying no task
-            // description. It fired prematurely — pushing the assignee into
-            // the busy state before the real, context-rich `send(kind=task)`
-            // arrived — so that send hit the busy-gate and forced operators
-            // to re-send with `force=true`. Removing it unifies dispatch on
-            // one path and kills the race (see #1496 spike).
-            serde_json::json!({
-                "id": id,
-                "event": "created",
-                "task": task,
-                "status": "created",
-            })
-        }
-        Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
-    }
-}
-
 fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
     // #2037 ①: accept the natural names as aliases of the filter_* params —
     // `status`/`assignee` are create/update params elsewhere, but on the
@@ -442,7 +220,16 @@ fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
         std::collections::HashMap::new();
     let tasks: Vec<Task> = if fleet_scope {
         let mut all = Vec::new();
-        for (project, ts) in super::board_router::list_all_boards(home) {
+        let boards = match super::board_router::list_all_boards_checked(home) {
+            Ok(boards) => boards,
+            Err(error) => {
+                return serde_json::json!({
+                    "error": format!("task catalog unreadable: {error}"),
+                    "code": "task_catalog_unreadable",
+                })
+            }
+        };
+        for (project, ts) in boards {
             for t in &ts {
                 project_of.insert(t.id.clone(), project.clone());
             }
@@ -454,7 +241,15 @@ fn handle_list(home: &Path, caller: &str, args: &Value) -> Value {
             .as_str()
             .map(String::from)
             .unwrap_or_else(|| super::board_router::resolve_current_project(home, caller));
-        super::list_all_at(home, &crate::task_events::board_root(home, &project))
+        match super::list_all_at_checked(home, &crate::task_events::board_root(home, &project)) {
+            Ok(tasks) => tasks,
+            Err(error) => {
+                return serde_json::json!({
+                    "error": format!("task catalog unreadable: {error}"),
+                    "code": "task_catalog_unreadable",
+                })
+            }
+        }
     };
     let mut filtered: Vec<Task> = tasks
         .iter()
@@ -579,6 +374,13 @@ fn minimal_task_value(v: &mut Value) {
     obj.retain(|k, _| KEEP.contains(&k.as_str()));
 }
 
+fn catalog_unreadable(error: impl std::fmt::Display) -> Value {
+    serde_json::json!({
+        "error": format!("task catalog unreadable: {error}"),
+        "code": "task_catalog_unreadable",
+    })
+}
+
 /// #2475 Phase 2: single-task detail fetch. The terse-by-default `list` caps
 /// `description`/`result`; `get` is the companion that returns ONE task's FULL
 /// record by id, so a caller can pull the full text of just the task it cares
@@ -596,10 +398,11 @@ fn handle_get(home: &Path, _caller: &str, args: &Value) -> Value {
     // unreadable board fails closed instead of the old arbitrary first-hit scan.
     let (task, project) = if let Some(project) = args["project"].as_str() {
         let board = crate::task_events::board_root(home, project);
-        match super::list_all_at(home, &board)
-            .into_iter()
-            .find(|t| t.id == id)
-        {
+        let tasks = match super::list_all_at_checked(home, &board) {
+            Ok(tasks) => tasks,
+            Err(error) => return catalog_unreadable(error),
+        };
+        match tasks.into_iter().find(|t| t.id == id) {
             Some(t) => (t, project.to_string()),
             None => return serde_json::json!({"error": format!("task not found: {id}")}),
         }
@@ -608,10 +411,11 @@ fn handle_get(home: &Path, _caller: &str, args: &Value) -> Value {
             // Re-read via `list_all_at` on the ROUTED board so the response keeps
             // the dep-derived status (in-memory blocking), matching pre-#2760 `get`.
             Ok(rt) => {
-                match super::list_all_at(home, rt.board().path())
-                    .into_iter()
-                    .find(|t| t.id == id)
-                {
+                let tasks = match super::list_all_at_checked(home, rt.board().path()) {
+                    Ok(tasks) => tasks,
+                    Err(error) => return catalog_unreadable(error),
+                };
+                match tasks.into_iter().find(|t| t.id == id) {
                     Some(t) => (t, rt.board().project().to_string()),
                     None => return serde_json::json!({"error": format!("task not found: {id}")}),
                 }
@@ -632,38 +436,6 @@ fn handle_get(home: &Path, _caller: &str, args: &Value) -> Value {
         obj.insert("project".to_string(), Value::String(project));
     }
     serde_json::json!({ "task": v })
-}
-
-/// #2117 P3a (FM5 / board isolation): per-board mutation authority. A task
-/// mutation resolves its board from the task_id, so a caller can name a task that
-/// lives on ANOTHER project's board. Deny unless the caller acts in that board's
-/// project — `super::acl::can_mutate_on_board` (system identities bypass; a hard
-/// fleet read failure fail-closes). `force` — the audited operator override, the
-/// SAME axis as the owner-ACL `can_mutate_record` — bypasses it on the paths that
-/// carry it. Single-project → caller project == task board project (both DEFAULT)
-/// → allow → byte-identical (no new denial). Returns `Some(error)` when denied.
-// #2760: `board_project` is the caller's ALREADY-resolved authoritative board
-// (from `super::load_routed`), so the mutation routes ONCE and this gate never
-// re-resolves (nor silently defaults). `None` = allowed.
-fn cross_board_denied(
-    home: &Path,
-    caller: &str,
-    id: &str,
-    board_project: &str,
-    force: bool,
-) -> Option<Value> {
-    if force {
-        return None;
-    }
-    if super::acl::can_mutate_on_board(home, caller, board_project) {
-        return None;
-    }
-    Some(serde_json::json!({
-        "error": format!(
-            "cross-board mutation denied: task '{id}' lives on the '{board_project}' project \
-             board but caller '{caller}' acts in a different project (board isolation, #2117 P3a)"
-        )
-    }))
 }
 
 fn handle_claim(
@@ -697,7 +469,12 @@ fn handle_claim(
     // #2117 P3a: board-isolation gate — a caller may only claim tasks on its own
     // project's board (claim has no `force`/owner-ACL — an open task is claimable
     // by anyone, but only within the board). Single-project → allow.
-    if let Some(deny) = cross_board_denied(home, &iname, &id, routed.board().project(), false) {
+    // #3511 passes `None`: claim is the one gated action with NO owner-ACL behind
+    // it, so the boundary is its only authority — an exception here would REMOVE
+    // the gate rather than defer it. Settlement needs no prior claim.
+    if let Some(deny) =
+        super::acl::cross_board_denied(home, &iname, &id, routed.board().project(), None)
+    {
         return deny;
     }
     // #t-21: validate + append in ONE critical section to close the
@@ -823,6 +600,11 @@ fn handle_done(
         None => return serde_json::json!({"error": "missing 'id' (alias: task_id)"}),
     };
     let result_text = args["result"].as_str().map(String::from);
+    let expected_branch = args
+        .get("expected_branch")
+        .and_then(Value::as_str)
+        .filter(|branch| !branch.is_empty())
+        .map(String::from);
     let caller = instance_name.to_string();
     // #2760: resolve the task's authoritative board ONCE via the strict route
     // (fail-closed); reuse it for the ACL gate, pre-checks, and the checked append.
@@ -840,23 +622,19 @@ fn handle_done(
     };
     let board = routed.board().path().to_path_buf();
     let record = routed.record().clone();
-    // #808: force flag bypasses the ACL gate for historical
-    // ghost-owned cleanup. Validator mirrors comms.rs:200-218.
-    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-    let force_reason = args
-        .get("force_reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if force && force_reason.is_empty() {
-        return serde_json::json!({
-            "error": "force=true requires a non-empty 'force_reason'"
-        });
-    }
     // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
-    if let Some(deny) = cross_board_denied(home, &caller, &id, routed.board().project(), force) {
+    // #3511: a row's own assignee settles it across boards; the owner-ACL below
+    // is still the authority on WHO may do it.
+    if let Some(deny) = super::acl::cross_board_denied(
+        home,
+        &caller,
+        &id,
+        routed.board().project(),
+        record.owner.as_ref().map(|o| o.0.as_str()),
+    ) {
         return deny;
     }
-    if !force && !can_mutate_record(home, &caller, &record) {
+    if !can_mutate_record(home, &caller, &record) {
         return serde_json::json!({
             "error": format!(
                 "task '{id}' owned by '{}', caller '{caller}' not authorized",
@@ -864,18 +642,23 @@ fn handle_done(
             )
         });
     }
-    let completion_receipt = if force {
-        None
-    } else {
-        match super::assignee_completion_guard(home, &id, &caller, &record) {
-            Ok(receipt) => receipt,
-            Err(reason) => {
-                return serde_json::json!({
-                    "error": reason,
-                    "code": "assignee_completion_blocked",
-                })
-            }
+    let completion_receipt = match super::assignee_completion_guard(home, &id, &caller, &record) {
+        super::CompletionGate::Permit(receipt) => receipt,
+        super::CompletionGate::Deny(reason) => {
+            return serde_json::json!({
+                "error": reason,
+                "code": "assignee_completion_blocked",
+            })
         }
+        // NOT a permit — the guard had no opinion, and the only authority that
+        // ran for this caller is `can_mutate_record` above. That ACL admits
+        // system identities, `is_orchestrator_of` and the owner's team
+        // orchestrator, so a non-assignee arriving here was authorized THERE.
+        // Whether it should be is a separate question about who may settle;
+        // this arm only makes it visible that the guard is not what decided.
+        super::CompletionGate::NotApplicable(
+            super::GateInapplicable::Branchless | super::GateInapplicable::NotTheAssignee,
+        ) => None,
     };
     // #1265: transition enforcement for done action.
     if !record
@@ -891,38 +674,11 @@ fn handle_done(
             "code": "illegal_transition",
         });
     }
-    if force {
-        crate::event_log::log(
-            home,
-            "task_force_done",
-            &caller,
-            &format!(
-                "task={id} owner={} reason={force_reason}",
-                record
-                    .owner
-                    .as_ref()
-                    .map(|o| o.0.as_str())
-                    .unwrap_or("none")
-            ),
-        );
-    }
     let by = record
         .owner
         .as_ref()
         .map(|o| o.0.clone())
         .unwrap_or_else(|| caller.clone());
-    // #808: when force is set, prefix the result with an
-    // audit marker so the persisted event itself names the
-    // caller + reason (event_log carries the same record for
-    // cross-board audit).
-    let result_text = if force {
-        Some(format!(
-            "[forced by '{caller}': {force_reason}] {}",
-            result_text.unwrap_or_default()
-        ))
-    } else {
-        result_text
-    };
     let event = crate::task_events::TaskEvent::Done {
         task_id: crate::task_events::TaskId(id.clone()),
         by: crate::task_events::InstanceName(by),
@@ -943,6 +699,9 @@ fn handle_done(
     // self-IPC or take other locks) runs AFTER the per-id flock drops (#1629). The
     // fingerprint match guarantees `routed.board()` still names the appended board,
     // so the post-lock read-back reads the right board.
+    #[cfg(test)]
+    super::fire_before_mutation_commit_hook_for_test();
+    let expected_branch_for_commit = expected_branch.clone();
     let append_result = routed.with_revalidated_board(home, |board| {
         crate::task_events::append_checked_at(board, &emitter, event, |state| {
             let tv = state
@@ -951,6 +710,14 @@ fn handle_done(
                 .map(record_to_task)
                 .find(|t| t.id == done_id)
                 .ok_or_else(|| format!("task '{done_id}' not found"))?;
+            if let Some(expected_branch) = expected_branch_for_commit.as_deref() {
+                if tv.branch.as_deref() != Some(expected_branch) {
+                    return Err(format!(
+                        "branch precondition failed for task {done_id}: expected '{expected_branch}', found '{}'",
+                        tv.branch.as_deref().unwrap_or("<none>")
+                    ));
+                }
+            }
             if !tv
                 .status
                 .can_transition_to(crate::task_events::TaskStatus::Done)
@@ -984,7 +751,11 @@ fn handle_done(
                     .as_ref()
                     .map(|o| o.0.clone())
                     .unwrap_or_else(|| caller.clone());
-                if let Some(binding) = crate::binding::read(home, &owner) {
+                // Receipt completion concerns an already released old task,
+                // never the owner's current (possibly rebound) workspace.
+                if let Some(binding) =
+                    crate::binding::read(home, &owner).filter(|_| completion_receipt.is_none())
+                {
                     // P0 cross-lease identity guard: only touch the owner's
                     // worktree / enqueue release when the binding's task_id
                     // matches the completed task. A stale task_done for an OLD
@@ -1033,7 +804,14 @@ fn handle_done(
                     "status": "done",
                 })
             }
-            Ok(Err(reason)) => serde_json::json!({"error": reason, "code": "illegal_transition"}),
+            Ok(Err(reason)) => {
+                let code = if reason.starts_with("illegal transition") {
+                    "illegal_transition"
+                } else {
+                    "precondition_failed"
+                };
+                serde_json::json!({"error": reason, "code": code})
+            }
             Err(e) => serde_json::json!({"error": format!("event log append failed: {e}")}),
         },
     }
@@ -1044,8 +822,7 @@ fn handle_done(
 /// it is the AUTHORITATIVE gate the out-of-lock ACL/transition checks only
 /// fast-reject. Fails closed when, since the out-of-lock read:
 /// - the task vanished;
-/// - ownership drifted so `caller` is no longer authorized (`force` bypasses,
-///   mirroring the out-of-lock gate at :633) — this covers BOTH status and
+/// - ownership drifted so `caller` is no longer authorized — this covers BOTH status and
 ///   non-status updates (the latter had no in-lock guard at all before);
 /// - the status transition became illegal (the prior #1868 guard); or
 /// - the owner moved out from under a Claimed/InProgress/Done event whose `by`
@@ -1163,7 +940,6 @@ fn update_batch_precondition(
     home: &Path,
     caller: &str,
     upd_id: &str,
-    force: bool,
     target_status: Option<crate::task_events::TaskStatus>,
     stale_owner: &Option<crate::task_events::InstanceName>,
 ) -> Result<(), String> {
@@ -1171,9 +947,8 @@ fn update_batch_precondition(
         .tasks
         .get(&crate::task_events::TaskId(upd_id.to_string()))
         .ok_or_else(|| format!("task '{upd_id}' not found"))?;
-    // (1) Ownership ACL re-check against fresh state — same `can_mutate_record`
-    //     + force semantics as the out-of-lock gate (:633).
-    if !force && !can_mutate_record(home, caller, fresh) {
+    // (1) Ownership ACL re-check against fresh state.
+    if !can_mutate_record(home, caller, fresh) {
         return Err(format!(
             "task '{upd_id}' ownership changed since authorization; \
              caller '{caller}' no longer authorized (retry)"
@@ -1255,23 +1030,20 @@ fn handle_update(
     };
     let board = routed.board().path().to_path_buf();
     let record = routed.record().clone();
-    // #808: force flag bypasses the ACL gate for historical
-    // ghost-owned cleanup. Validator mirrors comms.rs:200-218.
-    let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-    let force_reason = args
-        .get("force_reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
-    if force && force_reason.is_empty() {
-        return serde_json::json!({
-            "error": "force=true requires a non-empty 'force_reason'"
-        });
-    }
     // #2117 P3a: board-isolation gate (outer boundary, before the owner-ACL).
-    if let Some(deny) = cross_board_denied(home, &caller, &id, routed.board().project(), force) {
+    // #3511: cancellation rides `update` (there is no separate `cancel`), so the
+    // exception is offered ONLY for a pure cancellation — every other update
+    // mutation stays board-isolated. See `acl::update_settlement_owner`.
+    if let Some(deny) = super::acl::cross_board_denied(
+        home,
+        &caller,
+        &id,
+        routed.board().project(),
+        super::acl::update_settlement_owner(&record, args),
+    ) {
         return deny;
     }
-    if !force && !can_mutate_record(home, &caller, &record) {
+    if !can_mutate_record(home, &caller, &record) {
         return serde_json::json!({
             "error": format!(
                 "task '{id}' owned by '{}', caller '{caller}' not authorized",
@@ -1279,32 +1051,6 @@ fn handle_update(
             )
         });
     }
-    if force {
-        crate::event_log::log(
-            home,
-            "task_force_update",
-            &caller,
-            &format!(
-                "task={id} owner={} reason={force_reason}",
-                record
-                    .owner
-                    .as_ref()
-                    .map(|o| o.0.as_str())
-                    .unwrap_or("none")
-            ),
-        );
-    }
-    // #808: when force is set, embed the caller + reason
-    // directly in the emitted event's `reason` field so the
-    // per-task replay trail also carries the audit (in
-    // addition to the event_log entry above).
-    let reason_text = |base: &str| -> String {
-        if force {
-            format!("{base} [forced by '{caller}': {force_reason}]")
-        } else {
-            base.to_string()
-        }
-    };
     // F3: `depends_on` is set at `Created` and is immutable via `update` — there
     // is no post-create event that carries it, by design (circular-dependency
     // containment; see the contract in `tasks/tests.rs`). Reject it explicitly
@@ -1321,6 +1067,11 @@ fn handle_update(
     // single `append_batch` so updates are atomic at the F7 batch
     // level (all-or-nothing fsync window).
     let mut pending_events: Vec<crate::task_events::TaskEvent> = Vec::new();
+    // t-…-15764-33: set when the status arm queues a TERMINAL→open `Reopened`
+    // (the legacy string of the prior status). Drives the post-commit owner
+    // notification below — non-terminal reopens (Backlog→open) and `Released`
+    // stay silent, so the gate is the prior STATUS, not the event kind.
+    let mut reopened_from_terminal: Option<&'static str> = None;
     // PR3 — explicit status transition emits the canonical event.
     // Priority / assignee changes without status change have no
     // event variant in v2; the change is observable only through
@@ -1448,11 +1199,11 @@ fn handle_update(
                 (_, "cancelled") => Some(crate::task_events::TaskEvent::Cancelled {
                     task_id: crate::task_events::TaskId(id.clone()),
                     by: crate::task_events::InstanceName::from(caller.as_str()),
-                    reason: reason_text("operator update"),
+                    reason: "operator update".to_string(),
                 }),
                 (_, "blocked") => Some(crate::task_events::TaskEvent::Blocked {
                     task_id: crate::task_events::TaskId(id.clone()),
-                    reason: reason_text("operator update"),
+                    reason: "operator update".to_string(),
                 }),
                 (crate::task_events::TaskStatus::Blocked, "open") => {
                     Some(crate::task_events::TaskEvent::Unblocked {
@@ -1468,14 +1219,22 @@ fn handle_update(
                 | (crate::task_events::TaskStatus::InProgress, "open") => {
                     Some(crate::task_events::TaskEvent::Released {
                         task_id: crate::task_events::TaskId(id.clone()),
-                        reason: reason_text("operator update (status → open)"),
+                        reason: "operator update (status → open)".to_string(),
                     })
                 }
-                (_, "open") => Some(crate::task_events::TaskEvent::Reopened {
-                    task_id: crate::task_events::TaskId(id.clone()),
-                    reason: reason_text("operator update"),
-                    source_evidence: format!("status {} → open", status_to_legacy_str(prev_status)),
-                }),
+                (_, "open") => {
+                    if prev_status.is_terminal() {
+                        reopened_from_terminal = Some(status_to_legacy_str(prev_status));
+                    }
+                    Some(crate::task_events::TaskEvent::Reopened {
+                        task_id: crate::task_events::TaskId(id.clone()),
+                        reason: "operator update".to_string(),
+                        source_evidence: format!(
+                            "status {} → open",
+                            status_to_legacy_str(prev_status)
+                        ),
+                    })
+                }
                 (_, "backlog") => Some(crate::task_events::TaskEvent::MovedToBacklog {
                     task_id: crate::task_events::TaskId(id.clone()),
                 }),
@@ -1616,7 +1375,6 @@ fn handle_update(
                     home,
                     &caller,
                     &upd_id,
-                    force,
                     target_status,
                     &stale_owner,
                 )
@@ -1684,7 +1442,17 @@ fn handle_update(
         }
     }
     // #807 Item 1: see create arm note.
-    let task = read_task_record_at(&board, &id).map(|r| record_to_task(&r));
+    let record_back = read_task_record_at(&board, &id);
+    // t-…-15764-33: the batch is COMMITTED and the append flock has dropped
+    // (`with_revalidated_board` contract: cascade/notify only after return) —
+    // notify the preserved owner of a terminal→open reopen from the
+    // AUTHORITATIVE read-back, never the stale pre-commit record.
+    if had_events {
+        if let (Some(prev), Some(rec)) = (reopened_from_terminal, record_back.as_ref()) {
+            notify_reopened_owner(home, routed.board().project(), &id, prev, &caller, rec);
+        }
+    }
+    let task = record_back.map(|r| record_to_task(&r));
     if had_events {
         serde_json::json!({
             "id": id,
@@ -1732,20 +1500,9 @@ fn handle_sweep(home: &Path, args: &Value) -> Value {
     // `Closes t-XXX-N` PR markers). This action is operator-
     // triggered, scans for 4 stale categories, returns a
     // dry-run plan, then applies on a confirm round-trip.
-    let live_instances: std::collections::HashSet<String> = crate::api::call(
-        home,
-        &serde_json::json!({"method": crate::api::method::LIST}),
-    )
-    .ok()
-    .and_then(|r| {
-        r["result"]["agents"].as_array().map(|arr| {
-            arr.iter()
-                .filter_map(|a| a["name"].as_str().map(String::from))
-                .collect()
-        })
-    })
-    .unwrap_or_default();
-    handle_sweep_with_live_instances(home, args, &live_instances)
+    let live_instances = crate::runtime::list_live_agents(home);
+    let authority = owner_authority_from_live(home, live_instances);
+    handle_sweep_with_owner_authority(home, args, &authority)
 }
 
 fn handle_sweep_with_live_instances(
@@ -1755,6 +1512,36 @@ fn handle_sweep_with_live_instances(
 ) -> Value {
     // #2454: the MCP adapter supplies this set from the in-process runtime;
     // the public `handle` wrapper above retains its API-derived behavior.
+    let authority = owner_authority_from_live(home, Some(live_instances.clone()));
+    handle_sweep_with_owner_authority(home, args, &authority)
+}
+
+fn owner_authority_from_live(
+    home: &Path,
+    live_instances: Option<std::collections::HashSet<String>>,
+) -> super::sweep::OwnerAuthority {
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home));
+    let fleet_instances = fleet
+        .as_ref()
+        .map(|config| config.instances.keys().cloned().collect())
+        .unwrap_or_default();
+    let fleet_available = fleet.is_ok();
+    match live_instances {
+        Some(live_instances) => super::sweep::OwnerAuthority {
+            live_instances,
+            fleet_instances,
+            live_available: true,
+            fleet_available,
+        },
+        None => super::sweep::OwnerAuthority::unavailable(fleet_instances, fleet_available),
+    }
+}
+
+fn handle_sweep_with_owner_authority(
+    home: &Path,
+    args: &Value,
+    authority: &super::sweep::OwnerAuthority,
+) -> Value {
     let apply = args["apply"].as_bool().unwrap_or(false);
     let confirm_ids: std::collections::HashSet<String> = args["confirm_ids"]
         .as_array()
@@ -1769,25 +1556,73 @@ fn handle_sweep_with_live_instances(
     // None (shipped/superseded categories skipped without repo).
     let repo_owned: Option<String> = args["repository"]
         .as_str()
+        .filter(|repo| !repo.trim().is_empty())
         .map(String::from)
         .or_else(|| crate::daemon::task_sweep::load_sweep_config_for_doctor(home).repo);
+    let repository_scope = repo_owned.as_deref().map(|repository| {
+        crate::daemon::task_sweep::resolve_manual_sweep_repository_scope(home, repository)
+    });
+    if let Some(scope) = repository_scope
+        .as_ref()
+        .filter(|scope| !scope.diagnostics.is_empty())
+    {
+        let diagnostics =
+            serde_json::to_value(&scope.diagnostics).unwrap_or_else(|_| serde_json::json!([]));
+        if !apply {
+            return serde_json::json!({
+                "dry_run": true,
+                "categories": super::sweep::Categories::default().as_json(),
+                "candidate_ids": [],
+                "total_candidates": 0,
+                "diagnostics": diagnostics,
+                "repository_scope": scope.as_json(),
+                "owner_authority": authority.as_json(),
+                "to_apply_hint": "resolve repository scope before applying",
+            });
+        }
+        return serde_json::json!({
+            "error": "repository scope is not apply-capable",
+            "code": "repository_scope_unavailable",
+            "diagnostics": diagnostics,
+            "repository_scope": scope.as_json(),
+        });
+    }
+    let scope_projects = repository_scope.as_ref().map(|scope| {
+        scope
+            .projects
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>()
+    });
     let now = chrono::Utc::now();
     let pr_lookup: super::sweep::PrLookup = &super::sweep::gh_pr_lookup;
     let issue_lookup: super::sweep::IssueLookup = &super::sweep::gh_issue_lookup;
-    let categories = super::sweep::scan_categories(
+    let categories = match super::sweep::scan_categories_with_authority_scoped(
         home,
-        live_instances,
+        authority,
         pr_lookup,
         issue_lookup,
         repo_owned.as_deref(),
+        scope_projects.as_ref(),
         now,
-    );
+    ) {
+        Ok(categories) => categories,
+        Err(error) => {
+            return serde_json::json!({
+                "error": format!("task catalog unreadable: {error}"),
+                "code": "task_catalog_unreadable",
+            })
+        }
+    };
     if !apply {
         return serde_json::json!({
             "dry_run": true,
             "categories": categories.as_json(),
             "candidate_ids": categories.all_ids(),
             "total_candidates": categories.total(),
+            "diagnostics": categories.diagnostics,
+            "repository_scope": repository_scope.as_ref().map(|scope| scope.as_json()),
+            "owner_authority": authority.as_json(),
             "to_apply_hint": "task action=sweep apply=true confirm_ids=<subset> audit_reason=<...>",
         });
     }
@@ -1802,15 +1637,89 @@ fn handle_sweep_with_live_instances(
             "error": "apply=true requires non-empty 'audit_reason' for the cross-board event log entry"
         });
     }
+    if !categories.diagnostics.is_empty() {
+        return serde_json::json!({
+            "error": "repository provider unavailable; no candidates are apply-capable",
+            "code": "provider_unavailable",
+            "diagnostics": categories.diagnostics,
+            "repository_scope": repository_scope.as_ref().map(|scope| scope.as_json()),
+        });
+    }
     let candidate_set: std::collections::HashSet<String> =
         categories.all_ids().into_iter().collect();
     let unknown: Vec<String> = confirm_ids.difference(&candidate_set).cloned().collect();
     if !unknown.is_empty() {
+        let foreign: Vec<String> = if let Some(scope) = scope_projects.as_ref() {
+            unknown
+                .iter()
+                .filter(|id| {
+                    crate::tasks::load_routed(home, id)
+                        .ok()
+                        .is_some_and(|routed| !scope.contains(routed.board().project()))
+                })
+                .cloned()
+                .collect()
+        } else {
+            Vec::new()
+        };
         return serde_json::json!({
             "error": "confirm_ids contained entries not in current sweep candidates",
             "unknown": unknown,
+            "foreign_confirm_ids": foreign,
+            "code": if foreign.is_empty() { "confirm_ids_unknown" } else { "repository_scope_confirm_id_out_of_scope" },
             "hint": "re-run dry-run; candidates may have changed since last scan",
         });
+    }
+    // Repository/team provenance is mutable independently of the task boards.
+    // Re-check it under the same fleet lock used by team updates, and retain
+    // that lock through append so a claim cannot change after authorization.
+    #[cfg(test)]
+    super::fire_before_manual_sweep_repository_scope_hook_for_test();
+    let _fleet_authority_lock = if repository_scope.is_some() {
+        match crate::fleet::persist::acquire_fleet_lock(home) {
+            Ok(lock) => Some(lock),
+            Err(error) => {
+                return serde_json::json!({
+                    "error": format!("could not lock repository authority: {error}"),
+                    "code": "repository_scope_lock_unavailable",
+                })
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(expected_scope) = repository_scope.as_ref() {
+        let fresh_scope = crate::daemon::task_sweep::resolve_manual_sweep_repository_scope(
+            home,
+            &expected_scope.repository,
+        );
+        if !fresh_scope.diagnostics.is_empty() || fresh_scope.projects != expected_scope.projects {
+            return serde_json::json!({
+                "error": "repository scope changed after candidate confirmation",
+                "code": "repository_scope_changed",
+                "repository_scope": fresh_scope.as_json(),
+                "expected_repository_scope": expected_scope.as_json(),
+            });
+        }
+        let fresh_projects: std::collections::BTreeSet<String> =
+            fresh_scope.projects.iter().cloned().collect();
+        let foreign: Vec<String> = confirm_ids
+            .iter()
+            .filter(|id| {
+                crate::tasks::load_routed(home, id)
+                    .ok()
+                    .is_some_and(|routed| !fresh_projects.contains(routed.board().project()))
+            })
+            .cloned()
+            .collect();
+        if !foreign.is_empty() {
+            return serde_json::json!({
+                "error": "confirm_ids are outside the fresh repository scope",
+                "code": "repository_scope_confirm_id_out_of_scope",
+                "foreign_confirm_ids": foreign,
+                "repository_scope": fresh_scope.as_json(),
+            });
+        }
     }
     let applied = super::sweep::emit_cancelled_batch(home, &categories, &confirm_ids, audit_reason);
     match applied {
@@ -1853,7 +1762,14 @@ fn handle_health_with_live_instances(
             });
         }
     };
-    build_health_response(&state, live, &fleet_instances)
+    let mut response = build_health_response(&state, live, &fleet_instances);
+    if let Some(object) = response.as_object_mut() {
+        object.insert(
+            "task_sweep".to_string(),
+            crate::daemon::task_sweep::task_sweep_health(home),
+        );
+    }
+    response
 }
 
 fn handle_activity(home: &Path, args: &Value) -> Value {
@@ -1916,7 +1832,10 @@ fn handle_metadata_set(
     let record = routed.record().clone();
     // #2117 P3a: board-isolation gate (no force on metadata_set — mirror its
     // unconditional owner-ACL below).
-    if let Some(deny) = cross_board_denied(home, instance_name, id, routed.board().project(), false)
+    // #3511 passes `None`: metadata is not settlement — the deadlock is a row
+    // nobody can CLOSE, and arbitrary metadata writes are more than that needs.
+    if let Some(deny) =
+        super::acl::cross_board_denied(home, instance_name, id, routed.board().project(), None)
     {
         return deny;
     }
@@ -2029,6 +1948,15 @@ fn metadata_write_outcome(
         }))
     };
     match key {
+        // #3419: these fields are immutable authority captured in Created.
+        // Generic metadata writes must never forge, downgrade, or even
+        // rewrite the same value after creation.
+        "review_class" | "governing_decision_id" => {
+            MetadataWriteOutcome::Denied(serde_json::json!({
+                "error": format!("{key} is create-only task authority"),
+                "code": "create_only_metadata",
+            }))
+        }
         // I1: plan_acks is system-managed (only `ack_plan` / the reopen-reset write
         // it) — a direct metadata_set is rejected for EVERY identity.
         "plan_acks" => MetadataWriteOutcome::Denied(serde_json::json!({
@@ -2153,7 +2081,10 @@ fn handle_ack_plan(
         }
     };
     let record = routed.record().clone();
-    if let Some(deny) = cross_board_denied(home, instance_name, id, routed.board().project(), false)
+    // #3511 passes `None`: `ack_plan` records a NON-assignee's ack by definition,
+    // so an owner exception could never fire here.
+    if let Some(deny) =
+        super::acl::cross_board_denied(home, instance_name, id, routed.board().project(), None)
     {
         return deny;
     }
@@ -2328,7 +2259,7 @@ fn cascade_cancel_children(
     // locks (which would require sorted multi-lock acquisition); the children are
     // all on this one board and the batch append rides its board writer lock. The
     // pre-#2760 batch semantics are unchanged.
-    let Ok(state) = crate::task_events::replay_at(board) else {
+    let Ok(state) = crate::task_events::projected_state_at(board) else {
         return;
     };
     let parent_tid = crate::task_events::TaskId(parent_id.to_string());
@@ -2430,6 +2361,9 @@ pub fn register_subscriber() {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod reopened_notify_tests;
 
 #[cfg(test)]
 mod review_repro_tasks;

@@ -6,12 +6,42 @@
 //! `ComposedDelegate` / `DeliveryCtx` / `track_delegate_success` via `super::`.
 
 use super::{track_delegate_success, ComposedDelegate, DeliveryCtx};
-use crate::daemon::pr_state::ReviewClass;
 use crate::identity::Sender;
 use crate::mcp::handlers::comms_gates::{DispatchPreChecks, ReviewAuthor};
 use crate::mcp::handlers::dispatch_hook;
 use serde_json::{json, Value};
 use std::path::Path;
+
+#[cfg(test)]
+type MarkerAuthorityValidatedHook = Box<dyn FnOnce(&Path) + Send + 'static>;
+
+#[cfg(test)]
+static MARKER_AUTHORITY_VALIDATED_HOOK: std::sync::OnceLock<
+    std::sync::Mutex<Option<MarkerAuthorityValidatedHook>>,
+> = std::sync::OnceLock::new();
+
+#[cfg(test)]
+pub(crate) fn install_marker_authority_validated_hook(hook: MarkerAuthorityValidatedHook) {
+    let hooks = MARKER_AUTHORITY_VALIDATED_HOOK.get_or_init(|| std::sync::Mutex::new(None));
+    let mut slot = hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    *slot = Some(hook);
+}
+
+#[cfg(test)]
+fn fire_marker_authority_validated_hook(home: &Path) {
+    let Some(hooks) = MARKER_AUTHORITY_VALIDATED_HOOK.get() else {
+        return;
+    };
+    let hook = hooks
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .take();
+    if let Some(hook) = hook {
+        hook(home);
+    }
+}
 
 /// t-…-17 reviewer-assignment marker gate. Runs BETWEEN `run_dispatch_pre_checks`
 /// and `maybe_auto_bind_lease` — i.e. AFTER the generic pre-send gates but BEFORE
@@ -31,7 +61,7 @@ use std::path::Path;
 ///       same-namespace self-review; `External(login)` is a distinct principal and
 ///       is NEVER string-compared to the agent target. (sender == target is already
 ///       rejected upstream in `resolve_delegate`.)
-// #6: pub(crate) so ci/review_workspace_tests can drive bind rejection tests.
+// #6: pub(crate) so ci/review_workspace_tests can drive the marker gate.
 pub(crate) fn validate_review_assignment_marker(
     home: &Path,
     sender: &Sender,
@@ -39,27 +69,6 @@ pub(crate) fn validate_review_assignment_marker(
     args: &Value,
     checks: &DispatchPreChecks,
 ) -> Result<String, Value> {
-    // #6: review_assignment must not bind the reviewer to the implementer's branch.
-    // Workspace provisioning is a separate concern — reviewers get isolated worktrees
-    // via `repo checkout` instead.
-    if args.get("bind").and_then(|v| v.as_bool()) == Some(true) {
-        return Err(json!({
-            "error": "review_assignment must not bind the reviewer to the subject branch \
-                      — use an isolated review branch via repo checkout instead",
-            "code": "review_assignment_bind_rejected",
-        }));
-    }
-    if args
-        .get("worktree_binding_required")
-        .and_then(|v| v.as_bool())
-        == Some(true)
-    {
-        return Err(json!({
-            "error": "review_assignment does not support worktree_binding_required \
-                      — reviewer workspace provisioning is separate",
-            "code": "review_assignment_worktree_binding_rejected",
-        }));
-    }
     // (a) mandatory explicit generation-bound identifiers.
     if args["task_id"].as_str().unwrap_or("").is_empty() {
         return Err(json!({
@@ -196,18 +205,23 @@ pub(crate) fn validate_review_assignment_marker(
             "code": "review_assignment_task_terminal",
         }));
     }
-    let task_review_class = task
-        .metadata
-        .get("review_class")
-        .and_then(|value| value.as_str())
-        .map(|value| ReviewClass::parse_fail_closed(Some(value)))
-        .unwrap_or(ReviewClass::Unresolved);
-    if matches!(task_review_class, ReviewClass::Unresolved) {
-        return Err(json!({
-            "error": "review_assignment requires a resolved review_class on the task",
-            "code": "review_assignment_subject_mismatch",
-        }));
-    }
+    let task_review_class =
+        match crate::tasks::governance::validate_existing_authority(home, task_id, task) {
+            Ok(Some(class)) => class,
+            Ok(None) => {
+                return Err(json!({
+                    "error": "review_assignment requires a resolved review_class on the task",
+                    "code": "review_assignment_subject_mismatch",
+                }))
+            }
+            Err(error) => return Err(error),
+        };
+    // Keep the real-entry test seam immediately after the first authority
+    // check. It models a decision/task mutation before the later preflight and
+    // store re-checks, proving the reviewer-assignment early return cannot
+    // bypass fresh authority validation.
+    #[cfg(test)]
+    fire_marker_authority_validated_hook(home);
     // #2800/#3168: ensure a PrState exists even for a cold or provisional PR
     // (CI still pending). Complete state stays on the no-SCM fast path;
     // missing/provisional state uses SCM-confirmed CAS-create/hydrate.
@@ -237,25 +251,115 @@ pub(crate) fn validate_review_assignment_marker(
             "code": "review_assignment_subject_mismatch",
         }));
     }
+    match crate::mcp::handlers::review_class_correction::is_incomplete(
+        home,
+        &repo_slug,
+        branch,
+        pr_number,
+        reviewed_head,
+    ) {
+        Ok(true) => {
+            return Err(json!({
+                "error": "review-class correction is incomplete for this exact PR subject",
+                "code": "review_class_correction_incomplete",
+            }));
+        }
+        Ok(false) => {}
+        Err(error) => {
+            return Err(json!({
+                "error": format!("review-class correction fence unavailable: {error}"),
+                "code": "review_class_correction_fence_unavailable",
+            }));
+        }
+    }
     // The validated, canonical `owner/repo` slug is returned so the store dispatch
     // (A1) keys the record on the SAME lockstep form the ACL matched (I25) — no
     // second resolve (which could redrift or re-run a git subprocess).
     Ok(repo_slug)
 }
 
+fn review_workspace_branch(
+    pr_number: u64,
+    reviewed_head: &str,
+    slot: crate::review_receipt::ReviewSlot,
+    assignment_id: uuid::Uuid,
+) -> String {
+    let slot = match slot {
+        crate::review_receipt::ReviewSlot::Primary => "r0",
+        crate::review_receipt::ReviewSlot::Secondary => "r1",
+    };
+    let head8: String = reviewed_head.chars().take(8).collect();
+    let assignment8 = assignment_id.simple().to_string();
+    format!("review/pr{pr_number}-{head8}-{slot}-{}", &assignment8[..8])
+}
+
+#[allow(clippy::too_many_arguments)]
+fn provision_review_workspace(
+    home: &Path,
+    target: &str,
+    task_id: &str,
+    repo_slug: &str,
+    pr_number: u64,
+    reviewed_head: &str,
+    slot: crate::review_receipt::ReviewSlot,
+    assignment_id: uuid::Uuid,
+) -> Result<String, Value> {
+    let source_repo = dispatch_hook::resolve_source_repo_for_target(home, target)?;
+    let branch = review_workspace_branch(pr_number, reviewed_head, slot, assignment_id);
+    let checkout = crate::mcp::handlers::ci::handle_checkout_repo(
+        home,
+        &json!({
+            "repository_path": source_repo.display().to_string(),
+            "branch": branch,
+            "bind": true,
+            "task_id": task_id,
+            // #3675: pin the exact PR so a locally-absent fork head can be
+            // fetched by the checkout precondition.
+            "repository": repo_slug,
+            "pr_number": pr_number,
+            "from_ref": reviewed_head,
+            "expected_head": reviewed_head,
+            "checkout_purpose": "disposable_review",
+        }),
+        target,
+    );
+    if checkout.get("error").is_some() {
+        return Err(checkout);
+    }
+    Ok(branch)
+}
+
+/// Deliver a validated reviewer-assignment marker dispatch after provisioning
+/// the isolated reviewer workspace. This is the public handler's path; the
+/// store-only helper below remains available to focused store tests/callers.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_review_assignment_with_workspace(
+    home: &Path,
+    sender: &Sender,
+    target: &str,
+    task: &str,
+    args: &Value,
+    checks: &DispatchPreChecks,
+    composed: &ComposedDelegate,
+    repo_slug: &str,
+) -> Value {
+    dispatch_review_assignment_via_store_impl(
+        home, sender, target, task, args, checks, composed, repo_slug, true,
+    )
+}
+
 /// t-…-17 C11 (A1→A2→A3): deliver a validated reviewer-assignment marker dispatch
-/// through the DURABLE outbox store instead of `deliver_delegate`. Called from
-/// [`handle_delegate_task`] AFTER `maybe_auto_bind_lease` (bind) has succeeded and
-/// the marker gate has resolved the canonical `repo_slug`.
+/// through the DURABLE outbox store instead of `deliver_delegate`. This store-only
+/// entry is kept separate from the public handler so it can be exercised without
+/// a source checkout in focused authority/store tests.
 ///
-/// A1 `persist` the PENDING record (mint assignment_id + delivery_nonce; store the
-/// mandatory `pr_number` — the generation identity). A2 `durable_enqueue` the
+/// A1 persists the PENDING record (mint assignment_id + delivery_nonce; store the
+/// mandatory `pr_number` — the generation identity). A2 `durable_enqueue`s the
 /// reviewer's actionable inbox row (the store owns delivery — this is NOT a
-/// `deliver_delegate`/API send). A3 emit a best-effort self-IPC WAKE pointer OUTSIDE
-/// all flocks (`durable_enqueue` has already released its lock). A store failure
-/// AFTER the bind FAILS LOUD (structured error) rather than silently proceeding
-/// (I23) — the bind is already durable, so a swallowed store error would strand the
-/// assignment with no record.
+/// `deliver_delegate`/API send). A3 emits a queued self-IPC WAKE pointer
+/// OUTSIDE all flocks. The public workspace path wraps this sequence with
+/// exact-head provisioning and cleans up its fresh binding on later failure.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn dispatch_review_assignment_via_store(
     home: &Path,
@@ -267,22 +371,52 @@ pub(super) fn dispatch_review_assignment_via_store(
     composed: &ComposedDelegate,
     repo_slug: &str,
 ) -> Value {
+    dispatch_review_assignment_via_store_impl(
+        home, sender, target, task, args, checks, composed, repo_slug, false,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_review_assignment_via_store_impl(
+    home: &Path,
+    sender: &Sender,
+    target: &str,
+    task: &str,
+    args: &Value,
+    checks: &DispatchPreChecks,
+    composed: &ComposedDelegate,
+    repo_slug: &str,
+    provision_workspace: bool,
+) -> Value {
     // All three are gate-validated: branch + task_id non-empty, pr_number nonzero.
     let branch = args["branch"].as_str().unwrap_or_default();
     let task_id = args["task_id"].as_str().unwrap_or_default();
     let pr_number = checks.pr_number.unwrap_or(0);
     // The marker gate has already proved this exact routed task metadata matches
     // the current PR state; re-read it only to populate the durable assignment.
-    let review_class = crate::tasks::load_routed(home, task_id)
-        .ok()
-        .and_then(|rt| {
-            rt.task
-                .metadata
-                .get("review_class")
-                .and_then(|v| v.as_str())
-                .map(|s| ReviewClass::parse_fail_closed(Some(s)))
-        })
-        .expect("marker gate requires resolvable task review_class");
+    let routed = match crate::tasks::load_routed(home, task_id) {
+        Ok(routed) => routed,
+        Err(error) => {
+            return json!({
+                "ok": false,
+                "error": format!("review_assignment task route became unresolved: {error}"),
+                "code": "review_assignment_subject_mismatch",
+            })
+        }
+    };
+    let review_class =
+        match crate::tasks::governance::validate_existing_authority(home, task_id, routed.record())
+        {
+            Ok(Some(class)) => class,
+            Ok(None) => {
+                return json!({
+                    "ok": false,
+                    "error": "review_assignment task review_class is unresolved",
+                    "code": "review_assignment_subject_mismatch",
+                })
+            }
+            Err(error) => return error,
+        };
     // `review_author` is MANDATORY on the marker path: the gate
     // (`validate_review_assignment_marker`) fail-closes on an absent author BEFORE
     // this A1 wiring runs, so it is guaranteed present here. NO sentinel principal is
@@ -325,27 +459,120 @@ pub(super) fn dispatch_review_assignment_via_store(
         args["parent_id"].as_str().map(String::from),
         &now,
     );
-    // A1 — persist the PENDING record (no PrState/inbox row seeded — I9).
+    // A1 — provision the reviewer workspace before the assignment can be delivered.
+    // `checkout` validates `expected_head` before creating the review branch and
+    // owns rollback for every later provisioning failure.
+    let review_branch = if provision_workspace {
+        match provision_review_workspace(
+            home,
+            target,
+            task_id,
+            repo_slug,
+            pr_number,
+            reviewed_head,
+            slot,
+            record.assignment_id,
+        ) {
+            Ok(branch) => Some(branch),
+            Err(error) => return error,
+        }
+    } else {
+        None
+    };
+    let cleanup_workspace = || {
+        if !provision_workspace {
+            return;
+        }
+        let outcome = crate::worktree_pool::release_full(home, target, false);
+        if let Some(error) = outcome.error {
+            tracing::warn!(%target, branch = ?review_branch, %error,
+                "review assignment workspace cleanup failed");
+        }
+    };
+    // A2 — persist the PENDING record (no PrState/inbox row seeded — I9).
     if let Err(e) = crate::daemon::assignment_authority::persist(home, &record) {
+        cleanup_workspace();
         return json!({
             "ok": false,
-            "error": format!("review_assignment store persist failed after bind: {e}"),
+            "error": format!("review_assignment store persist failed after workspace bind: {e}"),
             "code": "review_assignment_store_persist_failed",
         });
     }
-    // A2 — durable enqueue of the reviewer's actionable row (store owns delivery).
+    if provision_workspace {
+        if let Err(e) = crate::binding::augment_binding_with_lease(
+            home,
+            target,
+            "review",
+            &record.assignment_id.to_string(),
+            reviewed_head,
+        ) {
+            let _ = crate::daemon::assignment_authority::retire_if_id_matches(
+                home,
+                repo_slug,
+                branch,
+                target,
+                record.assignment_id,
+                &now,
+            );
+            cleanup_workspace();
+            return json!({
+                "ok": false,
+                "error": format!("review_assignment workspace lease metadata failed: {e}"),
+                "code": "review_assignment_workspace_lease_failed",
+            });
+        }
+    }
+    // A3 — durable enqueue of the reviewer's actionable row (store owns delivery).
     if let Err(e) =
         crate::daemon::assignment_authority::durable_enqueue(home, repo_slug, branch, target, &now)
     {
+        let _ = crate::daemon::assignment_authority::retire_if_id_matches(
+            home,
+            repo_slug,
+            branch,
+            target,
+            record.assignment_id,
+            &now,
+        );
+        cleanup_workspace();
         return json!({
             "ok": false,
-            "error": format!("review_assignment store enqueue failed after bind: {e}"),
+            "error": format!("review_assignment store enqueue failed after workspace bind: {e}"),
             "code": "review_assignment_store_enqueue_failed",
         });
     }
-    // A3 — best-effort self-IPC WAKE pointer, OUTSIDE all flocks.
-    crate::inbox::notify::wake_review_assignment(home, target);
-    let result = json!({
+    // A4 — self-IPC WAKE pointer, OUTSIDE all flocks. The assignment identity
+    // follows the queued job so the worker can update the lease only after the
+    // adapter reports accepted or failed; queue admission is not delivery.
+    if let Err(error) = crate::inbox::notify::wake_review_assignment_result_for_assignment(
+        home,
+        target,
+        repo_slug,
+        branch,
+        record.assignment_id,
+        &now,
+    ) {
+        let reason = match &error {
+            crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { .. } => "queue-full",
+            crate::daemon::delivery_worker::TransportEnqueueError::Fenced { .. } => "fenced",
+        };
+        let _ = crate::daemon::assignment_authority::set_short_retry_lease(
+            home,
+            repo_slug,
+            branch,
+            target,
+            &now,
+            record.assignment_id,
+            reason,
+        );
+        tracing::warn!(
+            target = %target,
+            error = ?error,
+            reason = %reason,
+            "review assignment wake admission failed; durable short retry retained"
+        );
+    }
+    let mut result = json!({
         "target": target,
         "review_assignment": true,
         "assignment_id": record.assignment_id.to_string(),
@@ -354,6 +581,9 @@ pub(super) fn dispatch_review_assignment_via_store(
         "target_instance_id": target_instance_id.full(),
         "review_slot": slot,
     });
+    if let Some(review_branch) = review_branch {
+        result["review_branch"] = json!(review_branch);
+    }
     // Dispatch tracking / UX parity with the legacy path (task_id is explicit).
     let ctx = DeliveryCtx {
         home,

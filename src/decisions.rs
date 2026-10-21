@@ -94,7 +94,17 @@ pub struct Decision {
     pub updated_at: String,
     pub archived: bool,
     pub supersedes: Option<String>,
+    #[serde(default)]
+    pub superseded_by: Option<String>,
     pub working_directory: Option<String>,
+    /// Optional typed review authority. Additive and create-only; tasks may
+    /// inherit this value when they name the decision as their governor.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::daemon::pr_state::review_class_serde"
+    )]
+    pub review_class: Option<crate::daemon::pr_state::ReviewClass>,
     /// #1990: see [`SCHEMA_VERSION`]. `#[serde(default)]` → a pre-#1990 record
     /// (no field) reads back as 0 (≤ current, loads normally).
     #[serde(default)]
@@ -205,6 +215,102 @@ pub(crate) fn decision_path(home: &Path, id: &str) -> std::path::PathBuf {
     decisions_dir(home).join(format!("{id}.json"))
 }
 
+fn is_safe_decision_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".." && !id.contains('/') && !id.contains('\\')
+}
+
+/// Acquire the exact decision's flock for callers that must couple a fresh
+/// authority read with a later write in another store (notably task Created).
+pub(crate) fn acquire_decision_lock(
+    home: &Path,
+    id: &str,
+) -> anyhow::Result<crate::store::FileFlockGuard> {
+    if !is_safe_decision_id(id) {
+        anyhow::bail!("governing decision id is not a safe exact identifier")
+    }
+    let dir = decisions_dir(home);
+    std::fs::create_dir_all(&dir)?;
+    crate::store::acquire_file_lock(&decision_lock_path(home, id))
+}
+
+/// The resolved authority named by a task create request.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct GoverningDecision {
+    pub review_class: Option<crate::daemon::pr_state::ReviewClass>,
+}
+
+/// Resolve one exact decision as an active, unsuperseded leaf. The entire
+/// decision directory is scanned so malformed/newer records, records filed
+/// under a name that is not their id, or multiple reverse `supersedes` links
+/// cannot be hidden by the normal list path.
+pub(crate) fn resolve_governing_decision(
+    home: &Path,
+    id: &str,
+) -> anyhow::Result<GoverningDecision> {
+    if !is_safe_decision_id(id) {
+        anyhow::bail!("governing decision id is not a safe exact identifier")
+    }
+    let dir = decisions_dir(home);
+    let exact_path = decision_path(home, id);
+    let exact_raw = std::fs::read_to_string(&exact_path)
+        .map_err(|e| anyhow::anyhow!("governing decision '{id}' is missing: {e}"))?;
+    let exact: Decision = serde_json::from_str(&exact_raw)
+        .map_err(|e| anyhow::anyhow!("governing decision '{id}' is corrupt: {e}"))?;
+    if exact.id != id {
+        anyhow::bail!("governing decision '{id}' has mismatched record identity")
+    }
+    if exact.schema_version > SCHEMA_VERSION {
+        anyhow::bail!("governing decision '{id}' uses a newer schema")
+    }
+    if exact.archived {
+        anyhow::bail!("governing decision '{id}' is archived")
+    }
+
+    let mut reverse = Vec::new();
+    let entries = std::fs::read_dir(&dir)
+        .map_err(|e| anyhow::anyhow!("decision directory is unreadable: {e}"))?;
+    for entry in entries {
+        let entry = entry?;
+        if entry.path().extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        let path = entry.path();
+        let raw = std::fs::read_to_string(&path).map_err(|e| {
+            anyhow::anyhow!("decision record '{}' is unreadable: {e}", path.display())
+        })?;
+        let decision: Decision = serde_json::from_str(&raw)
+            .map_err(|e| anyhow::anyhow!("decision record '{}' is corrupt: {e}", path.display()))?;
+        if decision.schema_version > SCHEMA_VERSION {
+            anyhow::bail!("decision record '{}' uses a newer schema", path.display())
+        }
+        // Every record must live under its own id. A record filed under another
+        // name is the tamper shape this scan exists to expose: it can claim the
+        // resolved id (or any other) while the normal by-id path never sees it.
+        let stem = path
+            .file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("");
+        if decision.id != stem {
+            anyhow::bail!(
+                "decision record '{}' has mismatched record identity",
+                path.display()
+            )
+        }
+        if decision.supersedes.as_deref() == Some(id) {
+            reverse.push(decision);
+        }
+    }
+    if !reverse.is_empty() {
+        if reverse.len() > 1 {
+            anyhow::bail!("governing decision '{id}' has an ambiguous superseding leaf")
+        }
+        anyhow::bail!("governing decision '{id}' is superseded")
+    }
+    Ok(GoverningDecision {
+        review_class: exact.review_class,
+    })
+}
+
 fn decision_lock_path(home: &Path, id: &str) -> std::path::PathBuf {
     decisions_dir(home).join(format!("{id}.lock"))
 }
@@ -215,9 +321,7 @@ fn decision_lock_path(home: &Path, id: &str) -> std::path::PathBuf {
 /// [`with_decision_lock`] — this function acquires the lock only for the
 /// write itself.
 fn save(home: &Path, decision: &Decision) -> anyhow::Result<()> {
-    let dir = decisions_dir(home);
-    std::fs::create_dir_all(&dir)?;
-    let _lock = crate::store::acquire_file_lock(&decision_lock_path(home, &decision.id))?;
+    let _lock = acquire_decision_lock(home, &decision.id)?;
     crate::store::save_atomic(&decision_path(home, &decision.id), decision)
 }
 
@@ -229,10 +333,231 @@ pub(crate) fn with_decision_lock<R>(
     id: &str,
     f: impl FnOnce() -> R,
 ) -> anyhow::Result<R> {
-    let dir = decisions_dir(home);
-    std::fs::create_dir_all(&dir)?;
-    let _lock = crate::store::acquire_file_lock(&decision_lock_path(home, id))?;
+    let _lock = acquire_decision_lock(home, id)?;
     Ok(f())
+}
+
+/// Hold two decision locks in stable identifier order so a retroactive
+/// supersession cannot deadlock against another update touching the same pair.
+fn with_decision_locks<R>(
+    home: &Path,
+    left: &str,
+    right: &str,
+    f: impl FnOnce() -> R,
+) -> anyhow::Result<R> {
+    if left == right {
+        let _lock = acquire_decision_lock(home, left)?;
+        return Ok(f());
+    }
+    if left < right {
+        let _left_lock = acquire_decision_lock(home, left)?;
+        let _right_lock = acquire_decision_lock(home, right)?;
+        Ok(f())
+    } else {
+        let _right_lock = acquire_decision_lock(home, right)?;
+        let _left_lock = acquire_decision_lock(home, left)?;
+        Ok(f())
+    }
+}
+
+fn read_decision_for_update(home: &Path, id: &str) -> anyhow::Result<Decision> {
+    anyhow::ensure!(
+        is_safe_decision_id(id),
+        "decision id is not a safe exact identifier"
+    );
+    let path = decision_path(home, id);
+    let content = std::fs::read_to_string(&path)
+        .map_err(|e| anyhow::anyhow!("decision '{id}' not found: {e}"))?;
+    let decision: Decision = serde_json::from_str(&content)
+        .map_err(|e| anyhow::anyhow!("decision '{id}' corrupted: {e}"))?;
+    anyhow::ensure!(
+        decision.id == id,
+        "decision '{id}' has mismatched record identity"
+    );
+    anyhow::ensure!(
+        decision.schema_version <= SCHEMA_VERSION,
+        "decision '{id}' was written by a newer schema version ({} > {SCHEMA_VERSION})",
+        decision.schema_version
+    );
+    Ok(decision)
+}
+
+fn validate_retroactive_supersession(
+    home: &Path,
+    caller: &str,
+    successor: &Decision,
+    predecessor: &Decision,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        successor.id != predecessor.id,
+        "a decision cannot supersede itself"
+    );
+    anyhow::ensure!(
+        !successor.archived,
+        "archived successor decision cannot record a supersession"
+    );
+    anyhow::ensure!(
+        !predecessor.archived,
+        "supersession target '{}' is already archived",
+        predecessor.id
+    );
+    anyhow::ensure!(
+        can_mutate_decision(home, caller, successor)
+            && can_mutate_decision(home, caller, predecessor),
+        "caller '{caller}' is not authorized to supersede both decisions"
+    );
+    if let Some(existing) = successor.supersedes.as_deref() {
+        anyhow::ensure!(
+            existing == predecessor.id,
+            "decision '{}' already supersedes '{}'; relationship is immutable",
+            successor.id,
+            existing
+        );
+    }
+    if let Some(existing) = predecessor.superseded_by.as_deref() {
+        anyhow::ensure!(
+            existing == successor.id,
+            "decision '{}' is already superseded by '{}'; relationship is ambiguous",
+            predecessor.id,
+            existing
+        );
+    }
+
+    // A late link must not close a cycle through an existing supersession
+    // chain. Missing or malformed chain records fail closed rather than
+    // allowing a partially understood authority graph to be rewritten.
+    let mut seen = std::collections::HashSet::new();
+    let mut next = predecessor.supersedes.clone();
+    while let Some(id) = next {
+        anyhow::ensure!(
+            seen.insert(id.clone()),
+            "supersession chain contains a cycle"
+        );
+        anyhow::ensure!(id != successor.id, "supersession would create a cycle");
+        let decision = read_decision_for_update(home, &id)?;
+        next = decision.supersedes;
+    }
+    Ok(())
+}
+
+fn apply_update_fields(decision: &mut Decision, args: &Value) {
+    // #2037 (3): same content|text alias as `post` — the schema declares
+    // `text` tool-wide, so update honoring only `content` was a silent lie.
+    if let Some(content) = args["content"].as_str().or_else(|| args["text"].as_str()) {
+        decision.content = content.to_string();
+    }
+    if let Some(tags) = args["tags"].as_array() {
+        decision.tags = tags
+            .iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect();
+    }
+    if let Some(ttl) = args["ttl_days"].as_u64() {
+        decision.ttl_days = Some(ttl);
+    }
+}
+
+fn update_with_retroactive_supersession(
+    home: &Path,
+    caller: &str,
+    args: &Value,
+    successor_id: &str,
+) -> Value {
+    let predecessor_id = match args.get("supersedes") {
+        Some(Value::String(id)) if !id.is_empty() => id.clone(),
+        Some(Value::String(_)) => {
+            return serde_json::json!({
+                "error": "supersedes must be a non-empty decision id",
+                "code": "invalid_supersession_target",
+            });
+        }
+        Some(_) => {
+            return serde_json::json!({
+                "error": "supersedes must be a decision id string",
+                "code": "invalid_supersession_target",
+            });
+        }
+        None => unreachable!("retroactive update requires supersedes"),
+    };
+    if !is_safe_decision_id(&predecessor_id) {
+        return serde_json::json!({
+            "error": "supersedes must be a safe exact decision id",
+            "code": "invalid_supersession_target",
+        });
+    }
+    if args["archive"].as_bool() == Some(true) {
+        return serde_json::json!({
+            "error": "archive cannot be combined with retroactive supersession",
+            "code": "invalid_supersession_update",
+        });
+    }
+    if args.get("review_class").is_some() {
+        return serde_json::json!({
+            "error": "decision review_class is immutable after creation",
+            "code": "decision_review_class_immutable",
+        });
+    }
+
+    let locked = with_decision_locks(home, successor_id, &predecessor_id, || -> Value {
+        let successor_path = decision_path(home, successor_id);
+        let predecessor_path = decision_path(home, &predecessor_id);
+        let mut successor = match read_decision_for_update(home, successor_id) {
+            Ok(decision) => decision,
+            Err(error) => return serde_json::json!({"error": error.to_string()}),
+        };
+        let mut predecessor = match read_decision_for_update(home, &predecessor_id) {
+            Ok(decision) => decision,
+            Err(error) => {
+                return serde_json::json!({
+                    "error": error.to_string(),
+                    "code": "decision_supersession_target_not_found",
+                });
+            }
+        };
+        if let Err(error) =
+            validate_retroactive_supersession(home, caller, &successor, &predecessor)
+        {
+            return serde_json::json!({
+                "error": error.to_string(),
+                "code": "invalid_decision_supersession",
+            });
+        }
+
+        apply_update_fields(&mut successor, args);
+        let now = chrono::Utc::now().to_rfc3339();
+        successor.supersedes = Some(predecessor_id.clone());
+        successor.updated_at = now.clone();
+        successor.schema_version = SCHEMA_VERSION;
+        predecessor.archived = true;
+        predecessor.superseded_by = Some(successor_id.to_string());
+        predecessor.updated_at = now;
+        predecessor.schema_version = SCHEMA_VERSION;
+
+        // Match post-time ordering: never leave a predecessor pointing at a
+        // successor whose write failed. Both writes happen while both locks
+        // are held, preventing concurrent updates from splitting the pair.
+        if let Err(error) = crate::store::save_atomic(&successor_path, &successor) {
+            return serde_json::json!({
+                "error": format!("failed to save successor decision: {error}"),
+                "code": "decision_supersession_save_failed",
+            });
+        }
+        if let Err(error) = crate::store::save_atomic(&predecessor_path, &predecessor) {
+            return serde_json::json!({
+                "error": format!("failed to archive superseded decision: {error}"),
+                "code": "decision_supersession_save_failed",
+            });
+        }
+        serde_json::json!({"id": successor_id, "status": "updated"})
+    });
+
+    match locked {
+        Ok(value) => value,
+        Err(error) => serde_json::json!({
+            "error": format!("lock acquisition failed: {error}"),
+            "code": "decision_supersession_lock_failed",
+        }),
+    }
 }
 
 pub fn post(home: &Path, author: &str, args: &Value) -> Value {
@@ -296,6 +621,31 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
     } else {
         None
     };
+    let review_class = match args.get("review_class") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(raw)) => {
+            match crate::daemon::pr_state::ReviewClass::parse_fail_closed(Some(raw)) {
+                crate::daemon::pr_state::ReviewClass::Single => {
+                    Some(crate::daemon::pr_state::ReviewClass::Single)
+                }
+                crate::daemon::pr_state::ReviewClass::Dual => {
+                    Some(crate::daemon::pr_state::ReviewClass::Dual)
+                }
+                crate::daemon::pr_state::ReviewClass::Unresolved => {
+                    return serde_json::json!({
+                        "error": "review_class must be exactly 'single' or 'dual'",
+                        "code": "invalid_review_class",
+                    })
+                }
+            }
+        }
+        Some(_) => {
+            return serde_json::json!({
+                "error": "review_class must be a string ('single' or 'dual')",
+                "code": "invalid_review_class",
+            })
+        }
+    };
 
     let clock = chrono::Utc::now();
     let now = clock.to_rfc3339();
@@ -308,38 +658,6 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
     let ts = clock.format("%Y%m%d%H%M%S%6f");
     let seq = ID_SEQ.fetch_add(1, Ordering::Relaxed);
     let id = format!("d-{ts}-{seq}");
-
-    // Archive the superseded decision under its own flock. The previous
-    // implementation read-all → mutated-one → saved outside any lock, so
-    // two concurrent callers (post(supersedes=X) + update(X), or two
-    // posts both superseding X) would race: both read the same old
-    // record, both flip fields, whichever wrote last clobbered the other.
-    if let Some(ref old_id) = supersedes {
-        let old_id_c = old_id.clone();
-        let now_c = now.clone();
-        let _ = with_decision_lock(home, &old_id_c, || {
-            let path = decision_path(home, &old_id_c);
-            let Ok(content) = std::fs::read_to_string(&path) else {
-                return;
-            };
-            let Ok(mut old) = serde_json::from_str::<Decision>(&content) else {
-                return;
-            };
-            // #1990: don't archive (and thereby re-save/downgrade) a record a
-            // newer daemon wrote.
-            if old.schema_version > SCHEMA_VERSION {
-                return;
-            }
-            old.archived = true;
-            old.updated_at = now_c;
-            old.schema_version = SCHEMA_VERSION;
-            // Write inline; save() re-acquires the same (non-reentrant)
-            // flock and would deadlock.
-            if let Err(e) = crate::store::save_atomic(&path, &old) {
-                tracing::warn!(id = %old_id_c, error = %e, "supersede archive write failed");
-            }
-        });
-    }
 
     let working_dir = std::env::current_dir()
         .ok()
@@ -357,7 +675,9 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
         updated_at: now,
         archived: false,
         supersedes,
+        superseded_by: None,
         working_directory: working_dir,
+        review_class,
         schema_version: SCHEMA_VERSION,
         needs_answer,
         status,
@@ -370,10 +690,50 @@ pub fn post(home: &Path, author: &str, args: &Value) -> Value {
         timeout_default,
     };
 
-    match save(home, &decision) {
+    match persist_post(home, &decision) {
         Ok(()) => serde_json::json!({"id": id, "status": "posted"}),
         Err(e) => serde_json::json!({"error": format!("{e}")}),
     }
+}
+
+/// Persist the successor before recording the reverse link on its predecessor.
+/// This ordering prevents an old decision from pointing at a successor whose
+/// save failed. The predecessor's read→mutate→save remains under its own lock.
+fn persist_post(home: &Path, decision: &Decision) -> anyhow::Result<()> {
+    let Some(old_id) = decision.supersedes.as_ref() else {
+        return save(home, decision);
+    };
+    let old_id_c = old_id.clone();
+    let successor_id = decision.id.clone();
+    let now = decision.updated_at.clone();
+    with_decision_lock(home, &old_id_c, || -> anyhow::Result<()> {
+        // The generated successor id differs from the predecessor id, so this
+        // acquires a distinct lock while keeping the full supersede operation
+        // serialized on the predecessor.
+        save(home, decision)?;
+        let path = decision_path(home, &old_id_c);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            return Ok(());
+        };
+        let Ok(mut old) = serde_json::from_str::<Decision>(&content) else {
+            return Ok(());
+        };
+        // #1990: don't archive (and thereby re-save/downgrade) a record a
+        // newer daemon wrote.
+        if old.schema_version > SCHEMA_VERSION {
+            return Ok(());
+        }
+        old.archived = true;
+        old.superseded_by = Some(successor_id);
+        old.updated_at = now;
+        old.schema_version = SCHEMA_VERSION;
+        // Write inline; save() re-acquires the same (non-reentrant) flock and
+        // would deadlock.
+        if let Err(e) = crate::store::save_atomic(&path, &old) {
+            tracing::warn!(id = %old_id_c, error = %e, "supersede archive write failed");
+        }
+        Ok(())
+    })?
 }
 
 /// #2305: parse the `options` arg — accepts either `[{label, recommended}]`
@@ -418,6 +778,69 @@ pub fn list_pending(home: &Path) -> Vec<Decision> {
         .into_iter()
         .filter(|d| !d.archived && d.needs_answer && d.status == Some(DecisionStatus::Pending))
         .collect()
+}
+
+/// Return one decision's complete record. Unlike the bounded list path, this
+/// keyed lookup checks only the exact live and retained-history paths, so its
+/// cost does not grow with the decision store.
+pub fn get(home: &Path, args: &Value) -> Value {
+    let Some(id) = args["id"].as_str() else {
+        return serde_json::json!({"error": "missing 'id'", "code": "missing_id"});
+    };
+    if !is_safe_decision_id(id) {
+        return serde_json::json!({"error": "invalid decision id", "code": "invalid_id"});
+    }
+
+    let live_dir = decisions_dir(home);
+    let archive_dir = live_dir.join(".archive");
+    let mut decision = None;
+    for dir in [live_dir.as_path(), archive_dir.as_path()] {
+        let path = dir.join(format!("{id}.json"));
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(raw) => raw,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return decision_unreadable(&path, format!("read failed: {error}")),
+        };
+        let parsed: Decision = match serde_json::from_str(&raw) {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                return decision_unreadable(
+                    &path,
+                    format!(
+                        "malformed JSON at line {}, column {}",
+                        error.line(),
+                        error.column()
+                    ),
+                )
+            }
+        };
+        if parsed.schema_version > SCHEMA_VERSION {
+            return decision_unreadable(&path, "record uses a newer schema");
+        }
+        if parsed.id != id {
+            return decision_unreadable(&path, "record id does not match requested id");
+        }
+        decision = Some(parsed);
+        break;
+    }
+    let Some(decision) = decision else {
+        return serde_json::json!({
+            "error": format!("decision not found: {id}"),
+            "code": "decision_not_found",
+        });
+    };
+
+    let record = serde_json::to_value(decision).unwrap_or(Value::Null);
+    serde_json::json!({"decision": record})
+}
+
+fn decision_unreadable(path: &Path, reason: impl Into<String>) -> Value {
+    serde_json::json!({
+        "error": "decision record is unreadable",
+        "code": "decision_unreadable",
+        "path": path.display().to_string(),
+        "reason": reason.into(),
+    })
 }
 
 /// #2313 P2b: pending-question tally bucketed by author, computed with ONE
@@ -732,6 +1155,8 @@ pub fn list(home: &Path, args: &Value) -> Value {
             })
         })
         .unwrap_or(0);
+    let verbose = args["verbose"].as_bool().unwrap_or(false);
+    let minimal = args["fields"].as_str() == Some("minimal");
     let mut decisions = Vec::new();
     let mut errors = Vec::new();
     let mut scanned = 0usize;
@@ -762,7 +1187,14 @@ pub fn list(home: &Path, args: &Value) -> Value {
                     since,
                     until,
                 ) {
-                    decisions.push(decision);
+                    let mut value = serde_json::to_value(decision).unwrap_or(Value::Null);
+                    if !verbose {
+                        terse_decision_value(&mut value);
+                    }
+                    if minimal {
+                        minimal_decision_value(&mut value);
+                    }
+                    decisions.push(value);
                 }
             }
             Ok(decision) => errors.push(serde_json::json!({
@@ -804,7 +1236,38 @@ pub fn list(home: &Path, args: &Value) -> Value {
         "scan_exhausted": scanned == scan_budget && has_more,
         "next_cursor": next_cursor,
         "errors": errors,
+        "terse": !verbose,
+        "fields": if minimal { "minimal" } else { "full" },
     })
+}
+
+fn terse_decision_value(value: &mut Value) {
+    const CAP: usize = 200;
+    let Some(Value::String(content)) = value.get_mut("content") else {
+        return;
+    };
+    let count = content.chars().count();
+    if count > CAP {
+        let kept: String = content.chars().take(CAP).collect();
+        *content = format!("{kept}… (+{} chars; verbose=true for full)", count - CAP);
+    }
+}
+
+fn minimal_decision_value(value: &mut Value) {
+    const KEEP: &[&str] = &[
+        "id",
+        "title",
+        "author",
+        "status",
+        "tags",
+        "created_at",
+        "archived",
+    ];
+    let Some(object) = value.as_object_mut() else {
+        return;
+    };
+    object.entry("status".to_string()).or_insert(Value::Null);
+    object.retain(|key, _| KEEP.contains(&key.as_str()));
 }
 
 fn protected_policy(home: &Path) -> anyhow::Result<(Vec<String>, String)> {
@@ -1387,6 +1850,10 @@ pub fn update(home: &Path, caller: &str, args: &Value) -> Value {
     };
     let args = args.clone();
 
+    if args.get("supersedes").is_some() {
+        return update_with_retroactive_supersession(home, caller, &args, &id);
+    }
+
     // Read+mutate+write must all happen under the same per-decision flock
     // so concurrent updates don't lose field changes. The previous code
     // load_all'd every decision on disk and clobbered whatever version
@@ -1426,20 +1893,14 @@ pub fn update(home: &Path, caller: &str, args: &Value) -> Value {
             });
         }
 
-        // #2037 (3): same content|text alias as `post` — the schema declares
-        // `text` tool-wide, so update honoring only `content` was a silent lie.
-        if let Some(content) = args["content"].as_str().or_else(|| args["text"].as_str()) {
-            decision.content = content.to_string();
+        if args.get("review_class").is_some() {
+            return serde_json::json!({
+                "error": "decision review_class is immutable after creation",
+                "code": "decision_review_class_immutable",
+            });
         }
-        if let Some(tags) = args["tags"].as_array() {
-            decision.tags = tags
-                .iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect();
-        }
-        if let Some(ttl) = args["ttl_days"].as_u64() {
-            decision.ttl_days = Some(ttl);
-        }
+
+        apply_update_fields(&mut decision, &args);
         if args["archive"].as_bool() == Some(true) {
             decision.archived = true;
         }

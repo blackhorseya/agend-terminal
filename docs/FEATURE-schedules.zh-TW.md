@@ -43,6 +43,81 @@ agent 或操作者想在 PR merge 後 30 分鐘做一次 cleanup，這類只會�
 }
 ```
 
+### Daemon 管理的 Job 排程
+
+使用 `job` 取代 `instance`，讓 daemon 在到點時建立 worker，負責執行紀錄、完成與復原追蹤，不需要常駐協調者。此版只對尚未記錄啟動意圖的失敗自動重試；一旦 attempt 可能已啟動，就不自動換 backend 重跑。
+
+```json
+{
+  "action": "create",
+  "cron": "0 15 * * 4,7",
+  "timezone": "Asia/Taipei",
+  "message": "尋找新 Podcast 集數，沿用已保存逐字稿，產生摘要並依 output_context 推送。依集數 GUID 與目的地保存進度。",
+  "job": {
+    "backends": ["codex", "claude"],
+    "artifact_directory": "/absolute/path/podcast-artifacts",
+    "timeout_secs": 3600,
+    "max_attempts": 3,
+    "retry_delay_secs": 60,
+    "output_context": "使用既有設定的 Telegram 與 LINE 目的地推送，各自保存送達紀錄。"
+  }
+}
+```
+
+`backends` 必須是非空、不重複且有順序的標準 backend 名稱列表：`claude`、`codex`、`kiro-cli`、`opencode`、`antigravity-cli` 或 `grok`。不接受任意命令或 shell。`artifact_directory` 必須是絕對路徑。預設值與範圍：`timeout_secs` 3600（60–86400）、`max_attempts` 3（1–10）、`retry_delay_secs` 60（1–3600）；未知 Job 欄位會被拒絕。`backends`、`max_attempts` 與 `retry_delay_secs` 只適用於啟動意圖記錄前的失敗，不適用於啟動後的額度限制或故障。
+
+`output_context` 是固定的業務推送指示，不是憑證，也不會自動建立通道目的地。Worker 必須使用其工具可存取且已獲授權的目的地設定。每次嘗試有獨立工作目錄；逐字稿、摘要及推送紀錄應保存在 `artifact_directory`。
+
+`job.auto_cleanup`（預設 `false`）讓 Job 選擇性自動清理已成功、且 daemon 能證明完全受控的 Run——child 已觀察到結束，整個隔離的 process group 已回收，外部 registry 沒有殘留。啟用後任務訊息也會指示 worker 在工作（及已設定的業務推送）完成後自行結束 session，使 worker 自己退出。由於 worker 可能需要一點時間才結束，清理會隨每個 daemon tick 在有界視窗內重試（`job.cleanup_retry_secs`，預設 60，範圍 0–600；`0` 等同立即回退）：在視窗內結束的 worker 會自動清理，只有超過視窗仍無法證明的 Run 才回退為 `recovery_required`。這份證明只存在於啟動該 worker 的 daemon 生命週期內：daemon 重啟後，或只剩 `Intent` journal、worker 仍在執行、外部 registry 仍有該名字時，該 Run 無法自動清理，仍需人工復原。未啟用 `auto_cleanup` 時，worker 訊息與復原行為完全不變。
+
+選填的 `job.notification` 會發出一次完成或待人工復原的狀態通知，與業務推送分開：
+
+```json
+"notification": {"channel": "telegram", "chat_id": -1001234567890, "topic_id": 42}
+```
+
+請將範例 chat ID 換成 fleet 已設定的 Telegram 群組，topic ID 換成既有主題；省略 `topic_id` 則不指定討論串。Daemon 在設定與發送時核對明確的群組，不從建立者或 worker 推測目的地，也不建立新主題。憑證沿用既有通道環境設定。Telegram 回傳的 message ID 會保存在 Run；發送途中當機或傳輸結果不明時記為 `unknown`，不盲目重送。通知狀態與執行成功、清理分開，可透過 `runs` 核對未知結果。此版狀態通知支援 Telegram；Podcast 的 Telegram／LINE 業務推送仍依任務指示執行。
+
+選填的 `job.worker_topic` 讓 worker 對既有 Telegram 主題進行業務推送，不受狀態通知的長度上限限制：
+
+```json
+"worker_topic": {"channel": "telegram", "chat_id": -1001234567890, "topic_id": 12153}
+```
+
+`topic_id` 為必填。Daemon 核對明確群組是否為 fleet 設定，不從建立者或 worker 推測目的地；不建立新主題，也不持有 registry 項目，因此 worker 清理永遠不會刪到共用主題。與 `job.notification` 不同，業務推送沒有狀態通知的長度上限：內容會切成傳輸大小分段，完整送出。Worker 以以下方式推送：
+
+```json
+{"action":"deliver","run_id":"<run-id>","attempt_id":1,"message_from_file":"/absolute/path/summary.md"}
+```
+
+Worker 透過 `message` 或 `message_from_file` 提供輸出。推送進行中或失敗時不允許完成，因此 worker 只在輸出完整被接受、或刻意略過推送（沒有內容可送的 Run 直接完成）後才結束。Run 會將推送結果與執行狀態分開記錄：`sent`（每段一個收據）、`failed`（含原因）或 `not_requested`。除非傳輸接受了每一段，Run 不會被記為已送達。未設定時，worker 產生的 topic binding 維持 `skip`，行為與今日相同。
+
+Job 使用獨立且持久化的排程進度。停機期間錯過的 cron 合併為最近一次到點，不累積 worker；前一 Run 仍在執行時，後續到點記為重疊略過。Job 不走舊的一次性訊息補送或目標 instance 遺失停用流程。已啟動的 attempt 不會自動換 backend；即使 backend 程序已退出，其工具或其他子孫程序仍可能存活。額度限制、逾時、當機及啟動後故障都需要人工復原。`recovery_required` 或清理尚未解除時，後續到點持續記為重疊略過——除非 `job.auto_cleanup` 讓受控的成功 Run 解除了這個保留。
+
+使用 `{"action":"runs","id":"<schedule-id>"}` 查看執行紀錄。成功必須由目前 worker 呼叫：
+
+```json
+{"action":"complete","run_id":"<run-id>","attempt_id":1,"result":"已完成；成果：/absolute/path/podcast-artifacts/..."}
+```
+
+Daemon 核對目前 attempt 與呼叫者身分後保存完成收據。Idle、程序退出、訊息已排入及 task 狀態本身都不代表成功。Task 結案在收據保存後接續處理，後續步驟失敗不會重跑已成功的工作。即使 `cleanup_pending` 與 `recovery_required` 仍需人工清理，已成功的 Run 仍保留成功狀態。未啟用 `job.auto_cleanup` 時，正常成功後也需要完成人工復原，才能啟動後續 Run。
+
+人工解除復原狀態：
+
+1. 查看 `runs`、保存需要的工作目錄檔案，並在外部停止 worker 及所有工具／子孫程序；核對不明的推送結果與進度紀錄。
+2. 完成上述清理後，使用既有 `delete_instance` 操作移除 worker 的 fleet 項目。僅刪除主程序並不能證明所有子孫程序已停止。
+3. 操作者確認外部清理完成後，在操作者的 shell 執行：
+
+```sh
+agend-terminal admin resolve-job-recovery '<run-id>' --attempt 1 --cleanup-confirmed --result "worker 與工具程序全部停止，推送及進度紀錄已核對。"
+```
+
+解除復原需要通過驗證的 Operator API 身分。Agent 身分的請求會被拒絕，這個 CLI 也會拒絕一般 agent 環境；排程建立者與 worker 不能透過 agent 工具自行批准清理。此操作要求 worker 已無 fleet 項目，保存稽核說明，但不終止程序。既有成功收據會保留；未完成的工作改記失敗。解除復原後不會重試同一 Run，後續排程到點才可再次執行，已略過的到點不補跑。
+
+Job 與 instance 模式不能互換，需建立新排程。更新 `job` 會替換後續 Run 的設定，既有 Run 保留原快照。Job 不接受 `instance`、`linked_task_id`、`replacement_key` 或 `fire_strategy: "until_success"`。
+
+排程去重不等於外部推送 exactly-once。業務流程必須保存每集、每個目的地的進度；遇到可能已送出但回應遺失時，應先核對再重試不支援冪等的 API。
+
 ### 操作
 
 #### create — 建立排程

@@ -90,10 +90,6 @@ pub(super) fn create_with_supersession(
     let typed_predecessor = crate::task_events::TaskId(predecessor_id.to_string());
     let typed_successor = crate::task_events::TaskId(successor_id.to_string());
     let plan_reason = args["plan_ack_reason"].as_str().unwrap_or("").to_string();
-    let review_class = args["review_class"]
-        .as_str()
-        .filter(|value| !value.is_empty())
-        .map(str::to_string);
     let append = crate::task_events::append_batch_computed_at(&board, emitter, |state| {
         let Some(current) = state.tasks.get(&typed_predecessor) else {
             return Err(format!(
@@ -134,18 +130,11 @@ pub(super) fn create_with_supersession(
                 value: serde_json::json!(plan_reason),
             });
         }
-        if let Some(review_class) = review_class {
-            events.push(crate::task_events::TaskEvent::MetadataSet {
-                task_id: typed_successor.clone(),
-                by: emitter.clone(),
-                key: "review_class".to_string(),
-                value: serde_json::json!(review_class),
-            });
-        }
         events.push(crate::task_events::TaskEvent::Superseded {
             task_id: typed_predecessor.clone(),
             by: emitter.clone(),
             successor_id: typed_successor.clone(),
+            proof: None,
         });
         Ok(events)
     });
@@ -167,7 +156,7 @@ pub(super) fn create_with_supersession(
     };
 
     if seqs.is_empty() {
-        let state = match crate::task_events::replay_at(&board) {
+        let state = match crate::task_events::projected_state_at(&board) {
             Ok(state) => state,
             Err(error) => {
                 return serde_json::json!({
@@ -189,7 +178,6 @@ pub(super) fn create_with_supersession(
         };
         let task = super::handler::read_task_record_at(&board, &existing_id)
             .map(|record| super::record_to_task(&record));
-        let _ = super::board_router::record_task_project(home, &existing_id, project);
         drop(id_locks);
         super::task_terminal_cleanup(home, predecessor_id);
         return serde_json::json!({
@@ -200,7 +188,6 @@ pub(super) fn create_with_supersession(
         });
     }
 
-    let _ = super::board_router::record_task_project(home, successor_id, project);
     let task = super::handler::read_task_record_at(&board, successor_id)
         .map(|record| super::record_to_task(&record));
     drop(id_locks);

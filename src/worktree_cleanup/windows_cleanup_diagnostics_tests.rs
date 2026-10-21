@@ -68,6 +68,17 @@ fn setup_repo() -> PathBuf {
     git_in(&repo, &["checkout", "main"]);
     git_in(&repo, &["worktree", "add", "wt-done", "feat/done"]);
     git_in(&repo, &["merge", "feat/done"]);
+    let exclude = repo.join(".git").join("info").join("exclude");
+    let existing = std::fs::read_to_string(&exclude).unwrap_or_default();
+    if !existing.lines().any(|line| line == ".agend-managed") {
+        std::fs::write(&exclude, format!("{existing}\n.agend-managed\n")).expect("write exclude");
+    }
+    std::fs::write(
+        repo.join("wt-done")
+            .join(crate::worktree_pool::MANAGED_MARKER),
+        "agent=other-agent\nbranch=feat/done\n",
+    )
+    .expect("managed marker");
     repo
 }
 
@@ -85,7 +96,7 @@ fn write_binding(home: &Path, repo: &Path) {
 }
 
 fn hygiene_tasks(home: &Path) -> Vec<(String, serde_json::Value)> {
-    crate::task_events::replay(home)
+    crate::task_events::projected_state(home)
         .map(|state| {
             state
                 .tasks

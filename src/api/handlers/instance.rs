@@ -75,14 +75,27 @@ pub(crate) fn handle_delete(params: &Value, ctx: &HandlerCtx) -> Value {
         return json!({"ok": false, "error": e});
     }
     let skip_exit_wait = params["no_wait"].as_bool().unwrap_or(false);
+    let restart_id = params["restart_id"]
+        .as_str()
+        .filter(|value| !value.is_empty());
     let delete_context = crate::agent_ops::DeleteContext {
         registry: ctx.registry,
         configs: ctx.configs,
         externals: ctx.externals,
         notifier: ctx.notifier,
     };
-    crate::agent_ops::delete_instance(ctx.home, name, &delete_context, skip_exit_wait);
-    json!({"ok": true})
+    let (_, observed_exit) = crate::agent_ops::delete_instance_with_exit_status_for_restart(
+        ctx.home,
+        name,
+        &delete_context,
+        skip_exit_wait,
+        restart_id,
+    );
+    if observed_exit {
+        json!({"ok": true})
+    } else {
+        json!({"ok": false, "error": "child exit was not confirmed"})
+    }
 }
 
 /// Parse the SPAWN-RPC `env` field into a `HashMap` of process env vars.
@@ -100,6 +113,26 @@ fn parse_env_object(value: Option<&Value>) -> Option<std::collections::HashMap<S
     )
 }
 
+fn notify_restart_failure(params: &Value, ctx: &HandlerCtx<'_>, error: String) {
+    let Some(restart_id) = params["restart_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+    else {
+        return;
+    };
+    let old_instance_ref = params
+        .get("old_instance_ref")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+    if let Some(notifier) = ctx.notifier {
+        notifier.notify(ApiEvent::InstanceRestartFailed {
+            name: params["name"].as_str().unwrap_or_default().to_string(),
+            restart_id: restart_id.to_string(),
+            old_instance_ref,
+            error,
+        });
+    }
+}
+
 #[allow(clippy::too_many_lines)]
 pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
     let name = match params["name"].as_str() {
@@ -110,6 +143,12 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         return json!({"ok": false, "error": e});
     }
     let env_from_params = parse_env_object(params.get("env"));
+    let restart_id = params["restart_id"]
+        .as_str()
+        .filter(|value| !value.is_empty());
+    let old_instance_ref = params
+        .get("old_instance_ref")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
     let spawn_params = crate::agent_ops::spawn::SpawnParams {
         name,
         backend: params["backend"].as_str(),
@@ -134,12 +173,32 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
         layout: params["layout"].as_str().unwrap_or("tab"),
         spawner: params["spawner"].as_str().filter(|s| !s.is_empty()),
         target_pane: params["target_pane"].as_str().filter(|s| !s.is_empty()),
+        // Public create_instance requests do not expose these fields in their
+        // MCP schema. Direct API access is operator-capability gated; only the
+        // daemon's internal restart path supplies lifecycle identity here.
+        restart_id,
+        old_instance_ref,
     };
-    let request = crate::agent_ops::spawn::resolve_spawn_request(ctx.home, &spawn_params);
+    let request = match crate::agent_ops::spawn::resolve_spawn_request(ctx.home, &spawn_params) {
+        Ok(request) => request,
+        Err(error) => {
+            let error_text = error.to_string();
+            notify_restart_failure(params, ctx, error_text.clone());
+            return json!({
+                "ok": false,
+                "error": error_text,
+                "code": "env_source_missing",
+                "instance": error.instance,
+                "destination": error.destination,
+                "source": error.source,
+            });
+        }
+    };
     match crate::agent_ops::spawn::spawn_instance(
         &crate::agent_ops::spawn::SpawnContext {
             home: ctx.home,
             registry: ctx.registry,
+            configs: ctx.configs,
             externals: ctx.externals,
             notifier: ctx.notifier,
         },
@@ -152,7 +211,10 @@ pub(crate) fn handle_spawn(params: &Value, ctx: &HandlerCtx) -> Value {
             }
             json!({"ok": true, "result": result})
         }
-        Err(e) => json!({"ok": false, "error": e}),
+        Err(e) => {
+            notify_restart_failure(params, ctx, e.clone());
+            json!({"ok": false, "error": e})
+        }
     }
 }
 
@@ -262,7 +324,40 @@ mod tests {
     use parking_lot::Mutex;
     use serde_json::json;
     use std::collections::HashMap;
+    use std::io;
     use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct NeverExitingChild;
+
+    impl portable_pty::ChildKiller for NeverExitingChild {
+        fn kill(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            Box::new(Self)
+        }
+    }
+
+    impl portable_pty::Child for NeverExitingChild {
+        fn try_wait(&mut self) -> io::Result<Option<portable_pty::ExitStatus>> {
+            Ok(None)
+        }
+
+        fn wait(&mut self) -> io::Result<portable_pty::ExitStatus> {
+            Ok(portable_pty::ExitStatus::with_exit_code(0))
+        }
+
+        fn process_id(&self) -> Option<u32> {
+            None
+        }
+
+        #[cfg(windows)]
+        fn as_raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+            None
+        }
+    }
 
     fn test_ctx_with_agent(name: &str) -> (HandlerCtx<'static>, Box<std::path::PathBuf>) {
         let home = Box::new(std::env::temp_dir().join(format!(
@@ -344,6 +439,53 @@ mod tests {
         }
     }
 
+    #[test]
+    fn delete_timeout_remains_fail_closed_across_retry_3385() {
+        let name = "delete-timeout-retry";
+        let (ctx, home) = test_ctx_with_agent(name);
+        let id = crate::fleet::resolve_uuid(ctx.home, name).expect("fleet id");
+        {
+            let mut reg = agent::lock_registry(ctx.registry);
+            let handle = reg.get_mut(&id).expect("spawned handle");
+            let _ = handle.child.lock().kill();
+            handle.child = Arc::new(Mutex::new(Box::new(NeverExitingChild)));
+        }
+        let workspace = crate::paths::workspace_dir(ctx.home).join(name);
+        std::fs::create_dir_all(&workspace).expect("create workspace evidence directory");
+        std::fs::write(workspace.join("evidence"), "keep").expect("write workspace evidence");
+
+        let response = handle_delete(&json!({"name": name}), &ctx);
+        assert_eq!(response["ok"], json!(false), "{response:?}");
+        assert!(
+            agent::lock_registry(ctx.registry).contains_key(&id),
+            "a timeout must retain the child handle for retry"
+        );
+
+        let delete_context = crate::agent_ops::DeleteContext {
+            registry: ctx.registry,
+            configs: ctx.configs,
+            externals: ctx.externals,
+            notifier: ctx.notifier,
+        };
+        let retry =
+            crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
+                ctx.home,
+                name,
+                Some(&delete_context),
+            );
+        assert!(retry.is_err(), "retry must remain fail-closed: {retry:?}");
+        assert!(
+            crate::fleet::resolve_uuid(ctx.home, name).is_some(),
+            "fleet evidence must survive an unconfirmed retry"
+        );
+        assert!(
+            workspace.join("evidence").exists(),
+            "workspace evidence must survive an unconfirmed retry"
+        );
+        cleanup_agent(&ctx, name);
+        std::fs::remove_dir_all(home.as_ref()).ok();
+    }
+
     /// Slice-2 RED: the API kill producer must publish Crashed before the PTY
     /// exit path and later exact-generation admission, never Restarting itself.
     #[test]
@@ -403,6 +545,149 @@ mod tests {
                 .is_some_and(|error| error.contains("crashed")),
             "Crashed INJECT rejection must say crashed: {response:?}"
         );
+        cleanup_agent(&ctx, name);
+        std::fs::remove_dir_all(home.as_ref()).ok();
+    }
+
+    /// Corrective RED for #3670: the runtime-less watchdog route reaches the
+    /// legacy DELETE and SPAWN API adapters. Both lifecycle events must retain
+    /// the same internal correlation and predecessor identity so the TUI can
+    /// replace the pane in place.
+    #[test]
+    fn runtime_less_restart_delete_spawn_carries_correlation_3670_red() {
+        struct RecordingNotifier {
+            events: Mutex<Vec<ApiEvent>>,
+        }
+
+        impl crate::api::ApiNotifier for RecordingNotifier {
+            fn notify(&self, event: ApiEvent) {
+                self.events.lock().push(event);
+            }
+        }
+
+        let name = "watchdog-correlation-3670";
+        let (mut ctx, home) = test_ctx_with_agent(name);
+        let notifier = Arc::new(RecordingNotifier {
+            events: Mutex::new(Vec::new()),
+        });
+        let notifier_trait: Arc<dyn crate::api::ApiNotifier> = notifier.clone();
+        let notifier_ref: &'static Arc<dyn crate::api::ApiNotifier> =
+            Box::leak(Box::new(notifier_trait));
+        ctx.notifier = Some(notifier_ref);
+        let old_instance_ref = agent::instance_ref_for_name(ctx.registry, ctx.home, name)
+            .expect("live watchdog predecessor identity");
+        let restart_id = "watchdog-restart-3670";
+
+        let deleted = handle_delete(
+            &json!({"name": name, "no_wait": true, "restart_id": restart_id}),
+            &ctx,
+        );
+        assert_eq!(
+            deleted["ok"], true,
+            "watchdog DELETE must succeed: {deleted}"
+        );
+        let spawned = handle_spawn(
+            &json!({
+                "name": name,
+                "backend": crate::default_shell(),
+                "mode": "fresh",
+                "restart_id": restart_id,
+                "old_instance_ref": old_instance_ref,
+            }),
+            &ctx,
+        );
+        assert_eq!(
+            spawned["ok"], true,
+            "watchdog SPAWN must succeed: {spawned}"
+        );
+
+        let events = notifier.events.lock();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    ApiEvent::InstanceDeleted { restart_id: Some(delete_id), .. },
+                    ApiEvent::InstanceCreated {
+                        restart_id: Some(create_id),
+                        old_instance_ref: Some(create_old_ref),
+                        ..
+                    }
+                ] if delete_id == restart_id
+                    && create_id == restart_id
+                    && *create_old_ref == old_instance_ref
+            ),
+            "runtime-less restart events lost correlation: {events:?}"
+        );
+        drop(events);
+        cleanup_agent(&ctx, name);
+        std::fs::remove_dir_all(home.as_ref()).ok();
+    }
+
+    #[test]
+    fn runtime_less_restart_spawn_failure_emits_correlated_event_3670() {
+        struct RecordingNotifier {
+            events: Mutex<Vec<ApiEvent>>,
+        }
+
+        impl crate::api::ApiNotifier for RecordingNotifier {
+            fn notify(&self, event: ApiEvent) {
+                self.events.lock().push(event);
+            }
+        }
+
+        let name = "watchdog-failure-3670";
+        let (mut ctx, home) = test_ctx_with_agent(name);
+        let notifier = Arc::new(RecordingNotifier {
+            events: Mutex::new(Vec::new()),
+        });
+        let notifier_trait: Arc<dyn crate::api::ApiNotifier> = notifier.clone();
+        let notifier_ref: &'static Arc<dyn crate::api::ApiNotifier> =
+            Box::leak(Box::new(notifier_trait));
+        ctx.notifier = Some(notifier_ref);
+        let old_instance_ref = agent::instance_ref_for_name(ctx.registry, ctx.home, name)
+            .expect("live watchdog predecessor identity");
+        let restart_id = "watchdog-failure-3670";
+
+        let deleted = handle_delete(
+            &json!({"name": name, "no_wait": true, "restart_id": restart_id}),
+            &ctx,
+        );
+        assert_eq!(
+            deleted["ok"], true,
+            "watchdog DELETE must succeed: {deleted}"
+        );
+        let spawned = handle_spawn(
+            &json!({
+                "name": name,
+                "backend": "/definitely-missing-agent-3670",
+                "mode": "fresh",
+                "restart_id": restart_id,
+                "old_instance_ref": old_instance_ref,
+            }),
+            &ctx,
+        );
+        assert_eq!(spawned["ok"], false, "watchdog SPAWN must fail: {spawned}");
+
+        let events = notifier.events.lock();
+        assert!(
+            matches!(
+                events.as_slice(),
+                [
+                    ApiEvent::InstanceDeleted { restart_id: Some(delete_id), .. },
+                    ApiEvent::InstanceRestartFailed {
+                        restart_id: failure_id,
+                        old_instance_ref: Some(failure_old_ref),
+                        error,
+                        ..
+                    }
+                ] if delete_id == restart_id
+                    && failure_id == restart_id
+                    && *failure_old_ref == old_instance_ref
+                    && error.contains("Failed to spawn")
+            ),
+            "watchdog failure event lost correlation: {events:?}"
+        );
+        drop(events);
         cleanup_agent(&ctx, name);
         std::fs::remove_dir_all(home.as_ref()).ok();
     }

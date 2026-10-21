@@ -438,13 +438,9 @@ fn run_loop(home: PathBuf, registry: AgentRegistry) {
             // 10s cadence. The trackers keep their internal TICKS_PER_SCAN
             // throttle, so the effective scan cadence is unchanged.
             // #986: the supervisor loop NO LONGER scans pr_state directly. The
-            // `PrStateScanHandler` per-tick handler is the SINGLE scanner in ALL
-            // modes — it runs in run_core's handler vec (daemon) AND in
-            // `app::app_tick_handlers` (app standalone, both attached and owned,
-            // since `pr_state_scan` is not in `APP_TICK_ALLOWLIST`). The old direct
-            // scan here was a vestigial app-mode belt from when the handler was
-            // run_core-only; with the handler now live in every mode it was a
-            // redundant SECOND scanner + (post-#986) a SECOND gh-poll worker. The
+            // `PrStateScanHandler` per-tick handler is the SINGLE scanner in the
+            // run_core handler pipeline. The old direct scan here was redundant:
+            // a SECOND scanner + (post-#986) a SECOND gh-poll worker. The
             // handler owns the single snapshot cache + worker.
             // Source-pin: `pr_state_scan_wired_into_supervisor_loop` asserts the
             // supervisor does NOT scan (guards against re-adding it here).
@@ -760,7 +756,13 @@ fn tick(
     // that agent's core — the core→registry inversion that risked an AB-BA
     // deadlock with the registry→core render/monitor loops. Backend resolution
     // on the captured values is lock-free.
-    let handles: Vec<(String, Option<crate::backend::Backend>, String, _)> = {
+    let handles: Vec<(
+        String,
+        Option<crate::backend::Backend>,
+        String,
+        _,
+        Arc<std::sync::atomic::AtomicBool>,
+    )> = {
         let reg = agent::lock_registry(registry);
         reg.values()
             // #1915 TIER-B1: skip a handle being deleted (deleted flag set in
@@ -775,12 +777,16 @@ fn tick(
                     h.declared_backend.clone(),
                     h.backend_command.clone(),
                     Arc::clone(&h.core),
+                    // #78207-1: carry the SAME handle-scoped flag the filter
+                    // above just trusted, so the emit can re-read it without
+                    // re-locking the registry.
+                    Arc::clone(&h.deleted),
                 )
             })
             .collect()
     };
 
-    for (name, declared_backend, backend_command, core) in handles {
+    for (name, declared_backend, backend_command, core, deleted) in handles {
         // #1665/#2042 reply-ledger: TTL/settled fallback for a user-message
         // turn that never hit a clear site (no reply, no mirror, no takeover).
         // Lock-free snapshot read; acts only past the grace window AND when the
@@ -859,6 +865,15 @@ fn tick(
         // lock, then perform all disk/registry work after the guard drops.
         let usage_limit_raw_state: crate::state::AgentState;
         let usage_limit_pane_tail: String;
+        // #3671: drain the #1527 transition buffer under the core lock but
+        // emit the file appends AFTER the guard drops (`log_state_transition_at`
+        // takes a blocking companion flock plus retention filesystem IO —
+        // holding the per-agent core mutex across it stalls the PTY
+        // read-loop `feed`; CR-2026-06-14 blocking-IO class). Owned rows +
+        // snippet cross the boundary; behavior (one row per drained
+        // transition, same ts/snippet) is unchanged.
+        let logged_transitions: Vec<crate::state::TransitionRecord>;
+        let transition_snippet: String;
         // CR-2026-06-14 (concurrency): hoist the two per-agent disk reads that
         // feed the awaiting-operator gate OUT of the core lock. Both depend only
         // on (home, name), not on core state, so reading them lock-free here
@@ -908,8 +923,13 @@ fn tick(
             // the old prev/new-at-tick comparison, which silently missed any
             // transition that completed async between two supervisor ticks
             // (prev==new), i.e. nearly all feed-driven ones including the error
-            // states. `log_state_transition_at` is a file append (no self-IPC,
-            // no new lock) so logging under the core lock is #1492-safe.
+            // states. #3671: the drain happens here but the file appends run
+            // AFTER the core lock drops (see `logged_transitions` below) —
+            // `log_state_transition_at` takes a blocking companion flock plus
+            // retention filesystem IO, so emitting under the lock would hold
+            // the per-agent core mutex across it (CR-2026-06-14 class). The
+            // append itself takes no registry/core lock, so lock-free emission
+            // stays #1492-safe.
             let snippet = core.vterm.tail_lines(3);
             let (transitions, dropped) = core.state.drain_pending_transitions();
             if dropped > 0 {
@@ -919,11 +939,8 @@ fn tick(
                     "#1527: transition-log buffer overflowed (drainer fell behind) — oldest dropped"
                 );
             }
-            for t in &transitions {
-                crate::daemon::usage_limit::log_state_transition_at(
-                    home, &name, t.from, t.to, &t.ts, &snippet,
-                );
-            }
+            transition_snippet = snippet.clone();
+            logged_transitions = transitions;
 
             // #1530: de-gate the UsageLimit + member-state reactions off the
             // (feed-blind) `prev != new` tick comparison. React on the NET state
@@ -947,7 +964,7 @@ fn tick(
             // ships. The big `supervise_one()->TickOutcome` extraction that would
             // make it compile-impossible is deferred (#1644) — revisit when a new
             // reaction is added to this loop; both guards above make that safe.
-            for decision in reactions_from_transitions(&transitions) {
+            for decision in reactions_from_transitions(&logged_transitions) {
                 // #1530/F2/#2877: backend resolved from the immutable declared
                 // identity, falling back to the captured live command for legacy
                 // handles (no registry re-acquire while holding core).
@@ -1107,6 +1124,22 @@ fn tick(
             }
         };
 
+        // #3671: emit the drained transition rows now that the core lock is
+        // dropped — the append takes the blocking companion flock plus
+        // retention filesystem IO, which must not hold the per-agent core
+        // mutex (CR-2026-06-14 blocking-IO class). Same rows, same ts and
+        // snippet as the in-lock drain; only the emission point moved.
+        for t in &logged_transitions {
+            crate::daemon::usage_limit::log_state_transition_at(
+                home,
+                &name,
+                t.from,
+                t.to,
+                &t.ts,
+                &transition_snippet,
+            );
+        }
+
         // #1530: emit the collected reactions now that the core lock is dropped
         // (#1492-safe — the member-notify self-IPC no longer runs under the
         // lock; propagate already required the drop pre-#1530). Routed through
@@ -1135,6 +1168,11 @@ fn tick(
         if !reaction_intents.is_empty() {
             let config = crate::runtime_config::get();
             for intent in &reaction_intents {
+                if intent.to == crate::state::AgentState::UsageLimit
+                    && crate::schedule_jobs::owns_worker(home, &name)
+                {
+                    continue;
+                }
                 for kind in reaction_kinds(intent.to, config.usage_limit_propagation_enabled) {
                     match kind {
                         ReactionKind::NotifyOperator => {
@@ -1265,8 +1303,34 @@ fn tick(
             );
         }
 
+        // #78207-1: a normal full_delete can set this handle's flag between the
+        // snapshot above and this emit. Re-read the SAME captured Arc here —
+        // monotonic, so no registry re-lock. Sited above the match so it covers
+        // EVERY operator-facing notice with one check: a `Stall` for an instance
+        // that no longer exists, and a `Recovered` that would otherwise tell the
+        // operator a torn-down instance is ready to keep talking. All internal
+        // per-episode cleanup already ran under the core lock above, so this
+        // suppresses the emit only.
+        if deleted.load(std::sync::atomic::Ordering::Acquire) {
+            continue;
+        }
         match action {
             Some(NoticeAction::Stall { tail, silent_secs }) => {
+                // #3547 P0-near Task3: persist the stalled frame for post-mortem
+                // diagnosis (best-effort — a failed save warns and the notice
+                // still goes out). Runs lock-free here at the emit site, never
+                // under the core lock (CR-2026-06-14 concurrency).
+                match save_stalled_snapshot(home, &name, &tail) {
+                    Some(path) => tracing::info!(
+                        agent = %name,
+                        snapshot = %path.display(),
+                        "stalled pane snapshot saved"
+                    ),
+                    None => tracing::warn!(
+                        agent = %name,
+                        "stalled pane snapshot save failed (best-effort, notice continues)"
+                    ),
+                }
                 let msg = format_stall_notice(&name, &tail, silent_secs);
                 // Outbound info-leak gate (Sprint 21 Phase 1): `tail`
                 // carries 40 lines of PTY output — must not leak to a
@@ -1588,6 +1652,7 @@ fn enqueue_reply_ledger_lead_escalation(
         ci_handoff_episode: None,
         ci_handoff_class: None,
         ci_handoff_settlement: None,
+        idempotency_key: None,
         delivery_nonce: None,
         review_assignment: None,
     };
@@ -2322,6 +2387,43 @@ fn format_stall_notice(name: &str, tail: &str, silent_secs: Option<u64>) -> Stri
          ────────\n\
          💬 回覆將以原始鍵盤輸入寫入 agent stdin"
     )
+}
+
+/// #3547 P0-near Task3: persist the stalled pane `tail` to
+/// `$AGEND_HOME/stalled-captures/<instance>-<epoch_ms>.log` so the next
+/// dismiss-miss can be diagnosed from a real frame instead of guessed.
+/// Best-effort: any IO failure returns None and the caller logs a warn —
+/// the snapshot must never block or break the stall notice itself.
+/// Pure w.r.t. daemon state (takes `home`/`name`/`tail` only), so it is
+/// unit-testable without a registry or a core lock.
+fn save_stalled_snapshot(
+    home: &std::path::Path,
+    name: &str,
+    tail: &str,
+) -> Option<std::path::PathBuf> {
+    let dir = home.join("stalled-captures");
+    std::fs::create_dir_all(&dir).ok()?;
+    let epoch_ms = std::time::SystemTime::now()
+        .duration_since(std::time::SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis();
+    let path = dir.join(format!(
+        "{}-{}.log",
+        crate::transport::safe_component(name),
+        epoch_ms
+    ));
+    // #3547: the capture is the only artefact a human reads after a stall, so
+    // it carries the gate's own account of what it did. #3548's first-Refuse log
+    // cannot answer this: the gate is consulted on every PTY read and the first
+    // reads of a healthy generation precede the modal being painted, so the
+    // FIRST refuse is `NoCompleteModal` on successful dismisses too. The LAST
+    // refuse plus the distribution is what separates a real miss from noise.
+    let dev_modal = crate::agent::dev_modal::refuse_summary(name)
+        .unwrap_or_else(|| "dev_modal: no gate published for this agent".to_string());
+    let body =
+        format!("agent: {name}\ncaptured_at_ms: {epoch_ms}\n{dev_modal}\n────────\n{tail}\n");
+    std::fs::write(&path, body).ok()?;
+    Some(path)
 }
 
 /// Short, silent ping emitted when an agent leaves a blocked state

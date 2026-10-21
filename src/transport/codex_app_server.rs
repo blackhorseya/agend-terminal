@@ -115,6 +115,38 @@ impl CodexNativeShared {
         }
     }
 
+    /// Checkpoint the exact user thread already loaded by a managed Codex
+    /// app-server. A persisted thread id is already authoritative; a missing
+    /// id is discovered through the same validated app-server handshake used
+    /// by structured delivery, then atomically persisted before the caller can
+    /// tear down the agent/client.
+    pub(crate) fn checkpoint_session(
+        home: &Path,
+        instance: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(locator) = super::registry::codex_attach_locator(home, instance)? else {
+            return Ok(None);
+        };
+        if let Some(thread_id) = locator
+            .thread_id
+            .as_deref()
+            .filter(|thread_id| !thread_id.is_empty())
+        {
+            return Ok(Some(thread_id.to_string()));
+        }
+
+        let mut adapter = Self::new(home, instance);
+        adapter.start_or_attach_blocking(locator)?;
+        let thread_id = adapter
+            .locator
+            .as_ref()
+            .and_then(|locator| locator.thread_id.as_deref())
+            .filter(|thread_id| !thread_id.is_empty())
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("Codex checkpoint completed without a thread_id"))?;
+        Ok(Some(thread_id))
+    }
+
     pub(crate) fn deliver_blocking(
         &mut self,
         mut envelope: DeliveryEnvelope,
@@ -133,12 +165,15 @@ impl CodexNativeShared {
         if let Some(locator) = self.locator.clone() {
             envelope.session = locator;
         }
-        if self.in_flight.is_some() && !matches!(envelope.kind, DeliveryKind::Steer) {
+        if self.in_flight.is_some()
+            && self.active_turn_id.is_none()
+            && !matches!(envelope.kind, DeliveryKind::Steer)
+        {
             let mut queued = DeliveryReceipt::for_state(&envelope, DeliveryState::Queued);
-            queued.detail = Some("one ordinary turn is already in flight".to_string());
+            queued.detail = Some("the active Codex turn id is not known yet".to_string());
             store.record(queued)?;
             return Err(anyhow::anyhow!(
-                "Codex thread already has an ordinary turn in flight"
+                "Codex active turn is not ready for turn/steer"
             ));
         }
 
@@ -152,6 +187,7 @@ impl CodexNativeShared {
                 return Err(error);
             }
         };
+        let steers_active_turn = method == "turn/steer";
         let request_id = self.next_request_id.to_string();
         let response = match self.send_request(&method, params) {
             Ok(response) => response,
@@ -184,12 +220,19 @@ impl CodexNativeShared {
                     .and_then(Value::as_str)
                     .map(str::to_string)
             });
-        self.pending.insert(envelope.delivery_id, envelope.clone());
-        self.in_flight = Some(envelope.delivery_id);
+        if !steers_active_turn {
+            self.active_turn_id = backend_request_id.clone();
+            self.pending.insert(envelope.delivery_id, envelope.clone());
+            self.in_flight = Some(envelope.delivery_id);
+        }
         let mut receipt = DeliveryReceipt::for_state(&envelope, DeliveryState::ProtocolAccepted);
         receipt.protocol_request_id = Some(backend_request_id.unwrap_or(request_id));
         receipt.tui_visibility = Some("shared_codex_thread".to_string());
-        receipt.detail = Some("Codex app-server accepted turn request".to_string());
+        receipt.detail = Some(if steers_active_turn {
+            "Codex app-server accepted turn/steer".to_string()
+        } else {
+            "Codex app-server accepted turn/start".to_string()
+        });
         store.record(receipt.clone())?;
         Ok(receipt)
     }
@@ -207,6 +250,7 @@ impl CodexNativeShared {
         codex: &str,
         locator: &SessionLocator,
         cwd: &Path,
+        config_args: &[String],
     ) -> anyhow::Result<std::process::Child> {
         #[cfg(unix)]
         {
@@ -241,6 +285,7 @@ impl CodexNativeShared {
             use std::os::unix::process::CommandExt;
             let mut command = std::process::Command::new(codex);
             command
+                .args(config_args)
                 .args(["app-server", "--listen", &locator.remote_attach_arg()])
                 .current_dir(cwd)
                 .stdout(std::process::Stdio::piped())
@@ -285,7 +330,7 @@ impl CodexNativeShared {
         }
         #[cfg(not(unix))]
         {
-            let _ = (codex, locator, cwd);
+            let _ = (codex, locator, cwd, config_args);
             Err(anyhow::anyhow!("Codex NativeShared requires Unix sockets"))
         }
     }
@@ -298,20 +343,23 @@ impl CodexNativeShared {
             .filter(|id| !id.is_empty())
             .ok_or_else(|| anyhow::anyhow!("Codex NativeShared requires a thread_id"))?;
         let input = json!([{"type": "text", "text": envelope.body}]);
+        if matches!(envelope.kind, DeliveryKind::Steer)
+            || (self.in_flight.is_some() && !matches!(envelope.kind, DeliveryKind::Interrupt))
+        {
+            let turn_id = self
+                .active_turn_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("turn/steer requires an active Codex turn id"))?;
+            return Ok((
+                "turn/steer".to_string(),
+                json!({
+                    "threadId": thread_id,
+                    "expectedTurnId": turn_id,
+                    "input": input,
+                }),
+            ));
+        }
         match envelope.kind {
-            DeliveryKind::Steer => {
-                let turn_id = self.active_turn_id.clone().ok_or_else(|| {
-                    anyhow::anyhow!("turn/steer requires an active Codex turn id")
-                })?;
-                Ok((
-                    "turn/steer".to_string(),
-                    json!({
-                        "threadId": thread_id,
-                        "expectedTurnId": turn_id,
-                        "input": input,
-                    }),
-                ))
-            }
             DeliveryKind::Interrupt => Err(anyhow::anyhow!(
                 "interrupt requires an explicit Codex protocol operation; ordinary delivery cannot infer it"
             )),
@@ -327,6 +375,7 @@ impl CodexNativeShared {
                     "clientUserMessageId": envelope.delivery_id.to_string(),
                 }),
             )),
+            DeliveryKind::Steer => unreachable!("steer is handled before ordinary turn/start"),
         }
     }
 
@@ -414,9 +463,15 @@ impl CodexNativeShared {
         let deadline = std::time::Instant::now() + IO_TIMEOUT;
         loop {
             let response = self.send_request("thread/loaded/list", json!({}))?;
-            let thread_ids = loaded_thread_ids(&response);
-            match thread_ids.as_slice() {
-                [thread_id] => return Ok(thread_id.clone()),
+            let loaded_threads = loaded_threads(&response);
+            match loaded_threads.as_slice() {
+                [thread] if !thread.is_known_non_user() => return Ok(thread.id.clone()),
+                [thread] => {
+                    return Err(anyhow::anyhow!(
+                        "Codex app-server has no real user TUI thread (loaded {})",
+                        thread.id
+                    ));
+                }
                 [] if std::time::Instant::now() < deadline => {
                     std::thread::sleep(Duration::from_millis(25));
                 }
@@ -426,13 +481,55 @@ impl CodexNativeShared {
                     ));
                 }
                 _ => {
-                    return Err(anyhow::anyhow!(
-                        "Codex app-server has {} loaded threads; refusing ambiguous TUI delivery",
-                        thread_ids.len()
-                    ));
+                    let real_user_ids = self.real_user_loaded_thread_ids(loaded_threads)?;
+                    match real_user_ids.as_slice() {
+                        [thread_id] => return Ok(thread_id.clone()),
+                        [] => {
+                            return Err(anyhow::anyhow!(
+                                "Codex app-server has no real user TUI thread among loaded threads"
+                            ));
+                        }
+                        _ => {
+                            return Err(anyhow::anyhow!(
+                                "Codex app-server has {} loaded threads ({}); refusing ambiguous TUI delivery",
+                                real_user_ids.len(),
+                                ambiguous_thread_ids_preview(&real_user_ids)
+                            ));
+                        }
+                    }
                 }
             }
         }
+    }
+
+    #[cfg(unix)]
+    fn real_user_loaded_thread_ids(
+        &mut self,
+        loaded_threads: Vec<LoadedThread>,
+    ) -> anyhow::Result<Vec<String>> {
+        loaded_threads
+            .into_iter()
+            .filter_map(|thread| {
+                if thread.is_known_non_user() {
+                    return None;
+                }
+                if thread.is_known_user() {
+                    return Some(Ok(thread.id));
+                }
+                let thread_id = thread.id.clone();
+                let response = self.send_request("thread/read", json!({"threadId": thread_id}));
+                match response {
+                    Ok(response) => match thread_read_user_classification(&response) {
+                        Some(true) => Some(Ok(thread.id)),
+                        Some(false) => None,
+                        None => Some(Err(anyhow::anyhow!(
+                            "Codex app-server thread/read for {thread_id} omitted or returned unrecognized thread classification metadata"
+                        ))),
+                    },
+                    Err(error) => Some(Err(error)),
+                }
+            })
+            .collect()
     }
 
     #[cfg(unix)]
@@ -768,6 +865,32 @@ impl CodexNativeShared {
     }
 }
 
+pub(crate) fn checkpoint_codex_session(
+    home: &Path,
+    instance: &str,
+) -> anyhow::Result<Option<String>> {
+    CodexNativeShared::checkpoint_session(home, instance)
+}
+
+/// Strict restart gate: every configured Codex instance must have an exact
+/// persisted or discoverable thread. A missing locator is not a permission to
+/// start a fresh context during restart.
+pub(crate) fn checkpoint_codex_sessions_strict(
+    home: &Path,
+    instances: &[String],
+) -> anyhow::Result<usize> {
+    let mut checkpointed = 0usize;
+    for instance in instances {
+        if checkpoint_codex_session(home, instance)?.is_none() {
+            return Err(anyhow::anyhow!(
+                "Codex instance {instance:?} has no session locator to checkpoint"
+            ));
+        }
+        checkpointed += 1;
+    }
+    Ok(checkpointed)
+}
+
 fn readiness_failure_detail(error: &anyhow::Error) -> String {
     let mut detail = format!("NativeShared readiness failed closed: {error}");
     if detail.len() <= MAX_READINESS_DETAIL_BYTES {
@@ -813,25 +936,94 @@ fn validate_initialize_response(response: &Value) -> anyhow::Result<String> {
     Ok(version.to_string())
 }
 
+/// #3535: truncated preview of ambiguous loaded thread ids for the refusal
+/// diagnostic. The guard verdict (refuse when != 1) lives in
+/// `discover_loaded_tui_thread` and is untouched.
+///
+/// This only renders the ids the helper already holds, truncated to 8 chars
+/// per id so the receipt detail + event-log let the operator compare against
+/// visible TUI threads without persisting full identifiers.
 #[cfg(unix)]
-fn loaded_thread_ids(response: &Value) -> Vec<String> {
-    let mut thread_ids = Vec::new();
+fn ambiguous_thread_ids_preview(thread_ids: &[String]) -> String {
+    thread_ids
+        .iter()
+        .map(|thread_id| thread_id.chars().take(8).collect::<String>())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct LoadedThread {
+    id: String,
+    ephemeral: Option<bool>,
+    source: Option<String>,
+}
+
+#[cfg(unix)]
+impl LoadedThread {
+    fn is_known_non_user(&self) -> bool {
+        self.ephemeral == Some(true) || self.source.as_deref() == Some("system")
+    }
+
+    fn is_known_user(&self) -> bool {
+        self.ephemeral == Some(false) && self.source.as_deref() == Some("user")
+    }
+}
+
+#[cfg(unix)]
+fn loaded_threads(response: &Value) -> Vec<LoadedThread> {
+    let mut loaded_threads = Vec::new();
     for item in response
         .get("data")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
     {
-        let thread_id = item
+        let Some(thread_id) = item
             .as_str()
-            .or_else(|| item.get("id").and_then(Value::as_str));
-        if let Some(thread_id) = thread_id.filter(|thread_id| !thread_id.is_empty()) {
-            if !thread_ids.iter().any(|loaded| loaded == thread_id) {
-                thread_ids.push(thread_id.to_string());
-            }
+            .or_else(|| item.get("id").and_then(Value::as_str))
+            .filter(|thread_id| !thread_id.is_empty())
+        else {
+            continue;
+        };
+        if !loaded_threads
+            .iter()
+            .any(|loaded: &LoadedThread| loaded.id == thread_id)
+        {
+            loaded_threads.push(LoadedThread {
+                id: thread_id.to_string(),
+                ephemeral: item.get("ephemeral").and_then(Value::as_bool),
+                source: item
+                    .get("threadSource")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
         }
     }
-    thread_ids
+    loaded_threads
+}
+
+#[cfg(unix)]
+fn thread_read_user_classification(response: &Value) -> Option<bool> {
+    let thread = response
+        .pointer("/result/thread")
+        .or_else(|| response.get("thread"))?;
+    let loaded = LoadedThread {
+        id: String::new(),
+        ephemeral: thread.get("ephemeral").and_then(Value::as_bool),
+        source: thread
+            .get("threadSource")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    };
+    if loaded.is_known_user() {
+        Some(true)
+    } else if loaded.is_known_non_user() {
+        Some(false)
+    } else {
+        None
+    }
 }
 
 #[cfg(unix)]
@@ -1007,7 +1199,19 @@ fn launch_managed_server(
     locator: &mut SessionLocator,
     cwd: Option<&Path>,
 ) -> anyhow::Result<()> {
-    let child = CodexNativeShared::launch(codex, locator, cwd.unwrap_or_else(|| Path::new(".")))?;
+    let mut config_args = crate::mcp_config::codex_managed_config_args(home, Some(instance), cwd)?;
+    // Codex rejects client permission overrides when a remote `resume
+    // <thread_id>` is requested. Apply the same autonomous policy to the
+    // managed app-server so resumed clients can omit that forbidden override
+    // without making AgEnD MCP calls approval-gated.
+    config_args.extend([
+        "-c".to_string(),
+        "approval_policy=\"never\"".to_string(),
+        "-c".to_string(),
+        "sandbox_mode=\"danger-full-access\"".to_string(),
+    ]);
+    let cwd = cwd.unwrap_or_else(|| Path::new("."));
+    let child = CodexNativeShared::launch(codex, locator, cwd, &config_args)?;
     let pid = child.id();
     let start_token = crate::process::process_start_token(pid);
     locator.managed = true;
@@ -1031,6 +1235,15 @@ fn launch_managed_server(
             },
         );
     Ok(())
+}
+
+#[cfg(unix)]
+fn remove_managed_socket_file(endpoint: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(endpoint) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
 }
 
 #[cfg(unix)]
@@ -1080,7 +1293,7 @@ fn remove_managed_endpoint(
             endpoint.display()
         ));
     }
-    std::fs::remove_file(endpoint).map_err(|error| {
+    remove_managed_socket_file(endpoint).map_err(|error| {
         anyhow::anyhow!(
             "cannot remove Codex managed socket {}: {error}",
             endpoint.display()
@@ -1320,699 +1533,5 @@ impl AgentDeliveryTransport for CodexNativeShared {
 }
 
 #[cfg(all(test, unix))]
-mod tests {
-    use super::*;
-    use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener;
-    use std::thread;
-
-    const STDIO_PROBE_MARKER: &str = "AGEND_CODEX_STDIO_LEAK_MARKER";
-
-    #[test]
-    fn codex_launch_stdio_probe_helper() {
-        if std::env::var_os("AGEND_CODEX_STDIO_PROBE_CHILD").is_none() {
-            return;
-        }
-        let helper_ran =
-            std::env::var_os("AGEND_CODEX_STDIO_PROBE_RAN").expect("probe helper sentinel path");
-        std::fs::write(helper_ran, b"ran").expect("record probe helper execution");
-
-        let root = std::env::temp_dir().join(format!("agend-codex-stdio-{}", Uuid::new_v4()));
-        let endpoint = root.join("transport/codex/probe.sock");
-        let executable = root.join("fake-codex");
-        std::fs::create_dir_all(&root).expect("probe root");
-        std::fs::write(
-            &executable,
-            format!(
-                "#!/bin/sh\nendpoint=${{3#unix://}}\nprintf '{STDIO_PROBE_MARKER} stdout\\n'\nprintf '{STDIO_PROBE_MARKER} stderr\\n' >&2\ntouch \"$endpoint\"\ntrap 'exit 0' TERM\nwhile :; do sleep 1; done\n"
-            ),
-        )
-        .expect("probe executable");
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("probe metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        std::fs::set_permissions(&executable, permissions).expect("probe permissions");
-
-        let locator = SessionLocator::codex(endpoint, None);
-        let mut child = CodexNativeShared::launch(
-            executable.to_str().expect("UTF-8 executable"),
-            &locator,
-            &root,
-        )
-        .expect("launch fake Codex app-server");
-        std::thread::sleep(Duration::from_millis(50));
-        child.kill().expect("stop probe child");
-        let _ = child.wait();
-        let _ = std::fs::remove_dir_all(root);
-    }
-
-    #[test]
-    fn codex_app_server_output_does_not_escape_to_parent_terminal() {
-        let helper_ran =
-            std::env::temp_dir().join(format!("agend-codex-stdio-helper-ran-{}", Uuid::new_v4()));
-        let output = std::process::Command::new(std::env::current_exe().expect("test executable"))
-            .args([
-                "--exact",
-                "transport::codex_app_server::tests::codex_launch_stdio_probe_helper",
-                "--nocapture",
-            ])
-            .env("AGEND_CODEX_STDIO_PROBE_CHILD", "1")
-            .env("AGEND_CODEX_STDIO_PROBE_RAN", &helper_ran)
-            .output()
-            .expect("run isolated stdio probe");
-
-        assert!(helper_ran.exists(), "stdio probe helper did not run");
-        let _ = std::fs::remove_file(helper_ran);
-        assert!(
-            output.status.success(),
-            "stdio probe helper failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let combined = format!(
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            !combined.contains(STDIO_PROBE_MARKER),
-            "Codex app-server output escaped to the parent terminal: {combined}"
-        );
-    }
-
-    #[test]
-    fn drain_server_output_continues_past_invalid_utf8_to_eof() {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        use std::sync::Arc;
-
-        struct EofTrackingReader {
-            inner: std::io::Cursor<Vec<u8>>,
-            reached_eof: Arc<AtomicBool>,
-        }
-
-        impl std::io::Read for EofTrackingReader {
-            fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-                let read = self.inner.read(buffer)?;
-                if read == 0 {
-                    self.reached_eof.store(true, Ordering::Release);
-                }
-                Ok(read)
-            }
-        }
-
-        let reached_eof = Arc::new(AtomicBool::new(false));
-        let reader = EofTrackingReader {
-            inner: std::io::Cursor::new(b"first\n\xff\xfe\x80\nlast\n".to_vec()),
-            reached_eof: Arc::clone(&reached_eof),
-        };
-
-        drain_server_output(reader, "stderr");
-
-        assert!(
-            reached_eof.load(Ordering::Acquire),
-            "invalid UTF-8 must not stop the drain before EOF"
-        );
-    }
-
-    fn write_server_frame(stream: &mut std::os::unix::net::UnixStream, value: Value) {
-        let body = serde_json::to_vec(&value).expect("serialize frame");
-        let mut frame = vec![0x81_u8];
-        match body.len() {
-            0..=125 => frame.push(body.len() as u8),
-            126..=65_535 => {
-                frame.push(126);
-                frame.extend_from_slice(&(body.len() as u16).to_be_bytes());
-            }
-            _ => {
-                frame.push(127);
-                frame.extend_from_slice(&(body.len() as u64).to_be_bytes());
-            }
-        }
-        frame.extend_from_slice(&body);
-        stream.write_all(&frame).expect("write server frame");
-        stream.flush().expect("flush server frame");
-    }
-
-    fn run_fake_codex(endpoint: &Path) -> thread::JoinHandle<()> {
-        let listener = UnixListener::bind(endpoint).expect("bind fake Codex socket");
-        // fire-and-forget: the fake app-server owns the socket until the client drains events.
-        thread::spawn(move || {
-            let (mut stream, _) = listener.accept().expect("accept fake Codex client");
-            let mut handshake = Vec::new();
-            let mut suffix = [0_u8; 4];
-            loop {
-                let mut byte = [0_u8; 1];
-                stream.read_exact(&mut byte).expect("read handshake");
-                handshake.push(byte[0]);
-                suffix.rotate_left(1);
-                suffix[3] = byte[0];
-                if suffix == *b"\r\n\r\n" {
-                    break;
-                }
-            }
-            assert!(String::from_utf8_lossy(&handshake).contains("Upgrade: websocket"));
-            stream
-                .write_all(
-                    b"HTTP/1.1 101 Switching Protocols\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n",
-                )
-                .expect("write handshake");
-            stream.flush().expect("flush handshake");
-
-            loop {
-                let (_, body) = read_websocket_frame(&mut stream).expect("read client frame");
-                let request: Value = serde_json::from_slice(&body).expect("decode client frame");
-                let method = request
-                    .get("method")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default();
-                let id = request.get("id").cloned();
-                match method {
-                    "initialize" => write_server_frame(
-                        &mut stream,
-                        json!({
-                            "id": id,
-                            "result": {
-                                "userAgent": "codex/0.146.0",
-                                "codexHome": "/tmp/codex",
-                                "platformFamily": "unix",
-                                "platformOs": "macos"
-                            }
-                        }),
-                    ),
-                    "initialized" => {}
-                    "thread/resume" => {
-                        assert_eq!(
-                            request.pointer("/params/excludeTurns"),
-                            Some(&Value::Bool(true)),
-                            "readiness must rejoin the live thread without downloading turn history"
-                        );
-                        write_server_frame(
-                            &mut stream,
-                            json!({"id": id, "result": {"thread": {"id": "thread-1"}}}),
-                        );
-                    }
-                    "thread/loaded/list" => {
-                        write_server_frame(
-                            &mut stream,
-                            json!({"id": id, "result": {"data": [{"id": "thread-1"}]}}),
-                        );
-                    }
-                    "thread/start" => {
-                        panic!("daemon must not pre-create the visible TUI thread");
-                    }
-                    "turn/start" => {
-                        write_server_frame(
-                            &mut stream,
-                            json!({"id": id, "result": {"turn": {"id": "turn-1"}}}),
-                        );
-                        write_server_frame(
-                            &mut stream,
-                            json!({"method": "turn/started", "params": {"turn": {"id": "turn-1"}}}),
-                        );
-                        write_server_frame(
-                            &mut stream,
-                            json!({"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}),
-                        );
-                        break;
-                    }
-                    _ => panic!("unexpected method from client: {method}"),
-                }
-            }
-        })
-    }
-
-    #[test]
-    fn first_delivery_discovers_the_tui_created_thread_without_precreating_one() {
-        let home =
-            std::env::temp_dir().join(format!("agend-codex-managed-bootstrap-{}", Uuid::new_v4()));
-        let endpoint = std::env::temp_dir().join(format!("a-{}.sock", Uuid::new_v4()));
-        std::fs::create_dir_all(&home).expect("home");
-        let server = run_fake_codex(&endpoint);
-        let locator = SessionLocator::codex(endpoint.clone(), None);
-        let mut adapter = CodexNativeShared::new(&home, "codex-agent");
-
-        let envelope = DeliveryEnvelope::new(
-            "codex-agent",
-            locator,
-            DeliveryKind::Prompt,
-            "hello",
-            Some("corr-managed".to_string()),
-        );
-        let accepted = adapter
-            .deliver_blocking(envelope)
-            .expect("managed thread must accept a structured turn");
-        assert_eq!(accepted.state, DeliveryState::ProtocolAccepted);
-        assert_eq!(
-            accepted.tui_visibility.as_deref(),
-            Some("shared_codex_thread")
-        );
-        let persisted = super::super::registry::load_session_locator(&home, "codex-agent")
-            .expect("first delivery must persist the discovered TUI thread");
-        assert_eq!(persisted.thread_id.as_deref(), Some("thread-1"));
-
-        server.join().expect("fake server");
-        let _ = std::fs::remove_file(endpoint);
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn websocket_handshake_turn_and_event_receipts_are_structured() {
-        let home = std::env::temp_dir().join(format!("agend-codex-native-{}", Uuid::new_v4()));
-        // macOS limits Unix-domain socket paths to SUN_LEN; keep this test
-        // endpoint short even though the temporary home path is descriptive.
-        let endpoint = std::env::temp_dir().join(format!("a-{}.sock", Uuid::new_v4()));
-        std::fs::create_dir_all(&home).expect("home");
-        let server = run_fake_codex(&endpoint);
-        let locator = SessionLocator::codex(endpoint.clone(), Some("thread-1".to_string()));
-        let envelope = DeliveryEnvelope::new(
-            "codex-agent",
-            locator,
-            DeliveryKind::Prompt,
-            "hello",
-            Some("corr-1".to_string()),
-        );
-        let delivery_id = envelope.delivery_id;
-        let mut adapter = CodexNativeShared::new(&home, "codex-agent");
-        let accepted = adapter.deliver_blocking(envelope).expect("accepted");
-        assert_eq!(accepted.state, DeliveryState::ProtocolAccepted);
-        assert!(matches!(
-            adapter.next_event_blocking().expect("started"),
-            BackendEvent::TurnStarted { .. }
-        ));
-        assert!(matches!(
-            adapter.next_event_blocking().expect("completed"),
-            BackendEvent::Completed { .. }
-        ));
-        let store = ReceiptStore::for_instance(&home, "codex-agent").expect("store");
-        assert_eq!(
-            store.latest(delivery_id).expect("latest").map(|r| r.state),
-            Some(DeliveryState::Completed)
-        );
-        let receipt = store
-            .latest(delivery_id)
-            .expect("latest receipt")
-            .expect("completed receipt");
-        assert_eq!(receipt.protocol_request_id.as_deref(), Some("turn-1"));
-        assert_eq!(receipt.backend_event.as_deref(), Some("turn/completed"));
-        server.join().expect("fake server");
-        let _ = std::fs::remove_file(endpoint);
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn readiness_failure_records_a_failed_closed_receipt() {
-        let home =
-            std::env::temp_dir().join(format!("agend-codex-failed-readiness-{}", Uuid::new_v4()));
-        let envelope = DeliveryEnvelope::new(
-            "codex-agent",
-            SessionLocator::codex(
-                std::env::temp_dir().join(format!("missing-{}.sock", Uuid::new_v4())),
-                Some("thread-1".to_string()),
-            ),
-            DeliveryKind::Prompt,
-            "hello",
-            Some("corr-failed".to_string()),
-        );
-        let delivery_id = envelope.delivery_id;
-        let mut adapter = CodexNativeShared::new(&home, "codex-agent");
-        assert!(adapter.deliver_blocking(envelope).is_err());
-
-        let store = ReceiptStore::for_instance(&home, "codex-agent").expect("store");
-        let receipt = store
-            .latest(delivery_id)
-            .expect("latest receipt")
-            .expect("failed readiness receipt");
-        assert_eq!(receipt.state, DeliveryState::Failed);
-        let detail = receipt.detail.expect("failed readiness detail");
-        assert!(
-            detail.starts_with("NativeShared readiness failed closed: "),
-            "receipt must preserve the readiness failure class: {detail}"
-        );
-        assert!(
-            detail.contains("No such file or directory"),
-            "receipt must preserve the exact readiness cause: {detail}"
-        );
-        assert!(detail.len() <= 1024, "receipt detail must remain bounded");
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn readiness_failure_detail_is_utf8_safe_and_bounded() {
-        let error = anyhow::anyhow!("{}", "界".repeat(MAX_READINESS_DETAIL_BYTES));
-
-        let detail = readiness_failure_detail(&error);
-
-        assert!(detail.len() <= MAX_READINESS_DETAIL_BYTES);
-        assert!(detail.starts_with("NativeShared readiness failed closed: "));
-        assert!(detail.ends_with("..."));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn persisted_server_identity_rejects_pid_reuse_or_missing_start_token() {
-        let pid = std::process::id();
-        let token = crate::process::process_start_token(pid).expect("current process token");
-        let mut locator = SessionLocator::codex(
-            std::env::temp_dir().join("codex-managed.sock"),
-            Some("thread-1".to_string()),
-        );
-        locator.managed = true;
-        locator.server_pid = Some(pid);
-        locator.server_start_token = Some(token);
-        assert!(persisted_server_owned(&locator));
-        locator.server_start_token = Some(token.wrapping_add(1));
-        assert!(!persisted_server_owned(&locator));
-        locator.server_start_token = None;
-        assert!(!persisted_server_owned(&locator));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn stop_owned_process_rejects_identity_mismatch_without_signaling() {
-        let home = std::env::temp_dir().join(format!("agend-codex-identity-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&home).expect("home");
-        let marker = home.join("term-marker");
-        let mut child = std::process::Command::new("sh")
-            .args([
-                "-c",
-                "ulimit -t 30; trap 'printf term > \"$AGEND_TERM_MARKER\"; exit 0' TERM; while :; do :; done",
-            ])
-            .env("AGEND_TERM_MARKER", &marker)
-            .spawn()
-            .expect("identity fixture");
-        let pid = child.id();
-        let token = crate::process::process_start_token(pid).expect("start token");
-
-        let result = stop_owned_process(pid, token.wrapping_add(1), Some(&mut child));
-
-        assert!(result.is_err(), "identity mismatch must fail closed");
-        assert!(
-            crate::process::process_start_token(pid).is_some(),
-            "mismatched identity must not stop the live child"
-        );
-        assert!(!marker.exists(), "mismatched identity must not signal TERM");
-        child.kill().expect("cleanup identity fixture");
-        let _ = child.wait();
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn missing_socket_reaps_owned_server_before_relaunch() {
-        let home =
-            std::env::temp_dir().join(format!("agend-codex-owned-relaunch-{}", Uuid::new_v4()));
-        std::fs::create_dir_all(&home).expect("home");
-        let instance = "a";
-        let endpoint = home
-            .join("transport/codex")
-            .join(format!("a-{}.sock", Uuid::new_v4()));
-        let child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .expect("owned server fixture");
-        let pid = child.id();
-        let start_token = crate::process::process_start_token(pid).expect("start token");
-        let mut locator = SessionLocator::codex(endpoint, None);
-        locator.managed = true;
-        locator.server_pid = Some(pid);
-        locator.server_start_token = Some(start_token);
-        super::super::registry::save_session_locator(&home, instance, &locator)
-            .expect("persist locator");
-        managed_servers()
-            .lock()
-            .expect("server registry lock")
-            .insert(
-                server_key(&home, instance),
-                ManagedServer {
-                    child,
-                    pid,
-                    start_token: Some(start_token),
-                },
-            );
-
-        let result = prepare_managed_tui(&home, instance, "/bin/false", locator, None);
-        assert!(result.is_err(), "false must not create a Codex socket");
-        assert!(
-            crate::process::process_start_token(pid).is_none(),
-            "owned child must be reaped before a replacement launch"
-        );
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_endpoint_for_long_instance_fits_macos_sun_len() {
-        let home = Path::new("/Users/suzuke/.agend-terminal");
-        let instance = "archfix-codex-native-smoke-072903";
-        let mut locator = SessionLocator::codex(PathBuf::new(), None);
-
-        rotate_managed_endpoint(home, instance, &mut locator);
-
-        let endpoint = locator.endpoint.expect("managed endpoint");
-        let endpoint_name = endpoint
-            .file_name()
-            .and_then(|name| name.to_str())
-            .expect("UTF-8 endpoint name");
-        assert!(
-            endpoint.as_os_str().as_encoded_bytes().len() < 104,
-            "managed Codex socket must fit macOS sockaddr_un.sun_path: {} ({} bytes)",
-            endpoint.display(),
-            endpoint.as_os_str().as_encoded_bytes().len()
-        );
-        assert!(valid_managed_endpoint_name(instance, endpoint_name));
-        assert!(!valid_managed_endpoint_name(
-            "another-instance",
-            endpoint_name
-        ));
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn teardown_removes_owned_socket_but_not_other_socket() {
-        let suffix = Uuid::new_v4().to_string();
-        let home = std::path::PathBuf::from("/tmp").join(format!("c-{}", &suffix[..8]));
-        let instance = "a";
-        let socket_dir = home.join("transport/codex");
-        std::fs::create_dir_all(&socket_dir).expect("socket dir");
-        let endpoint = socket_dir.join(managed_endpoint_name(instance, Uuid::new_v4()));
-        let other_endpoint = socket_dir.join("other.sock");
-        let listener = UnixListener::bind(&endpoint).expect("owned socket");
-        let other_listener = UnixListener::bind(&other_endpoint).expect("other socket");
-        drop(listener);
-
-        let term_marker = home.join("term-grace");
-        let trap_ready = home.join("trap-ready");
-        let child = std::process::Command::new("sh")
-            .args([
-                "-c",
-                "ulimit -t 30; trap 'printf done > \"$AGEND_TERM_MARKER\"; exit 0' TERM; touch \"$AGEND_TRAP_READY\"; while :; do :; done",
-            ])
-            .env("AGEND_TERM_MARKER", &term_marker)
-            .env("AGEND_TRAP_READY", &trap_ready)
-            .spawn()
-            .expect("owned server fixture");
-        let pid = child.id();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !trap_ready.exists() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "owned server fixture did not install TERM trap"
-            );
-            thread::sleep(std::time::Duration::from_millis(10));
-        }
-        let start_token = crate::process::process_start_token(pid).expect("start token");
-        let mut locator = SessionLocator::codex(endpoint.clone(), None);
-        locator.managed = true;
-        locator.server_pid = Some(pid);
-        locator.server_start_token = Some(start_token);
-        super::super::registry::save_session_locator(&home, instance, &locator)
-            .expect("persist locator");
-        managed_servers()
-            .lock()
-            .expect("server registry lock")
-            .insert(
-                server_key(&home, instance),
-                ManagedServer {
-                    child,
-                    pid,
-                    start_token: Some(start_token),
-                },
-            );
-
-        stop_instance_server(&home, instance).expect("owned teardown");
-        assert!(term_marker.exists(), "owned child must receive TERM grace");
-        assert!(!endpoint.exists(), "owned stale socket must be removed");
-        assert!(other_endpoint.exists(), "unowned socket must remain");
-        drop(other_listener);
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn shared_process_group_stop_does_not_kill_caller() {
-        let suffix = Uuid::new_v4().to_string();
-        let home = std::path::PathBuf::from("/tmp").join(format!("c-{}", &suffix[..8]));
-        let instance = "a";
-        let socket_dir = home.join("transport/codex");
-        std::fs::create_dir_all(&socket_dir).expect("socket dir");
-        let endpoint = socket_dir.join(format!("a-{}.sock", Uuid::new_v4()));
-        let listener = UnixListener::bind(&endpoint).expect("owned socket");
-        drop(listener);
-
-        let term_marker = home.join("term-grace");
-        let trap_ready = home.join("trap-ready");
-        let caller_pgid = unsafe { libc::getpgrp() };
-        let child = unsafe {
-            use std::os::unix::process::CommandExt;
-            std::process::Command::new("sh")
-                .args([
-                    "-c",
-                    "ulimit -t 30; trap 'printf term > \"$AGEND_TERM_MARKER\"' TERM; touch \"$AGEND_TRAP_READY\"; while :; do :; done",
-                ])
-                .env("AGEND_TERM_MARKER", &term_marker)
-                .env("AGEND_TRAP_READY", &trap_ready)
-                .pre_exec(move || {
-                    if libc::setpgid(0, caller_pgid) == -1 {
-                        return Err(std::io::Error::last_os_error());
-                    }
-                    Ok(())
-                })
-                .spawn()
-                .expect("shared-group fixture")
-        };
-        let pid = child.id();
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
-        while !trap_ready.exists() {
-            assert!(
-                std::time::Instant::now() < deadline,
-                "shared-group fixture did not install TERM trap"
-            );
-            thread::sleep(std::time::Duration::from_millis(10));
-        }
-        assert_ne!(
-            crate::process::process_group_id(pid),
-            Some(pid),
-            "fixture must share the caller process group"
-        );
-        let start_token = crate::process::process_start_token(pid).expect("start token");
-        let mut locator = SessionLocator::codex(endpoint.clone(), None);
-        locator.managed = true;
-        locator.server_pid = Some(pid);
-        locator.server_start_token = Some(start_token);
-        super::super::registry::save_session_locator(&home, instance, &locator)
-            .expect("persist locator");
-        managed_servers()
-            .lock()
-            .expect("Codex server registry lock")
-            .insert(
-                server_key(&home, instance),
-                ManagedServer {
-                    child,
-                    pid,
-                    start_token: Some(start_token),
-                },
-            );
-
-        stop_instance_server(&home, instance).expect("shared-group teardown");
-        assert!(term_marker.exists(), "shared-group child must receive TERM");
-        assert!(
-            crate::process::process_start_token(pid).is_none(),
-            "shared-group child must be reaped"
-        );
-        assert!(!endpoint.exists(), "owned socket must be removed");
-        assert!(crate::process::is_pid_alive(std::process::id()));
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_endpoint_cleanup_rejects_symlink() {
-        use std::os::unix::fs::symlink;
-
-        let suffix = Uuid::new_v4().to_string();
-        let home = std::path::PathBuf::from("/tmp").join(format!("c-{}", &suffix[..8]));
-        let instance = "a";
-        let socket_dir = home.join("transport/codex");
-        std::fs::create_dir_all(&socket_dir).expect("socket dir");
-        let target = home.join("target");
-        let endpoint = socket_dir.join(format!("a-{}.sock", Uuid::new_v4()));
-        std::fs::write(&target, "must survive").expect("target");
-        symlink(&target, &endpoint).expect("endpoint symlink");
-        let locator = SessionLocator::codex(endpoint.clone(), None);
-
-        assert!(remove_managed_endpoint(&home, instance, &locator).is_err());
-        assert!(std::fs::symlink_metadata(&endpoint)
-            .expect("endpoint metadata")
-            .file_type()
-            .is_symlink());
-        assert_eq!(
-            std::fs::read_to_string(target).expect("target contents"),
-            "must survive"
-        );
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn managed_endpoint_cleanup_rejects_real_socket_outside_namespace() {
-        let suffix = Uuid::new_v4().to_string();
-        let home = std::path::PathBuf::from("/tmp").join(format!("c-{}", &suffix[..8]));
-        let instance = "a";
-        std::fs::create_dir_all(home.join("transport/codex")).expect("socket dir");
-        let endpoint = home.join("outside.sock");
-        let listener = UnixListener::bind(&endpoint).expect("outside socket");
-        drop(listener);
-        let locator = SessionLocator::codex(endpoint.clone(), None);
-
-        assert!(remove_managed_endpoint(&home, instance, &locator).is_err());
-        assert!(endpoint.exists(), "outside socket must survive cleanup");
-        let _ = std::fs::remove_file(endpoint);
-        let _ = std::fs::remove_dir_all(home);
-    }
-
-    #[test]
-    fn initialize_version_and_capability_shape_fail_closed() {
-        let missing_version =
-            json!({"codexHome": "/tmp", "platformFamily": "unix", "platformOs": "macos"});
-        assert!(validate_initialize_response(&missing_version).is_err());
-        let missing_platform = json!({"userAgent": "codex/0.146.0", "codexHome": "/tmp"});
-        assert!(validate_initialize_response(&missing_platform).is_err());
-        let null_platform = json!({
-            "userAgent": "codex/0.146.0",
-            "codexHome": "/tmp",
-            "platformFamily": null,
-            "platformOs": "macos"
-        });
-        assert!(validate_initialize_response(&null_platform).is_err());
-    }
-
-    #[test]
-    fn reconcile_preserves_ambiguity_after_restart() {
-        let home = std::env::temp_dir().join(format!("agend-codex-reconcile-{}", Uuid::new_v4()));
-        let envelope = DeliveryEnvelope::new(
-            "codex-agent",
-            SessionLocator::codex(PathBuf::from("/tmp/missing.sock"), Some("thread-1".into())),
-            DeliveryKind::Prompt,
-            "hello",
-            None,
-        );
-        let store = ReceiptStore::for_instance(&home, "codex-agent").expect("store");
-        store.record_queued(&envelope).expect("queued");
-        store
-            .record(DeliveryReceipt::for_state(
-                &envelope,
-                DeliveryState::ProtocolAccepted,
-            ))
-            .expect("accepted");
-
-        let mut adapter = CodexNativeShared::new(&home, "codex-agent");
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .build()
-            .expect("runtime");
-        let reconciled = runtime
-            .block_on(adapter.reconcile(envelope.delivery_id))
-            .expect("reconcile");
-        assert_eq!(reconciled, DeliveryState::Ambiguous);
-        let _ = std::fs::remove_dir_all(home);
-    }
-}
+#[path = "codex_app_server/tests.rs"]
+mod tests;

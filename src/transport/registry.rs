@@ -16,9 +16,14 @@ pub(crate) fn backend_for_instance(home: &Path, instance: &str) -> Option<Backen
     crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
         .ok()
         .and_then(|fleet| {
-            fleet
-                .resolve_instance(instance)
-                .map(|resolved| resolved.backend)
+            let configured = fleet.instances.get(instance)?;
+            Some(
+                configured
+                    .backend
+                    .clone()
+                    .or_else(|| fleet.defaults.backend.clone())
+                    .unwrap_or(Backend::ClaudeCode),
+            )
         })
 }
 
@@ -359,6 +364,24 @@ pub(crate) fn codex_thread_for_spawn(
     }
 }
 
+/// #3538: can a `mode=resume` restart of this instance actually resume its
+/// managed Codex conversation? True iff the NativeShared locator loads AND
+/// carries a non-empty `thread_id`. Every other shape (missing file,
+/// unreadable locator, empty id) is `false` — fail-closed: an unknown resume
+/// state must never be reported as a successful resume, and the gate caller
+/// (restart path) refuses to DELETE before checking this.
+pub(crate) fn codex_resume_available(home: &Path, instance: &str) -> bool {
+    locator_for_instance(
+        home,
+        instance,
+        Some(&Backend::Codex),
+        TransportMode::NativeShared,
+    )
+    .ok()
+    .and_then(|locator| codex_thread_for_spawn(&locator, crate::backend::SpawnMode::Resume))
+    .is_some()
+}
+
 pub(crate) fn opencode_attach_args(locator: &SessionLocator) -> anyhow::Result<Vec<String>> {
     OpenCodeNativeShared::attach_args(locator)
 }
@@ -373,18 +396,47 @@ pub(crate) fn codex_attach_args(locator: &SessionLocator) -> anyhow::Result<Vec<
     Ok(CodexNativeShared::remote_attach_args(locator))
 }
 
+/// #3414: which OpenCode session the next spawn should attach to.
+///
+/// Sibling of [`codex_thread_for_spawn`]. `mode=fresh` must produce a NEW
+/// conversation, but the managed loopback server's endpoint and credentials
+/// are still valid and expensive to re-establish — so Fresh clears ONLY
+/// `session_id` and keeps `endpoint_url` / `username` / `password` / `model`.
+/// With no session id the resident adapter's `POST /session` creates a new one.
+pub(crate) fn opencode_locator_for_spawn(
+    mut locator: SessionLocator,
+    spawn_mode: crate::backend::SpawnMode,
+) -> SessionLocator {
+    if spawn_mode == crate::backend::SpawnMode::Fresh {
+        locator.session_id = None;
+    }
+    locator
+}
+
 pub(crate) fn prepare_opencode_tui_session(
     home: &Path,
     instance: &str,
     working_dir: Option<&Path>,
     args: &[String],
+    spawn_mode: crate::backend::SpawnMode,
 ) -> anyhow::Result<SessionLocator> {
-    let mut locator = locator_for_instance(
-        home,
-        instance,
-        Some(&Backend::OpenCode),
-        TransportMode::NativeShared,
-    )?;
+    // #3414: clearing the new locator's session_id is not enough on its own —
+    // `resident_adapter` returns an already-resident worker for this key and
+    // drops the locator we just prepared, so the OLD session would survive.
+    // Retire the worker first; the managed server (endpoint/auth) is left
+    // running so the new session reuses it.
+    if spawn_mode == crate::backend::SpawnMode::Fresh {
+        super::opencode_server::retire_resident_adapter(home, instance);
+    }
+    let mut locator = opencode_locator_for_spawn(
+        locator_for_instance(
+            home,
+            instance,
+            Some(&Backend::OpenCode),
+            TransportMode::NativeShared,
+        )?,
+        spawn_mode,
+    );
     if let Some(model) = parse_opencode_model_args(args)?.model {
         locator.model = Some(model);
     }
@@ -407,7 +459,7 @@ pub(crate) fn envelope_for_instance(
     body: &str,
 ) -> anyhow::Result<DeliveryEnvelope> {
     let mode = mode_for_instance(home, instance);
-    envelope_for_mode(home, instance, body, mode)
+    envelope_for_mode(home, instance, body, mode, None)
 }
 
 fn envelope_for_mode(
@@ -415,6 +467,7 @@ fn envelope_for_mode(
     instance: &str,
     body: &str,
     mode: TransportMode,
+    channel_origin: Option<crate::channel::ChannelKind>,
 ) -> anyhow::Result<DeliveryEnvelope> {
     let backend = backend_for_instance(home, instance);
     let locator = if mode == TransportMode::ChannelBridge {
@@ -427,6 +480,10 @@ fn envelope_for_mode(
     envelope.transport_mode = Some(mode.receipt_route().to_string());
     envelope.logical_delivery_id =
         crate::daemon::notification_dedup::extract_msg_id_from_header(body);
+    // #3324: typed provenance, CARRIED from the inbound construction. Never
+    // re-derived from the rendered header — a display name is free text and can
+    // contain the `]` that closes it.
+    envelope.channel_origin = channel_origin;
     Ok(envelope)
 }
 
@@ -435,6 +492,7 @@ fn self_kick_envelope_for_mode(
     instance: &str,
     body: &str,
     mode: TransportMode,
+    channel_origin: Option<crate::channel::ChannelKind>,
 ) -> anyhow::Result<DeliveryEnvelope> {
     let backend = backend_for_instance(home, instance);
     let locator = if mode == TransportMode::ChannelBridge {
@@ -446,6 +504,8 @@ fn self_kick_envelope_for_mode(
     envelope.transport_mode = Some(mode.receipt_route().to_string());
     envelope.logical_delivery_id =
         crate::daemon::notification_dedup::extract_msg_id_from_header(body);
+    // #3324: the second envelope path carries it identically — see the first.
+    envelope.channel_origin = channel_origin;
     Ok(envelope)
 }
 
@@ -489,16 +549,24 @@ pub(crate) fn record_delivery_drop(
 /// Deliver one already-composed notification. The selected mode is persisted
 /// before the physical/structured attempt; a Codex failure is returned as a
 /// hard error and never invokes the LegacyPty closure.
+/// #3324: `channel_origin` is the TYPED external-channel provenance, carried
+/// from the inbound construction into the durable envelope so the ChannelBridge
+/// reply guard can tell a forwarded Telegram message from AgEnD's own traffic
+/// without reading the header text. It is a required argument rather than a
+/// defaulted one: a permissive `None` must be a caller's stated claim about its
+/// own delivery, never something a new call site inherits by picking the
+/// shorter overload.
 pub(crate) fn deliver_notification<F>(
     home: &Path,
     instance: &str,
     body: &str,
+    channel_origin: Option<crate::channel::ChannelKind>,
     legacy_injector: F,
 ) -> anyhow::Result<DeliveryReceipt>
 where
     F: Fn(&Path, &str, &str) -> anyhow::Result<()> + Send + Sync + 'static,
 {
-    deliver_notification_kind(home, instance, body, false, legacy_injector)
+    deliver_notification_kind(home, instance, body, false, channel_origin, legacy_injector)
 }
 
 /// Deliver the fresh-restart self-kick through the same exact-target and keyed
@@ -514,7 +582,7 @@ pub(crate) fn deliver_self_kick_notification<F>(
 where
     F: Fn(&Path, &str, &str) -> anyhow::Result<()> + Send + Sync + 'static,
 {
-    deliver_notification_kind(home, instance, body, true, legacy_injector)
+    deliver_notification_kind(home, instance, body, true, None, legacy_injector)
 }
 
 fn deliver_notification_kind<F>(
@@ -522,6 +590,7 @@ fn deliver_notification_kind<F>(
     instance: &str,
     body: &str,
     self_kick: bool,
+    channel_origin: Option<crate::channel::ChannelKind>,
     legacy_injector: F,
 ) -> anyhow::Result<DeliveryReceipt>
 where
@@ -533,9 +602,9 @@ where
     }
     let mode = mode_for_instance(home, instance);
     let envelope = if self_kick {
-        self_kick_envelope_for_mode(home, instance, body, mode)?
+        self_kick_envelope_for_mode(home, instance, body, mode, channel_origin)?
     } else {
-        envelope_for_mode(home, instance, body, mode)?
+        envelope_for_mode(home, instance, body, mode, channel_origin)?
     };
     match mode {
         TransportMode::NativeShared => match envelope.session.backend.as_str() {
@@ -644,6 +713,161 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    /// #3324: the durable envelope records the origin the CALLER passed, for
+    /// both channel kinds. This is the value the ChannelBridge reply guard
+    /// reads, and it now arrives as a typed argument from the inbound
+    /// construction rather than being recovered from the rendered header.
+    #[test]
+    fn envelope_records_the_caller_supplied_channel_origin_3324() {
+        let home = registry_test_home("origin-typed-3324");
+        for kind in [
+            crate::channel::ChannelKind::Telegram,
+            crate::channel::ChannelKind::Discord,
+        ] {
+            for pointer_only in [false, true] {
+                let body = crate::inbox::notify::format_notification_for_inject(
+                    pointer_only,
+                    &crate::inbox::NotifySource::Channel("chiachenghuang", kind),
+                    "please research this",
+                    &[],
+                );
+                let envelope = envelope_for_mode(
+                    &home,
+                    "claude-agent",
+                    &body,
+                    TransportMode::LegacyPty,
+                    Some(kind),
+                )
+                .expect("envelope");
+                assert_eq!(
+                    envelope.channel_origin,
+                    Some(kind),
+                    "#3324: the envelope must carry the origin it was given \
+                     (kind={kind:?}, pointer_only={pointer_only})"
+                );
+            }
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// #3324 REGRESSION GUARD: the envelope must NOT consult the body text.
+    ///
+    /// The rejected first cut recovered the origin by reverse-parsing the
+    /// `[{source}]` header, which made a security classification depend on
+    /// operator- and sender-authored free text — a display name containing the
+    /// header's own `]` classified an external delivery as internal, the
+    /// permissive side of the guard. Both directions are pinned here: a body
+    /// that LOOKS external stays unstamped when the caller says internal, and a
+    /// body that looks internal is stamped when the caller says external. Any
+    /// reintroduced parser fails one of the two.
+    #[test]
+    fn envelope_origin_ignores_the_body_text_entirely_3324() {
+        let home = registry_test_home("origin-not-parsed-3324");
+        // Looks external, caller says internal (e.g. an agent quoting a user).
+        for body in [
+            "[user:alice via telegram] quoted by an internal sender",
+            "[user:bob via discord] quoted by an internal sender",
+        ] {
+            let envelope =
+                envelope_for_mode(&home, "claude-agent", body, TransportMode::LegacyPty, None)
+                    .expect("envelope");
+            assert_eq!(
+                envelope.channel_origin, None,
+                "#3324: the header text must not stamp an origin the caller did \
+                 not claim; body={body:?}"
+            );
+        }
+        // Looks internal, caller says external — the bracketed-display-name
+        // case reaches the guard through exactly this shape.
+        let envelope = envelope_for_mode(
+            &home,
+            "claude-agent",
+            "[from:codex-125550] nothing here says telegram",
+            TransportMode::LegacyPty,
+            Some(crate::channel::ChannelKind::Telegram),
+        )
+        .expect("envelope");
+        assert_eq!(
+            envelope.channel_origin,
+            Some(crate::channel::ChannelKind::Telegram),
+            "#3324: an external delivery must stay external even when its text \
+             carries no channel marker"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// #3324: internal traffic must stay unstamped, or the guard would refuse
+    /// every agent-to-agent and system delivery the bridge legitimately owns.
+    #[test]
+    fn envelope_leaves_channel_origin_absent_for_internal_bodies_3324() {
+        let home = registry_test_home("origin-internal-3324");
+        for body in [
+            "[from:codex-125550] status?",
+            "[system:ci] build finished",
+            "plain text with no header at all",
+        ] {
+            let envelope =
+                envelope_for_mode(&home, "claude-agent", body, TransportMode::LegacyPty, None)
+                    .expect("envelope");
+            assert_eq!(
+                envelope.channel_origin, None,
+                "#3324: internal delivery must not be stamped; body={body:?}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    /// #3324: the self-kick constructor is the second envelope path and must
+    /// carry the origin identically — stamping only one constructor leaves the
+    /// other silently unguarded, which is how a two-path defect survives a
+    /// one-path fix. Production pins `None` there (the self-kick prompt is
+    /// daemon-composed); this pins the PLUMBING, so the day a resumable
+    /// external delivery needs it the value is not silently dropped.
+    #[test]
+    fn self_kick_envelope_carries_the_caller_supplied_origin_3324() {
+        let home = registry_test_home("origin-self-kick-3324");
+        let envelope = self_kick_envelope_for_mode(
+            &home,
+            "claude-agent",
+            "[AGEND-RESUME] recover your own state",
+            TransportMode::LegacyPty,
+            Some(crate::channel::ChannelKind::Telegram),
+        )
+        .expect("envelope");
+        assert_eq!(
+            envelope.channel_origin,
+            Some(crate::channel::ChannelKind::Telegram),
+            "#3324: both envelope constructors must carry the origin"
+        );
+        let internal = self_kick_envelope_for_mode(
+            &home,
+            "claude-agent",
+            "[AGEND-RESUME] x",
+            TransportMode::LegacyPty,
+            None,
+        )
+        .expect("envelope");
+        assert_eq!(
+            internal.channel_origin, None,
+            "#3324: and the daemon-composed self-kick stays internal"
+        );
+        let _ = std::fs::remove_dir_all(home);
+    }
+
+    fn registry_test_home(tag: &str) -> std::path::PathBuf {
+        let home = std::env::temp_dir().join(format!(
+            "agend-transport-registry-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&home).expect("home");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "instances:\n  claude-agent:\n    backend: claude\n",
+        )
+        .expect("fleet");
+        home
+    }
+
     #[test]
     fn codex_mode_failure_never_calls_pty_fallback() {
         let home =
@@ -656,7 +880,7 @@ mod tests {
         .expect("fleet");
         let pty_calls = Arc::new(AtomicUsize::new(0));
         let pty_calls_for_injector = Arc::clone(&pty_calls);
-        let result = deliver_notification(&home, "codex-agent", "hello", move |_, _, _| {
+        let result = deliver_notification(&home, "codex-agent", "hello", None, move |_, _, _| {
             pty_calls_for_injector.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
@@ -681,7 +905,7 @@ mod tests {
             .expect("corrupt locator");
         let pty_calls = Arc::new(AtomicUsize::new(0));
         let pty_calls_for_injector = Arc::clone(&pty_calls);
-        let result = deliver_notification(&home, "codex-agent", "hello", move |_, _, _| {
+        let result = deliver_notification(&home, "codex-agent", "hello", None, move |_, _, _| {
             pty_calls_for_injector.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
@@ -719,10 +943,11 @@ mod tests {
             .expect("session locator");
             let pty_calls = Arc::new(AtomicUsize::new(0));
             let pty_calls_for_injector = Arc::clone(&pty_calls);
-            let result = deliver_notification(&home, "codex-agent", "hello", move |_, _, _| {
-                pty_calls_for_injector.fetch_add(1, Ordering::SeqCst);
-                Ok(())
-            });
+            let result =
+                deliver_notification(&home, "codex-agent", "hello", None, move |_, _, _| {
+                    pty_calls_for_injector.fetch_add(1, Ordering::SeqCst);
+                    Ok(())
+                });
             assert!(
                 result.is_err(),
                 "structured resolution must fail closed: {tag}"
@@ -747,7 +972,7 @@ mod tests {
             .expect("corrupt locator");
         let pty_calls = Arc::new(AtomicUsize::new(0));
         let pty_calls_for_injector = Arc::clone(&pty_calls);
-        let result = deliver_notification(&home, "codex-agent", "hello", move |_, _, _| {
+        let result = deliver_notification(&home, "codex-agent", "hello", None, move |_, _, _| {
             pty_calls_for_injector.fetch_add(1, Ordering::SeqCst);
             Ok(())
         });
@@ -814,5 +1039,146 @@ mod tests {
             0o700
         );
         let _ = std::fs::remove_dir_all(home);
+    }
+}
+
+#[cfg(test)]
+mod session_contract_3414_tests {
+    use super::*;
+    use crate::backend::SpawnMode;
+
+    /// Unique per CALL, not per process: cargo runs these tests in parallel
+    /// threads of ONE process, so a pid-keyed directory is shared and each
+    /// test's `remove_dir_all` pulls it out from under the other. That made
+    /// `opencode_resume_retains_session_id_3414` flaky — observed failing once
+    /// and passing on the immediate rerun.
+    #[allow(clippy::expect_used)]
+    fn scratch_home(tag: &str) -> std::path::PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        std::env::temp_dir().join(format!(
+            "agend-3414-{tag}-{}-{}",
+            std::process::id(),
+            SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        ))
+    }
+
+    /// Built through the PRODUCTION constructor rather than a literal, so the
+    /// test cannot drift from the real locator shape.
+    #[allow(clippy::expect_used)]
+    fn opencode_locator() -> SessionLocator {
+        let home = scratch_home("loc");
+        std::fs::create_dir_all(&home).expect("scratch home");
+        let mut locator = default_opencode_locator(&home, "dev").expect("default opencode locator");
+        locator.session_id = Some("sess-existing".to_string());
+        locator.endpoint_url = Some("http://127.0.0.1:41999".to_string());
+        locator.username = Some("opencode".to_string());
+        locator.password = Some("secret".to_string());
+        std::fs::remove_dir_all(&home).ok();
+        locator
+    }
+
+    #[allow(clippy::expect_used)]
+    fn codex_locator() -> SessionLocator {
+        let home = scratch_home("cx");
+        let mut locator = default_codex_locator(&home, "dev");
+        locator.thread_id = Some("thread-1".to_string());
+        locator
+    }
+
+    /// #3414: Fresh must start a NEW OpenCode conversation. Clearing the whole
+    /// locator would also throw away a healthy managed server — so only
+    /// `session_id` is cleared and endpoint/auth are retained for reuse.
+    #[test]
+    fn opencode_fresh_clears_only_session_id_3414() {
+        let prepared = opencode_locator_for_spawn(opencode_locator(), SpawnMode::Fresh);
+        assert_eq!(
+            prepared.session_id, None,
+            "#3414: fresh must not reattach to the previous OpenCode session"
+        );
+        assert_eq!(
+            prepared.endpoint_url.as_deref(),
+            Some("http://127.0.0.1:41999"),
+            "#3414: the managed endpoint is still valid and must be reused"
+        );
+        assert_eq!(prepared.username.as_deref(), Some("opencode"));
+        assert_eq!(prepared.password.as_deref(), Some("secret"));
+    }
+
+    /// Resume is the whole point of keeping the locator: the session id stays.
+    #[test]
+    fn opencode_resume_retains_session_id_3414() {
+        let prepared = opencode_locator_for_spawn(opencode_locator(), SpawnMode::Resume);
+        assert_eq!(prepared.session_id.as_deref(), Some("sess-existing"));
+        assert_eq!(
+            prepared.endpoint_url.as_deref(),
+            Some("http://127.0.0.1:41999")
+        );
+    }
+
+    /// Codex defends in two INDEPENDENT layers, and both must hold:
+    /// the typed thread selector already returns None on Fresh, and the caller
+    /// args must additionally lose a `resume` pin. Either alone would leave a
+    /// path back into the old conversation.
+    #[test]
+    fn codex_fresh_defends_in_both_layers_3414() {
+        let locator = codex_locator();
+        assert_eq!(
+            codex_thread_for_spawn(&locator, SpawnMode::Fresh),
+            None,
+            "layer 1: the typed thread selector must not resume on fresh"
+        );
+        assert_eq!(
+            codex_thread_for_spawn(&locator, SpawnMode::Resume).as_deref(),
+            Some("thread-1"),
+            "layer 1: resume still attaches"
+        );
+
+        let args: Vec<String> = ["resume", "thread-1", "--model", "gpt"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(
+            crate::backend_session::sanitize_for_fresh(&Backend::Codex, &args)
+                .expect("codex resume grammar resolves"),
+            vec!["--model".to_string(), "gpt".to_string()],
+            "layer 2: a caller `resume` pin must not survive a fresh restart"
+        );
+    }
+
+    /// #3538: resume availability is exactly thread-presence. Missing file,
+    /// empty id, and present id are three distinct inputs with two outcomes
+    /// (fail-closed: only a non-empty thread resumes).
+    #[test]
+    fn codex_resume_available_tracks_thread_presence_3538() {
+        let home = scratch_home("resume-avail");
+        // No locator file at all → `locator_for_instance` hands back a DEFAULT
+        // locator (its NotFound arm), which carries no thread → unavailable.
+        assert!(
+            !codex_resume_available(&home, "ghost"),
+            "missing locator must not resume"
+        );
+        // Locator without a thread → unavailable.
+        let mut locator = default_codex_locator(&home, "bare");
+        locator.thread_id = None;
+        save_session_locator(&home, "bare", &locator).expect("save bare locator");
+        assert!(
+            !codex_resume_available(&home, "bare"),
+            "thread-less locator must not resume"
+        );
+        // Empty-string thread → unavailable.
+        locator.thread_id = Some(String::new());
+        save_session_locator(&home, "empty", &locator).expect("save empty locator");
+        assert!(
+            !codex_resume_available(&home, "empty"),
+            "empty thread_id must not resume"
+        );
+        // Non-empty thread → available.
+        locator.thread_id = Some("thread-1".to_string());
+        save_session_locator(&home, "live", &locator).expect("save live locator");
+        assert!(
+            codex_resume_available(&home, "live"),
+            "thread-carrying locator must resume"
+        );
+        std::fs::remove_dir_all(&home).ok();
     }
 }

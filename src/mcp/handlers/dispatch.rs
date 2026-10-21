@@ -280,6 +280,20 @@ macro_rules! action_adapter {
 // Flat adapters — one per simple (non-action-based) tool.
 // ---------------------------------------------------------------------
 
+/// #3480: orchestrator-only operator page. The handler owns every gate; this
+/// is a plain adapter so the registry entry stays uniform with its neighbours.
+/// `ctx.runtime` is forwarded because authority binds to the daemon-resolved LIVE
+/// requester, not to the `instance` string the call carried: without a runtime
+/// there is no registry to resolve against and the handler fails closed.
+pub(crate) fn dispatch_operator_page(ctx: &HandlerCtx<'_>) -> Value {
+    crate::channel::operator_page::handle_operator_page(
+        ctx.home,
+        ctx.args,
+        ctx.instance_name,
+        ctx.runtime,
+    )
+}
+
 pub(crate) fn dispatch_list_instances(ctx: &HandlerCtx<'_>) -> Value {
     instance::handle_list_instances_with_runtime(ctx.home, ctx.args, ctx.instance_name, ctx.runtime)
 }
@@ -323,13 +337,20 @@ pub(crate) fn dispatch_start_instance(ctx: &HandlerCtx<'_>) -> Value {
 adapter!(dispatch_bind_topic, ha, instance::handle_bind_topic);
 /// #2454 Slice 10: D7 restart DELETE uses the same runtime-owned service.
 pub(crate) fn dispatch_restart_instance(ctx: &HandlerCtx<'_>) -> Value {
-    instance::handle_restart_instance_with_runtime(ctx.home, ctx.args, ctx.runtime)
+    // #3662: this is the public, explicit MCP ingress. Keep the unsent-draft
+    // bypass separate from `force`, whose existing meaning also permits a
+    // fresh restart through an uncommitted worktree.
+    let mut args = ctx.args.clone();
+    if let Some(object) = args.as_object_mut() {
+        object.insert("skip_unsent_draft_gate".into(), json!(true));
+    }
+    instance::handle_restart_instance_with_runtime(ctx.home, &args, ctx.runtime)
 }
-adapter!(
-    dispatch_set_model,
-    has,
-    instance::set_model::handle_set_model
-);
+/// #3572: preserve the API-owned RuntimeContext through set_model's optional
+/// restart so DELETE/SPAWN use the same in-process lifecycle as restart_instance.
+pub(crate) fn dispatch_set_model(ctx: &HandlerCtx<'_>) -> Value {
+    instance::set_model::handle_set_model_with_runtime(ctx.home, ctx.args, ctx.sender, ctx.runtime)
+}
 /// #2454: move_pane is a runtime-aware adapter over the neutral service.
 pub(crate) fn dispatch_move_pane(ctx: &HandlerCtx<'_>) -> Value {
     // The owned notifier travels inside RuntimeContext to the MCP adapter.
@@ -370,22 +391,27 @@ pub(crate) fn dispatch_pane_snapshot(ctx: &HandlerCtx<'_>) -> Value {
 /// standalone bridge call that never traversed the api `mcp_tool` ingress) maps
 /// to `None` → default-deny in the handler.
 pub(crate) fn dispatch_restart_daemon(ctx: &HandlerCtx<'_>) -> Value {
-    let requester_id = if ctx
-        .runtime
-        .is_some_and(|runtime| runtime.capability == crate::api::RestartCapability::App)
-        && !ctx.instance_name.is_empty()
-    {
-        match crate::agent::resolve_instance(ctx.home, ctx.instance_name) {
-            Ok((id, _)) => Some(id),
-            Err(_) => {
-                return json!({
-                    "ok": false,
-                    "error": "restart_daemon requires the managed caller's stable InstanceId; fleet intact — no restart"
-                });
+    let requester_id = match (ctx.runtime, ctx.instance_name.is_empty()) {
+        (Some(runtime), false)
+            if matches!(
+                runtime.capability,
+                crate::api::RestartCapability::App | crate::api::RestartCapability::Daemon
+            ) =>
+        {
+            match crate::api::handlers::mcp_proxy::live_requester_id(
+                &runtime.registry,
+                ctx.instance_name,
+            ) {
+                Some(id) => Some(id),
+                None => {
+                    return json!({
+                        "ok": false,
+                        "error": "restart_daemon requires the managed caller's stable InstanceId from a live handle; fleet intact — no restart"
+                    });
+                }
             }
         }
-    } else {
-        None
+        _ => None,
     };
     dispatch_restart_daemon_with_requester(ctx, requester_id)
 }
@@ -405,6 +431,7 @@ pub(crate) fn dispatch_restart_daemon_with_requester(
         ctx.runtime.and_then(|r| r.post_flush.clone()),
         ctx.runtime.and_then(|r| r.shutdown.clone()),
         requester_id,
+        ctx.runtime.map(|runtime| &runtime.registry),
     )
 }
 
@@ -413,29 +440,59 @@ pub(crate) fn dispatch_restart_daemon_with_requester(
 // handler. Unknown actions produce tool-specific error JSON.
 // ---------------------------------------------------------------------
 
-/// #2454 Slice 5: task health/sweep are runtime-backed reads.  They must use
-/// the live registry forwarded through the in-process MCP ingress and must
-/// fail closed when that runtime is absent; all other task actions preserve
-/// the existing public `tasks::handle` path.
+/// #2454/#3584: task health/sweep and orphan reconciliation are runtime-backed
+/// actions. They use the live registry forwarded through the in-process MCP
+/// ingress and fail closed when that runtime is absent; all other task actions
+/// preserve the existing public `tasks::handle` path.
 pub(crate) fn dispatch_task(ctx: &HandlerCtx<'_>) -> Value {
     let action = ctx.args["action"].as_str().unwrap_or("");
-    if !matches!(action, "health" | "sweep") {
+    if !matches!(
+        action,
+        "health" | "sweep" | "orphan_reconcile_preview" | "orphan_reconcile_apply"
+    ) {
         return task::handle_task(ctx.home, ctx.args, ctx.instance_name);
     }
     let Some(runtime) = ctx.runtime else {
         return json!({
-            "error": "runtime unavailable: task health/sweep requires the in-process daemon runtime"
+            "error": "runtime unavailable: runtime-backed task action requires the in-process daemon runtime"
         });
     };
-    let live_instances =
-        crate::agent_ops::list_snapshot(ctx.home, &runtime.registry, &runtime.externals)["result"]
-            ["agents"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|agent| agent["name"].as_str().map(String::from))
-            .collect::<std::collections::HashSet<_>>();
-    crate::tasks::handle_with_live_instances(ctx.home, ctx.instance_name, ctx.args, &live_instances)
+    let live_refresh = || {
+        let snapshot =
+            crate::agent_ops::list_snapshot(ctx.home, &runtime.registry, &runtime.externals);
+        if snapshot["ok"] != true {
+            return None;
+        }
+        snapshot["result"]["agents"].as_array().map(|agents| {
+            agents
+                .iter()
+                .filter_map(|agent| agent["name"].as_str().map(String::from))
+                .collect::<std::collections::HashSet<_>>()
+        })
+    };
+    dispatch_task_with_live_refresh(ctx, &live_refresh)
+}
+
+fn dispatch_task_with_live_refresh(
+    ctx: &HandlerCtx<'_>,
+    live_refresh: &dyn Fn() -> Option<std::collections::HashSet<String>>,
+) -> Value {
+    let live_instances = match live_refresh() {
+        Some(live_instances) => live_instances,
+        None => {
+            return json!({
+                "error":"live owner authority unavailable",
+                "code":"owner_authority_unavailable"
+            });
+        }
+    };
+    crate::tasks::handle_with_live_instances_and_refresh(
+        ctx.home,
+        ctx.instance_name,
+        ctx.args,
+        &live_instances,
+        &live_refresh,
+    )
 }
 pub(crate) fn dispatch_usage_limit_takeover(ctx: &HandlerCtx<'_>) -> Value {
     usage_limit_takeover::handle_usage_limit_takeover(ctx)
@@ -452,6 +509,7 @@ action_adapter!(dispatch_ci, "ci", [
 action_adapter!(dispatch_decision, "decision", [
     "post"          => task::handle_post_decision,           hais;
     "list"          => task::handle_list_decisions,           ha;
+    "get"           => task::handle_get_decision,              ha;
     "update"        => task::handle_update_decision,          hai;
     "answer"        => task::handle_answer_decision,          hais;
     "archive_batch" => task::handle_archive_batch_decisions,  hai;
@@ -507,8 +565,18 @@ action_adapter!(dispatch_repo, "repo", [
     "merge"                   => ci::handle_merge_repo,                 hai;
 ]);
 
-action_adapter!(dispatch_schedule, "schedule", [
+pub(crate) fn dispatch_schedule(ctx: &HandlerCtx<'_>) -> Value {
+    if ctx.args["action"].as_str() == Some("resolve_recovery") && ctx.sender.is_some() {
+        return serde_json::json!({"error":"resolve_recovery is operator-only", "code":"operator_only"});
+    }
+    dispatch_schedule_actions(ctx)
+}
+action_adapter!(dispatch_schedule_actions, "schedule", [
     "create" => schedule::handle_create_schedule,  hai;
+    "runs" => schedule::handle_job_runs, ha;
+    "complete" => schedule::handle_job_complete, hai;
+    "deliver" => schedule::handle_job_deliver, hai;
+    "resolve_recovery" => schedule::handle_job_resolve_recovery, ha;
     "list"   => schedule::handle_list_schedules,   ha;
     "update" => schedule::handle_update_schedule,  ha;
     "delete" => schedule::handle_delete_schedule,  ha;
@@ -523,11 +591,32 @@ action_adapter!(dispatch_set_metadata, "set_metadata", [
 /// transport-neutral service; public legacy wrappers remain for callers that
 /// do not have an in-process daemon context.
 pub(crate) fn dispatch_team(ctx: &HandlerCtx<'_>) -> Value {
+    dispatch_scoped_team(ctx, None)
+}
+
+pub(crate) fn dispatch_scoped_team(
+    ctx: &HandlerCtx<'_>,
+    requester_id: Option<crate::types::InstanceId>,
+) -> Value {
     match ctx.args["action"].as_str().unwrap_or("") {
         "create" => task::handle_create_team(ctx.home, ctx.args, ctx.runtime),
         "delete" => task::handle_delete_team(ctx.home, ctx.args, ctx.runtime),
         "list" => task::handle_list_teams(ctx.home, ctx.runtime),
-        "update" => task::handle_update_team(ctx.home, ctx.args, ctx.runtime),
+        "update" => {
+            let requester = requester_id.and_then(|id| {
+                ctx.runtime.and_then(|runtime| {
+                    crate::agent::lock_registry(&runtime.registry)
+                        .get(&id)
+                        .map(|handle| handle.name.clone())
+                })
+            });
+            match requester.as_deref() {
+                Some(requester) => {
+                    task::handle_update_team_as(ctx.home, ctx.args, ctx.runtime, Some(requester))
+                }
+                None => task::handle_update_team(ctx.home, ctx.args, ctx.runtime),
+            }
+        }
         other => json!({"error": format!("unknown team action: {other}")}),
     }
 }
@@ -579,12 +668,23 @@ pub(crate) fn dispatch_revoke_review_assignment(ctx: &HandlerCtx<'_>) -> Value {
     review_assignment::handle_revoke_review_assignment(ctx.home, ctx.args, ctx.sender)
 }
 
+/// Decision45: operator-only exact-PR audited review-class correction.
+pub(crate) fn dispatch_correct_review_class(ctx: &HandlerCtx<'_>) -> Value {
+    super::review_class_correction::handle_correct_review_class(ctx.home, ctx.args, ctx.sender)
+}
+
 pub(crate) fn dispatch_config(ctx: &HandlerCtx<'_>) -> Value {
     match ctx.args["action"].as_str().unwrap_or("") {
         "get" => {
             let key = ctx.args["key"].as_str().unwrap_or("");
             if key.is_empty() {
                 return json!({"error": "key is required for get"});
+            }
+            if key == "experimental.tool_cli_enabled" {
+                return json!({
+                    "key": key,
+                    "value": crate::runtime_config::list()["experimental"]["tool_cli_enabled"]
+                });
             }
             match crate::runtime_config::get_key(key) {
                 Ok(v) => json!({"key": key, "value": v}),
@@ -668,6 +768,42 @@ mod tests {
         );
     }
 
+    #[test]
+    fn dispatch_restart_daemon_requires_live_daemon_requester() {
+        static EMPTY_SENDER: Option<Sender> = None;
+        let home = std::env::temp_dir();
+        let args = json!({});
+        let runtime = RuntimeContext {
+            registry: Default::default(),
+            configs: Default::default(),
+            externals: Default::default(),
+            capability: crate::api::RestartCapability::Daemon,
+            app_restart: None,
+            post_flush: None,
+            notifier: None,
+            shutdown: Some(Arc::new(std::sync::atomic::AtomicBool::new(false))),
+        };
+        let ctx = HandlerCtx {
+            home: &home,
+            args: &args,
+            instance_name: "fleet-only-requester",
+            sender: &EMPTY_SENDER,
+            runtime: Some(&runtime),
+        };
+        let resp = dispatch_restart_daemon(&ctx);
+        assert_eq!(
+            resp["ok"], false,
+            "unresolved daemon caller must fail: {resp}"
+        );
+        assert!(
+            resp["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("live handle"),
+            "daemon path must require a live requester identity: {resp}"
+        );
+    }
+
     /// #2453 Stage R1: an ABSENT runtime (standalone bridge, no api ingress) →
     /// `None` → default-deny, and must NOT take the app arm.
     #[test]
@@ -709,6 +845,7 @@ mod tests {
             names,
             vec![
                 "reply",
+                "operator_page",
                 "download_attachment",
                 "send",
                 "inbox",
@@ -739,10 +876,11 @@ mod tests {
                 "release_worktree",
                 "binding_state",
                 "revoke_review_assignment",
+                "correct_review_class",
                 "usage_limit_takeover",
             ]
         );
-        assert_eq!(crate::mcp::registry::all().len(), 32);
+        assert_eq!(crate::mcp::registry::all().len(), 34);
     }
 
     #[test]
@@ -786,13 +924,22 @@ mod tests {
             (
                 "task",
                 &[
-                    "create", "list", "claim", "update", "done", "sweep", "health", "activity",
+                    "create",
+                    "list",
+                    "claim",
+                    "update",
+                    "done",
+                    "sweep",
+                    "health",
+                    "activity",
+                    "orphan_reconcile_preview",
+                    "orphan_reconcile_apply",
                 ],
             ),
             ("ci", &["watch", "unwatch", "status", "defer"]),
             (
                 "decision",
-                &["post", "list", "update", "answer", "archive_batch"],
+                &["post", "list", "get", "update", "answer", "archive_batch"],
             ),
             ("deployment", &["deploy", "teardown", "list"]),
             ("health", &["report", "clear"]),
@@ -1222,6 +1369,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         std::fs::write(path, format!("{rewritten}\n")).expect("rewrite task event log");
+        crate::task_events::catalog::rebuild_for_test(home);
     }
 
     #[test]
@@ -1317,6 +1465,36 @@ mod tests {
                 "task action={action} with runtime=None must fail explicitly, never socket-fallback: {result}"
             );
         }
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn orphan_reconcile_missing_live_snapshot_fails_closed_before_preview_3584() {
+        let home = std::env::temp_dir().join(format!(
+            "agend-orphan-dispatch-authority-outage-{}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&home).expect("create temp home");
+        let args = json!({
+            "action": "orphan_reconcile_preview",
+            "decision_id": "d-20260922032524703479-91",
+            "board": "Hack_agend-terminal",
+            "audit_reason": "authority outage regression",
+        });
+        let runtime = runtime_with_external("unused-live-agent");
+        let ctx = task_runtime_ctx(&home, &args, &runtime);
+        let response = dispatch_task_with_live_refresh(&ctx, &|| None);
+        assert_eq!(
+            response["code"], "owner_authority_unavailable",
+            "{response}"
+        );
+        assert!(
+            std::fs::read_dir(&home)
+                .expect("read temp home")
+                .next()
+                .is_none(),
+            "authority outage must not write a confirmation or task event"
+        );
         std::fs::remove_dir_all(home).ok();
     }
 
@@ -1587,6 +1765,25 @@ mod tests {
         assert!(
             api_region.contains("agent_ops::move_pane"),
             "API move_pane must call the same shared neutral service"
+        );
+    }
+
+    /// #3662 RED: public MCP restart ingress must mark the request explicit;
+    /// internal restart callers retain the ordinary draft gate.
+    #[test]
+    fn explicit_mcp_restart_marks_draft_gate_bypass_3662() {
+        let source = include_str!("dispatch.rs");
+        let start = source
+            .find("pub(crate) fn dispatch_restart_instance(")
+            .expect("restart dispatch must exist");
+        let end = source[start..]
+            .find("pub(crate) fn dispatch_set_model(")
+            .map(|offset| start + offset)
+            .expect("restart dispatch end marker");
+        let region = &source[start..end];
+        assert!(
+            region.contains("skip_unsent_draft_gate"),
+            "MCP restart ingress must bypass only the unsent-draft gate"
         );
     }
 
@@ -1887,8 +2084,17 @@ mod tests {
         if path == "src/mcp/handlers/restart.rs" && function == "phase1_gate" && kind == "call_at" {
             return "cross_daemon_successor_status";
         }
+        if path == "src/app/rpc.rs"
+            && matches!(function, "call_task" | "call_tool" | "call_tool_at")
+            && kind == "call_at"
+        {
+            return "app_thin_client_task_rpc";
+        }
         if path == "src/mcp/handlers/instance_state/lifecycle.rs"
-            && function == "delete_with_runtime_or_legacy"
+            && matches!(
+                function,
+                "delete_with_runtime_or_legacy" | "delete_with_runtime_or_legacy_for_restart"
+            )
         {
             return "runtime_none_instance_delete";
         }
@@ -1930,6 +2136,8 @@ mod tests {
             "src/connect.rs"
                 | "src/bugreport.rs"
                 | "src/main.rs"
+                // #3539: `stop` moved out of main.rs; same class (operator CLI client).
+                | "src/cli_stop.rs"
                 | "src/tray/mod.rs"
                 | "src/verify.rs"
         ) {
@@ -1963,7 +2171,9 @@ mod tests {
         assert_eq!(counts.get("runtime_none_deployment_create_team"), Some(&1));
         assert_eq!(counts.get("runtime_none_deployment_delete"), Some(&1));
         assert_eq!(counts.get("runtime_none_send_bridge"), Some(&1));
-        assert_eq!(counts.get("runtime_none_task_sweep_wrapper"), Some(&1));
+        // Public sweep now obtains LIST through the shared runtime wrapper;
+        // there is no longer a direct transport call in tasks::handle_sweep.
+        assert_eq!(counts.get("runtime_none_task_sweep_wrapper"), None);
         assert_eq!(counts.get("shared_runtime_none_list_wrapper"), Some(&1));
     }
 
@@ -2006,7 +2216,9 @@ mod tests {
         assert!(spawn_route.contains("spawn_instance"));
 
         let lifecycle = include_str!("instance_state/lifecycle.rs");
-        let delete = source_region(lifecycle, "delete_with_runtime_or_legacy");
+        let delete_wrapper = source_region(lifecycle, "delete_with_runtime_or_legacy");
+        assert!(delete_wrapper.contains("delete_with_runtime_or_legacy_for_restart"));
+        let delete = source_region(lifecycle, "delete_with_runtime_or_legacy_for_restart");
         assert!(delete.contains("if let Some(context)"));
         assert!(delete.contains("agent_ops::delete_instance"));
         assert!(delete.contains("crate::api::call"));

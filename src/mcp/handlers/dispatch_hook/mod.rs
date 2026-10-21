@@ -6,169 +6,33 @@ use std::path::{Path, PathBuf};
 
 mod auto_watch;
 mod branch_start_point;
+mod cleanup_trunk;
+mod exact_head;
 mod from_ref;
 mod lifecycle_permit;
 mod live_binding;
+// #3675: shared external-PR-head availability helper (dispatch + checkout sides).
+pub(crate) mod pr_head_pin;
 mod provider_neutral_slug;
 mod rebase_dispatch;
+mod source_repo_resolution;
+mod stale_dir;
+mod types;
+pub(crate) use branch_start_point::BranchProvision;
 pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
 pub(crate) use provider_neutral_slug::derive_repo_slug_any_forge_pub;
 pub(crate) use rebase_dispatch::dispatch_auto_bind_lease_with_source_and_chain_preheld;
 // t-…-17: the lockstep source→slug normalizer shared by the reviewer-assignment
 // repo resolve and the team-authority ACL (teams::resolve_team_by_source_repo).
 pub(crate) use lifecycle_permit::{
-    is_active as lifecycle_is_active, BindGuard, LifecycleOperation, LifecyclePermit,
+    active_operation as lifecycle_active_operation, is_active as lifecycle_is_active, BindGuard,
+    LifecycleOperation, LifecyclePermit,
 };
 pub(crate) use provider_neutral_slug::canonical_repo_slug_for_source;
-
-/// #781 Piece 7: structured dispatch outcome. Mirrors the #784 success
-/// response shape for `repo action=checkout bind:true` so callers across
-/// the fleet observe a single canonical schema regardless of whether the
-/// worktree was provisioned via the `repo` MCP tool or via the
-/// auto-bind hook fired from `send kind=task`.
-///
-/// Introduced in C1 as a types-only commit; first call site materializes
-/// in C2 (signature migration).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DispatchOutcome {
-    /// Which tier of [`resolve_source_repo`] fired — exposes the
-    /// silent-miss class of Bug A0 (operator sees `Stub` and knows team
-    /// `source_repo` is unset).
-    pub source_repo_tier: SourceRepoTier,
-    /// `true` when this dispatch authored the branch on `source_repo`.
-    /// `false` when the branch pre-existed (back-compat / race
-    /// fall-through). Mirrors `auto_created_branch` from #784.
-    pub auto_created_branch: bool,
-    /// `true` when the lazy `git fetch origin` was invoked because
-    /// `from_ref` did not resolve locally. Surfaces network I/O so
-    /// callers can correlate slow dispatches with fetch fallback.
-    pub fetch_attempted: bool,
-    /// `true` when the post-bind ci-watch arm failed (F7). The primary
-    /// dispatch succeeded; callers surface a degraded warning.
-    pub ci_watch_arm_failed: bool,
-    /// The truthful result of an attempted dispatch-time ci-watch arm. `None`
-    /// means that no watch was attempted (for example `bind:false` or an
-    /// unresolved repository), while `Some` preserves the normalized chain
-    /// targets echoed by the typed send response.
-    pub ci_watch: Option<CiWatchOutcome>,
-}
-
-/// Result of an attempted dispatch-time ci-watch arm.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CiWatchOutcome {
-    /// Whether the watch sidecar was armed successfully.
-    pub armed: bool,
-    /// The normalized chain targets passed to the watch arm.
-    pub next_after_ci: Vec<String>,
-}
-
-/// #781 Piece 7: structured error. The string-only `Result<_, String>`
-/// it supersedes (pre-#781) lost the `code` / `stage` / `raw` triple
-/// callers need to dispatch error handling programmatically.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DispatchError {
-    /// Human-readable summary. Safe to log verbatim.
-    pub message: String,
-    /// Canonical reason class — see [`ErrorCode`]. Stable enum, not
-    /// stderr fragments.
-    pub code: ErrorCode,
-    /// Pipeline locator — which step of `dispatch_auto_bind_lease`
-    /// raised. See [`Stage`].
-    pub stage: Stage,
-    /// `true` when the fetch fallback fired before the failure (lets
-    /// callers distinguish "config / option-injection invalid" from
-    /// "fetch happened but couldn't resolve from_ref").
-    pub fetch_attempted: bool,
-    /// Raw git stderr if any — for debug / post-mortem. `None` when
-    /// the failure didn't involve a git subprocess.
-    pub raw: Option<String>,
-}
-
-impl std::fmt::Display for DispatchError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for DispatchError {}
-
-/// Which tier of [`resolve_source_repo`] fired. Observable via
-/// [`DispatchOutcome::source_repo_tier`] so callers can audit
-/// configuration completeness without parsing logs.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum SourceRepoTier {
-    /// Tier 1 — explicit `source_repo_override` from
-    /// `bind_self(source_repo=...)` etc.
-    Override,
-    /// Tier 2 — per-instance `source_repo:` in fleet.yaml.
-    FleetSourceRepo,
-    /// Tier 2.5 — team `source_repo:` in fleet.yaml.
-    TeamSourceRepo,
-    /// Tier 3 — per-instance `working_directory:` fallback (deprecation
-    /// candidate).
-    WorkingDirectory,
-    /// Tier 4 — `$AGEND_HOME/workspace/<agent>` stub (last resort).
-    /// Surfacing this signals operator config gap.
-    Stub,
-}
-
-/// Pipeline stage that produced a [`DispatchError`]. Coarse enough to
-/// remain stable across refactors, fine enough to debug.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Stage {
-    /// `from_ref` rejected by `validate_branch` charset / option-injection guard.
-    ValidateFromRef,
-    /// `branch` rejected by `validate_branch` (charset / option-injection) or by
-    /// `is_protected_ref` (E4.5) — at the validation boundary, before any git
-    /// subprocess runs (CR-2026-06-14 F1).
-    ValidateBranch,
-    /// First `git branch <name> <from_ref>` attempt failed for a reason
-    /// other than "already exists" / "not a valid ref".
-    CreateBranch,
-    /// `git fetch origin` after the missing-ref fallback failed.
-    Fetch,
-    /// Retry `git branch <name> <from_ref>` after fetch still failed.
-    RetryCreate,
-    /// `worktree_pool::lease` returned error (worktree creation failed,
-    /// cross-agent lease conflict, same-agent different-branch conflict).
-    WorktreeLeaseConflict,
-    /// Source repo resolution fell through to stub (tier 4) while
-    /// `AGEND_BIND_STRICT_MODE=1`.
-    ResolveSourceRepo,
-    /// `bind_full` write failed after worktree was leased.
-    Bind,
-}
-
-/// Canonical `code` enum — stable across releases. Callers MUST match
-/// on this rather than parsing `message` substrings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ErrorCode {
-    /// `from_ref` arg rejected by `validate_branch` charset rules.
-    InvalidFromRef,
-    /// `branch` arg rejected by `validate_branch` charset / option-injection
-    /// rules (CR-2026-06-14 F1).
-    InvalidBranch,
-    /// `git branch` failed at a stage we can't recover from (not
-    /// already-exists, not invalid-ref).
-    BranchCreateFailed,
-    /// `git fetch origin` exit non-zero / spawn error.
-    FetchFailed,
-    /// `worktree_pool::lease` rejected — cross-agent branch lease,
-    /// same-agent different-branch, worktree::create None, etc.
-    LeaseConflict,
-    /// E4.5 protected ref guard (`main` / `master`).
-    ProtectedBranch,
-    /// `bind_in_flight_set` already contains `(home, agent)` — concurrent
-    /// dispatch blocked.
-    BindInFlight,
-    /// `AGEND_BIND_STRICT_MODE=1` and source_repo resolved to stub (tier 4).
-    StubRejected,
-    /// `bind_full` failed — worktree was rolled back.
-    BindFailed,
-}
+pub(crate) use source_repo_resolution::resolve_team_source_repo;
+pub(crate) use types::{
+    CiWatchOutcome, DispatchError, DispatchOutcome, ErrorCode, SourceRepoTier, Stage,
+};
 
 #[allow(dead_code)]
 pub(crate) fn acquire_bind_guard(home: &Path, target: &str) -> Result<BindGuard, String> {
@@ -253,6 +117,7 @@ pub(crate) fn dispatch_auto_bind_lease(
         branch,
         repo,
         None,
+        None,
         &[],
         None,
         true, // #2158 GR1: dispatch entry → arm ci-watch
@@ -285,6 +150,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_chain(
         branch,
         repo,
         None,
+        None,
         &next_after_ci_targets,
         review_class,
         true, // #2158 GR1: dispatch entry (delegate/comms) → arm ci-watch
@@ -311,6 +177,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_chain(
 /// C2 commit performs the signature migration mechanically — `source_repo_tier`,
 /// `auto_created_branch`, `fetch_attempted` populated with placeholders here
 /// and wired to real observability sources in C4.
+///
 pub(crate) fn dispatch_auto_bind_lease_with_source(
     home: &Path,
     target: &str,
@@ -326,6 +193,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source(
         branch,
         repo,
         source_repo_override,
+        None,
         &[],
         None,
         false, // #2158 GR1: bind_self self-claim → do NOT silently arm ci-watch
@@ -362,6 +230,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     branch: &str,
     repo: Option<&str>,
     source_repo_override: Option<&Path>,
+    expected_head: Option<&str>,
     next_after_ci: &[String],
     // #1877: `review_class` (e.g. "dual" from a `second_reviewer=true` dispatch)
     // must reach the auto-armed watch — else the dual-review signal accepted at
@@ -386,11 +255,21 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         })?,
     };
     let lifecycle_permit = _guard.permit();
-    let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-        .ok()
-        .and_then(|f| f.resolve_instance(target));
+    let resolved = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+        Ok(fleet) => fleet
+            .resolve_instance_checked(target)
+            .map_err(|error| DispatchError {
+                message: error.to_string(),
+                code: ErrorCode::EnvSourceMissing,
+                stage: Stage::ResolveSourceRepo,
+                fetch_attempted: false,
+                raw: None,
+            })?,
+        Err(_) => None,
+    };
     let (source_repo, source_repo_tier) =
         resolve_source_repo(home, target, source_repo_override, resolved.as_ref());
+    let expected_head = exact_head::resolve(&source_repo, expected_head)?;
 
     if source_repo_tier == SourceRepoTier::Stub
         && std::env::var("AGEND_BIND_STRICT_MODE").as_deref() == Ok("1")
@@ -496,12 +375,9 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // auto_created_branch / fetch_attempted) and shares one decision
     // tree with `repo action=checkout bind:true` (the #784 entry).
     //
-    // #2703: `from_ref` is the repo's DEFAULT branch (`origin/<default_branch>`
-    // via `git_helpers::default_branch`, reading `origin/HEAD`), NOT a hard-coded
-    // `origin/main` (the #784 default, which mis-based every dispatched branch in a
-    // dev-default repo). Invariant for main-default (and origin/HEAD-blind) repos:
-    // `default_branch` returns "main" → `origin/main`, byte-identical to the prior
-    // literal (pinned by `dispatch_auto_create_main_default_invariance_2703`).
+    // #2703: use `origin/<default_branch>`, not hard-coded `origin/main`.
+    // `git_helpers::default_branch` checks origin/HEAD, then local HEAD, then
+    // falls back to main. The main-default invariant remains byte-identical.
     //
     // Strict error contract (#781 Phase 3 r1, Path A — restored after
     // initial fail-soft fix was found to weaken Piece 7's structured-
@@ -514,20 +390,53 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // `dispatch_hook/tests.rs` and `setup_git_repo_with_remote` in
     // `p0b_tests.rs` for the canonical fixture pattern).
     let reused = reuse_live_worktree.is_some(); // #2158: skip #869 ref-advance + gate rollback
-    let (auto_created_branch, fetch_attempted) = if reused {
-        (false, false)
+    let prior_branch_tip = expected_head
+        .as_ref()
+        .filter(|_| !reused)
+        .and_then(|_| exact_head::branch_tip(&source_repo, branch));
+    // #3546 R1 blocker 1: take the PROVISIONED view, not the back-compat tuple.
+    // This is the path every `send kind=task` with a branch travels, and it hits
+    // the same state-3 fail-open as `repo checkout` — an offline agent still gets
+    // a tree, provisioned from a remote-tracking ref nothing could refresh. The
+    // tuple wrapper drops that fact on the floor, so the binding was written with
+    // the flag hardcoded false and `binding_state` then asserted, positively,
+    // that the base was fresh. Carrying it here is what makes the two entry
+    // points agree.
+    let (auto_created_branch, fetch_attempted, base_from_stale_view) = if reused {
+        // A reused live worktree provisioned nothing, so it claims nothing.
+        (false, false, false)
     } else {
-        // #2703: base on the repo's default branch (origin/HEAD), not a literal
-        // origin/main. `default_branch` returns a bare branch name; qualify it with
-        // the push remote (`origin`, per #2047) so `resolve_from_ref_remote` splits
-        // it correctly for both the create base and the #1755 pre-create fetch.
-        let base = format!(
+        // #2703: qualify the bare default branch with the push remote so both
+        // branch creation and the pre-create fetch use the same remote.
+        let default_base = format!(
             "origin/{}",
             crate::git_helpers::default_branch(&source_repo)
         );
-        ensure_branch_exists(home, &source_repo, branch, &base, target)?
+        let base = expected_head.as_deref().unwrap_or(&default_base);
+        let provision = ensure_branch_exists_provisioned_with_context(
+            home,
+            &source_repo,
+            branch,
+            base,
+            target,
+            Some(source_repo_tier),
+        )?;
+        (
+            provision.created,
+            provision.fetch_attempted,
+            provision.base_from_stale_view,
+        )
     };
 
+    stale_dir::preflight(
+        home,
+        target,
+        branch,
+        &source_repo,
+        reused,
+        auto_created_branch,
+        fetch_attempted,
+    )?;
     // #2234 cure-(B): under the flag the agent's WORKSPACE dir IS its worktree
     // (cwd == worktree) — switch it to `branch` IN PLACE instead of leasing a
     // fresh per-branch worktree. Default OFF → legacy lease → byte-identical. The
@@ -535,8 +444,8 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // scan_existing_branch_binding) key on binding.json, NOT the worktree path,
     // so this swap leaves concurrency serialized exactly as before.
     let workspace_b = crate::worktree_pool::workspace_as_worktree_enabled(target);
-    // Build a lease-reject DispatchError from a PRE-classified `protected` flag +
-    // message. The two lease sinks classify differently: the typed `lease` path
+    // Build a lease-reject DispatchError from a PRE-classified `protected` flag + message.
+    // The two lease sinks classify differently: the typed `lease` path
     // uses `LeaseError::is_protected_branch()` (a variant check — finding D+H, no
     // stringly probe); the workspace-prepare path still returns an anyhow string,
     // classified by `contains("E4.5")` at its call site (`bind_self` dispatches on
@@ -553,7 +462,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         raw: Some(msg),
     };
     let wt_path = if let Some(wt) = reuse_live_worktree {
-        wt // #2158 partial-skip: reuse verbatim — NO lease/`sync_worktree_to_head` reset (wipe)
+        crate::worktree::verify_reused_submodules(wt).map_err(|m| lease_err(false, m))?
     } else if workspace_b {
         // (B): reconcile → free `branch` from stale legacy holders (work-at-risk
         // backed up before --force) → in-place checkout. Encapsulated helper.
@@ -575,6 +484,11 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         let _ = clean_empty_init_commits(&lease.path).ok();
         lease.path
     };
+    if reused {
+        if let Some(expected) = expected_head.as_deref() {
+            exact_head::verify(&wt_path, expected)?;
+        }
+    }
 
     // Bind with worktree + source-repo paths.
     // #779 P2: bind_full returns Result — on Err roll back a *fresh* lease
@@ -587,7 +501,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
         if let Some(reason) = bind_test_seam::hit() {
             Err(reason)
         } else {
-            crate::binding::bind_full(
+            crate::binding::bind_full_with_provenance(
                 home,
                 target,
                 task_id,
@@ -595,11 +509,13 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                 &wt_path,
                 &source_repo,
                 !arm_ci_watch,
+                None,
+                base_from_stale_view,
             )
         }
         #[cfg(not(test))]
         {
-            crate::binding::bind_full(
+            crate::binding::bind_full_with_provenance(
                 home,
                 target,
                 task_id,
@@ -607,14 +523,35 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                 &wt_path,
                 &source_repo,
                 !arm_ci_watch,
+                None,
+                base_from_stale_view,
             )
         }
     };
     match bind_result {
-        Ok(()) => tracing::info!(
-            %target, %branch, path = %wt_path.display(),
-            "dispatch auto-bind OK"
-        ),
+        Ok(()) => {
+            if !reused {
+                if let Some(expected) = expected_head.as_deref() {
+                    if let Err(error) = exact_head::verify(&wt_path, expected) {
+                        exact_head::rollback_bound_worktree(
+                            home,
+                            target,
+                            &source_repo,
+                            branch,
+                            &wt_path,
+                            workspace_b,
+                            prior_branch_tip.as_deref(),
+                            lifecycle_permit,
+                        );
+                        return Err(error);
+                    }
+                }
+            }
+            tracing::info!(
+                %target, %branch, path = %wt_path.display(),
+                "dispatch auto-bind OK"
+            );
+        }
         Err(e) => {
             tracing::warn!(
                 %target, %branch, path = %wt_path.display(), error = %e,
@@ -672,8 +609,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // #2158 GR1: auto-arm the dispatch ci-watch ONLY on an explicit dispatch intent
     // (`arm_ci_watch`), NOT on task_id presence — a single-target `send kind=task`
     // (auto-create-exempt) reaches here with task_id="" and MUST still arm. bind_self
-    // self-claims pass `arm_ci_watch=false` and skip the silent arm (#2158 GR1). The
-    // arming body lives in `auto_watch.rs` (file-size split).
+    // self-claims pass `arm_ci_watch=false` and skip the silent arm (#2158 GR1).
     let mut ci_watch_arm_failed = false;
     let mut ci_watch = None;
     if arm_ci_watch {
@@ -683,6 +619,7 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
                 target,
                 &r,
                 branch,
+                exact_head::branch_tip(&source_repo, branch).as_deref(),
                 next_after_ci,
                 review_class,
                 task_id,
@@ -752,20 +689,19 @@ fn resolve_source_repo(
 /// long after the proxy returned `accepted_in_progress` (false success),
 /// swallowing a later bind failure. Worst path is ≤2 sequential best-effort
 /// fetches, so 12s each stays under the proxy ceiling.
-const DISPATCH_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
+pub(crate) const DISPATCH_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(12);
 
 /// #781 Piece 6: shared auto-create-branch helper (decision tree formerly inlined
-/// in `ci::handle_checkout_repo`, #780) — both `repo checkout bind:true` and
-/// `dispatch_auto_bind_lease` route through here (#784 / d-20260514102305998399-0).
-/// Branch exists → fetch + `update-ref` so the local ref tracks the remote PR HEAD
-/// (#869); else `git branch <branch> <from_ref>` with a fetch-then-retry on an
-/// unresolved ref. Returns `(auto_created, fetch_attempted)`.
-///
-/// BOTH the user-supplied `branch` and `from_ref` run through `validate_branch`
-/// (defense in depth, rejecting option-injection like `--upload-pack=...` at the
-/// API boundary before any git subprocess); `branch` is additionally rejected by
-/// `is_protected_ref` (E4.5). `actor` = event_log id for the fetch breadcrumb; the
-/// `from_ref`→remote split lives in [`from_ref::resolve_from_ref_remote`].
+/// Back-compat tuple view of [`ensure_branch_exists_provisioned`]: `(auto_created,
+/// fetch_attempted)`. Every caller that does not need to know HOW TRUSTWORTHY the
+/// base was keeps this shape, so #3546 adds a fact without rewriting call sites
+/// that make no claim about it.
+// #3546: the last PRODUCTION caller (`dispatch_auto_bind_lease_with_source_and_chain`)
+// moved to the provisioned view, because it does make a claim about the base. The
+// tuple view stays as the documented back-compat surface — ~15 tests exercise this
+// exact shape, and rewriting them to unpack a struct would churn coverage that has
+// nothing to do with this fix.
+#[allow(dead_code)]
 pub(crate) fn ensure_branch_exists(
     home: &Path,
     source: &Path,
@@ -773,6 +709,39 @@ pub(crate) fn ensure_branch_exists(
     from_ref: &str,
     actor: &str,
 ) -> Result<(bool, bool), DispatchError> {
+    ensure_branch_exists_provisioned(home, source, branch, from_ref, actor)
+        .map(|p| (p.created, p.fetch_attempted))
+}
+
+/// in `ci::handle_checkout_repo`, #780) — both `repo checkout bind:true` and
+/// `dispatch_auto_bind_lease` route through here (#784 / d-20260514102305998399-0).
+/// Branch exists → fetch + `update-ref` so the local ref tracks the remote PR HEAD
+/// (#869); else `git branch <branch> <from_ref>` with a fetch-then-retry on an
+/// unresolved ref. Returns a [`BranchProvision`].
+///
+/// BOTH the user-supplied `branch` and `from_ref` run through `validate_branch`
+/// (defense in depth, rejecting option-injection like `--upload-pack=...` at the
+/// API boundary before any git subprocess); `branch` is additionally rejected by
+/// `is_protected_ref` (E4.5). `actor` = event_log id for the fetch breadcrumb; the
+/// `from_ref`→remote split lives in [`from_ref::resolve_from_ref_remote`].
+pub(crate) fn ensure_branch_exists_provisioned(
+    home: &Path,
+    source: &Path,
+    branch: &str,
+    from_ref: &str,
+    actor: &str,
+) -> Result<BranchProvision, DispatchError> {
+    ensure_branch_exists_provisioned_with_context(home, source, branch, from_ref, actor, None)
+}
+
+fn ensure_branch_exists_provisioned_with_context(
+    home: &Path,
+    source: &Path,
+    branch: &str,
+    from_ref: &str,
+    actor: &str,
+    source_repo_tier: Option<SourceRepoTier>,
+) -> Result<BranchProvision, DispatchError> {
     // CR-2026-06-14 F1 (security): validate `branch` before it reaches
     // `git branch <branch>` as a positional (arg-injection: `--upload-pack=...`).
     if !crate::agent_ops::validate_branch(branch) {
@@ -862,7 +831,13 @@ pub(crate) fn ensure_branch_exists(
             crate::git_helpers::git_bypass(source, &["rev-parse", "--verify", &remote_branch_ref])
                 .map(|o| o.status.success())
                 .unwrap_or(false);
+        // #3546 R1 blocker 2: which fetch proves this branch's base is fresh
+        // depends on WHERE the base comes from, so the flag is decided per arm.
+        let base_from_stale_view;
         if remote_exists {
+            // Base = `origin/<branch>`, refreshed by the #869 fetch above, so
+            // that fetch's result is exactly the right evidence here.
+            base_from_stale_view = !fetched_ok;
             let _ = crate::git_helpers::git_bypass(
                 source,
                 &["update-ref", &branch_ref, &remote_branch_ref],
@@ -889,12 +864,19 @@ pub(crate) fn ensure_branch_exists(
             // fetch) so the re-align lands on the current base, not a stale local
             // copy. All steps best-effort; the returned `fetched_ok` stays the
             // #869 working-branch fetch result (this from_ref fetch is internal).
+            // #3546: this is the fetch that refreshes the base actually used on
+            // this arm, so its result — not the #869 one — is what the staleness
+            // flag must be read from. It used to be discarded with `let _`.
+            // `true` when there is no remote branch to refresh (`from_ref` is a
+            // raw SHA): a literal commit cannot be a stale view of anything.
+            let mut from_ref_refreshed = true;
             if let Some(rb) = from_ref_branch.as_deref() {
-                let _ = crate::git_helpers::git_bypass_timeout(
+                let out = crate::git_helpers::git_bypass_timeout(
                     source,
                     &["fetch", &remote, rb, "--quiet"],
                     DISPATCH_FETCH_TIMEOUT,
                 );
+                from_ref_refreshed = matches!(&out, Ok(o) if o.status.success());
             }
             let ff_safe = crate::git_helpers::git_bypass(
                 source,
@@ -917,8 +899,25 @@ pub(crate) fn ensure_branch_exists(
                     }
                 }
             }
+            // Claim staleness ONLY when this call actually re-based the branch
+            // off a ref it could not refresh. Without `ff_safe` the branch keeps
+            // the tip it already had — this call chose no base, so it asserts
+            // nothing, which is what a false flag means.
+            //
+            // This is the arm that produced the reviewer's P1 false positive: a
+            // branch that was never pushed makes `git fetch origin <branch>`
+            // fail no matter how reachable origin is, and the old
+            // `base_from_stale_view: !fetched_ok` turned that into a permanent
+            // "your base is stale" for every unpushed branch.
+            base_from_stale_view = ff_safe && !from_ref_refreshed;
         }
-        return Ok((false, fetched_ok));
+        return Ok(BranchProvision {
+            created: false,
+            // Unchanged: the pre-#3546 second tuple element is still the #869
+            // working-branch fetch result.
+            fetch_attempted: fetched_ok,
+            base_from_stale_view,
+        });
     }
     // Local ref absent -> create it. Prefers an existing origin/<branch>
     // over from_ref (#t-83936-5 data-loss guard); the full rationale and the
@@ -931,54 +930,35 @@ pub(crate) fn ensure_branch_exists(
         actor,
         &remote,
         from_ref_branch.as_deref(),
+        source_repo_tier,
     )
 }
 
-/// Resolve source_repo from the agent's team configuration.
-///
-/// #781 Piece 5 (defensive logging): the prior `.ok()?` swallowed
-/// FleetConfig::load errors silently — a malformed fleet.yaml or
-/// transient I/O fault dropped Tier 2.5 to None with zero diagnostics,
-/// making post-mortem investigation harder. The defensive branches
-/// below surface the actual error class (load failure vs no team
-/// match vs team match without `source_repo`) so operators can
-/// distinguish "Bug A0 legacy-migration case" (team matched but
-/// source_repo None) from "team membership setup gap".
-pub(crate) fn resolve_team_source_repo(home: &Path, agent: &str) -> Option<PathBuf> {
-    let fleet = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
-        Ok(f) => f,
-        Err(e) => {
-            tracing::warn!(
-                %agent,
-                home = %home.display(),
-                error = %e,
-                "Tier 2.5 resolution skipped: fleet.yaml load failed — \
-                 dispatch will fall through to tier 3 (working_directory) or \
-                 tier 4 (workspace stub)"
-            );
-            return None;
-        }
+/// Resolve the canonical source repository path using the same tiered lookup
+/// as ordinary branch dispatch. Review assignments use this path to provision
+/// their separate disposable workspace while keeping the subject branch in
+/// assignment authority.
+pub(crate) fn resolve_source_repo_for_target(
+    home: &Path,
+    target: &str,
+) -> Result<PathBuf, serde_json::Value> {
+    let resolved = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+        Ok(fleet) => fleet
+            .resolve_instance_checked(target)
+            .map_err(env_resolve_error_json)?,
+        Err(_) => None,
     };
-    for cfg in fleet.teams.values() {
-        if cfg.members.contains(&agent.to_string()) {
-            if cfg.source_repo.is_none() {
-                tracing::warn!(
-                    %agent,
-                    "Tier 2.5 team match but `source_repo` is None — \
-                     likely legacy migration from teams.json (Bug A0, see #781). \
-                     Operator must run `team update name=<team> source_repo=<canonical>` \
-                     to escape the workspace stub fallback at tier 4"
-                );
-            }
-            return cfg.source_repo.clone();
-        }
-    }
-    tracing::debug!(
-        %agent,
-        teams_searched = fleet.teams.len(),
-        "Tier 2.5: no team membership found for agent — falling through to tier 3/4"
-    );
-    None
+    Ok(resolve_source_repo(home, target, None, resolved.as_ref()).0)
+}
+
+fn env_resolve_error_json(error: crate::fleet::EnvResolveError) -> serde_json::Value {
+    serde_json::json!({
+        "error": error.to_string(),
+        "code": "env_source_missing",
+        "instance": error.instance,
+        "destination": error.destination,
+        "source": error.source,
+    })
 }
 
 /// Parse `owner/repo` from a `git remote get-url origin` output.
@@ -1137,9 +1117,12 @@ pub(crate) fn resolve_review_assignment_repo(
         return provider_neutral_slug::canonicalize_repo_slug_any_forge(repo)
             .ok_or_else(unresolved);
     }
-    let resolved = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-        .ok()
-        .and_then(|f| f.resolve_instance(resolved_target));
+    let resolved = match crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)) {
+        Ok(fleet) => fleet
+            .resolve_instance_checked(resolved_target)
+            .map_err(env_resolve_error_json)?,
+        Err(_) => None,
+    };
     let (source_repo, _tier) = resolve_source_repo(home, resolved_target, None, resolved.as_ref());
     canonical_repo_slug_for_source(&source_repo).ok_or_else(unresolved)
 }
@@ -1194,7 +1177,7 @@ fn run_git_idempotent(args: &[&str], cwd: &Path) -> std::io::Result<std::process
     Ok(last.expect("loop runs at least once"))
 }
 
-/// Remove empty commits with message "init" between origin/main and HEAD.
+/// Remove empty "init" commits between [`cleanup_trunk::resolve`] and HEAD.
 /// These come from BACKEND session checkpoints (claude-code / kiro-cli)
 /// that fire heartbeats every ~90s; not from agend-terminal production
 /// code (worktree.rs uses message "init (agend-terminal)" which the
@@ -1223,14 +1206,18 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
     // helper — worst case we get the same status 256 we had before.
     clear_stale_rebase_state(worktree);
 
+    // Resolve once so enumeration, reset, and rebase cannot disagree.
+    let trunk = cleanup_trunk::resolve(worktree)?;
+
     // #1787: retry — the confirmed #1783 windows flake was this command exiting
     // non-zero with empty stderr under scratch-repo lock contention.
-    let output = run_git_idempotent(&["log", "origin/main..HEAD", "--format=%H %s"], worktree);
+    let range = format!("{trunk}..HEAD");
+    let output = run_git_idempotent(&["log", &range, "--format=%H %s"], worktree);
     let output = match output {
         Ok(o) if o.status.success() => o,
         Ok(o) => {
             return Err(format!(
-                "git log origin/main..HEAD failed: {}",
+                "git log {range} failed: {}",
                 String::from_utf8_lossy(&o.stderr).trim()
             ));
         }
@@ -1278,11 +1265,11 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
         return Ok(0);
     }
 
-    // All commits between origin/main..HEAD are empty inits → soft reset.
+    // All commits between trunk..HEAD are empty inits → soft reset.
     let total_commits = log.lines().count();
     if empty_inits.len() == total_commits {
         // #1787: retry — soft-reset to a fixed ref is idempotent.
-        let status = run_git_idempotent(&["reset", "--soft", "origin/main"], worktree);
+        let status = run_git_idempotent(&["reset", "--soft", &trunk], worktree);
         match status {
             Ok(o) if o.status.success() => {
                 tracing::info!(
@@ -1294,7 +1281,7 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
             Ok(o) => {
                 tracing::warn!("failed to soft-reset empty init commits");
                 return Err(format!(
-                    "git reset --soft origin/main exited with status {:?}",
+                    "git reset --soft {trunk} exited with status {:?}",
                     o.status
                 ));
             }
@@ -1334,7 +1321,7 @@ pub(crate) fn clean_empty_init_commits(worktree: &Path) -> Result<usize, String>
     // blind retry would trip over). `clear_stale_rebase_state` above pre-clears
     // that state, and the `Err` arm below already surfaces a failed abort.
     let status = std::process::Command::new("git")
-        .args(["-c", "core.abbrev=7", "rebase", "-i", "origin/main"])
+        .args(["-c", "core.abbrev=7", "rebase", "-i", &trunk])
         .current_dir(worktree)
         .env("AGEND_GIT_BYPASS", "1")
         .env("GIT_SEQUENCE_EDITOR", format!("sed -i.bak '{sed_script}'"))

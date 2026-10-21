@@ -339,6 +339,16 @@ impl PerTickHandler for RespawnWatchdogHandler {
             (stuck, auth, live)
         };
 
+        // Read durable ownership only after dropping the registry lock.
+        let stuck: Vec<_> = stuck
+            .into_iter()
+            .filter(|name| !crate::schedule_jobs::owns_worker(ctx.home, name))
+            .collect();
+        let auth: HashSet<_> = auth
+            .into_iter()
+            .filter(|name| !crate::schedule_jobs::owns_worker(ctx.home, name))
+            .collect();
+
         // Forgive/evict stale retry records (agent recovered or left).
         self.gc_records(&stuck, &live);
 
@@ -458,6 +468,10 @@ impl RespawnWatchdogHandler {
         }
         let home = ctx.home.to_path_buf();
         let name_owned = name.to_string();
+        let old_instance_ref = Some(crate::types::InstanceRef::new(
+            observation.instance_id,
+            observation.generation.value(),
+        ));
         // fire-and-forget: the restart round-trips DELETE+SPAWN over the api
         // socket (~100ms+) and must not block the supervisor tick. No JoinHandle
         // is kept — the restart is self-contained, its outcome is reported via
@@ -481,6 +495,7 @@ impl RespawnWatchdogHandler {
                 &home,
                 &name_owned,
                 &reason,
+                old_instance_ref,
             );
             if spawned {
                 let _ = agent::crash_disposition::owner_ledger().mark_live(permit);

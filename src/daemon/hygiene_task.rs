@@ -1,6 +1,6 @@
 //! V1 of d-20260712065632138568-7: durable system-hygiene alerts live ON the
 //! task board — one active task per episode key, created/updated atomically
-//! under the board JSONL lock via `append_batch_checked` (fresh-replay
+//! under the board JSONL lock via `append_batch_checked` (fresh-catalog
 //! precondition). Task metadata is the ONLY durable episode authority: there
 //! is no separate receipt store to desync (create-then-crash or
 //! receipt-then-crash两store窗 impossible by construction).
@@ -26,6 +26,26 @@ pub const LAST_SEEN_META: &str = "last_seen";
 /// Metadata key counting observations folded into this episode task.
 pub const OCCURRENCES_META: &str = "occurrences";
 
+/// Metadata flag written once when [`OCCURRENCES_CAP`] is reached, so a
+/// reader can tell a frozen counter from an episode that stopped recurring.
+pub const OCCURRENCES_CAPPED_META: &str = "occurrences_capped";
+
+/// Upper bound on the observation counter (t-…-241). A count in the
+/// thousands carries nothing the first two hundred did not, and each
+/// increment costs a board event: on the fleet board 55 episodes produced
+/// 17,694 of 17,881 events, one counter reaching 4,411.
+pub const OCCURRENCES_CAP: u64 = 200;
+
+/// Minimum spacing between `last_seen` refreshes for an episode whose
+/// evidence has not changed. The sweep observes every ~10 minutes — 144 ticks
+/// a day, each of which used to append `last_seen` + `occurrences`, so 288
+/// events. At this spacing a recurring-but-unchanged episode writes at most
+/// 4 times a day (8 events while the counter is live, 4 after it caps), and
+/// `last_seen` stays accurate enough to judge staleness on a board item that
+/// has typically been open for weeks. (R1 F3: the earlier "4 events a day"
+/// conflated writes with events — one write appends two.)
+const LAST_SEEN_THROTTLE: chrono::Duration = chrono::Duration::hours(6);
+
 const EMITTER: &str = "system:hygiene";
 
 #[derive(Debug, PartialEq, Eq)]
@@ -44,7 +64,9 @@ impl HygieneUpsert {
 
 /// Find the ACTIVE (not Done/Cancelled/Superseded) task carrying `key` in
 /// `system_alert_key` metadata, plus its current occurrence count.
-fn find_active(state: &TaskBoardState, key: &str) -> Option<(TaskId, u64)> {
+/// The active episode for `key`, as `(task id, occurrences, evidence,
+/// last_seen)`. `last_seen` feeds the write throttle (t-…-241).
+fn find_active(state: &TaskBoardState, key: &str) -> Option<ActiveEpisode> {
     state.tasks.values().find_map(|t| {
         if t.status.is_terminal() {
             return None;
@@ -55,9 +77,69 @@ fn find_active(state: &TaskBoardState, key: &str) -> Option<(TaskId, u64)> {
                 .get(OCCURRENCES_META)
                 .and_then(|v| v.as_u64())
                 .unwrap_or(1);
-            (t.id.clone(), n)
+            ActiveEpisode {
+                id: t.id.clone(),
+                occurrences: n,
+                evidence: t.metadata.get(EVIDENCE_META).cloned(),
+                last_seen: t
+                    .metadata
+                    .get(LAST_SEEN_META)
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+            }
         })
     })
+}
+
+/// The probed state of one active episode.
+#[derive(Clone)]
+struct ActiveEpisode {
+    id: TaskId,
+    occurrences: u64,
+    evidence: Option<serde_json::Value>,
+    last_seen: Option<String>,
+}
+
+/// Every active episode as `(task id, alert key)`. Detectors use it to
+/// revalidate their own targets before re-observing them (t-…-241).
+pub fn active_episodes(home: &Path) -> anyhow::Result<Vec<(TaskId, String)>> {
+    Ok(task_events::projected_state(home)?
+        .tasks
+        .values()
+        .filter(|t| !t.status.is_terminal())
+        .filter_map(|t| {
+            Some((
+                t.id.clone(),
+                t.metadata.get(ALERT_KEY_META)?.as_str()?.to_string(),
+            ))
+        })
+        .collect())
+}
+
+/// Close an episode whose target no longer exists. `Cancelled` rather than
+/// `Done`: every `DoneSource` carries a provenance this has none of (a PR
+/// merge, an operator, a backfill sweep), while `Cancelled.reason` is exactly
+/// the audit field for "the subject of this work item is gone". A recurrence
+/// re-opens a fresh task, per the episode contract above.
+pub fn close_episode(home: &Path, task_id: &TaskId, reason: &str) -> anyhow::Result<()> {
+    let emitter = InstanceName::from(EMITTER);
+    let event = TaskEvent::Cancelled {
+        task_id: task_id.clone(),
+        by: emitter.clone(),
+        reason: reason.to_string(),
+    };
+    match task_events::append_batch_checked(home, &emitter, vec![event], |state| {
+        match state.tasks.get(task_id) {
+            // Someone else closed it between our read and this append — not
+            // an error, just nothing left to do.
+            Some(t) if t.status.is_terminal() => Err("already terminal".to_string()),
+            Some(_) => Ok(()),
+            None => Err("task not on this board".to_string()),
+        }
+    })? {
+        Ok(_) => Ok(()),
+        Err(e) => anyhow::bail!("hygiene episode close skipped: {e}"),
+    }
 }
 
 /// r2 (§3.20 deterministic RED): test-only rendezvous at the stale-probe
@@ -167,7 +249,7 @@ fn new_task_id() -> TaskId {
 
 /// Atomically create-or-update the hygiene task for `key`. `title` is used
 /// only on create; `evidence` (a JSON object with exact repo/branch/reason
-/// fields) replaces the previous evidence on update. CAS loop: each attempt
+/// fields) replaces different previous evidence on update. CAS loop: each attempt
 /// is individually atomic and validates the exact state its write assumes;
 /// rejections hand back the fresh state, so W concurrent writers converge in
 /// ≤W serialized rounds (bounded by `ATTEMPTS`, overrun = loud error).
@@ -185,7 +267,7 @@ pub fn upsert_system_hygiene_task(
         value: v,
     };
     // CAS loop. Every attempt validates its full assumption under the board
-    // lock against a fresh replay — "no active task" for create, the exact
+    // lock against a fresh catalog snapshot — "no active task" for create, the exact
     // `(task id, occurrences)` pair for update — and every rejection hands the
     // freshly observed state to the next attempt. An ID-only update check
     // would let two stale probes both commit `n+1` (lost update, REJECTED
@@ -194,13 +276,13 @@ pub fn upsert_system_hygiene_task(
     // generous multiple and overrunning it is a loud error, never a silent
     // drop.
     const ATTEMPTS: usize = 16;
-    let mut probe: Option<(TaskId, u64)> = None;
+    let mut probe: Option<ActiveEpisode> = None;
     for _ in 0..ATTEMPTS {
         let now = chrono::Utc::now().to_rfc3339();
         match probe.take() {
             None => {
                 let task_id = new_task_id();
-                let mut seen: Option<(TaskId, u64)> = None;
+                let mut seen = None;
                 let create = vec![
                     TaskEvent::Created {
                         task_id: task_id.clone(),
@@ -220,6 +302,8 @@ pub fn upsert_system_hygiene_task(
                         eta_secs: None,
                         tags: vec!["system-hygiene".to_string()],
                         parent_id: None,
+                        governing_decision_id: None,
+                        review_class: None,
                     },
                     meta(&task_id, ALERT_KEY_META, key.into()),
                     meta(&task_id, EVIDENCE_META, evidence.clone()),
@@ -242,25 +326,66 @@ pub fn upsert_system_hygiene_task(
                     }
                 }
             }
-            Some((tid, n)) => {
+            Some(ActiveEpisode {
+                id: tid,
+                occurrences: n,
+                evidence: current_evidence,
+                last_seen,
+            }) => {
                 // r2: deterministic stale-probe rendezvous — no-op in
                 // production, lets tests pin writers at the same probed `n`.
                 #[cfg(test)]
                 test_sync::wait_if_armed(home);
-                let update = vec![
-                    meta(&tid, EVIDENCE_META, evidence.clone()),
-                    meta(&tid, LAST_SEEN_META, now.into()),
-                    meta(&tid, OCCURRENCES_META, (n + 1).into()),
-                ];
+                let evidence_changed = current_evidence.as_ref() != Some(&evidence);
+                // t-…-241: an unresolved episode is re-observed every sweep
+                // tick, forever. Counting each tick cost two board events and
+                // told the reader nothing the first ones had not, so the
+                // counter is capped and `last_seen` is throttled. Evidence
+                // that actually CHANGED is still written immediately — that is
+                // the one thing a reader cannot reconstruct.
+                let capped = n >= OCCURRENCES_CAP;
+                let last_seen_due = last_seen
+                    .as_deref()
+                    .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                    .is_none_or(|seen| {
+                        chrono::Utc::now().signed_duration_since(seen.with_timezone(&chrono::Utc))
+                            >= LAST_SEEN_THROTTLE
+                    });
+                if !evidence_changed && !last_seen_due {
+                    // Nothing a reader would learn from — append nothing.
+                    return Ok(HygieneUpsert::Updated(tid));
+                }
+                let mut update = Vec::with_capacity(4);
+                if evidence_changed {
+                    update.push(meta(&tid, EVIDENCE_META, evidence.clone()));
+                }
+                if last_seen_due {
+                    // R1 F2: the cap freezes the COUNTER, not the clock. A
+                    // capped episode is still recurring, and `last_seen` is
+                    // the only field that answers "is this still happening?"
+                    // — freezing it too left the flag saying "capped" and no
+                    // way to tell an active episode from one that stopped at
+                    // the moment it capped. Refreshing it costs 4 events a
+                    // day against the 288 this bound removes.
+                    update.push(meta(&tid, LAST_SEEN_META, now.into()));
+                }
+                if !capped {
+                    update.push(meta(&tid, OCCURRENCES_META, (n + 1).into()));
+                    if n + 1 == OCCURRENCES_CAP {
+                        // Written exactly at the transition, so a frozen
+                        // counter is distinguishable from a stopped episode.
+                        update.push(meta(&tid, OCCURRENCES_CAPPED_META, true.into()));
+                    }
+                }
                 let tid_check = tid.clone();
-                let mut seen: Option<(TaskId, u64)> = None;
+                let mut seen = None;
                 match task_events::append_batch_checked(home, &emitter, update, |state| {
                     match find_active(state, key) {
                         // CAS: identity AND the count our `n+1` was computed
                         // from must both still hold — exactly one commit per
                         // observed `n` can succeed (r2a commit replays the
                         // identity-only lost-update RED).
-                        Some((t, cur)) if t == tid_check && cur == n => Ok(()),
+                        Some(ref e) if e.id == tid_check && e.occurrences == n => Ok(()),
                         other => {
                             seen = other;
                             Err("episode state moved since probe".to_string())
@@ -268,7 +393,7 @@ pub fn upsert_system_hygiene_task(
                     }
                 })? {
                     Ok(_) => return Ok(HygieneUpsert::Updated(tid)),
-                    // Fresh (tid, n) → CAS-retry; None (closed) → create path.
+                    // Fresh episode state → CAS-retry; None (closed) → create path.
                     Err(_) => {
                         probe = seen;
                         continue;
@@ -378,6 +503,172 @@ mod tests {
             .filter(|t| t.metadata.contains_key(ALERT_KEY_META))
             .count();
         assert_eq!(hygiene_count, 1);
+    }
+
+    #[test]
+    fn unchanged_evidence_is_not_appended_again_3388() {
+        let home = tmp_home("evidence-dedup");
+        let evidence = ev("same");
+        upsert_system_hygiene_task(&home, "k:r:b", "residue", evidence.clone()).unwrap();
+        upsert_system_hygiene_task(&home, "k:r:b", "residue", evidence).unwrap();
+
+        let evidence_events = std::fs::read_to_string(home.join("task_events.jsonl"))
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<task_events::TaskEventEnvelope>(line).unwrap())
+            .filter(|envelope| {
+                matches!(
+                    &envelope.event,
+                    TaskEvent::MetadataSet { key, .. } if key == EVIDENCE_META
+                )
+            })
+            .count();
+        assert_eq!(
+            evidence_events, 1,
+            "unchanged evidence must only be written when the episode is created"
+        );
+
+        let state = board_state(&home);
+        let task = state
+            .tasks
+            .values()
+            .find(|task| task.metadata.get(ALERT_KEY_META) == Some(&"k:r:b".into()))
+            .unwrap();
+        // t-…-241 CHANGED THIS ASSERTION (was `2`). This test's subject is
+        // evidence dedup (#3388) and that is unchanged above; the counter
+        // value here was incidental to it. Under the write bound, an
+        // unchanged episode re-observed inside the `LAST_SEEN_THROTTLE`
+        // window appends NOTHING at all, so the counter stays at its
+        // creation value. The old `2` was precisely the per-tick counting
+        // this task exists to stop.
+        assert_eq!(task.metadata[OCCURRENCES_META], 1);
+        assert!(task.metadata.contains_key(LAST_SEEN_META));
+    }
+
+    /// t-…-241 (RED): an episode whose evidence has not changed must stop
+    /// writing board events. Before the bound, EVERY observation appended
+    /// `last_seen` + `occurrences` — 55 episodes produced 17,694 of the
+    /// 17,881 events on the fleet board, and one counter reached 4,411.
+    #[test]
+    fn unchanged_episode_stops_writing_events_once_seen_241() {
+        let home = tmp_home("bounded-writes");
+        let evidence = ev("steady");
+        upsert_system_hygiene_task(&home, "k:r:b", "residue", evidence.clone()).unwrap();
+        let after_create = std::fs::read_to_string(home.join("task_events.jsonl"))
+            .unwrap()
+            .lines()
+            .count();
+
+        for _ in 0..20 {
+            upsert_system_hygiene_task(&home, "k:r:b", "residue", evidence.clone()).unwrap();
+        }
+
+        let after_repeats = std::fs::read_to_string(home.join("task_events.jsonl"))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(
+            after_repeats,
+            after_create,
+            "20 re-observations of an unchanged episode must append NOTHING \
+             (was: 2 events each); got {} new events",
+            after_repeats - after_create
+        );
+    }
+
+    /// t-…-241 (RED): the counter itself is bounded, so an episode nobody
+    /// resolves cannot grow without limit even when its evidence keeps
+    /// changing (each change is a legitimate write).
+    #[test]
+    fn occurrences_stop_at_the_cap_241() {
+        let home = tmp_home("occurrence-cap");
+        for i in 0..(OCCURRENCES_CAP + 25) {
+            upsert_system_hygiene_task(&home, "k:r:b", "residue", ev(&format!("change-{i}")))
+                .unwrap();
+        }
+        let state = board_state(&home);
+        let task = state
+            .tasks
+            .values()
+            .find(|t| t.metadata.get(ALERT_KEY_META) == Some(&"k:r:b".into()))
+            .unwrap();
+        assert_eq!(
+            task.metadata.get(OCCURRENCES_META).and_then(|v| v.as_u64()),
+            Some(OCCURRENCES_CAP),
+            "counter must freeze at the cap"
+        );
+        assert_eq!(
+            task.metadata
+                .get(OCCURRENCES_CAPPED_META)
+                .and_then(|v| v.as_bool()),
+            Some(true),
+            "reaching the cap must be recorded once, so a reader knows the \
+             counter is frozen rather than the episode having stopped"
+        );
+    }
+
+    /// R1 F2: the cap freezes the counter, not the clock. A capped episode
+    /// that is still recurring must still refresh `last_seen` — it is the
+    /// only field that distinguishes "still happening" from "stopped at the
+    /// moment it capped", and the capped flag alone cannot say which.
+    #[test]
+    fn last_seen_still_advances_after_the_counter_caps_241() {
+        let home = tmp_home("capped-last-seen");
+        for i in 0..(OCCURRENCES_CAP + 5) {
+            upsert_system_hygiene_task(&home, "k:r:b", "residue", ev(&format!("c-{i}"))).unwrap();
+        }
+        let capped_at = board_state(&home)
+            .tasks
+            .values()
+            .find(|t| t.metadata.get(ALERT_KEY_META) == Some(&"k:r:b".into()))
+            .and_then(|t| t.metadata.get(LAST_SEEN_META).cloned())
+            .unwrap();
+
+        // Backdate `last_seen` past the throttle so the next observation is
+        // due, exactly as a real episode recurring hours later would be.
+        let stale =
+            (chrono::Utc::now() - LAST_SEEN_THROTTLE - chrono::Duration::minutes(1)).to_rfc3339();
+        let tid = board_state(&home)
+            .tasks
+            .values()
+            .find(|t| t.metadata.get(ALERT_KEY_META) == Some(&"k:r:b".into()))
+            .map(|t| t.id.clone())
+            .unwrap();
+        task_events::append_batch_checked(
+            &home,
+            &InstanceName::from(EMITTER),
+            vec![TaskEvent::MetadataSet {
+                task_id: tid.clone(),
+                by: InstanceName::from(EMITTER),
+                key: LAST_SEEN_META.to_string(),
+                value: stale.clone().into(),
+            }],
+            |_| Ok(()),
+        )
+        .unwrap()
+        .unwrap();
+
+        // R2 F4: the evidence must be UNCHANGED here. R1 F2's defect only
+        // shows when nothing changed — changed evidence writes either way, so
+        // an altered payload exercises the push gate and leaves the early
+        // return, where the defect actually lived, untested. `c-204` is the
+        // last value the loop above wrote.
+        let unchanged = ev(&format!("c-{}", OCCURRENCES_CAP + 4));
+        upsert_system_hygiene_task(&home, "k:r:b", "residue", unchanged).unwrap();
+
+        let task = board_state(&home).tasks.get(&tid).cloned().unwrap();
+        assert_eq!(
+            task.metadata.get(OCCURRENCES_META).and_then(|v| v.as_u64()),
+            Some(OCCURRENCES_CAP),
+            "the counter stays frozen at the cap"
+        );
+        assert_ne!(
+            task.metadata.get(LAST_SEEN_META).and_then(|v| v.as_str()),
+            Some(stale.as_str()),
+            "`last_seen` must still advance after the cap, or a live episode \
+             is indistinguishable from one that stopped when it capped \
+             (capped_at was {capped_at:?})"
+        );
     }
 
     /// r4 (codex REJECTED@1beac4e6): overlapping arms — a STALE guard's Drop

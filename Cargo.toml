@@ -4,6 +4,7 @@ members = [
     ".",
     "vendor/agentic-git/crates/agentic-git-core",
     "vendor/agentic-git/crates/agentic-git",
+    "vendor/agentic-git/crates/agentic-audit-append",
 ]
 default-members = ["."]
 
@@ -128,7 +129,7 @@ arc-swap = "1"
 tokio = { version = "1", features = ["rt", "net", "io-util", "fs", "macros", "time"] }
 
 # Serialization
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 base64 = "0.23"
 syn = { version = "3", features = ["parsing", "full", "visit"] }
@@ -142,7 +143,7 @@ teloxide = { version = "0.17", default-features = false, features = ["macros", "
 async-trait = "0.1"
 anyhow = "1"
 fs4 = "1.1"
-dirs = "6"
+dirs = "7"
 # Issue #893: dunce::canonicalize strips Windows `\\?\` UNC verbatim prefix
 # when safe, so the path encoding matches what claude CLI's Node
 # `fs.realpathSync.native` produces. Used in claude_session::has_resumable
@@ -176,6 +177,10 @@ hex = "0.4"
 # enforced by tests/agentic_core_single_source.rs (RED-first).
 agentic-git-core = { path = "vendor/agentic-git/crates/agentic-git-core", version = "0.2.1" }
 agentic-git = { path = "vendor/agentic-git/crates/agentic-git", version = "0.2.5" }
+# #3416: the one serialized fleet_events.jsonl appender, shared by the daemon
+# and both shims so no sink can append unlocked. Same in-tree PATH discipline
+# as agentic-git-core above.
+agentic-audit-append = { path = "vendor/agentic-git/crates/agentic-audit-append", version = "0.2.1" }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10"
 cron = "0.17"
@@ -209,8 +214,8 @@ iana-time-zone = "0.1.65"
 # Icon::from_rgba natively — do NOT pull the `image` crate. `toml` is
 # for `$AGEND_HOME/tray.toml`; dev-dependencies already list it, so the
 # runtime entry here only adds it to release graphs when `tray` is on.
-tray-icon = { version = "0.24", optional = true }
-tao = { version = "0.36", optional = true }
+tray-icon = { version = "0.25", optional = true }
+tao = { version = "0.37", optional = true }
 toml = { version = "1.1", optional = true }
 
 # Discord (feature = "discord"). Modular twilight crates — gateway for
@@ -225,7 +230,7 @@ twilight-model = { version = "0.17", optional = true }
 libc = "0.2"
 
 [target.'cfg(windows)'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Threading", "Win32_System_Console", "Win32_Foundation", "Win32_System_Registry", "Win32_System_JobObjects"] }
+windows-sys = { version = "0.61", features = ["Win32_System_Threading", "Win32_System_Console", "Win32_Foundation", "Win32_System_Registry", "Win32_System_JobObjects", "Win32_Storage_FileSystem"] }
 # #1547 (A): directory junctions for the non-hidden agy workspace link. A
 # junction needs no privilege, unlike `std::os::windows::fs::symlink_dir`
 # (which requires Developer Mode / admin). Windows-only.

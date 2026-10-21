@@ -1,9 +1,24 @@
 pub(crate) mod set_model;
+#[cfg(test)]
+mod set_model_tests;
 
 use serde_json::{json, Value};
 use std::path::Path;
 
+mod delete;
+mod instance_layout;
 pub(crate) mod lifecycle;
+mod restart_prep;
+mod topic;
+#[cfg(test)]
+pub(super) use delete::handle_delete_instance;
+pub(super) use delete::handle_delete_instance_with_runtime;
+pub(super) use instance_layout::resolve_team_layout;
+pub(crate) use restart_prep::restart_instance_autonomic;
+use restart_prep::{await_unsent_draft_or_grace, restart_spawn_params};
+#[cfg(test)]
+use restart_prep::{restart_draft_gate, DraftGate, RESTART_DRAFT_GRACE};
+pub(super) use topic::handle_bind_topic;
 #[cfg(not(test))]
 pub(super) mod spawn;
 #[cfg(test)]
@@ -15,6 +30,31 @@ pub(crate) mod spawn;
 /// 64 is already far beyond any real team size; reject above it at the MCP
 /// boundary, before the allocation and the CREATE_TEAM RPC.
 const MAX_TEAM_COUNT: usize = 64;
+
+fn record_creator_force_delete(
+    home: &Path,
+    caller: &str,
+    name: &str,
+    reason: &str,
+    has_binding: bool,
+    has_active_task: bool,
+) -> Result<(), String> {
+    let event = serde_json::json!({
+        "kind": "creator_force_delete",
+        "agent": caller,
+        "target": name,
+        "force_reason": reason,
+        "has_binding": has_binding,
+        "has_active_task": has_active_task,
+        "timestamp": chrono::Utc::now().to_rfc3339(),
+    });
+    agentic_audit_append::append_audit_line_bounded(
+        home,
+        &event,
+        agentic_audit_append::DEFAULT_BOUNDED_BUDGET,
+    )
+    .map_err(|e| e.to_string())
+}
 
 pub(super) fn handle_create_instance(
     home: &Path,
@@ -124,6 +164,7 @@ pub(super) fn handle_create_instance(
                     accept_from: Vec::new(),
                 },
                 &rt.registry,
+                &rt.configs,
                 rt.notifier.as_deref(),
             )
         } else {
@@ -205,157 +246,6 @@ pub(super) fn handle_create_instance(
     }
 }
 
-#[cfg(test)]
-pub(super) fn handle_delete_instance(
-    home: &Path,
-    args: &Value,
-    sender: &Option<crate::identity::Sender>,
-) -> Value {
-    handle_delete_instance_with_runtime(home, args, sender, None)
-}
-
-pub(super) fn handle_delete_instance_with_runtime(
-    home: &Path,
-    args: &Value,
-    sender: &Option<crate::identity::Sender>,
-    runtime: Option<&super::dispatch::RuntimeContext>,
-) -> Value {
-    let name = match super::require_instance(args) {
-        Ok(n) => n,
-        Err(e) => return e,
-    };
-    crate::validate_name_or_err!(name);
-    // AUDIT2-002: deleting an instance tears down its PTY, inbox and worktree and
-    // orphans its tasks. Restrict an identified caller to deleting itself or a
-    // member of a team it orchestrates — a peer can no longer remove another
-    // agent by naming it. Anonymous (no sender: operator-direct / standalone)
-    // keeps full authority (the TUI close path calls `full_delete_instance`).
-    //
-    // ACL improvement: also allow the instance's CREATOR (the caller that ran
-    // `create_instance` for it, stamped as `created_by` in fleet.yaml — the
-    // "為 ACL 建 team" pain point: a creator wanting to redo/retire its own
-    // spawn shouldn't have to build a team just to gain orchestrator
-    // authority). Guarded by an in-flight safety valve: if the target has an
-    // active worktree binding or a claimed/in_progress task, the creator path
-    // requires `force=true` + a non-empty `force_reason` (audit-logged), so a
-    // creator can't casually reap an agent mid-work. Self/orchestrator deletes
-    // are unaffected by the valve — this only gates the NEW creator path.
-    if let Some(caller) = sender.as_ref().map(|s| s.as_str()) {
-        if caller != name && !crate::teams::is_orchestrator_of(home, caller, name) {
-            let is_creator = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
-                .ok()
-                .and_then(|c| c.instances.get(name).and_then(|i| i.created_by.clone()))
-                .as_deref()
-                == Some(caller);
-            if !is_creator {
-                return serde_json::json!({
-                    "error": format!(
-                        "permission denied: '{caller}' cannot delete '{name}' \
-                         (only the instance itself, its team orchestrator, or its creator may)"
-                    ),
-                    "code": "not_owner_or_orchestrator"
-                });
-            }
-            let has_binding = crate::binding::read(home, name).is_some();
-            let has_active_task = crate::tasks::list_all(home).iter().any(|t| {
-                t.assignee.as_deref() == Some(name)
-                    && matches!(
-                        t.status,
-                        crate::task_events::TaskStatus::Claimed
-                            | crate::task_events::TaskStatus::InProgress
-                    )
-            });
-            if has_binding || has_active_task {
-                let force = args.get("force").and_then(|v| v.as_bool()).unwrap_or(false);
-                let force_reason = args
-                    .get("force_reason")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty());
-                match force_reason {
-                    Some(reason) if force => {
-                        tracing::warn!(
-                            caller,
-                            target = name,
-                            reason,
-                            has_binding,
-                            has_active_task,
-                            "creator force-deleting instance with in-flight work"
-                        );
-                        // Durable audit trail — a permission override deleting
-                        // in-flight work needs more than a process log line.
-                        // Mirrors ci/merge.rs's merge_force_bypass: fail-closed
-                        // if the write itself fails (an unrecordable override
-                        // must not proceed).
-                        let event = serde_json::json!({
-                            "kind": "creator_force_delete",
-                            "agent": caller,
-                            "target": name,
-                            "force_reason": reason,
-                            "has_binding": has_binding,
-                            "has_active_task": has_active_task,
-                            "timestamp": chrono::Utc::now().to_rfc3339(),
-                        });
-                        let events_path = home.join("fleet_events.jsonl");
-                        let audit_written = (|| -> std::io::Result<()> {
-                            use std::io::Write;
-                            let mut f = std::fs::OpenOptions::new()
-                                .create(true)
-                                .append(true)
-                                .open(events_path)?;
-                            writeln!(f, "{event}")?;
-                            Ok(())
-                        })();
-                        if let Err(e) = audit_written {
-                            return serde_json::json!({
-                                "error": format!(
-                                    "creator force-delete refused: audit log write failed: {e}"
-                                ),
-                                "code": "creator_force_delete_audit_failed"
-                            });
-                        }
-                    }
-                    _ => {
-                        return serde_json::json!({
-                            "error": format!(
-                                "'{name}' has in-flight work (binding={has_binding}, \
-                                 active_task={has_active_task}) — creator delete requires \
-                                 force=true and a non-empty force_reason"
-                            ),
-                            "code": "creator_delete_requires_force"
-                        });
-                    }
-                }
-            }
-        }
-    }
-    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
-    if let Some(ref config) = fleet {
-        if config.channel.is_some()
-            && config.instances.contains_key(name)
-            && config.instances.len() <= 1
-        {
-            return json!({"error": "cannot delete the last instance — channel needs at least one instance to receive messages"});
-        }
-    }
-    // Full multi-store teardown lives in the `lifecycle` submodule of this
-    // `instance_state` concept (Sprint 54 P1-B Bug 1).
-    let delete_context = runtime.map(|runtime| crate::agent_ops::DeleteContext {
-        registry: &runtime.registry,
-        configs: &runtime.configs,
-        externals: &runtime.externals,
-        notifier: runtime.notifier.as_ref(),
-    });
-    match lifecycle::full_delete_instance_with_runtime(home, name, delete_context.as_ref()) {
-        Ok(()) => json!({"name": name}),
-        Err(detail) => json!({
-            "name": name,
-            "error": format!(
-                "delete completed with residual state — fleet may resurrect on next reconcile: {detail}"
-            ),
-        }),
-    }
-}
-
 /// #991 Phase 2: retrofit a Telegram topic for a `deferred`/`auto`-without-
 /// topic instance. See `bind_topic_for_instance` for the core logic and
 /// `BindTopicOutcome`'s variants for the exact result shapes below.
@@ -367,40 +257,6 @@ pub(super) fn handle_delete_instance_with_runtime(
 /// §4 — that resolver returns `None` whenever 0 OR MULTIPLE channels are
 /// registered, a pre-existing, separately-tracked bug this action avoids by
 /// never calling it).
-pub(super) fn handle_bind_topic(home: &Path, args: &Value) -> Value {
-    let name = match super::require_instance(args) {
-        Ok(n) => n,
-        Err(e) => return e,
-    };
-    crate::validate_name_or_err!(name);
-    if let Some(channel) = args["channel"].as_str() {
-        if channel != "telegram" {
-            return json!({
-                "error": format!("bind_topic: channel '{channel}' not yet supported (only 'telegram')"),
-                "code": "channel_not_supported"
-            });
-        }
-    }
-    use crate::channel::telegram::BindTopicOutcome;
-    match crate::channel::telegram::bind_topic_for_instance(home, name) {
-        BindTopicOutcome::Bound(tid) => json!({"bound": true, "topic_id": tid}),
-        BindTopicOutcome::AlreadyBound(tid) => {
-            json!({"bound": true, "topic_id": tid, "already_bound": true})
-        }
-        BindTopicOutcome::NotEligible { reason } => {
-            json!({"error": reason, "code": "not_eligible"})
-        }
-        BindTopicOutcome::InstanceNotFound => {
-            json!({"error": format!("instance '{name}' not found"), "code": "instance_not_found"})
-        }
-        BindTopicOutcome::ChannelUnavailable => json!({
-            "error": "telegram channel not ready yet — retry in a few seconds",
-            "code": "channel_unavailable"
-        }),
-        BindTopicOutcome::ApiError(e) => json!({"error": e, "code": "api_error"}),
-    }
-}
-
 pub(super) fn handle_start_instance_with_runtime(
     home: &Path,
     args: &Value,
@@ -422,8 +278,8 @@ pub(super) fn handle_start_instance_with_runtime(
         Ok(c) => c,
         Err(e) => return json!({"error": format!("fleet.yaml: {e}")}),
     };
-    match config.resolve_instance(name) {
-        Some(resolved) => {
+    match config.resolve_instance_checked(name) {
+        Ok(Some(resolved)) => {
             let cmd_args = resolved.args.join(" ");
             // #900: forward the resolved env explicitly so the daemon's
             // SPAWN handler doesn't have to re-read fleet.yaml for what
@@ -450,107 +306,15 @@ pub(super) fn handle_start_instance_with_runtime(
                 Err(e) => json!({"error": format!("API unavailable: {e}")}),
             }
         }
-        None => json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
+        Ok(None) => json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
+        Err(error) => json!({
+            "error": error.to_string(),
+            "code": "env_source_missing",
+            "instance": error.instance,
+            "destination": error.destination,
+            "source": error.source,
+        }),
     }
-}
-
-/// #1625: assemble the SPAWN params for a restart. Tags `layout: same-tab` so
-/// the respawned pane returns to the tab the killed pane occupied (recorded
-/// on its DELETE) instead of opening a fresh tab. `mode` only toggles backend
-/// resume args — placement is identical for resume and fresh restarts — so
-/// the hint is applied unconditionally.
-fn restart_spawn_params(
-    name: &str,
-    backend_command: &str,
-    args: &[String],
-    working_directory: Option<&Path>,
-    env: &std::collections::HashMap<String, String>,
-    mode: &str,
-) -> Value {
-    let mut spawn_params = json!({
-        "name": name,
-        "backend": backend_command,
-        "args": args.join(" "),
-        "working_directory": working_directory.map(|p| p.display().to_string()),
-        "env": serde_json::to_value(env).unwrap_or(serde_json::Value::Null),
-        "layout": "same-tab",
-    });
-    if mode == "resume" {
-        spawn_params["mode"] = json!("resume");
-    } else {
-        // fresh restart only: arm the daemon's first-turn self-kick so the
-        // respawned (context-lost) instance runs its recovery sequence instead of
-        // sitting idle until an operator happens to type (the overnight
-        // restart-strands-the-fleet failure). INDEPENDENT flag — the SPAWN handler
-        // must NOT derive self-kick from SpawnMode::Fresh, which initial fleet
-        // spawns also map to; only THIS restart-fresh path sets it.
-        spawn_params["self_kick_on_ready"] = json!(true);
-    }
-    spawn_params
-}
-
-/// Grace ceiling for [`await_unsent_draft_or_grace`]: even while the operator
-/// keeps typing, force the restart after this long so a context-full / stuck
-/// agent can't be deferred indefinitely. The primary release is the operator
-/// submitting (draft clears well before this); the ceiling only bounds the
-/// pathological continuous-typing case. Tunable.
-const RESTART_DRAFT_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
-/// Re-check cadence while deferring — silent (no per-poll event / nudge).
-const RESTART_DRAFT_POLL: std::time::Duration = std::time::Duration::from_millis(500);
-
-#[derive(Debug, PartialEq, Eq)]
-enum DraftGate {
-    Proceed,
-    Defer,
-}
-
-/// Pure restart-gate decision (unit-tested exhaustively): proceed with the kill
-/// iff `force`, there is no live operator draft, or the grace ceiling has
-/// elapsed; otherwise keep deferring. Kept pure (no clock / no IO) so the whole
-/// decision matrix is deterministic without real sleeps.
-fn restart_draft_gate(
-    force: bool,
-    has_live_draft: bool,
-    elapsed: std::time::Duration,
-    grace: std::time::Duration,
-) -> DraftGate {
-    if force || !has_live_draft || elapsed >= grace {
-        DraftGate::Proceed
-    } else {
-        DraftGate::Defer
-    }
-}
-
-/// Block the restart while the operator has unsent keystrokes in `name`'s input
-/// line, releasing the instant the draft is submitted/cleared or after
-/// [`RESTART_DRAFT_GRACE`]. Emits exactly two log lines (defer-start, proceed) —
-/// no per-poll noise. Thread-safety rationale is at the call site.
-fn await_unsent_draft_or_grace(home: &Path, name: &str, force: bool) {
-    if restart_draft_gate(
-        force,
-        crate::inbox::notify::operator_has_live_draft(home, name),
-        std::time::Duration::ZERO,
-        RESTART_DRAFT_GRACE,
-    ) == DraftGate::Proceed
-    {
-        return; // fast path: force, or no live draft — no wait, no log.
-    }
-    tracing::info!(%name, "restart deferred: operator has an unsent draft in the input line");
-    let start = std::time::Instant::now();
-    while restart_draft_gate(
-        force,
-        crate::inbox::notify::operator_has_live_draft(home, name),
-        start.elapsed(),
-        RESTART_DRAFT_GRACE,
-    ) == DraftGate::Defer
-    {
-        std::thread::sleep(RESTART_DRAFT_POLL);
-    }
-    tracing::info!(
-        %name,
-        elapsed_ms = start.elapsed().as_millis() as u64,
-        "restart proceeding: draft submitted/cleared or grace ceiling reached"
-    );
 }
 
 pub(super) fn handle_restart_instance(home: &Path, args: &Value) -> Value {
@@ -567,11 +331,16 @@ pub(super) fn handle_restart_instance_with_runtime(
         Err(e) => return e,
     };
     crate::validate_name_or_err!(name);
-    // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal
-    // self-orch once-off latch, so a fresh terminal death after this restart re-pages.
-    crate::daemon::escalation_persist::clear_failed_escalated(home, name);
     let reason = args["reason"].as_str().unwrap_or("manual restart");
     let mode = args["mode"].as_str().unwrap_or("resume");
+    let restart_id = args["restart_id"]
+        .as_str()
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .unwrap_or_else(|| crate::types::InstanceId::new().full());
+    let requested_old_instance_ref = args
+        .get("old_instance_ref")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
 
     // #2476: a `fresh` restart DROPS the agent's in-memory context (that is its
     // value — it releases a stale prompt cache while a dev idles waiting on
@@ -584,7 +353,7 @@ pub(super) fn handle_restart_instance_with_runtime(
         if let Some(wt) = crate::binding::read(home, name)
             .and_then(|b| b["worktree"].as_str().map(std::path::PathBuf::from))
         {
-            if wt.exists() && crate::worktree::has_uncommitted_changes(&wt) {
+            if wt.exists() && crate::worktree_pool::worktree_has_work_at_risk(&wt) {
                 return json!({
                     "error": "refusing fresh restart: bound worktree has uncommitted changes \
                               that a context drop would strand. Commit/push (or leave a task-board \
@@ -602,20 +371,120 @@ pub(super) fn handle_restart_instance_with_runtime(
         Ok(c) => c,
         Err(e) => return json!({"error": format!("fleet.yaml: {e}")}),
     };
-    let resolved = match config.resolve_instance(name) {
-        Some(r) => r,
-        None => return json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
+    let resolved = match config.resolve_instance_checked(name) {
+        Ok(Some(resolved)) => resolved,
+        Ok(None) => return json!({"error": format!("Instance '{name}' not in fleet.yaml")}),
+        Err(error) => {
+            return json!({
+                "error": error.to_string(),
+                "code": "env_source_missing",
+                "instance": error.instance,
+                "destination": error.destination,
+                "source": error.source,
+            })
+        }
     };
+
+    // #3414 PREFLIGHT — must stay HERE: after `resolve_instance` (it needs the
+    // DECLARED backend + stored args) and before EVERY destructive step below
+    // (draft wait, inbox requeue, DELETE, SPAWN, self-kick arming). Fixing this
+    // at `restart_spawn_params` is too late: by then the instance is gone.
+    //
+    // `mode=fresh` is a statement about the SESSION, not merely about the
+    // preset. `SpawnMode` only selects `Backend::preset_spawn_args`, so a
+    // session pin living in the CALLER args (the observed `--resume <uuid>`)
+    // was never inspected and survived every fresh restart.
+    //
+    // Grammar comes from `resolved.backend` — the DECLARED identity — never
+    // from `backend_command`, whose basename misclassifies wrappers (#2744).
+    // Unresolvable grammar fails closed: guessing would either strand the
+    // operator on the old session or silently drop a real value, and the live
+    // instance is still running at this point.
+    let sanitized_args = if mode == "resume" {
+        resolved.args.clone()
+    } else {
+        match crate::backend_session::sanitize_for_fresh(&resolved.backend, &resolved.args) {
+            Ok(args) => args,
+            Err(error) => {
+                return json!({
+                    "error": format!(
+                        "refusing fresh restart: {error}. Fix the instance's stored args \
+                         (or restart with mode=resume) — the running instance was left untouched."
+                    ),
+                    "name": name,
+                    "code": "fresh_session_args_invalid",
+                    "backend": error.backend,
+                    "token": error.token,
+                    "reason": error.reason.as_str(),
+                });
+            }
+        }
+    };
+
+    // #3538: resume-availability gate — must stay HERE: after `resolve_instance`
+    // (it needs the DECLARED backend) and before EVERY destructive or mutating
+    // step below. Body lives in `restart_prep` (same 750-LOC split as #3414).
+    let codex_thread =
+        match restart_prep::resume_availability_gate(home, name, reason, mode, &resolved.backend) {
+            restart_prep::ResumeGate::Proceed { codex_thread } => codex_thread,
+            restart_prep::ResumeGate::Refused { response } => return response,
+        };
+
+    // Correlation is authoritative only when the daemon can snapshot the live
+    // predecessor. A caller-supplied ref is accepted only for legacy/no-runtime
+    // paths; an in-process runtime with no registry identity must fail closed.
+    let old_instance_ref = if let Some(runtime) = runtime {
+        match crate::agent::instance_ref_for_name(&runtime.registry, home, name) {
+            Some(instance_ref) => Some(instance_ref),
+            None => {
+                if requested_old_instance_ref.is_some() {
+                    return json!({
+                        "error": format!("runtime registry has no live identity for '{name}'"),
+                        "code": "restart_identity_unavailable",
+                        "name": name,
+                        "restart_id": restart_id,
+                    });
+                }
+                None
+            }
+        }
+    } else {
+        requested_old_instance_ref
+    };
+    let _restart_admission = match restart_prep::try_admit_restart(home, name, &restart_id) {
+        Ok(admission) => admission,
+        Err(error) => {
+            return json!({
+                "error": error,
+                "code": "restart_in_progress",
+                "name": name,
+                "restart_id": restart_id,
+            })
+        }
+    };
+
+    // #1744-PR-B (latch-scope): operator-initiated recovery resets the terminal
+    // self-orch once-off latch, so a fresh terminal death after this restart re-pages.
+    // Keep this AFTER typed session preflight: a refused fresh restart must not
+    // mutate persisted escalation state or any other runtime state.
+    crate::daemon::escalation_persist::clear_failed_escalated(home, name);
 
     // t-95913-5: the operator's unsent keystrokes live ONLY in the input line of
     // the process we're about to kill — a fresh OR resume restart destroys them
     // (`--continue` restores the conversation, not the input line). If the pane
     // has a live draft, defer the kill until the operator submits (draft clears)
     // or a grace ceiling elapses (so continuous typing can't defer forever).
-    // Mode-agnostic; `force:true` bypasses. Safe to block here: each api tool call
+    // Mode-agnostic; explicit restart callers bypass with the dedicated marker,
+    // while `force:true` retains its existing worktree-protection meaning and
+    // also bypasses this gate. Safe to block here: each api tool call
     // runs on its own `api_handler` thread (`api::serve` per-session spawn), and
     // the operator's submit arrives via the TUI write path, not this thread.
-    await_unsent_draft_or_grace(home, name, args["force"].as_bool().unwrap_or(false));
+    let skip_unsent_draft_gate = args["skip_unsent_draft_gate"].as_bool().unwrap_or(false);
+    await_unsent_draft_or_grace(
+        home,
+        name,
+        skip_unsent_draft_gate || args["force"].as_bool().unwrap_or(false),
+    );
 
     // Session-reset inbox handoff: for a FRESH restart (context-lost), requeue
     // all unconfirmed DELIVERING rows before killing the old instance. The
@@ -625,25 +494,78 @@ pub(super) fn handle_restart_instance_with_runtime(
     // silently lose an unconfirmed message; #3228 intentionally chooses
     // visible redelivery and recovery. Resume restarts preserve context → the
     // implicit next-drain ack (A) handles it.
-    if mode != "resume" {
-        crate::inbox::requeue_delivering_for_session_reset(home, name);
-    }
-
     let delete_context = runtime.map(|runtime| crate::agent_ops::DeleteContext {
         registry: &runtime.registry,
         configs: &runtime.configs,
         externals: &runtime.externals,
         notifier: runtime.notifier.as_ref(),
     });
-    lifecycle::delete_with_runtime_or_legacy(home, name, delete_context.as_ref(), true);
+
+    // #3414: the runtime DELETE goes through `delete_instance_under_guard`,
+    // whose contract is that the CALLER already owns the `DeleteFence`. Restart
+    // owned none, so neither the deleting mark that makes a concurrent
+    // `dispatch_transport` refuse a job aimed at the dying session nor the
+    // transport delivery cleanup that fence fronts ever ran. The legacy API
+    // DELETE builds its own fence inside the daemon
+    // (`agent_ops::delete_instance_with_exit_status`) and the transport lane is a
+    // non-reentrant mutex, so nesting a second fence around that call would block
+    // the serving thread on this lane while we block on its response: the fence is
+    // scoped to exactly the path that lacks one. It opens after the draft gate so
+    // a long grace never marks a still-live instance.
+    let fence = delete_context
+        .is_some()
+        .then(|| crate::daemon::lifecycle::DeleteFence::new(home, name, true));
+
+    if mode != "resume" {
+        crate::inbox::requeue_delivering_for_session_reset(home, name);
+    }
+
+    // Restart intentionally uses no-wait deletion: admission of the kill signal,
+    // followed by the replacement spawn, is this path's existing contract.
+    let torn_down = lifecycle::delete_with_runtime_or_legacy_for_restart(
+        home,
+        name,
+        delete_context.as_ref(),
+        true,
+        Some(&restart_id),
+    );
+    // A fresh restart destroys the session, so every transport receipt keyed
+    // to it is unresolvable — the consumer that owed the acknowledgement no
+    // longer exists. Left behind, the self-kick watchdog escalates it to every
+    // channel as an unacknowledged delivery on an instance the operator
+    // deliberately restarted. A resume restores the SAME session, so its
+    // receipts stay resolvable and are preserved. Only under the fence:
+    // `remove_instance_delivery_state` requires the cleanup guard so no
+    // in-flight transport job can recreate the files behind it. Only after a
+    // CONFIRMED teardown: `remove_instance_delivery_state` is an audited
+    // policy discharge legitimate solely because no recipient survives to be
+    // owed anything, so it must not run ahead of that outcome. Restart's
+    // `skip_exit_wait=true` above makes the teardown call always report `Ok`
+    // today (the refusal branch inside it is unreachable while that argument
+    // stays `true`), but gating on the result here keeps the invariant local
+    // instead of depending on that argument never changing.
+    if mode != "resume" && fence.is_some() && torn_down.is_ok() {
+        if let Err(error) = crate::transport::remove_instance_delivery_state(home, name) {
+            tracing::warn!(
+                agent = %name,
+                error = %error,
+                "restart: transport delivery cleanup failed"
+            );
+        }
+    }
+    // SPAWN refuses a name that is mid-delete (`agent::spawn_agent`), so the fence
+    // must close before the replacement spawn.
+    drop(fence);
 
     let spawn_params = restart_spawn_params(
         name,
         &resolved.backend_command,
-        &resolved.args,
+        &sanitized_args,
         resolved.working_directory.as_deref(),
         &resolved.env,
         mode,
+        &restart_id,
+        old_instance_ref,
     );
 
     let spawn_request = json!({
@@ -657,63 +579,49 @@ pub(super) fn handle_restart_instance_with_runtime(
         .map(|r| r["ok"].as_bool() == Some(true))
         .unwrap_or(false);
 
-    tracing::info!(%name, %reason, %mode, %spawned, "restart_instance");
-    json!({"name": name, "reason": reason, "mode": mode, "spawned": spawned})
-}
-
-/// #t-777-3: daemon-autonomic self-heal entry — the respawn-stuck watchdog's
-/// narrow path to a **Fresh** restart. Wraps `handle_restart_instance(mode=fresh)`,
-/// which round-trips the PROVEN direct `DELETE`(no_wait)+`SPAWN` api::calls →
-/// `ApiEvent::InstanceCreated` → app pane Fresh respawn (the same path the
-/// operator's manual `restart_instance fresh` takes, working in the live
-/// app-mode daemon where the crash_tx→respawn machinery is inert).
-///
-/// **Gate-exempt BY CONSTRUCTION** (no new operator-gate surface): the inner
-/// `DELETE`/`SPAWN` are DIRECT api methods — operator-transport, which
-/// `operator_gate::check_operation_allowed` returns `Ok` for before `classify`
-/// is consulted. Reached ONLY from the per-tick hang-detection watchdog (never
-/// agent-invocable), so the narrowness is enforced by the trigger, exactly like
-/// crash-respawn / hang-recovery (`operator_gate` module scope note). Returns
-/// whether the SPAWN succeeded so the caller can escalate a failed recovery.
-pub(crate) fn restart_instance_autonomic(home: &Path, name: &str, reason: &str) -> bool {
-    let result = handle_restart_instance(
-        home,
-        &json!({"name": name, "mode": "fresh", "reason": reason}),
-    );
-    result
-        .get("spawned")
-        .and_then(serde_json::Value::as_bool)
-        .unwrap_or(false)
-}
-
-pub(super) fn resolve_team_layout(
-    home: &Path,
-    name: &str,
-    layout_arg: Option<&serde_json::Value>,
-    target_pane_arg: Option<&serde_json::Value>,
-) -> (&'static str, Option<String>) {
-    let caller_set_layout = layout_arg.and_then(|v| v.as_str()).is_some();
-    let caller_set_target = target_pane_arg
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .is_some();
-    if !caller_set_layout && !caller_set_target {
-        if let Some(team) = crate::teams::find_team_for(home, name) {
-            let anchor = team.orchestrator.or_else(|| team.members.first().cloned());
-            return ("split-right", anchor);
+    if !spawned {
+        let error = spawn_result
+            .as_ref()
+            .ok()
+            .and_then(|result| result["error"].as_str())
+            .map(str::to_string)
+            .or_else(|| spawn_result.as_ref().err().map(ToString::to_string))
+            .unwrap_or_else(|| "restart spawn failed".to_string());
+        if let Some(runtime) = runtime {
+            if let Some(notifier) = runtime.notifier.as_ref() {
+                notifier.notify(crate::api::ApiEvent::InstanceRestartFailed {
+                    name: name.to_string(),
+                    restart_id: restart_id.clone(),
+                    old_instance_ref,
+                    error,
+                });
+            }
         }
     }
-    let layout = layout_arg.and_then(|v| v.as_str()).unwrap_or("tab");
-    let target = target_pane_arg
-        .and_then(|v| v.as_str())
-        .filter(|s| !s.is_empty())
-        .map(String::from);
-    let layout = match layout {
-        "split-right" => "split-right",
-        "split-below" => "split-below",
-        _ => "tab",
-    };
-    (layout, target)
+
+    // Restart/TUI 交接確認見 restart_prep::settle_tui_handoff。
+    let (tui_handoff, handoff_warning) = restart_prep::settle_tui_handoff(home, name, spawned);
+
+    tracing::info!(%name, %reason, %mode, %spawned, tui_handoff, "restart_instance");
+    let successor_instance_ref = runtime
+        .and_then(|runtime| crate::agent::instance_ref_for_name(&runtime.registry, home, name));
+    let mut resp = json!({"name": name, "reason": reason, "mode": mode, "spawned": spawned, "tui_handoff": tui_handoff, "restart_id": restart_id, "old_instance_ref": old_instance_ref, "successor_instance_ref": successor_instance_ref});
+    if !spawned {
+        resp["error"] = spawn_result
+            .as_ref()
+            .ok()
+            .and_then(|result| result.get("error"))
+            .cloned()
+            .unwrap_or_else(|| json!("restart spawn failed"));
+    }
+    if let Some(warning) = handoff_warning {
+        resp["tui_handoff_warning"] = json!(warning);
+    }
+    // #3538: exact-thread resume signal (boolean only — never leaks the id).
+    if codex_thread {
+        resp["resumed_thread"] = json!(true);
+    }
+    resp
 }
 
 #[cfg(test)]

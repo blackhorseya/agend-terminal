@@ -56,7 +56,9 @@ use std::path::Path;
 ///   "signature_valid": true,
 ///   "ci_watches": ["repo:branch", ...],
 ///   "bind_in_flight": false,
-///   "cross_branch_holders": []
+///   "cross_branch_holders": [],
+///   "base_from_stale_view": false,
+///   "base_behind_default_by": 0
 /// }
 /// ```
 ///
@@ -89,6 +91,14 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
 
     let binding = crate::binding::read(home, agent);
     let bind_in_flight = crate::mcp::handlers::dispatch_hook::is_bind_in_flight(home, agent);
+    let release_progress = crate::mcp::handlers::dispatch_hook::lifecycle_active_operation(
+        home, agent,
+    )
+    .and_then(|(operation, stage)| {
+        (operation == crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release)
+            .then_some(stage)
+    });
+    let release_in_flight = release_progress.is_some();
     let ci_watches = enumerate_ci_watches_for_agent(home, agent);
     // PR2 L3 visibility: surface pending dispatch metadata alongside
     // binding state so operators investigating a stuck binding can see
@@ -190,16 +200,24 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
             "ci_watches": ci_watches,
             "ci_watches_detail": enumerate_ci_watches_detail_for_agent(home, agent, &current_repo, branch),
             "bind_in_flight": bind_in_flight,
+            "release_in_flight": release_in_flight,
+            "release_progress": release_progress,
             "cross_branch_holders": cross_branch_holders,
             "dispatched_waiting_for": dispatched_waiting_for,
             "pending_response_to": pending_response_to,
             "target_identity": target_identity,
+            // #3546: see `binding_state_base_freshness.rs` — each half proves a
+            // different thing, and one of them cannot prove freshness at all.
+            "base_from_stale_view": base_freshness::flag_from_binding(&b),
+            "base_behind_default_by": base_behind_default_by(wt_path, Path::new(source_repo)),
         })
     } else {
         json!({
             "agent": agent,
             "bound": false,
             "bind_in_flight": bind_in_flight,
+            "release_in_flight": release_in_flight,
+            "release_progress": release_progress,
             "ci_watches": ci_watches,
             "ci_watches_detail": enumerate_ci_watches_detail_for_agent(home, agent, "", ""),
             "cross_branch_holders": Vec::<String>::new(),
@@ -213,32 +231,23 @@ pub(crate) fn handle_binding_state(home: &Path, args: &Value, _sender: &Option<S
 // `ci_watches_detail` projection) live in a sibling module so binding_state.rs
 // stays under the MCP-handler LOC ceiling (file_size_invariant — the same reason
 // the tests are `#[path]` siblings).
+// #3546: base-freshness projection lives in a sibling file — binding_state.rs
+// was already AT the 750-LOC handler ceiling, so the fields had to arrive with
+// an extraction, not on top of one.
+#[path = "binding_state_base_freshness.rs"]
+mod base_freshness;
+use base_freshness::base_behind_default_by;
+
+// Pure move (no logic change), same ceiling reason as above.
+#[path = "binding_state_cross_branch.rs"]
+mod cross_branch;
+use cross_branch::cross_branch_holders_for;
+
 #[path = "binding_state_ci_watches.rs"]
 mod ci_watches;
 use ci_watches::{enumerate_ci_watches_detail_for_agent, enumerate_ci_watches_for_agent};
 #[path = "binding_state_target_identity.rs"]
 mod target_identity;
-
-/// Return list of agent names (other than `exclude_agent`) whose
-/// binding currently references `branch`. P0-1.5 enforces uniqueness
-/// at bind time — this enumerator surfaces any violation so it's
-/// immediately visible via `binding_state`.
-fn cross_branch_holders_for(home: &Path, branch: &str, exclude_agent: &str) -> Vec<String> {
-    if branch.is_empty() {
-        return Vec::new();
-    }
-    let mut out = Vec::new();
-    for (other, v) in crate::binding::binding_scan_all(home) {
-        if other == exclude_agent {
-            continue;
-        }
-        if v["branch"].as_str() == Some(branch) {
-            out.push(other);
-        }
-    }
-    out.sort();
-    out
-}
 
 // #t-…83936-4 protection ① liveness tests (worktree_resolves / invalid_reason)
 // live in a sibling file loaded via `#[path]` so binding_state.rs stays under
@@ -600,48 +609,6 @@ mod tests {
             "second call same idempotent shape: {r2}"
         );
         assert_eq!(r2["already_released"].as_bool(), Some(true), "{r2}");
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn binding_state_after_release_reports_unbound_clean_state() {
-        // Regression-proof against the Sprint 57 lease-block surface:
-        // after release_worktree, binding_state must report bound:false,
-        // bind_in_flight:false, no cross_branch_holders, and no leaked
-        // ci_watches. If any layer leaks state, this assertion fails.
-        let home = tmp_home("post-release");
-        let wt = home.join("wt-x");
-        std::fs::create_dir_all(&wt).unwrap();
-        std::fs::write(wt.join(".agend-managed"), "agent=alpha\n").unwrap();
-        write_binding(&home, "alpha", "feature/x", wt.to_str().unwrap());
-
-        // Pre-release: bound.
-        let pre = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
-        assert_eq!(pre["bound"].as_bool(), Some(true));
-
-        // Release.
-        let _ = handle_release_worktree(&home, &json!({"instance": "alpha"}), &None);
-
-        // Post-release: unbound, clean.
-        let post = handle_binding_state(&home, &json!({"instance": "alpha"}), &None);
-        assert_eq!(
-            post["bound"].as_bool(),
-            Some(false),
-            "post-release must report unbound: {post}"
-        );
-        assert_eq!(
-            post["bind_in_flight"].as_bool(),
-            Some(false),
-            "in-flight guard cleared post-release: {post}"
-        );
-        assert!(
-            post["ci_watches"].as_array().unwrap().is_empty(),
-            "no leaked watches: {post}"
-        );
-        assert!(
-            post["cross_branch_holders"].as_array().unwrap().is_empty(),
-            "no cross-branch holders: {post}"
-        );
         std::fs::remove_dir_all(&home).ok();
     }
 

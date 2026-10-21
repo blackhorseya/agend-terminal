@@ -2,7 +2,7 @@
 //!
 //! Mirrors `legacy_outbound_path_audit.rs` (Sprint 22 P0) and
 //! `spawn_rationale_audit.rs` (Sprint 21 Phase 5) — same anti-growth
-//! contract: only `src/task_events.rs` may reference `task_events.jsonl`
+//! contract: only the `src/task_events` module may reference `task_events.jsonl`
 //! or the `"task_events"` log-name string. Every other production caller
 //! MUST go through `task_events::append` / `task_events::append_batch`.
 //!
@@ -69,6 +69,8 @@ fn is_test_only_file(path: &Path) -> bool {
     };
     let filename = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
     let path_needle = format!("\"{filename}\"");
+    let module_name = filename.strip_suffix(".rs").unwrap_or(filename);
+    let module_needle = format!("mod {module_name};");
     let Ok(siblings) = std::fs::read_dir(parent) else {
         return false;
     };
@@ -83,7 +85,10 @@ fn is_test_only_file(path: &Path) -> bool {
         let lines: Vec<&str> = content.lines().collect();
         for (idx, line) in lines.iter().enumerate() {
             let trimmed = line.trim();
-            if !(trimmed.starts_with("#[path") && trimmed.contains(&path_needle)) {
+            let is_path_declaration =
+                trimmed.starts_with("#[path") && trimmed.contains(&path_needle);
+            let is_module_declaration = trimmed == module_needle;
+            if !is_path_declaration && !is_module_declaration {
                 continue;
             }
             let mut cursor = idx;
@@ -126,8 +131,8 @@ fn task_events_jsonl_only_referenced_by_task_events_module() {
 
     for path in rust_files_in_src() {
         let rel_path = rel(&path, &src_root);
-        // task_events.rs is the canonical producer.
-        if rel_path.ends_with("task_events.rs") {
+        // task_events.rs and its child modules are the canonical producer.
+        if rel_path == "task_events.rs" || rel_path.starts_with("task_events/") {
             continue;
         }
         if EXEMPTED_CALLERS.iter().any(|s| rel_path.ends_with(s)) {
@@ -139,9 +144,9 @@ fn task_events_jsonl_only_referenced_by_task_events_module() {
         let Ok(content) = std::fs::read_to_string(&path) else {
             continue;
         };
-        // Cut at first `#[cfg(test)]` so test fixtures aren't checked
-        // (they may emit hand-crafted envelopes for fail-closed asserts).
-        let cutoff = content.find("#[cfg(test)]").unwrap_or(content.len());
+        // Cut at the file's test module so earlier test-only items do not hide
+        // production code that follows them.
+        let cutoff = content.rfind("\nmod tests {").unwrap_or(content.len());
         let prod = &content[..cutoff];
         for (i, line) in prod.lines().enumerate() {
             let trim = line.trim_start();
@@ -161,8 +166,94 @@ fn task_events_jsonl_only_referenced_by_task_events_module() {
 
     assert!(
         violations.is_empty(),
-        "Sprint 24 P0 PR1 anti-bypass invariant — {} site(s) reference `task_events.jsonl` or the `\"task_events\"` log-name constant outside `src/task_events.rs`.\n\nFix: route all task-event mutations through `task_events::append` or `task_events::append_batch`. Direct file access defeats the seq-monotonicity guarantee + replay determinism contract.\n\nDo NOT add to `EXEMPTED_CALLERS` without explicit dispatch scope (the list is meant to shrink, not grow).\n\nViolations:\n{}",
+        "Sprint 24 P0 PR1 anti-bypass invariant — {} site(s) reference `task_events.jsonl` or the `\"task_events\"` log-name constant outside the `src/task_events` module.\n\nFix: route all task-event mutations through `task_events::append` or `task_events::append_batch`. Direct file access defeats the seq-monotonicity guarantee + replay determinism contract.\n\nDo NOT add to `EXEMPTED_CALLERS` without explicit dispatch scope (the list is meant to shrink, not grow).\n\nViolations:\n{}",
         violations.len(),
         violations.join("\n")
+    );
+}
+
+#[test]
+fn task_event_appends_have_one_catalog_commit_path() {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let facade =
+        std::fs::read_to_string(root.join("src/task_events.rs")).expect("read task-events facade");
+    let catalog = std::fs::read_to_string(root.join("src/task_events/catalog.rs"))
+        .expect("read task catalog");
+    let needle = "crate::event_log::append_lines_under_lock";
+
+    assert_eq!(
+        catalog.matches("pub(crate) fn commit_at").count(),
+        1,
+        "catalog::commit_at must remain the single task-event commit primitive"
+    );
+    assert_eq!(
+        facade.matches(needle).count(),
+        0,
+        "task_events.rs must not write the task-event log directly"
+    );
+    assert_eq!(
+        catalog.matches(needle).count(),
+        1,
+        "catalog may lock the task-event log only for its compaction rewrite"
+    );
+}
+
+#[test]
+fn task_authority_has_no_legacy_replay_or_index_path() {
+    let src_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+    let forbidden = [
+        "task_events::replay(",
+        "task_events::replay_at(",
+        "task_events::replay_strict_at(",
+        "task_events::replay_uncached(",
+        "task_events::replay_strict_scan(",
+        "task_index.jsonl",
+        "REPLAY_GENERATION",
+    ];
+    let mut violations = Vec::new();
+
+    for path in rust_files_in_src() {
+        if is_test_only_file(&path) {
+            continue;
+        }
+        let rel_path = rel(&path, &src_root);
+        let Ok(content) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let cutoff = content.rfind("\nmod tests {").unwrap_or(content.len());
+        for (line_no, line) in content[..cutoff].lines().enumerate() {
+            if line.trim_start().starts_with("//") {
+                continue;
+            }
+            for needle in forbidden {
+                if line.contains(needle) {
+                    violations.push(format!("{rel_path}:{} contains {needle}", line_no + 1));
+                }
+            }
+        }
+    }
+
+    assert!(
+        violations.is_empty(),
+        "task catalog cutover regressed:\n{}",
+        violations.join("\n")
+    );
+
+    let task_events =
+        std::fs::read_to_string(src_root.join("task_events.rs")).expect("read task-events facade");
+    let tasks = std::fs::read_to_string(src_root.join("tasks/mod.rs")).expect("read task facade");
+    let router = std::fs::read_to_string(src_root.join("tasks/board_router.rs"))
+        .expect("read task board router");
+    assert!(
+        task_events.contains("catalog::for_home(&home)"),
+        "compatibility-shaped task state must resolve through the catalog"
+    );
+    assert!(
+        tasks.contains("crate::task_events::projected_state_at(board)"),
+        "task list facade must resolve through the catalog view"
+    );
+    assert!(
+        router.contains("crate::task_events::catalog::for_home(home)"),
+        "task routing and strict listing must resolve through the catalog"
     );
 }

@@ -8,14 +8,16 @@ pub mod panels;
 pub mod panels_fleet;
 pub mod resize;
 pub mod scratch;
+mod team_render;
 
+#[allow(unused_imports)]
 pub use core_render::{
     active_tab_has_pending_output, drain_all_panes, drain_all_panes_until, render,
-    render_boot_indicator,
+    render_boot_indicator, render_with_team,
 };
 pub use overlay::{
     render_command_palette, render_confirm, render_help, render_menu, render_move_pane_target,
-    render_rename, render_scroll_indicator, render_tab_list,
+    render_notice, render_organizer, render_rename, render_scroll_indicator, render_tab_list,
 };
 pub use panels::{
     board_column_for_status, render_decisions, render_tasks, selectable_len, task_board_columns,

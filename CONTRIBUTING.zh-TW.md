@@ -9,12 +9,27 @@
 ```bash
 cargo build                          # debug build
 cargo build --release                # release (strip + LTO, matches CI)
-cargo test                           # unit + integration + MCP round-trip
-cargo test --bin agend-terminal      # unit tests only
-cargo test --test integration        # integration tests (Unix-only for now)
-scripts/fmt-owned.sh --check         # 唯一的 owned-source fmt surface（排除 vendor/）；不帶參數即直接格式化
+cargo nextest run --features tray    # 唯一的本地測試 gate：unit tests + 每一個 tests/*.rs invariant——與 CI 相同的 runner 與選取範圍
+cargo nextest run --features tray <filter>   # 同一個 gate 加過濾；仍會編譯每一個 tests/ target
+cargo test --tests --features tray   # 沒有 nextest 時的同選取範圍替代；同一個 binary 的測試會共用一個 process、可能互相干擾——CI 從不跑這種形式
+cargo test                           # unit + integration + MCP round-trip（+ doc-tests，預設 features）
+cargo test --test integration        # 只有一個 integration target（tests/integration.rs；目前僅 Unix）
+scripts/fmt-owned.sh --check         # 唯一的 owned-source fmt surface（含未追蹤且未忽略的 *.rs；排除 vendor/）；不帶參數即直接格式化
 cargo clippy -- -D warnings          # 快速檢查；scripts/preflight.sh 會跑 CI 完整的 owned-target 集合
 ```
+
+**`cargo test --bin agend-terminal` 不是 gate——絕不要用它回報「tests green」。** `--bin` 只編譯 binary 自己的 `#[cfg(test)]` 模組，永遠不會建置 `tests/` 底下的 target，而所有跨切面 invariant 都放在那裡（temp-fixture prefix 隔離、env 變更序列化、`task_events` scope、檔案大小上限、spawn rationale、文件雙語）。因此 `--bin` 綠燈對 CI 檢查的內容毫無說明力：曾有兩個互不相關的 PR 在同一晚都紅在 `temp_fixture_shapes_do_not_prefix_overlap`，其中一個還是在四次以該指令為據的「全綠」回報之後。迭代時用 `cargo nextest run --features tray <filter>`（任何過濾都可以，`tests/` 仍會編譯），宣稱綠燈前先跑 `scripts/preflight.sh --quick`。在 daemon 管理的 agent shell 裡請先 `export AGENTIC_GIT_HOME="$AGEND_HOME"`（preflight 會自己做）：否則把 `AGEND_HOME` 限定到暫存目錄再 spawn `git` 的測試會撞上 agentic-git shim 的遞迴防護——約 40 個必定失敗的測試，而 CI（PATH 上沒有 shim）永遠看不到。
+
+### agent worktree 內哪些本地結果可以信
+
+在 daemon 管理的 agent shell 裡（git shim 在 PATH 最前、`AGEND_INSTANCE_NAME` 已設）跑 `cargo nextest run --features tray`——或包著它的 `scripts/preflight.sh --quick`——會得到四種結果：
+
+- **直接可信。** 下面沒點名的全部：每一個 `tests/*.rs` invariant（文件雙語、temp-fixture 隔離、spawn rationale、檔案大小上限、env 普查）、真 git 模組（`worktree*`、`branch_sweep`、`cleanup_intents`、`dispatch_hook`、`ci`），以及過去必定失敗的三個叢集（`instructions::tests`、`usage_limit_takeover_tests`、`agent_resolve::tests`）——前提是 `AGENTIC_GIT_HOME` 已釘住：帶有 spawn 時注入的 daemon、或 `scripts/preflight.sh`、或上面那一行 export。沒釘住時，那些叢集的紅既不是證據、也不能拿來駁回——真正的回歸在那裡跟 shim 遞迴（#1504）長得一模一樣。先釘住再跑一次；仍然紅，才是你的問題。
+- **單跑一次確認後才可信。** 有固定 5 秒 sentinel 預算的真實行程 spawn 測試——`api::handlers::instance::tests::{handle_spawn_*, set_model_*}`、`transport::{codex_app_server, opencode_server}` 的 socket 探針、以及 `attached_path_mcp_invariants::bridge_tools_list_no_silent_empty_when_daemon_unreachable`。在這台共用主機上以 16 路平行整套跑時，它們會差幾百毫秒超過預算（一個下午兩次各紅 8 個，5.2–5.6 秒），單跑則不到一秒就過；活的 daemon 不是變因。這裡的紅只有在 `cargo nextest run --features tray -E 'test(<name>)'` 單跑再次失敗時才算證據。其中恰好三條——`transport::codex_app_server::tests::{codex_app_server_output_does_not_escape_to_parent_terminal, managed_app_server_launch_carries_config_before_subcommand_3402}` 與 `transport::opencode_server::teardown_tests::managed_teardown_kills_isolated_term_ignoring_server`——還多一個條件：不能是在同一個 worktree 裡一次被取消或 fail-fast 中止的 nextest run 之後立刻跑（`scripts/preflight.sh` 的 nextest 步驟是 fail-fast——它沒帶 `--no-fail-fast`——腳本本身則會把其餘步驟跑完、最後才以 1 結束；別的 worktree 的中止在實測中沒有影響到我們，但那是各自有獨立 target 目錄的情況——你的 target 目錄若是共用的，見下面的孤兒檢查）。中止會把 daemon 開機測試的 `agend-terminal start --foreground` 行程遺留成孤兒，孤兒還年輕時這三條單跑在任何負載下都會紅，之後自行恢復：唯一乾淨的一輪實測 ≤ 8 分鐘（479 秒），但取樣間隔退化到 8–13 分鐘，所以這個上界誠實但寬鬆；殺掉孤兒會立刻恢復。只是觀察、尚未解釋：超過約 25 分鐘的孤兒就不再擋。計入這類紅之前，先在你的 worktree 根目錄用 `pgrep -fl "${CARGO_TARGET_DIR:-$PWD/target}/debug/agend-terminal start --foreground"` 找孤兒——測試 daemon 跑的是 cargo 為那棵樹建出的 debug binary，而那個位置只有在沒有東西改道時才等於 `$PWD/target`（`CARGO_TARGET_DIR`，或 `.cargo/config.toml` 裡的 `build.target-dir`）。上面的展開**只**涵蓋 `CARGO_TARGET_DIR` 這種改道——`.cargo/config.toml` 裡的 `build.target-dir` 是 shell 展開看不到的，你的建置目錄若是那樣搬的，請自行把路徑代進去。任何一種改道沒處理到，這個樣式就什麼都比不中，每次都回答「沒有孤兒」，等於對**恰好設了改道的那些人**整條檢查失效。擋住活的 daemon（`target/release` 的 binary）的是 `debug` 這一半，所以不管你的 target 目錄在哪，那層保護都成立。worktree 範圍這一半則不然：target 目錄若是多個 worktree 共用的，清單裡也會有別的 worktree 的孤兒，這條指令就無法再告訴你哪些是你的。對孤兒而言誤差方向保守——你可能為了不是你的孤兒多等一輪、或把它殺掉，兩者都安全，因為 PPID 為 1 的 `--foreground` 行程本來就已經是被遺留的。但 PPID **不是** 1 的命中根本不是孤兒：target 目錄共用時，那是別的 worktree 正在跑測試的 daemon，殺掉它等於把這一節要防的假紅親手交給對方。PPID 為 1 的命中就是孤兒；`ps -o pid,ppid,lstart,command -p <pid>` 同時顯示這一點和它的年齡。路徑不能省：不帶路徑的 `pgrep -f 'agend-terminal start --foreground'` 只在 daemon 的後代 shell 裡看不到活的 daemon（`pgrep` 預設排除自己的祖先），換到任何別的 shell——operator 自己的終端機、daemon 重啟前留下的 session——它就會列出來，這時照「殺掉」做等於把全隊 daemon 殺掉。沒有孤兒卻仍然紅的，**不在**這條免責範圍內（opencode teardown 這條在另一種主機狀態下就這樣紅過，那是真的紅，t-…-108）。中止之後，只有在那條帶路徑的 `pgrep` 顯示沒有孤兒時，第一次單跑才算證據；還有孤兒就只殺它列出的那些 **PPID 為 1 的** PID、或等待，再跑一次。
+- **只在 CI 有意義。** `worktree_cleanup::windows_cleanup_diagnostics_tests::real_sweep_remove_failure_preserves_final_status_and_stderr_2830_red` 會把自己的 stub 目錄接到 PATH 最前，在任何 agent shell 裡都會於 `fetch --prune` 觸發 shim 的遞迴防護；它在本地變紅不帶任何資訊。
+- **永遠不是證據。** `cargo test --bin agend-terminal <filter>`（永遠不會建置 `tests/`，對任何住在那裡的 filter 都印出 `ok` 但零測試）；任何在 binary 的 unit tests 裡就停下來的 fail-fast run——preflight 的 nextest 步驟是 fail-fast（沒帶 `--no-fail-fast`），而純 `cargo test --tests` 是一個 binary 接一個跑、遇到第一個紅的就停——因為停下時尚未排程的 `tests/*.rs` target 就再也不會跑，而 bin target 一早就紅在 shim 上時那就是全部，它們守的每一條 invariant 都沒被檢查（shim 狀況存在時這是結構上必然，不是風險：#3531 上 runner 停在 bin target 的 shim 紅，`tests/file_size_invariant.rs` 從未執行，一條真的 LOC 超標兩輪後才被 CI 抓到）；以及在高負載主機上整套跑 `cargo test --tests`（每個 binary 一個 process、執行緒平行：本機 7367 個 unit tests 紅了 657 個，抽樣單跑全過）。
+
+回報用語：「tests green」指的是在 bound worktree 裡 `scripts/preflight.sh --quick` 以 0 結束，或它的 nextest 步驟只有「單跑確認」那一類失敗且每一個單跑都通過——要點名。
 
 `cargo clippy` 會強制 `unwrap_used = "deny"`（參見 `Cargo.toml`）。請用 `?` / `anyhow::Result` 來處理錯誤。
 
@@ -38,7 +53,7 @@ CI 會在 Ubuntu + macOS + Windows 上複製這些步驟（`.github/workflows/ci
 scripts/preflight.sh          # full matrix; --quick skips the Windows cross-check
 ```
 
-它執行與 CI `check` job 相同的 fmt/clippy 介面——`scripts/fmt-owned.sh --check`（owned `*.rs`，排除 `vendor/`）與 owned-target 的 `cargo clippy`——外加 `cargo test --tests --features tray`，以及一個 **Windows cross-check**（`x86_64-pc-windows-msvc`），用來抓出 unix 開發機原本會漏掉的 Windows-only 編譯錯誤。（注意：CI 是用 `nextest` 而非 `cargo test` 跑測試，且浮動的 stable toolchain 並非長期逐位元組一致——preflight 是強力的預先檢查，而非與 CI 逐位元組一致的保證。）Windows 這一步優先採用 [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin)（`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`），因為有一個傳遞性 C 依賴（`ring`）在沒有 MSVC toolchain 的情況下無法在 macOS/Linux 上交叉編譯；若未安裝，這一步會 SKIP 並附上提示，而不是誤判為失敗。
+它執行與 CI `check` job 相同的 fmt/clippy 介面——`scripts/fmt-owned.sh --check`（已追蹤加上未追蹤且未忽略的 `*.rs`，排除 `vendor/`）與 owned-target 的 `cargo clippy`——外加測試 gate（`cargo nextest run --features tray`，也就是 CI 用的 runner；只有在沒安裝 cargo-nextest 時才退回 `cargo test --tests --features tray`），以及一個 **Windows cross-check**（`x86_64-pc-windows-msvc`），用來抓出 unix 開發機原本會漏掉的 Windows-only 編譯錯誤。新 Rust 檔不必先 `git add` 才會進入格式檢查；preflight 偵測到它們時會印出提示，但先 stage 仍有助於檢視完整 PR diff。（浮動的 stable toolchain 並非長期逐位元組一致——preflight 是強力的預先檢查，而非與 CI 逐位元組一致的保證。）Windows 這一步優先採用 [`cargo-xwin`](https://github.com/rust-cross/cargo-xwin)（`cargo install cargo-xwin && rustup target add x86_64-pc-windows-msvc`），因為有一個傳遞性 C 依賴（`ring`）在沒有 MSVC toolchain 的情況下無法在 macOS/Linux 上交叉編譯；若未安裝，這一步會 SKIP 並附上提示，而不是誤判為失敗。
 
 ### 跨平台 lint 模式
 
@@ -131,6 +146,11 @@ git config user.email "1557604+suzuke@users.noreply.github.com"
 這是 `.git/config` 的 local 設定、**不進版控**,所以全新 `git clone` 後要重設一次。
 Fleet agent 在這個 clone 的 linked worktree 裡 commit,會自動繼承同一個身份。
 
+Fleet provenance trailer 會先驗證 branch。在 repository 的 main worktree 中，Git
+不會把 `GIT_DIR` 匯出給 hook，因此會保留 `Agend-Agent`，但不寫入 `Agend-Task`
+與 `Agend-Branch`。Agent binding 使用 linked worktree；Git 在那裡會匯出
+`GIT_DIR`，所以 branch 相符時仍會保留 task 與 branch provenance。
+
 ## Review 流程
 
 以下是你開 issue 或 PR 之後可以預期的狀況——目標是快速、具體的回饋，而不是繁文縟節。
@@ -153,6 +173,7 @@ Fleet agent 在這個 clone 的 linked worktree 裡 commit,會自動繼承同一
 - **Bug fix** → 一個在修復前會失敗、修復後會通過的回歸測試。daemon 層級的行為放 `tests/integration.rs`;單元測試用每個模組的 `#[cfg(test)]`。
 - **格式忠實度——拿 consumer/parser 去測*producer 的真實輸出*，絕不用手工捏造的結構。** 當一個測試在演練的程式碼會去消費另一個函式產生的 string/struct（一個 parser、一個 matcher、一個針對 wire format 的 predicate）時,要透過呼叫 producer 來建構輸入——不要手寫期望的結構。在 review 時要問:*「這個 fixture 跟 production 實際送出的東西一模一樣嗎?」*這就是 #1483 那一類的假綠燈:`notification_is_actionable_wake` matcher 鎖定的是 body 裡的方括號標記,而真正的 `[AGEND-MSG-PENDING]` pointer 根本不含這些標記,它的測試又手工捏造了那個永遠不會送出的結構——於是 matcher 是死碼而測試卻一直綠著(後來 #1487 加上一個手工字串沒有的 `now=` 欄位時又再次漂移)。修法是:讓 producer 和測試都走同一個 builder(`build_pending_pointer`),這樣在一處新增的欄位就會在各處都被演練到。手工捏造的輸入用來測 parser 對*格式錯誤/邊界*輸入的處理(空的/缺漏的欄位)仍然沒問題——只是要把 happy-path 的契約釘在真正的 producer 上(參見 `extract_msg_id_round_trips_real_format_header`)。
 - **新的 MCP tool** → 在 `src/mcp/handlers/` 底下對 handler 做單元測試,並在 `tests/mcp_bridge_client_handshake.rs`(handshake/framing)或 `tests/mcp_proxy_parity.rs`(daemon-proxy parity)中演練 bridge 的 wire path。舊有的 `agend-terminal mcp` subcommand 已在 Sprint 56 Track I-Phase2c(#531)中被硬移除;`agend-mcp-bridge` 是規範的 wire 進入點。
+- **通用 tool CLI** → 不要在 `src/tool_cli.rs` 增加 per-tool 分支。請在 `src/mcp/registry.rs` 與 `src/mcp/tools.rs` 註冊 handler/schema、更新 `docs/MCP-TOOLS.zh-TW.md`，並以 live daemon 驗證 `agend-terminal tool list`／`tool schema <NAME>`；CLI 會在 runtime 發現相同的依角色過濾目錄。
 - **新的 CLI flag** → 在 `tests/integration.rs` 或一個聚焦的單元測試中涵蓋它。
 - **Test fixture**——用 `std::env::temp_dir()` + `std::process::id()` 來隔離,絕不寫死 `/tmp/...`。需要清理的測試應該明確 `drop` 掉 temp dir,或使用 scope guard。
 - **確定性的等待,不是 sleep。** SOP 1（§3.20）禁止在等待非同步狀態的測試中使用
@@ -212,7 +233,7 @@ Fleet agent 在這個 clone 的 linked worktree 裡 commit,會自動繼承同一
 
 5. **commit + PR**：
    - Stage `tests/fixtures/state-replay/<scenario-name>.raw` + `tests/fixtures/state-replay/MANIFEST.yaml`
-   - 跑 `cargo test --bin agend-terminal corpus_measurement_smoke_f9_marker_signals` 確認煙霧測試 harness 的分類與 `--scenario-kind` 相符
+   - 跑 `cargo nextest run --features tray corpus_measurement_smoke_f9_marker_signals` 確認煙霧測試 harness 的分類與 `--scenario-kind` 相符
    - 在 PR 內文中註明擷取所用的分支與錄製條件,讓未來的操作員在漂移逼得重新擷取時可以重播
 
 ### 隱私與儲存
@@ -224,7 +245,7 @@ Fleet agent 在這個 clone 的 linked worktree 裡 commit,會自動繼承同一
 
 ## 風格
 
-- 一律 `cargo fmt`。CI 會在未格式化的 diff 上失敗。
+- Commit 前先跑 `scripts/fmt-owned.sh`。它會格式化已追蹤及未追蹤且未忽略的 Rust 檔，並排除 `vendor/`；CI 會在未格式化的 diff 上失敗。
 - `cargo clippy -- -D warnings`——修掉 warning,不要 `#[allow]` 掉它們,除非該檢查確實有誤,並留一行註解說明原因。
 - 非測試程式碼中不要有 `unwrap()` / `expect()`。用 `?` 搭配 `anyhow::Context` 做錯誤標註。
 - production 程式碼路徑中不要有 `println!` / `eprintln!`。用 `tracing::{info, warn, error, debug}`。

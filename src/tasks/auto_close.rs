@@ -101,8 +101,23 @@ fn auto_close_on_report_with_mode(
         None
     } else {
         match super::assignee_completion_guard(home, correlation_id, reporter, record) {
-            Ok(receipt) => receipt,
-            Err(reason) => return Err(anyhow::anyhow!(reason)),
+            super::CompletionGate::Permit(receipt) => receipt,
+            super::CompletionGate::Deny(reason) => return Err(anyhow::anyhow!(reason)),
+            // This caller does NOT share handler.rs's reading, and the
+            // difference is deliberate rather than an oversight to resolve.
+            // `NotTheAssignee` is unreachable here: the assignee check at the
+            // top of this function returned before the guard was ever called,
+            // so no non-assignee reaches this line. `Branchless` is reachable
+            // and is a permit — a task with no branch has no binding to prove,
+            // and refusing it would break auto-close for every branchless task.
+            super::CompletionGate::NotApplicable(super::GateInapplicable::Branchless) => None,
+            super::CompletionGate::NotApplicable(super::GateInapplicable::NotTheAssignee) => {
+                debug_assert!(
+                    false,
+                    "auto_close refuses non-assignees before calling the guard"
+                );
+                return Ok(false);
+            }
         }
     };
     let summary = if report_text.chars().count() > 200 {
@@ -129,6 +144,8 @@ fn auto_close_on_report_with_mode(
     // route revalidation (the closure does ONLY the append; the cascade below —
     // terminal cleanup + release recompute, which may self-IPC — runs AFTER the
     // flock drops, #1629). A route change under the lock → not closed.
+    #[cfg(test)]
+    super::fire_before_mutation_commit_hook_for_test();
     let closed = match routed.with_revalidated_board(home, |board| {
         crate::task_events::append_done_if_legal_at(board, &emitter, correlation_id, vec![event])
     }) {
@@ -152,7 +169,9 @@ fn auto_close_on_report_with_mode(
         // own) never enqueues an intent → its binding leaks (immortal review
         // worktree). `assignee == reporter` was enforced above; repo="" → the
         // sweeper derives it from the binding's source_repo.
-        if let Some(binding) = crate::binding::read(home, reporter) {
+        if let Some(binding) = crate::binding::read(home, reporter).filter(|binding| {
+            completion_receipt.is_none() && binding["task_id"].as_str() == Some(correlation_id)
+        }) {
             if let Some(branch) = binding["branch"].as_str() {
                 crate::daemon::auto_release::enqueue_release_recompute(
                     home,
@@ -211,6 +230,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Claimed {
                     task_id: tid,
@@ -242,6 +263,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Claimed {
                     task_id: tid,
@@ -273,6 +296,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Done {
                     task_id: tid,
@@ -308,6 +333,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Cancelled {
                     task_id: tid,
@@ -324,7 +351,7 @@ mod tests {
     }
 
     fn task_status_on_board(task_id: &str, board: &Path) -> Option<crate::task_events::TaskStatus> {
-        let state = crate::task_events::replay_at(board).unwrap();
+        let state = crate::task_events::projected_state_at(board).unwrap();
         state.tasks.get(&TaskId(task_id.into())).map(|r| r.status)
     }
 
@@ -373,6 +400,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Claimed {
                     task_id: TaskId(task_id.into()),
@@ -496,6 +525,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Created {
                     task_id: child.clone(),
@@ -511,6 +542,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: Some(parent.clone()),
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Done {
                     task_id: child,
@@ -605,8 +638,6 @@ mod tests {
         let home = tmp_home("assignee_close_project");
         let board = crate::task_events::board_root(&home, "proj-2498");
         seed_claimed_task_on_board("t-2498-project", "dev-agent", &board);
-        super::super::board_router::record_task_project(&home, "t-2498-project", "proj-2498")
-            .expect("record project index");
 
         let closed = auto_close_on_report(
             &home,
@@ -851,7 +882,7 @@ mod tests {
     }
 
     fn task_result(home: &Path, task_id: &str) -> Option<String> {
-        crate::task_events::replay(home)
+        crate::task_events::projected_state(home)
             .unwrap()
             .tasks
             .get(&TaskId(task_id.into()))
@@ -907,6 +938,8 @@ mod tests {
                     eta_secs: None,
                     tags: vec![],
                     parent_id: None,
+                    governing_decision_id: None,
+                    review_class: None,
                 },
                 TaskEvent::Done {
                     task_id: tid.clone(),
@@ -932,6 +965,45 @@ mod tests {
             task_result(&home, "t-f1-guard").as_deref(),
             Some("explicit operator result"),
             "F1 guard: ReportAutoClose must not overwrite an explicit result"
+        );
+    }
+
+    /// The half of `CompletionGate::NotApplicable` this caller never sees.
+    ///
+    /// `auto_close_on_report` refuses a non-assignee itself, before the guard is
+    /// ever called, so `NotTheAssignee` is unreachable from here — the
+    /// `debug_assert` in the match arm says so and this test is the evidence.
+    /// handler.rs makes the opposite choice and lets the ACL decide. Both
+    /// callers are consistent with themselves; they are not consistent with each
+    /// other, and that disagreement is the ambiguity the three-state type makes
+    /// visible rather than hides.
+    ///
+    /// The sibling arm, `Branchless`, IS reachable here and is a permit — pinned
+    /// by `assignee_terminal_report_auto_closes_claimed_task`, whose task is
+    /// seeded with `branch: None`.
+    #[test]
+    fn a_non_assignee_report_never_reaches_the_completion_guard() {
+        let home = tmp_home("non_assignee_never_reaches_guard");
+        seed_claimed_task(&home, "t-guard-unreachable", "dev-agent");
+
+        let closed = auto_close_on_report(
+            &home,
+            "report",
+            "t-guard-unreachable",
+            "someone-else",
+            "not my task to close",
+            true,
+        )
+        .expect("auto close must not error for a non-assignee");
+
+        assert!(
+            !closed,
+            "a non-assignee's terminal report must not auto-close"
+        );
+        assert_eq!(
+            task_status(&home, "t-guard-unreachable"),
+            Some(crate::task_events::TaskStatus::Claimed),
+            "the task stays claimed; the assignee check returned before the guard ran"
         );
     }
 }

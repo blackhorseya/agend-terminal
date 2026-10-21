@@ -3,6 +3,7 @@
 //! the post-rollback response mapping and the marker content-durability fsync.
 
 use super::checkout_txn::RollbackOutcome;
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 use std::path::Path;
 
@@ -49,6 +50,81 @@ pub(super) fn rollback_auto_created_branch_if_needed(
     if should_rollback {
         super::checkout_disposable::rollback_auto_created_branch(source, branch, expected_head);
     }
+}
+
+/// Replay a crashed checkout transaction before classifying any preserved
+/// marker-bearing directory at the same target.
+pub(super) fn recover_stale_checkout_txn(
+    home: &Path,
+    journal_key: &str,
+    target: &Path,
+    source: &Path,
+    now: DateTime<Utc>,
+) -> Result<(), String> {
+    let target_display = target.display().to_string();
+    super::checkout_txn::recover_stale(
+        home,
+        journal_key,
+        target,
+        &source.display().to_string(),
+        now,
+        || {
+            crate::git_helpers::git_bypass(
+                source,
+                &["worktree", "remove", "--force", &target_display],
+            )
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+        },
+    )
+}
+
+pub(super) fn remove_worktree(source: &Path, worktree_path: &str) -> bool {
+    crate::git_helpers::git_bypass(source, &["worktree", "remove", "--force", worktree_path])
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Classify a marker-bearing, unbound checkout target before invoking Git.
+/// This is preserved evidence from an interrupted daemon release, so callers
+/// get the guarded recovery route instead of raw `worktree add` stderr.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn stale_worktree_dir_response(
+    home: &Path,
+    target: &Path,
+    source: &Path,
+    agent: &str,
+    branch: &str,
+    expected_head: &str,
+    auto_created_branch: bool,
+) -> Option<Value> {
+    let target_is_directory =
+        std::fs::symlink_metadata(target).is_ok_and(|metadata| metadata.file_type().is_dir());
+    if crate::binding::read(home, agent).is_some() || !target_is_directory {
+        return None;
+    }
+    let marker_path = target.join(crate::worktree_pool::MANAGED_MARKER);
+    if !std::fs::symlink_metadata(&marker_path).is_ok_and(|metadata| metadata.file_type().is_file())
+    {
+        return None;
+    }
+    let marker = std::fs::read_to_string(marker_path).ok()?;
+    rollback_auto_created_branch_if_needed(source, branch, expected_head, auto_created_branch);
+    Some(json!({
+        "error": format!(
+            "stale daemon-managed worktree directory remains at {}; force-release it before checkout",
+            target.display()
+        ),
+        "code": "stale_worktree_dir",
+        "stage": "preflight",
+        "path": target.display().to_string(),
+        "marker": marker,
+        "hint": format!(
+            "call release_worktree with instance='{agent}', branch='{branch}', force=true, and repository_path='{}'",
+            source.display()
+        ),
+        "auto_created_branch": auto_created_branch,
+    }))
 }
 
 #[cfg(all(test, unix))]
@@ -207,19 +283,17 @@ pub(super) fn validate_expected_head(
         }));
     }
     let src = Path::new(source_path);
-    let verify = crate::git_helpers::git_cmd(
-        src,
-        &["rev-parse", "--verify", &format!("{expected}^{{commit}}")],
-    );
-    if verify.is_err() {
-        return Some(json!({
-            "error": format!(
-                "expected_head {expected} does not exist as a commit in the repository"
-            ),
-            "code": "expected_head_mismatch",
-            "expected_head": expected,
-            "actual_head": "",
-        }));
+    // #3675: a local hit is unchanged (no network). On a local miss, a
+    // `(repository, pr_number)` context lets the shared helper fetch the
+    // external (fork) PR head into a verified, transiently-ref'd object before
+    // the existing branch/HEAD comparison below runs. Every failure is a
+    // structured, fail-closed response.
+    let repository = args["repository"].as_str().filter(|s| !s.is_empty());
+    let pr_number = args["pr_number"].as_u64();
+    if let Err(error) = crate::mcp::handlers::dispatch_hook::pr_head_pin::ensure_commit_available(
+        src, expected, repository, pr_number,
+    ) {
+        return Some(error.checkout_value());
     }
     let branch_ref = format!("refs/heads/{branch}");
     let branch_exists = crate::git_helpers::git_cmd(src, &["rev-parse", "--verify", &branch_ref]);
@@ -329,4 +403,104 @@ pub(super) fn rollback_if_expected_head_drift(
     err["expected_head"] = json!(expected);
     err["actual_head"] = json!(actual);
     Some(err)
+}
+
+/// #3546 LOC: the bind-lifecycle permit acquisition, moved here verbatim so
+/// `checkout.rs` stays under `MAX_LOC` while gaining the base-freshness flag.
+/// Pure move — same order, same error shape, same `code`.
+///
+/// The permit owns the per-agent lifecycle authority for the whole bind
+/// transaction (branch locking → `bind_full` → commit → exact rollback), so
+/// checkout cannot race a release or rebase at the release→bind gap. `None` is
+/// the inspection-only (`bind:false`) case, which claims nothing.
+pub(super) fn acquire_bind_lifecycle_permit(
+    home: &Path,
+    instance_name: &str,
+    bind: bool,
+) -> Result<Option<crate::mcp::handlers::dispatch_hook::LifecyclePermit>, Value> {
+    if !bind {
+        return Ok(None);
+    }
+    match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        home,
+        instance_name,
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Bind,
+    ) {
+        Ok(permit) => Ok(Some(permit)),
+        Err(error) => Err(json!({
+            "error": format!("checkout bind refused: {error}"),
+            "code": "lifecycle_conflict",
+        })),
+    }
+}
+
+/// #3550: the two ways THIS agent's existing binding blocks a fresh provision,
+/// reported structurally instead of as raw `git worktree add` output.
+///
+/// - Same branch, bound worktree gone, a task still owns the binding →
+///   `stale_binding` (pre-existing behaviour, moved here so the handler stays
+///   under its LOC ceiling).
+/// - A DIFFERENT branch whose worktree is still on disk → `binding_conflict`.
+///   The binding is global to the agent, while the worktree path key is
+///   `(agent, repo)` and carries no branch (`checkout_path::bounded_mangled`).
+///   For a same-repo checkout, the fresh provision would target the directory
+///   the current binding occupies. A cross-repo checkout has a distinct target,
+///   but must still release the agent's existing binding first. In both cases
+///   this refuses early and names the binding instead of relaying a lower-level
+///   Git error; it never removes the existing worktree.
+///
+/// A branch auto-created by this now-refused checkout is rolled back, mirroring
+/// the `worktree_add_failed` path it replaces (arch14) — without this, moving
+/// the refusal earlier would start leaking branches that path cleans up.
+///
+/// Returns `None` when the binding does not block this checkout.
+pub(super) fn binding_mismatch_response(
+    existing: &Value,
+    branch: &str,
+    live_worktree: Option<&Path>,
+    source_path: &Path,
+    expected_head: &str,
+    auto_created_branch: bool,
+) -> Option<Value> {
+    let bound_branch = existing
+        .get("branch")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    let task_id = existing
+        .get("task_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if bound_branch == branch {
+        if live_worktree.is_none() && !task_id.is_empty() {
+            return Some(json!({
+                "error": format!(
+                    "stale binding for branch '{branch}' points at a missing worktree - release first before checkout"
+                ),
+                "code": "stale_binding",
+                "branch": branch,
+            }));
+        }
+        return None;
+    }
+    let current_path = live_worktree?;
+    if auto_created_branch {
+        super::checkout_disposable::rollback_auto_created_branch(
+            source_path,
+            branch,
+            expected_head,
+        );
+    }
+    Some(json!({
+        "error": format!(
+            "already bound to branch '{bound_branch}'; release that binding before checking out \
+             '{branch}'"
+        ),
+        "code": "binding_conflict",
+        "branch": branch,
+        "current_branch": bound_branch,
+        "current_path": current_path.display().to_string(),
+        "current_task_id": task_id,
+        "hint": "release_worktree first",
+        "auto_created_branch": auto_created_branch,
+    }))
 }

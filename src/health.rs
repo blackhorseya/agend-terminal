@@ -393,6 +393,45 @@ pub struct HealthTracker {
     /// `#[allow(dead_code)]` until the unpause sub-task lands.
     #[allow(dead_code)] // reserved for unpause sub-task (Stage 3 decay)
     pub(crate) last_stage3_fired_at: Option<Instant>,
+    /// t-20260902154222470714-82348-82: last pane line proving Codex refused
+    /// an MCP tool call (written ONLY by
+    /// `crate::daemon::per_tick::codex_mcp_refusal`). Deliberately NOT a
+    /// `BlockedReason` / `HealthState` change — this is evidence the
+    /// inbox-stuck watchdog quotes, never a dispatch-gating signal.
+    pub last_mcp_refusal: Option<McpRefusalEvidence>,
+    /// t-20260902165405106195-82348-105: the last fresh-restart self-kick
+    /// outcome the daemon RECONCILED for this agent. Written only by
+    /// `crate::daemon::per_tick::claude_self_kick`, and only for the two
+    /// outcomes that need an operator: an overdue acknowledgement and the
+    /// late ack that resolves it. Like `last_mcp_refusal` it is evidence, not
+    /// a `BlockedReason` / `HealthState` change — nothing gates dispatch on it.
+    pub last_self_kick: Option<SelfKickEvidence>,
+}
+
+/// The reconciled outcome of one fresh-restart self-kick delivery.
+/// `state` is `"ack_overdue"` (the 30 s window closed with no `ack_start`) or
+/// `"turn_started_late"` (an `ack_start` arrived afterwards and resolved it);
+/// a self-kick that acknowledges inside the window is never recorded, so a
+/// `None` slot means "nothing went wrong". `turn_observed_since_kick` is the
+/// distinguishing evidence: whether a hook-authority turn was observed after
+/// the bridge accepted the delivery.
+#[derive(Debug, Clone)]
+pub struct SelfKickEvidence {
+    pub delivery_id: String,
+    pub accepted_at: chrono::DateTime<chrono::Utc>,
+    pub state: &'static str,
+    pub turn_observed_since_kick: bool,
+    pub at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Evidence that Codex refused an MCP tool call: when it was seen, and the
+/// pane line that proved it. `reset()` intentionally does not clear it — that
+/// method resets crash/error state only (it never re-initialises every field),
+/// and stale evidence stays readable until the next detection overwrites it.
+#[derive(Debug, Clone)]
+pub struct McpRefusalEvidence {
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub line: String,
 }
 
 /// #1744-H3: shared rate-limit predicate for a per-class notify cooldown stamp.
@@ -480,7 +519,21 @@ impl HealthTracker {
             recovery_stage_state: RecoveryStageState::None,
             last_stage1_fired_at: None,
             last_stage3_fired_at: None,
+            last_mcp_refusal: None,
+            last_self_kick: None,
         }
+    }
+
+    /// Record the pane line proving Codex refused an MCP tool call.
+    pub fn record_mcp_refusal(&mut self, at: chrono::DateTime<chrono::Utc>, line: String) {
+        self.last_mcp_refusal = Some(McpRefusalEvidence { at, line });
+    }
+
+    /// Stamp the reconciled self-kick outcome. Overwrites the previous one:
+    /// only the latest fresh-restart matters to an operator, and the durable
+    /// receipt log keeps the full history.
+    pub fn record_self_kick(&mut self, evidence: SelfKickEvidence) {
+        self.last_self_kick = Some(evidence);
     }
 
     /// `#685` sub-task 7c: atomic transition into `HealthState::Paused`

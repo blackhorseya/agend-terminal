@@ -485,7 +485,23 @@ fn find_violations(
 // reason)` only for a genuinely-internal entry-handler read that is NOT an
 // agent-facing schema param for THAT tool; prefer a schema declaration when the
 // param is a real agent surface.
-const PER_TOOL_ALLOWLIST: &[(&str, &str, &str)] = &[];
+const PER_TOOL_ALLOWLIST: &[(&str, &str, &str)] = &[
+    (
+        "restart_instance",
+        "restart_id",
+        "internal app TUI restart correlation; not agent-facing",
+    ),
+    (
+        "restart_instance",
+        "old_instance_ref",
+        "internal app TUI predecessor identity; not agent-facing",
+    ),
+    (
+        "restart_instance",
+        "skip_unsent_draft_gate",
+        "internal explicit restart ingress marker; not agent-facing",
+    ),
+];
 
 fn per_tool_allow_set() -> BTreeSet<(String, String)> {
     PER_TOOL_ALLOWLIST

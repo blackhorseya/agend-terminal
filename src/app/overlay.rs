@@ -8,7 +8,10 @@ use std::path::Path;
 
 use crate::agent::AgentRegistry;
 use crate::backend::Backend;
+use crate::layout::organizer::{OrganizerPlan, OrganizerScope};
 use crate::layout::{Layout, Pane, SplitDir, Tab};
+
+mod organizer_ui;
 
 /// An item in the new-tab selection menu.
 pub struct MenuItem {
@@ -91,6 +94,16 @@ pub(super) enum Overlay {
     ConfirmClose {
         target: CloseTarget,
     },
+    /// Explicit operator restart confirmation. The command is retained until
+    /// the operator accepts, so no pane is killed while the prompt is shown.
+    ConfirmRestart {
+        command: String,
+    },
+    ConfirmDeleteInstance {
+        name: String,
+        input: String,
+        notice: Option<String>,
+    },
     TabList {
         selected: usize,
     },
@@ -111,6 +124,9 @@ pub(super) enum Overlay {
         split_dir: crate::layout::SplitDir,
     },
     Help,
+    ReconnectNotice {
+        message: String,
+    },
     /// Keyboard scroll mode (j/k/PgUp/PgDn). Pane's scroll_offset is used directly.
     Scroll,
     /// Command palette (:command input).
@@ -143,11 +159,25 @@ pub(super) enum Overlay {
         mode: TaskBoardMode,
         /// Active view: Tasks (kanban) or Fleet (agent dashboard).
         view: BoardView,
+        pending: bool,
+        notice: Option<String>,
     },
     /// Floating scratch shell (Ctrl+B ~). Esc kills the shell and closes the
     /// overlay. Pane is boxed because it's much larger than any other variant.
     ScratchShell {
         pane: Box<Pane>,
+    },
+    /// #3631: transactional Team Organizer. `plan` is a pure preview computed
+    /// from `scope`; nothing in the layout changes until Enter. `applied` marks a
+    /// committed transaction so a failed session save can be retried, and `u`
+    /// reverts via the snapshot held on the layout.
+    Organizer {
+        scope: OrganizerScope,
+        scopes: Vec<OrganizerScope>,
+        selected: usize,
+        plan: OrganizerPlan,
+        applied: bool,
+        notice: Option<String>,
     },
 }
 
@@ -180,12 +210,30 @@ pub(super) struct OverlayCtx<'a> {
     pub fleet_path: &'a Path,
     pub wakeup_tx: &'a crossbeam_channel::Sender<usize>,
     pub name_counter: &'a mut HashMap<String, usize>,
+    pub task_rpc_tx: &'a crossbeam_channel::Sender<super::rpc::TaskRequest>,
+    pub restart_request_tx:
+        Option<&'a crossbeam_channel::Sender<super::commands::RemoteRestartRequest>>,
+    pub reap_workers: &'a mut Vec<std::thread::JoinHandle<()>>,
 }
 
 #[derive(Default)]
 pub(super) struct OverlayOutcome {
     /// Layout changed in a way that requires a resize pass before next draw.
     pub needs_resize: bool,
+}
+
+fn execute_command(command: &str, ctx: &mut OverlayCtx<'_>, outcome: &mut OverlayOutcome) {
+    let mut cctx = super::commands::CommandCtx {
+        layout: &mut *ctx.layout,
+        registry: ctx.registry,
+        home: ctx.home,
+        wakeup_tx: ctx.wakeup_tx,
+        name_counter: &mut *ctx.name_counter,
+        restart_tx: ctx.restart_request_tx,
+    };
+    if super::commands::execute(command, &mut cctx) {
+        outcome.needs_resize = true;
+    }
 }
 
 /// Dispatch a key press to the currently-active overlay. Mutates `*overlay`
@@ -374,34 +422,21 @@ pub(super) fn handle_key(
             KeyCode::Char('y') | KeyCode::Char('Y') => {
                 let is_tab = matches!(target, CloseTarget::Tab);
                 *overlay = Overlay::None;
-                // Sprint 53 Smoke 2 r1 (operator m-16 override): TUI close
-                // path delegates to the canonical full-delete flow
-                // `mcp::handlers::instance::full_delete_instance`. DRY with
-                // the MCP `delete_instance` MCP tool — same side-effect set
-                // (PTY kill via delete_transaction, fleet.yaml removal,
-                // Telegram topic delete, working-dir cleanup, team removal).
+                // Pane/tab close is a VIEW operation. Fleet panes are remote
+                // views onto daemon-owned instances, so dropping one must never
+                // call the destructive instance lifecycle (fleet/team removal,
+                // worktree/workspace cleanup, topic/watch deletion). Permanent
+                // deletion remains behind the explicit `delete_instance`
+                // control surface. Dropping the Pane closes its bridge client.
                 //
-                // Layered on top, `deployments::reconcile_after_close` runs
-                // afterwards so deployment-store metadata + custom-directory
-                // subdirs (the actual Smoke 2 leak) get cleaned via
-                // `cleanup_deployment_dirs` — `full_delete_instance` only
-                // covers the per-instance working_dir which, for custom
-                // `directory:` deployments, was the user-provided-dir branch
-                // of `cleanup_working_dir` and only stripped agend files.
-                // #1363: remove pane/tab from layout FIRST for instant
-                // UI response, then run the blocking delete + cleanup
-                // in a background thread.
-                let names: Vec<String>;
-                // CR-2026-06-14 (resource-leak): also capture each closed pane's
-                // `agent_name` so a NON-fleet (shell) pane — `fleet_instance_name
-                // == None`, never in `names` — still has its PTY child killed.
-                // `full_delete_instance` only tears down FLEET instances; a
-                // scratch shell's registry entry (PTY master + child) would
-                // otherwise leak for the whole TUI session (`Pane` has no `Drop`).
-                let nonfleet_agents: Vec<crate::types::AgentName>;
+                // Also capture each closed pane's authoritative registry id so
+                // a non-fleet local shell still has its PTY child reaped. These
+                // shells are intentionally absent from fleet.yaml, so name-based
+                // managed deletion cannot resolve them.
+                let nonfleet_agents: Vec<crate::types::InstanceId>;
                 if is_tab {
                     let idx = ctx.layout.active;
-                    let panes: Vec<(crate::types::AgentName, Option<String>)> = ctx
+                    let panes: Vec<(crate::types::InstanceId, Option<String>)> = ctx
                         .layout
                         .tabs
                         .get(idx)
@@ -410,11 +445,10 @@ pub(super) fn handle_key(
                             t.root().pane_ids().into_iter().filter_map(|id| {
                                 t.root()
                                     .find_pane(id)
-                                    .map(|p| (p.agent_name.clone(), p.fleet_instance_name.clone()))
+                                    .map(|p| (p.instance_id, p.fleet_instance_name.clone()))
                             })
                         })
                         .collect();
-                    names = panes.iter().filter_map(|(_, f)| f.clone()).collect();
                     nonfleet_agents = panes
                         .into_iter()
                         .filter(|(_, f)| f.is_none())
@@ -424,55 +458,92 @@ pub(super) fn handle_key(
                     outcome.needs_resize = true;
                 } else if let Some(tab) = ctx.layout.active_tab_mut() {
                     let fid = tab.focus_id;
-                    let (agent_name, fleet_name): (
-                        Option<crate::types::AgentName>,
+                    let (instance_id, fleet_name): (
+                        Option<crate::types::InstanceId>,
                         Option<String>,
                     ) = tab
                         .root()
                         .find_pane(fid)
-                        .map(|p| (Some(p.agent_name.clone()), p.fleet_instance_name.clone()))
+                        .map(|p| (Some(p.instance_id), p.fleet_instance_name.clone()))
                         .unwrap_or((None, None));
                     if tab.close_focused().is_some() {
                         outcome.needs_resize = true;
                     }
-                    names = fleet_name.clone().into_iter().collect();
-                    nonfleet_agents = match (agent_name, fleet_name) {
+                    nonfleet_agents = match (instance_id, fleet_name) {
                         (Some(a), None) => vec![a],
                         _ => Vec::new(),
                     };
                 } else {
-                    names = Vec::new();
                     nonfleet_agents = Vec::new();
                 }
-                // Kill non-fleet (shell) panes' PTY children on the UI thread —
-                // `kill_agent` only drops the registry PTY master (fast, no
-                // blocking IO), mirroring the `ScratchShell` Esc arm. Fleet panes
-                // are torn down by `full_delete_instance` in the thread below.
-                for name in &nonfleet_agents {
-                    super::kill_agent(ctx.home, ctx.registry, name);
-                }
-                if !names.is_empty() {
-                    let home = ctx.home.to_path_buf();
-                    // fire-and-forget: blocking delete + deployment
-                    // cleanup runs off the UI thread
-                    std::thread::spawn(move || {
-                        for name in &names {
-                            if let Err(detail) =
-                                crate::mcp::handlers::instance_state::lifecycle::full_delete_instance(
-                                    &home, name,
-                                )
-                            {
-                                tracing::warn!(name, detail = %detail,
-                                    "TUI close: residual state — operator may need manual cleanup");
-                            }
-                        }
-                        let _ = crate::deployments::reconcile_after_close(&home, &names);
-                    });
-                }
+                // Reap non-fleet shell panes by UUID, mirroring ScratchShell Esc.
+                super::kill_unmanaged_agents(ctx.registry, nonfleet_agents, &mut *ctx.reap_workers);
             }
             _ => {
                 *overlay = Overlay::None;
             }
+        },
+        Overlay::ConfirmRestart { command } => match key.code {
+            KeyCode::Char('y') | KeyCode::Char('Y') => {
+                let command = command.clone();
+                *overlay = Overlay::None;
+                execute_command(&command, ctx, &mut outcome);
+            }
+            _ => {
+                *overlay = Overlay::None;
+            }
+        },
+        Overlay::ConfirmDeleteInstance {
+            name,
+            input,
+            notice,
+        } => match key.code {
+            KeyCode::Enter => {
+                if input == name {
+                    if crate::daemon::find_active_run_dir(ctx.home).is_none() {
+                        *notice = Some("delete refused: no active daemon".to_string());
+                    } else {
+                        // Capture the exact view identity before the daemon
+                        // delete. A name-only pane (legacy session) is not
+                        // safe to remove after a same-name replacement.
+                        let expected_ref = authoritative_instance_ref_for_delete(ctx, name);
+                        match crate::mcp::handlers::instance_state::lifecycle::full_delete_instance_with_runtime(
+                            ctx.home,
+                            name,
+                            None,
+                        ) {
+                            Ok(()) => {
+                                match finish_successful_delete(ctx, name, expected_ref) {
+                                    DeleteCompletion::Close => {
+                                        *overlay = Overlay::None;
+                                        outcome.needs_resize = true;
+                                    }
+                                    DeleteCompletion::Keep { notice: message } => {
+                                        *notice = Some(message);
+                                    }
+                                }
+                            }
+                            Err(error) => {
+                                *notice = Some(error);
+                            }
+                        }
+                    }
+                } else {
+                    *notice = Some(format!("type exact name to delete '{name}'"));
+                }
+            }
+            KeyCode::Esc => {
+                *overlay = Overlay::None;
+            }
+            KeyCode::Backspace => {
+                input.pop();
+                *notice = None;
+            }
+            KeyCode::Char(c) => {
+                input.push(c);
+                *notice = None;
+            }
+            _ => {}
         },
         Overlay::TabList { ref mut selected } => match key.code {
             KeyCode::Up | KeyCode::Char('k') if *selected > 0 => {
@@ -565,6 +636,9 @@ pub(super) fn handle_key(
         Overlay::Help => {
             *overlay = Overlay::None;
         }
+        Overlay::ReconnectNotice { .. } => {
+            *overlay = Overlay::None;
+        }
         Overlay::Scroll => match key.code {
             KeyCode::Up | KeyCode::Char('k') => super::scroll_focused(ctx.layout, 1),
             KeyCode::Down | KeyCode::Char('j') => super::scroll_focused(ctx.layout, -1),
@@ -584,16 +658,14 @@ pub(super) fn handle_key(
             // candidate, so muscle memory / scripts behave identically).
             KeyCode::Enter => {
                 let cmd = input.clone();
-                *overlay = Overlay::None;
-                let mut cctx = super::commands::CommandCtx {
-                    layout: &mut *ctx.layout,
-                    registry: ctx.registry,
-                    home: ctx.home,
-                    wakeup_tx: ctx.wakeup_tx,
-                    name_counter: &mut *ctx.name_counter,
-                };
-                if super::commands::execute(&cmd, &mut cctx) {
-                    outcome.needs_resize = true;
+                if super::commands::is_arrange_command(&cmd) {
+                    *overlay = organizer_ui::open_arrange_overlay(&cmd, ctx, &mut outcome)
+                        .unwrap_or(Overlay::None);
+                } else if super::commands::is_restart_command(&cmd) {
+                    *overlay = Overlay::ConfirmRestart { command: cmd };
+                } else {
+                    *overlay = Overlay::None;
+                    execute_command(&cmd, ctx, &mut outcome);
                 }
             }
             KeyCode::Esc => {
@@ -639,6 +711,10 @@ pub(super) fn handle_key(
             }
             _ => {}
         },
+        Overlay::Organizer { .. } => {
+            let org = organizer_ui::handle_organizer_key(overlay, key, ctx);
+            outcome.needs_resize = outcome.needs_resize || org.needs_resize;
+        }
         Overlay::Decisions {
             ref mut items,
             ref mut selected,
@@ -747,6 +823,8 @@ pub(super) fn handle_key(
             ref mut row,
             ref mut mode,
             ref mut view,
+            ref mut pending,
+            ref mut notice,
         } => {
             // Tab switches between Tasks and Fleet views
             if key.code == KeyCode::Tab && matches!(mode, TaskBoardMode::Board) {
@@ -769,17 +847,18 @@ pub(super) fn handle_key(
                 }
                 TaskBoardMode::NewTask { ref mut input } => match key.code {
                     KeyCode::Enter if !input.is_empty() => {
-                        crate::tasks::handle(
-                            ctx.home,
-                            "user",
-                            &serde_json::json!({
+                        if submit_task_request(
+                            ctx.task_rpc_tx,
+                            serde_json::json!({
                                 "action": "create",
                                 "title": input.as_str(),
                                 "priority": "normal",
                             }),
-                        );
-                        *items = crate::tasks::list_all(ctx.home);
-                        *mode = TaskBoardMode::Board;
+                            pending,
+                            notice,
+                        ) {
+                            *mode = TaskBoardMode::Board;
+                        }
                     }
                     KeyCode::Char(c) => input.push(c),
                     KeyCode::Backspace => {
@@ -804,17 +883,18 @@ pub(super) fn handle_key(
                     KeyCode::Enter if !choices.is_empty() => {
                         // M3: use captured task_id instead of col/row indices
                         let assignee = &choices[*selected].1;
-                        crate::tasks::handle(
-                            ctx.home,
-                            "user",
-                            &serde_json::json!({
+                        if submit_task_request(
+                            ctx.task_rpc_tx,
+                            serde_json::json!({
                                 "action": "update",
                                 "id": task_id,
                                 "assignee": assignee,
                             }),
-                        );
-                        *items = crate::tasks::list_all(ctx.home);
-                        *mode = TaskBoardMode::Board;
+                            pending,
+                            notice,
+                        ) {
+                            *mode = TaskBoardMode::Board;
+                        }
                     }
                     KeyCode::Esc => {
                         *mode = TaskBoardMode::Board;
@@ -870,20 +950,15 @@ pub(super) fn handle_key(
                                 && !columns[*col].is_empty() =>
                         {
                             if let Some(task) = columns[*col].get(*row) {
-                                crate::tasks::handle(
-                                    ctx.home,
-                                    "user",
-                                    &serde_json::json!({
+                                submit_task_request(
+                                    ctx.task_rpc_tx,
+                                    serde_json::json!({
                                         "action": "update",
                                         "id": task.id,
                                         "status": "cancelled",
                                     }),
-                                );
-                                *items = crate::tasks::list_all(ctx.home);
-                                let new_cols = crate::render::task_board_columns(items);
-                                *row = (*row).min(
-                                    crate::render::selectable_len(&new_cols, *col)
-                                        .saturating_sub(1),
+                                    pending,
+                                    notice,
                                 );
                             }
                         }
@@ -891,19 +966,14 @@ pub(super) fn handle_key(
                         // Match 'D' (legacy terminals) and 'd'+SHIFT (Kitty protocol)
                         KeyCode::Char('D') | KeyCode::Char('d') if !columns[*col].is_empty() => {
                             if let Some(task) = columns[*col].get(*row) {
-                                crate::tasks::handle(
-                                    ctx.home,
-                                    "user",
-                                    &serde_json::json!({
+                                submit_task_request(
+                                    ctx.task_rpc_tx,
+                                    serde_json::json!({
                                         "action": "done",
                                         "id": task.id,
                                     }),
-                                );
-                                *items = crate::tasks::list_all(ctx.home);
-                                let new_cols = crate::render::task_board_columns(items);
-                                *row = (*row).min(
-                                    crate::render::selectable_len(&new_cols, *col)
-                                        .saturating_sub(1),
+                                    pending,
+                                    notice,
                                 );
                             }
                         }
@@ -967,21 +1037,16 @@ pub(super) fn handle_key(
                                     _ => None,
                                 };
                                 if let Some(val) = new_status {
-                                    crate::tasks::handle(
-                                        ctx.home,
-                                        "user",
-                                        &serde_json::json!({"action": "update", "id": task.id, "status": val}),
+                                    submit_task_request(
+                                        ctx.task_rpc_tx,
+                                        serde_json::json!({"action": "update", "id": task.id, "status": val}),
+                                        pending,
+                                        notice,
                                     );
-                                    *items = crate::tasks::list_all(ctx.home);
                                     // Follow the task to whichever column its NEW
                                     // status lands in (column order != status order,
                                     // so a fixed ±1 would mis-track — e.g. Blocked).
                                     *col = crate::render::board_column_for_status(val);
-                                    let new_cols = crate::render::task_board_columns(items);
-                                    *row = (*row).min(
-                                        crate::render::selectable_len(&new_cols, *col)
-                                            .saturating_sub(1),
-                                    );
                                 }
                             }
                         }
@@ -1001,18 +1066,13 @@ pub(super) fn handle_key(
                                     _ => None,
                                 };
                                 if let Some(val) = new_status {
-                                    crate::tasks::handle(
-                                        ctx.home,
-                                        "user",
-                                        &serde_json::json!({"action": "update", "id": task.id, "status": val}),
+                                    submit_task_request(
+                                        ctx.task_rpc_tx,
+                                        serde_json::json!({"action": "update", "id": task.id, "status": val}),
+                                        pending,
+                                        notice,
                                     );
-                                    *items = crate::tasks::list_all(ctx.home);
                                     *col = crate::render::board_column_for_status(val);
-                                    let new_cols = crate::render::task_board_columns(items);
-                                    *row = (*row).min(
-                                        crate::render::selectable_len(&new_cols, *col)
-                                            .saturating_sub(1),
-                                    );
                                 }
                             }
                         }
@@ -1042,14 +1102,14 @@ pub(super) fn handle_key(
         }
         Overlay::ScratchShell { pane } => match key.code {
             KeyCode::Esc => {
-                // Capture the agent name before dropping the pane so we can
+                // Capture the registry key before dropping the pane so we can
                 // kill the shell process. The registry owns the PTY master;
-                // kill_agent drops it, the forwarder thread sees rx close,
+                // removing it drops the handle, the forwarder sees rx close,
                 // and exits. The pane (and its subscriber rx) drop with the
                 // overlay.
-                let name = pane.agent_name.clone();
+                let instance_id = pane.instance_id;
                 *overlay = Overlay::None;
-                super::kill_agent(ctx.home, ctx.registry, &name);
+                super::kill_unmanaged_agent(ctx.registry, instance_id, &mut *ctx.reap_workers);
             }
             _ => {
                 let bytes = crate::tui::key_to_bytes(key.code, key.modifiers);
@@ -1063,16 +1123,540 @@ pub(super) fn handle_key(
     outcome
 }
 
+fn authoritative_instance_ref_for_delete(
+    ctx: &OverlayCtx<'_>,
+    name: &str,
+) -> Option<crate::types::InstanceRef> {
+    crate::agent::instance_ref_for_name(ctx.registry, ctx.home, name)
+        .or_else(|| ctx.layout.unique_instance_ref_for_agent(name))
+}
+
+enum DeleteCompletion {
+    Close,
+    Keep { notice: String },
+}
+
+fn finish_successful_delete(
+    ctx: &mut OverlayCtx<'_>,
+    name: &str,
+    expected_ref: Option<crate::types::InstanceRef>,
+) -> DeleteCompletion {
+    let Some(expected_ref) = expected_ref else {
+        return DeleteCompletion::Keep {
+            notice: "delete completed but instance identity is unavailable; view retained"
+                .to_string(),
+        };
+    };
+
+    ctx.layout.remove_fleet_instance_views_exact(expected_ref);
+    if !super::session::save_session(ctx.home, ctx.layout)
+        && !super::session::record_retired_ref(ctx.home, expected_ref)
+    {
+        tracing::error!(
+            name = %name,
+            "delete completed but session retirement is pending retry"
+        );
+        return DeleteCompletion::Keep {
+            notice: "delete completed; session retirement pending retry".to_string(),
+        };
+    }
+    DeleteCompletion::Close
+}
+
+fn submit_task_request(
+    tx: &crossbeam_channel::Sender<super::rpc::TaskRequest>,
+    arguments: serde_json::Value,
+    pending: &mut bool,
+    notice: &mut Option<String>,
+) -> bool {
+    if *pending {
+        *notice = Some("task request already pending".to_string());
+        return false;
+    }
+    match tx.try_send(super::rpc::TaskRequest::Mutate(arguments)) {
+        Ok(()) => {
+            *pending = true;
+            *notice = None;
+            true
+        }
+        Err(crossbeam_channel::TrySendError::Full(_)) => {
+            *notice = Some("task request already pending".to_string());
+            false
+        }
+        Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+            *notice = Some("task RPC worker stopped".to_string());
+            false
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
     use parking_lot::Mutex;
     use std::collections::HashMap;
     use std::sync::Arc;
 
+    fn close_test_pane(
+        id: crate::types::InstanceId,
+        name: &str,
+        fleet_name: Option<&str>,
+    ) -> crate::layout::Pane {
+        crate::layout::Pane {
+            agent_name: name.into(),
+            instance_id: id,
+            instance_ref: None,
+            vterm: crate::vterm::VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            restart_error: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: fleet_name.map(str::to_string),
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: crate::layout::PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        }
+    }
+
+    fn confirm_close_tab(
+        home: &Path,
+        registry: &crate::agent::AgentRegistry,
+        pane: crate::layout::Pane,
+    ) -> crate::layout::Layout {
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(crate::layout::Tab::new("close-test".to_string(), pane));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let mut overlay = Overlay::ConfirmClose {
+            target: CloseTarget::Tab,
+        };
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry,
+            home,
+            fleet_path: home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
+            reap_workers: &mut reap_workers,
+        };
+        handle_key(&mut overlay, press(KeyCode::Char('y')), &mut ctx);
+        layout
+    }
+
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    #[test]
+    fn confirm_close_reaps_unmanaged_shell_by_instance_id() {
+        let home = dec_home("confirm_close_unmanaged");
+        let id = crate::types::InstanceId::new();
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        registry
+            .lock()
+            .insert(id, crate::agent::mk_test_handle("scratch", id));
+
+        let started = std::time::Instant::now();
+        let layout = confirm_close_tab(&home, &registry, close_test_pane(id, "scratch", None));
+
+        assert!(layout.tabs.is_empty(), "the tab view should close");
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "closing a shell view must not wait for the 2s child-termination grace window"
+        );
+        assert!(
+            !registry.lock().contains_key(&id),
+            "the unmanaged registry entry must be removed and reaped"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn confirm_close_preserves_managed_fleet_state() {
+        let home = dec_home("confirm_close_fleet");
+        let id = crate::types::InstanceId::new();
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        let fleet_bytes = format!(
+            "instances:\n  managed:\n    id: '{}'\n    backend: claude\n",
+            id
+        );
+        std::fs::write(&fleet_path, &fleet_bytes).expect("write fleet fixture");
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        registry
+            .lock()
+            .insert(id, crate::agent::mk_test_handle("managed", id));
+
+        let layout = confirm_close_tab(
+            &home,
+            &registry,
+            close_test_pane(id, "managed", Some("managed")),
+        );
+
+        assert!(layout.tabs.is_empty(), "the tab view should close");
+        // The incident path used a fire-and-forget delete thread. Poll across
+        // a bounded window so an asynchronous regression cannot pass merely
+        // because the assertions raced ahead of the destructive worker.
+        for _ in 0..20 {
+            assert!(
+                registry.lock().contains_key(&id),
+                "closing a fleet view must not remove its managed process"
+            );
+            assert_eq!(
+                std::fs::read(&fleet_path).expect("fleet still exists"),
+                fleet_bytes.as_bytes(),
+                "closing a fleet view must not mutate fleet.yaml"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        let handle = crate::agent::remove_and_unregister(&registry, &id).expect("cleanup handle");
+        crate::daemon::terminate_agents_parallel(vec![("managed".to_string(), handle.child)]);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn delete_instance_requires_exact_name_before_lifecycle() {
+        let home = dec_home("delete_exact_name");
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(crate::layout::Tab::new(
+            "managed".to_string(),
+            close_test_pane(
+                crate::types::InstanceId::default(),
+                "managed",
+                Some("managed"),
+            ),
+        ));
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let mut overlay = Overlay::ConfirmDeleteInstance {
+            name: "managed".to_string(),
+            input: "manage".to_string(),
+            notice: None,
+        };
+        let task_rpc_tx = test_task_channel().0.clone();
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
+            reap_workers: &mut reap_workers,
+        };
+
+        handle_key(&mut overlay, press(KeyCode::Enter), &mut ctx);
+        assert!(matches!(
+            overlay,
+            Overlay::ConfirmDeleteInstance {
+                name,
+                input,
+                notice: Some(notice),
+            } if name == "managed"
+                && input == "manage"
+                && notice.contains("type exact name")
+        ));
+        assert_eq!(layout.tabs.len(), 1, "mismatch must preserve all views");
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn delete_persistence_failure_keeps_explicit_retry_state() {
+        let home = dec_home("delete_persistence_retry");
+        let expected_ref = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 91);
+        let mut pane = close_test_pane(crate::types::InstanceId::new(), "managed", Some("managed"));
+        pane.instance_ref = Some(expected_ref);
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(crate::layout::Tab::new("managed".to_string(), pane));
+        assert!(super::super::session::save_session(&home, &layout));
+        assert!(layout.remove_fleet_instance_views_exact(expected_ref));
+        crate::store::fail_next_atomic_write_for_test(&home.join("session.json"));
+        crate::store::fail_next_atomic_write_for_test(&home.join("session.retired.json"));
+
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let task_rpc_tx = test_task_channel().0.clone();
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
+            reap_workers: &mut reap_workers,
+        };
+        let overlay = Overlay::ConfirmDeleteInstance {
+            name: "managed".to_string(),
+            input: "managed".to_string(),
+            notice: None,
+        };
+        let completion = finish_successful_delete(&mut ctx, "managed", Some(expected_ref));
+
+        assert!(
+            matches!(completion, DeleteCompletion::Keep { notice } if notice.contains("pending")),
+            "failed persistence must leave an explicit retry state"
+        );
+        assert!(matches!(overlay, Overlay::ConfirmDeleteInstance { .. }));
+        assert!(home.join("session.json").exists());
+        crate::store::fail_next_atomic_write_for_test(&home.join("session.json"));
+        assert!(!super::super::session::save_session(&home, ctx.layout));
+        let retired: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(home.join("session.retired.json"))
+                .expect("retry must persist retired identity"),
+        )
+        .expect("valid retired session JSON");
+        assert_eq!(
+            retired["instance_refs"]
+                .as_array()
+                .expect("instance_refs array")
+                .len(),
+            1
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn delete_without_authoritative_identity_fails_closed() {
+        let home = dec_home("delete_missing_identity");
+        let sentinel = br#"{"active_tab":0,"tabs":[]}"#;
+        std::fs::write(home.join("session.json"), sentinel).expect("write session sentinel");
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(crate::layout::Tab::new(
+            "managed".to_string(),
+            close_test_pane(crate::types::InstanceId::new(), "managed", Some("managed")),
+        ));
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let task_rpc_tx = test_task_channel().0.clone();
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
+            reap_workers: &mut reap_workers,
+        };
+        let overlay = Overlay::ConfirmDeleteInstance {
+            name: "managed".to_string(),
+            input: "managed".to_string(),
+            notice: None,
+        };
+        let completion = finish_successful_delete(&mut ctx, "managed", None);
+
+        assert!(matches!(
+            completion,
+            DeleteCompletion::Keep { notice } if notice.contains("identity")
+        ));
+        assert!(matches!(overlay, Overlay::ConfirmDeleteInstance { .. }));
+        assert_eq!(
+            std::fs::read(home.join("session.json")).expect("session sentinel"),
+            sentinel
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn delete_instance_without_active_daemon_is_fail_closed() {
+        let home = dec_home("delete_no_daemon");
+        let id = crate::types::InstanceId::new();
+        let fleet_path = crate::fleet::fleet_yaml_path(&home);
+        let fleet_bytes = format!(
+            "instances:\n  managed:\n    id: '{}'\n    backend: claude\n",
+            id
+        );
+        std::fs::write(&fleet_path, &fleet_bytes).expect("write fleet fixture");
+        let workspace = crate::paths::workspace_dir(&home).join("managed");
+        std::fs::create_dir_all(&workspace).expect("create workspace fixture");
+        std::fs::write(workspace.join("keep.txt"), b"keep").expect("write workspace fixture");
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(Tab::new(
+            "managed".to_string(),
+            close_test_pane(id, "managed", Some("managed")),
+        ));
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let task_rpc_tx = test_task_channel().0.clone();
+        let mut overlay = Overlay::ConfirmDeleteInstance {
+            name: "managed".to_string(),
+            input: "managed".to_string(),
+            notice: None,
+        };
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
+            reap_workers: &mut reap_workers,
+        };
+
+        handle_key(&mut overlay, press(KeyCode::Enter), &mut ctx);
+        assert!(matches!(
+            overlay,
+            Overlay::ConfirmDeleteInstance {
+                notice: Some(notice), ..
+            } if notice.contains("active daemon")
+        ));
+        assert_eq!(
+            std::fs::read(&fleet_path).expect("fleet remains"),
+            fleet_bytes.as_bytes()
+        );
+        assert!(workspace.join("keep.txt").exists(), "workspace remains");
+        assert_eq!(layout.tabs.len(), 1, "view remains");
+        assert!(
+            layout.tabs[0]
+                .root()
+                .first_pane()
+                .fleet_instance_name
+                .as_deref()
+                == Some("managed")
+        );
+
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn delete_instance_error_preserves_every_exact_name_view() {
+        let home = dec_home("delete_error_preserves_views");
+        let id = crate::types::InstanceId::new();
+        let run = home.join("run").join(std::process::id().to_string());
+        std::fs::create_dir_all(&run).expect("create active-run fixture");
+        crate::daemon::write_daemon_id(&run);
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(Tab::new(
+            "first".to_string(),
+            close_test_pane(id, "managed", Some("managed")),
+        ));
+        layout.add_tab(Tab::new(
+            "second".to_string(),
+            close_test_pane(id, "managed", Some("managed")),
+        ));
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let task_rpc_tx = test_task_channel().0.clone();
+        let mut overlay = Overlay::ConfirmDeleteInstance {
+            name: "managed".to_string(),
+            input: "managed".to_string(),
+            notice: None,
+        };
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
+            reap_workers: &mut reap_workers,
+        };
+
+        handle_key(&mut overlay, press(KeyCode::Enter), &mut ctx);
+        assert!(matches!(
+            overlay,
+            Overlay::ConfirmDeleteInstance {
+                notice: Some(_),
+                ..
+            }
+        ));
+        assert_eq!(layout.tabs.len(), 2, "deletion error preserves every tab");
+        assert_eq!(
+            layout
+                .tabs
+                .iter()
+                .flat_map(|tab| {
+                    tab.root()
+                        .pane_ids()
+                        .into_iter()
+                        .filter_map(|id| tab.root().find_pane(id))
+                })
+                .filter_map(|pane| pane.fleet_instance_name.as_deref())
+                .filter(|name| *name == "managed")
+                .count(),
+            2
+        );
+
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    #[test]
+    fn delete_instance_removes_current_ref_when_old_name_only_view_precedes_it_3625() {
+        let home = dec_home("delete_replacement_view");
+        let current_id = crate::types::InstanceId::new();
+        let current_ref = crate::types::InstanceRef::new(current_id, 77);
+
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut old = close_test_pane(crate::types::InstanceId::new(), "managed", Some("managed"));
+        old.instance_ref = None;
+        let mut replacement = close_test_pane(current_id, "managed", Some("managed"));
+        replacement.id = 2;
+        replacement.instance_ref = Some(current_ref);
+        let mut layout = crate::layout::Layout::new();
+        layout.add_tab(Tab::new("old".to_string(), old));
+        layout.add_tab(Tab::new("replacement".to_string(), replacement));
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let task_rpc_tx = test_task_channel().0.clone();
+        let ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
+            reap_workers: &mut reap_workers,
+        };
+
+        let expected = authoritative_instance_ref_for_delete(&ctx, "managed");
+        assert_eq!(expected, Some(current_ref));
+        let expected = match expected {
+            Some(expected) => expected,
+            None => panic!("current instance ref should be authoritative"),
+        };
+        assert!(ctx.layout.remove_fleet_instance_views_exact(expected));
+        assert!(
+            ctx.layout.find_pane_mut(1).is_some(),
+            "old scrollback remains"
+        );
+        assert!(
+            ctx.layout.find_pane_mut(2).is_none(),
+            "current view removed"
+        );
+        std::fs::remove_dir_all(home).ok();
     }
 
     fn task_overlay() -> Overlay {
@@ -1082,7 +1666,20 @@ mod tests {
             row: 0,
             mode: TaskBoardMode::Board,
             view: BoardView::Tasks,
+            pending: false,
+            notice: None,
         }
+    }
+
+    fn test_task_channel() -> &'static (
+        crossbeam_channel::Sender<crate::app::rpc::TaskRequest>,
+        crossbeam_channel::Receiver<crate::app::rpc::TaskRequest>,
+    ) {
+        static CHANNEL: std::sync::OnceLock<(
+            crossbeam_channel::Sender<crate::app::rpc::TaskRequest>,
+            crossbeam_channel::Receiver<crate::app::rpc::TaskRequest>,
+        )> = std::sync::OnceLock::new();
+        CHANNEL.get_or_init(crossbeam_channel::unbounded)
     }
 
     fn get_mode(overlay: &Overlay) -> &TaskBoardMode {
@@ -1090,6 +1687,23 @@ mod tests {
             Overlay::Tasks { mode, .. } => mode,
             _ => panic!("expected Tasks overlay"),
         }
+    }
+
+    #[test]
+    fn task_write_failure_is_visible_and_does_not_mark_pending() {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        drop(rx);
+        let mut pending = false;
+        let mut notice = None;
+
+        assert!(!submit_task_request(
+            &tx,
+            serde_json::json!({"action": "done", "id": "t-1"}),
+            &mut pending,
+            &mut notice,
+        ));
+        assert!(!pending);
+        assert_eq!(notice.as_deref(), Some("task RPC worker stopped"));
     }
 
     /// #2305: a per-test temp home (process+tag unique — no env, no cross-test
@@ -1108,6 +1722,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
             registry: &registry,
@@ -1115,6 +1730,9 @@ mod tests {
             fleet_path: home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
+            reap_workers: &mut reap_workers,
         };
         for k in keys {
             handle_key(overlay, press(*k), &mut ctx);
@@ -1129,6 +1747,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
             registry: &registry,
@@ -1136,6 +1755,9 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
+            reap_workers: &mut reap_workers,
         };
         let mut overlay = task_overlay();
         handle_key(&mut overlay, press(KeyCode::Char('?')), &mut ctx);
@@ -1151,6 +1773,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
             registry: &registry,
@@ -1158,6 +1781,9 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
+            reap_workers: &mut reap_workers,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
@@ -1165,6 +1791,8 @@ mod tests {
             row: 0,
             mode: TaskBoardMode::Help,
             view: BoardView::Tasks,
+            pending: false,
+            notice: None,
         };
         handle_key(&mut overlay, press(KeyCode::Esc), &mut ctx);
         assert!(matches!(get_mode(&overlay), TaskBoardMode::Board));
@@ -1179,6 +1807,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
             registry: &registry,
@@ -1186,6 +1815,9 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
+            reap_workers: &mut reap_workers,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
@@ -1193,6 +1825,8 @@ mod tests {
             row: 0,
             mode: TaskBoardMode::Help,
             view: BoardView::Tasks,
+            pending: false,
+            notice: None,
         };
         handle_key(&mut overlay, press(KeyCode::Char('?')), &mut ctx);
         assert!(matches!(get_mode(&overlay), TaskBoardMode::Board));
@@ -1223,7 +1857,9 @@ mod tests {
         layout: &'a mut crate::layout::Layout,
         registry: &'a crate::agent::AgentRegistry,
         tx: &'a crossbeam_channel::Sender<usize>,
+        task_rpc_tx: &'a crossbeam_channel::Sender<crate::app::rpc::TaskRequest>,
         name_counter: &'a mut HashMap<String, usize>,
+        reap_workers: &'a mut Vec<std::thread::JoinHandle<()>>,
     ) -> OverlayCtx<'a> {
         OverlayCtx {
             layout,
@@ -1232,18 +1868,23 @@ mod tests {
             fleet_path: home,
             wakeup_tx: tx,
             name_counter,
+            task_rpc_tx,
+            restart_request_tx: None,
+            reap_workers,
         }
     }
 
-    /// Regression: Shift+L (Kitty protocol: 'l'+SHIFT) must update task
-    /// status and persist to tasks.json.
+    /// Regression: Shift+L (Kitty protocol: 'l'+SHIFT) must request the
+    /// canonical status update through the daemon RPC seam.
     #[test]
-    fn task_board_l_updates_task_status_and_persists() {
+    fn task_board_l_requests_status_update_via_rpc() {
         let home = tmp_home("l_persist");
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = crossbeam_channel::unbounded();
+        let (task_tx, task_rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
 
         // Create a task (status=open) — #2306: open lives in the Todo column (0).
         crate::tasks::handle(
@@ -1260,20 +1901,30 @@ mod tests {
             row: 0,
             mode: TaskBoardMode::Board,
             view: BoardView::Tasks,
+            pending: false,
+            notice: None,
         };
 
         // Kitty protocol: Shift+L → KeyCode::Char('l') + SHIFT
-        let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter);
+        let mut ctx = make_ctx(
+            &home,
+            &mut layout,
+            &registry,
+            &tx,
+            &task_tx,
+            &mut name_counter,
+            &mut reap_workers,
+        );
         handle_key(&mut overlay, shift(KeyCode::Char('l')), &mut ctx);
 
-        // Reload from disk — must be persisted. #2306: Todo →L→ Working (in_progress).
-        let reloaded = crate::tasks::list_all(&home);
-        let task = reloaded.iter().find(|t| t.id == task_id).expect("task");
-        assert_eq!(
-            task.status,
-            crate::task_events::TaskStatus::InProgress,
-            "L must persist status change"
-        );
+        let crate::app::rpc::TaskRequest::Mutate(arguments) =
+            task_rx.recv().expect("task mutation should be queued")
+        else {
+            panic!("expected task mutation")
+        };
+        assert_eq!(arguments["action"], "update");
+        assert_eq!(arguments["id"], task_id);
+        assert_eq!(arguments["status"], "in_progress");
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1289,8 +1940,10 @@ mod tests {
             let home = tmp_home(&format!("shift_d_{label}"));
             let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
             let (tx, _rx) = crossbeam_channel::unbounded();
+            let (task_tx, task_rx) = crossbeam_channel::unbounded();
             let mut name_counter = HashMap::new();
             let mut layout = crate::layout::Layout::new();
+            let mut reap_workers = Vec::new();
 
             crate::tasks::handle(
                 &home,
@@ -1308,18 +1961,28 @@ mod tests {
                 row: 0,
                 mode: TaskBoardMode::Board,
                 view: BoardView::Tasks,
+                pending: false,
+                notice: None,
             };
 
-            let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter);
+            let mut ctx = make_ctx(
+                &home,
+                &mut layout,
+                &registry,
+                &tx,
+                &task_tx,
+                &mut name_counter,
+                &mut reap_workers,
+            );
             handle_key(&mut overlay, key_event, &mut ctx);
 
-            let reloaded = crate::tasks::list_all(&home);
-            let task = reloaded.iter().find(|t| t.id == task_id).expect("task");
-            assert_eq!(
-                task.status,
-                crate::task_events::TaskStatus::Done,
-                "Shift+D ({label}) must mark done"
-            );
+            let crate::app::rpc::TaskRequest::Mutate(arguments) =
+                task_rx.recv().expect("task mutation should be queued")
+            else {
+                panic!("expected task mutation")
+            };
+            assert_eq!(arguments["action"], "done", "Shift+D ({label}) action");
+            assert_eq!(arguments["id"], task_id, "Shift+D ({label}) task");
 
             std::fs::remove_dir_all(&home).ok();
         }
@@ -1333,8 +1996,10 @@ mod tests {
         let home = tmp_home("cursor_resolve");
         let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = crossbeam_channel::unbounded();
+        let (task_tx, task_rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
 
         // Create two tasks in Open column with different priorities
         crate::tasks::handle(
@@ -1367,28 +2032,29 @@ mod tests {
             row: 0,
             mode: TaskBoardMode::Board,
             view: BoardView::Tasks,
+            pending: false,
+            notice: None,
         };
 
-        let mut ctx = make_ctx(&home, &mut layout, &registry, &tx, &mut name_counter);
+        let mut ctx = make_ctx(
+            &home,
+            &mut layout,
+            &registry,
+            &tx,
+            &task_tx,
+            &mut name_counter,
+            &mut reap_workers,
+        );
         handle_key(&mut overlay, shift(KeyCode::Char('l')), &mut ctx);
 
-        // high-pri must have moved, low-pri must stay
-        let reloaded = crate::tasks::list_all(&home);
-        let high = reloaded.iter().find(|t| t.id == high_id).expect("high-pri");
-        assert_eq!(
-            high.status,
-            crate::task_events::TaskStatus::InProgress,
-            "cursor row 0 must move high-pri task (Todo →L→ Working)"
-        );
-        let low = reloaded
-            .iter()
-            .find(|t| t.title == "low-pri")
-            .expect("low-pri");
-        assert_eq!(
-            low.status,
-            crate::task_events::TaskStatus::Open,
-            "low-pri must remain in Open"
-        );
+        let crate::app::rpc::TaskRequest::Mutate(arguments) =
+            task_rx.recv().expect("task mutation should be queued")
+        else {
+            panic!("expected task mutation")
+        };
+        assert_eq!(arguments["action"], "update");
+        assert_eq!(arguments["id"], high_id, "cursor must target high-pri");
+        assert_eq!(arguments["status"], "in_progress");
 
         std::fs::remove_dir_all(&home).ok();
     }
@@ -1403,6 +2069,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
             registry: &registry,
@@ -1410,6 +2077,9 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
+            reap_workers: &mut reap_workers,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
@@ -1417,6 +2087,8 @@ mod tests {
             row: 0,
             mode: TaskBoardMode::Board,
             view: BoardView::Tasks,
+            pending: false,
+            notice: None,
         };
         handle_key(&mut overlay, press(KeyCode::Tab), &mut ctx);
         if let Overlay::Tasks { view, .. } = &overlay {
@@ -1447,6 +2119,7 @@ mod tests {
         let (tx, _rx) = crossbeam_channel::unbounded();
         let mut name_counter = HashMap::new();
         let mut layout = crate::layout::Layout::new();
+        let mut reap_workers = Vec::new();
         let mut ctx = OverlayCtx {
             layout: &mut layout,
             registry: &registry,
@@ -1454,6 +2127,9 @@ mod tests {
             fleet_path: &home,
             wakeup_tx: &tx,
             name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
+            reap_workers: &mut reap_workers,
         };
         let mut overlay = Overlay::Tasks {
             items: Vec::new(),
@@ -1461,6 +2137,8 @@ mod tests {
             row: 0,
             mode: TaskBoardMode::Help,
             view: BoardView::Tasks,
+            pending: false,
+            notice: None,
         };
         handle_key(&mut overlay, press(KeyCode::Tab), &mut ctx);
         if let Overlay::Tasks { view, .. } = &overlay {
@@ -1683,7 +2361,42 @@ mod tests {
         }
         std::fs::remove_dir_all(&home).ok();
     }
+
+    /// #3662 RED: `:restart` must ask for confirmation before the command
+    /// dispatcher can kill or replace a pane.
+    #[test]
+    fn restart_command_confirms_before_execution_3662() {
+        let source = include_str!("overlay.rs").replace("\r\n", "\n");
+        assert_restart_confirmation_order(&source);
+        let crlf_source = source.replace('\n', "\r\n");
+        assert_restart_confirmation_order(&crlf_source);
+    }
+
+    fn assert_restart_confirmation_order(source: &str) {
+        let source = source.replace("\r\n", "\n");
+        let start = source
+            .find("Overlay::Command {\n            ref mut input")
+            .expect("command overlay handler must exist");
+        let end = source[start..]
+            .find("Overlay::Decisions {")
+            .map(|offset| start + offset)
+            .expect("command overlay handler end marker");
+        let region = &source[start..end];
+        let confirm = region
+            .find("ConfirmRestart")
+            .expect("restart Enter must open a confirmation overlay");
+        let execute = region
+            .find("execute_command")
+            .expect("command overlay must retain the execution path");
+        assert!(
+            confirm < execute,
+            "restart confirmation must be established before command execution"
+        );
+    }
 }
+
+#[cfg(test)]
+mod organizer_tests;
 
 #[cfg(test)]
 mod review_repro_app_tui;

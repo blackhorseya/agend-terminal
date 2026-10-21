@@ -904,26 +904,147 @@ AGEND_HOME = {home_lit}
     tracing::debug!(path = %config_path.display(), "configured MCP");
 
     // NOTE: intentionally no `codex_trust_directory` write to
-    // `~/.codex/config.toml`. That file is the user's personal codex config
-    // and must stay untouched. The trust prompt is handled by
-    // `--dangerously-bypass-approvals-and-sandbox` on the codex command line
-    // (see `src/backend.rs`) plus the "Do you trust" dismiss_pattern as a
-    // fallback. Writing here would pollute user state and has caused multiple
-    // production bugs (see removed `codex_trust_directory` in git history).
+    // `~/.codex/config.toml`. That file is the user's personal codex config and
+    // must stay untouched; writing here has caused multiple production bugs
+    // (see the removed `codex_trust_directory` in git history).
+    //
+    // #3317: this file is NOT how fleet tools reach codex any more. codex only
+    // loads it once the directory is a TRUSTED project, which a new instance
+    // never is, so the registration also goes on the child argv via
+    // `codex_mcp_config_args`. The file is kept because it starts working again
+    // the moment a directory IS trusted, and it carries the identity stamp.
+    // Trust itself is deliberately NOT granted by us — see the note on the
+    // removed codex trust-dismiss matcher in `src/backend.rs`.
 
     Ok(())
+}
+
+/// #3317: per-invocation `-c` overrides that register the agend MCP bridge on a
+/// codex child's own argv.
+///
+/// codex 0.148/0.149 load a project-local `.codex/config.toml` ONLY when the
+/// directory is a trusted project, so `configure_codex`'s file is silently
+/// ignored for every new instance and the agent boots with no fleet tools.
+/// These overrides bypass trust entirely and — like the `#1626`
+/// `check_for_update_on_startup` override this mirrors — write NOTHING to the
+/// operator's global `$CODEX_HOME/config.toml`. Verified at codex 0.149.0: the
+/// injected server is launched by the interactive session, which then issues
+/// `initialize` and `tools/list` against it, on Fresh and on `resume --last`;
+/// and codex MERGES these entries with the user's own `mcp_servers`, so the
+/// operator's servers are preserved.
+///
+/// The `.codex/config.toml` written by `configure_codex` is deliberately kept:
+/// it is the path that works again the moment a directory IS trusted, and it
+/// carries the workspace-identity stamp.
+pub(crate) fn codex_mcp_config_args(home: &Path, instance_name: Option<&str>) -> Vec<String> {
+    let (bridge_cmd, bridge_args) = bridge_binary_path();
+    codex_mcp_config_args_from(&bridge_cmd, &bridge_args, &home_path(home), instance_name)
+}
+
+/// Build the invocation-only Codex project-trust override for a managed
+/// workspace. Codex resolves project identity using the canonical filesystem
+/// path, so the argv must use that same path (not a symlink or `/tmp` alias).
+/// This changes only the child process's effective config; it never writes the
+/// operator's `$CODEX_HOME/config.toml`. The full-table override intentionally
+/// exposes only this managed workspace to the child invocation.
+pub(crate) fn codex_project_trust_args(workspace: &Path) -> anyhow::Result<Vec<String>> {
+    let canonical = std::fs::canonicalize(workspace).map_err(|error| {
+        anyhow::anyhow!(
+            "canonicalize Codex workspace '{}' for invocation trust: {error}",
+            workspace.display()
+        )
+    })?;
+    Ok(codex_project_trust_args_from(&canonical.to_string_lossy()))
+}
+
+/// Compose all child-only Codex overrides for a managed fleet spawn.
+pub(crate) fn codex_managed_config_args(
+    home: &Path,
+    instance_name: Option<&str>,
+    workspace: Option<&Path>,
+) -> anyhow::Result<Vec<String>> {
+    let mut args = codex_mcp_config_args(home, instance_name);
+    if let Some(workspace) = workspace {
+        args.extend(codex_project_trust_args(workspace)?);
+    }
+    Ok(args)
+}
+
+fn codex_project_trust_args_from(path: &str) -> Vec<String> {
+    vec![
+        "-c".to_string(),
+        format!(
+            "projects={{{}={{trust_level='trusted'}}}}",
+            toml_string_value(path)
+        ),
+    ]
+}
+
+/// Pure core of [`codex_mcp_config_args`]: no filesystem, no process state, so
+/// the exact argv and TOML encoding are unit-testable for Windows paths,
+/// apostrophes and spaces.
+///
+/// Values reuse [`toml_string_value`] — identical encoding to the file
+/// `configure_codex` emits, so the two paths cannot drift.
+fn codex_mcp_config_args_from(
+    bin: &str,
+    bridge_args: &[&str],
+    home: &str,
+    instance_name: Option<&str>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut push = |expr: String| {
+        out.push("-c".to_string());
+        out.push(expr);
+    };
+    push(format!(
+        "mcp_servers.agend-terminal.command={}",
+        toml_string_value(bin)
+    ));
+    // ALWAYS emit `args`, empty included. `-c` MERGES with the user/global config
+    // rather than replacing the server entry, so on an install that still carries
+    // an older `[mcp_servers.agend-terminal]` with e.g. `args = ["mcp"]`, omitting
+    // this would replace `command` while INHERITING the stale argument vector —
+    // the bridge would be launched as `<bridge> mcp`. Measured at codex 0.149.0:
+    // omitting it leaves `args = ["mcp"]` in place; emitting `args=[]` clears it,
+    // and unrelated user `mcp_servers` are untouched either way.
+    //
+    // `env` cannot be made authoritative the same way: codex merges that table
+    // recursively, so an inherited key we do not know the name of survives even a
+    // whole-table `env={…}` override. The two keys the bridge reads
+    // (`AGEND_HOME`, `AGEND_INSTANCE_NAME`) ARE overwritten, and a stray extra
+    // env var does not change the command line the way a stale argv does.
+    let rendered = bridge_args
+        .iter()
+        .map(|a| toml_string_value(a))
+        .collect::<Vec<_>>()
+        .join(", ");
+    push(format!("mcp_servers.agend-terminal.args=[{rendered}]"));
+    push(format!(
+        "mcp_servers.agend-terminal.env.AGEND_HOME={}",
+        toml_string_value(home)
+    ));
+    if let Some(name) = instance_name {
+        push(format!(
+            "mcp_servers.agend-terminal.env.AGEND_INSTANCE_NAME={}",
+            toml_string_value(name)
+        ));
+    }
+    out
 }
 
 /// Render a string value as a TOML string, picking whichever quoting style
 /// survives on the target. Windows paths routinely contain `\U` / `\d` / …
 /// which a double-quoted basic string interprets as escapes and then fails
 /// to parse. Single-quoted literal strings don't interpret anything, so they
-/// round-trip any path. Fall back to an escaped basic string only if the
-/// value contains a `'`, which a single-line literal can't represent.
+/// round-trip ordinary paths. Fall back to a JSON-escaped basic string if the
+/// value contains a `'` or an ASCII control character. JSON string escaping is
+/// TOML-compatible except for DEL, which TOML also forbids unescaped.
 fn toml_string_value(s: &str) -> String {
-    if s.contains('\'') {
-        let escaped = s.replace('\\', "\\\\").replace('"', "\\\"");
-        format!("\"{escaped}\"")
+    if s.contains('\'') || s.chars().any(|ch| ch.is_ascii_control()) {
+        serde_json::to_string(s)
+            .expect("serializing a string cannot fail")
+            .replace('\u{7f}', "\\u007f")
     } else {
         format!("'{s}'")
     }
@@ -1367,7 +1488,7 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    // --- Kiro: must use wrapper script ---
+    // --- Kiro: bridge binary configuration ---
 
     #[test]
     fn kiro_creates_wrapper_script() {
@@ -1387,11 +1508,21 @@ mod tests {
             Some("dev"),
             "env must contain AGEND_INSTANCE_NAME"
         );
-        // Command must NOT be a wrapper script
         let cmd = entry["command"].as_str().expect("command str");
+        let fname = std::path::Path::new(cmd)
+            .file_name()
+            .and_then(|f| f.to_str())
+            .unwrap_or("");
+        let stem = fname.strip_suffix(".exe").unwrap_or(fname);
         assert!(
-            !cmd.contains("wrapper"),
-            "must not use wrapper script, got: {cmd}"
+            stem == "agend-mcp-bridge",
+            "command must be the agend-mcp-bridge binary, got filename {fname:?} \
+             (full path: {cmd})"
+        );
+        let args = entry["args"].as_array().expect("args array");
+        assert!(
+            args.is_empty(),
+            "bridge command must not use args, got: {args:?}"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1409,16 +1540,17 @@ mod tests {
         // absolute path; under this repo it always contains "agend-terminal"
         // (the checkout dir name), so the old `cmd.contains("agend-terminal")`
         // disjunct was a tautology. The command must be the bridge binary
-        // (`agend-mcp-bridge`) or the `agend-terminal` fallback by filename.
+        // (`agend-mcp-bridge`) by filename: `bridge_binary_path` emits nothing
+        // else, and the `agend-terminal mcp` fallback was removed in #531.
         let fname = std::path::Path::new(cmd)
             .file_name()
             .and_then(|f| f.to_str())
             .unwrap_or("");
         let stem = fname.strip_suffix(".exe").unwrap_or(fname);
         assert!(
-            stem == "agend-mcp-bridge" || stem == "agend-terminal",
-            "command must be the bridge binary or the agend-terminal fallback, \
-             got filename {fname:?} (full path: {cmd})"
+            stem == "agend-mcp-bridge",
+            "command must be the agend-mcp-bridge binary, got filename {fname:?} \
+             (full path: {cmd})"
         );
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1617,6 +1749,140 @@ mod tests {
 
     // --- toml_string_value helper ---
 
+    /// #3317: the exact `-c` argv for the common case — flag/value pairs, in
+    /// order, with values encoded exactly as `configure_codex` writes them.
+    #[test]
+    fn codex_mcp_config_args_emit_flag_value_pairs_3317() {
+        assert_eq!(
+            codex_mcp_config_args_from("/opt/agend-mcp-bridge", &[], "/home/a/.agend", Some("dev")),
+            vec![
+                "-c",
+                "mcp_servers.agend-terminal.command='/opt/agend-mcp-bridge'",
+                "-c",
+                "mcp_servers.agend-terminal.args=[]",
+                "-c",
+                "mcp_servers.agend-terminal.env.AGEND_HOME='/home/a/.agend'",
+                "-c",
+                "mcp_servers.agend-terminal.env.AGEND_INSTANCE_NAME='dev'",
+            ]
+        );
+    }
+
+    /// #3317: a Windows bridge path must stay a TOML literal. `\U` / `\a` are
+    /// escape triggers in a basic string — the exact bug class `722140bd` cites
+    /// (`a457430` → `09a66c8`), now pinned on the argv path too.
+    #[test]
+    fn codex_mcp_config_args_keep_windows_paths_literal_3317() {
+        let args = codex_mcp_config_args_from(
+            r"C:\Users\alice\agend-mcp-bridge.exe",
+            &[],
+            r"C:\Users\alice\.agend",
+            Some("win"),
+        );
+        assert_eq!(
+            args[1], r"mcp_servers.agend-terminal.command='C:\Users\alice\agend-mcp-bridge.exe'",
+            "backslashes must survive verbatim inside a single-quoted literal"
+        );
+        assert_eq!(
+            args[5],
+            r"mcp_servers.agend-terminal.env.AGEND_HOME='C:\Users\alice\.agend'"
+        );
+    }
+
+    /// #3317: a path containing `'` cannot be a single-line literal, so it falls
+    /// back to an escaped basic string — with backslashes doubled, or the value
+    /// would then be re-interpreted as escapes.
+    #[test]
+    fn codex_mcp_config_args_escape_apostrophe_paths_3317() {
+        let args = codex_mcp_config_args_from(
+            r"C:\Program' Files\bridge.exe",
+            &[],
+            "/home/it's/.agend",
+            None,
+        );
+        assert_eq!(
+            args[1],
+            r#"mcp_servers.agend-terminal.command="C:\\Program' Files\\bridge.exe""#
+        );
+        assert_eq!(
+            args[5],
+            r#"mcp_servers.agend-terminal.env.AGEND_HOME="/home/it's/.agend""#
+        );
+        assert_eq!(
+            args.len(),
+            6,
+            "no instance name → no AGEND_INSTANCE_NAME entry"
+        );
+    }
+
+    /// #3317: spaces need no special handling — a literal carries them, and the
+    /// value reaches codex as one argv element (no shell is involved).
+    #[test]
+    fn codex_mcp_config_args_carry_spaces_in_one_argv_element_3317() {
+        let args = codex_mcp_config_args_from(
+            "/Users/a/My Documents/agend-mcp-bridge",
+            &[],
+            "/Users/a/My Documents/.agend",
+            Some("spacey"),
+        );
+        assert_eq!(
+            args[1],
+            "mcp_servers.agend-terminal.command='/Users/a/My Documents/agend-mcp-bridge'"
+        );
+        assert!(
+            args.iter().all(|a| !a.contains('\n')),
+            "every override must be a single argv element"
+        );
+    }
+
+    /// #3317: `args` is emitted ALWAYS, empty included, because `-c` MERGES with
+    /// the user/global config instead of replacing the server entry — an install
+    /// carrying an older `[mcp_servers.agend-terminal] args = ["mcp"]` would
+    /// otherwise run the new command with the stale argument vector. Measured on
+    /// codex 0.149.0. Elements use the same encoding as every other value.
+    #[test]
+    fn codex_mcp_config_args_always_emit_args_to_clear_inherited_ones_3317() {
+        assert_eq!(
+            codex_mcp_config_args_from("/b", &[], "/h", None)[3],
+            "mcp_servers.agend-terminal.args=[]",
+            "an empty `args=[]` is what CLEARS an inherited value; omitting it inherits"
+        );
+        let args = codex_mcp_config_args_from("/b", &["serve", r"C:\x"], "/h", None);
+        assert_eq!(
+            args[3],
+            r"mcp_servers.agend-terminal.args=['serve', 'C:\x']"
+        );
+    }
+
+    #[test]
+    fn codex_project_trust_override_is_valid_toml_and_preserves_windows_path_3402() {
+        let path = r"C:\Users\alice\Agend Workspace";
+        let args = codex_project_trust_args_from(path);
+        assert_eq!(
+            args,
+            vec![
+                "-c",
+                r"projects={'C:\Users\alice\Agend Workspace'={trust_level='trusted'}}"
+            ]
+        );
+        let parsed: toml::Value = toml::from_str(&args[1]).expect("valid TOML override");
+        assert_eq!(
+            parsed["projects"][path]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
+    #[test]
+    fn codex_project_trust_override_escapes_apostrophe_path_3402() {
+        let path = r"C:\Users\alice\it's workspace";
+        let args = codex_project_trust_args_from(path);
+        let parsed: toml::Value = toml::from_str(&args[1]).expect("valid TOML override");
+        assert_eq!(
+            parsed["projects"][path]["trust_level"].as_str(),
+            Some("trusted")
+        );
+    }
+
     #[test]
     fn toml_string_value_uses_literal_for_paths_with_backslashes() {
         // Windows paths contain `\U` / `\d` / … which a TOML basic string
@@ -1638,6 +1904,16 @@ mod tests {
             toml_string_value(r"C:\Program' Files\x"),
             r#""C:\\Program' Files\\x""#
         );
+    }
+
+    #[test]
+    fn toml_string_value_escapes_control_characters_3402() {
+        for value in ["workspace\nline", "it's\r\na workspace", "delete\u{7f}me"] {
+            let rendered = toml_string_value(value);
+            let parsed: toml::Value = toml::from_str(&format!("value={rendered}"))
+                .expect("control characters must remain valid TOML");
+            assert_eq!(parsed["value"].as_str(), Some(value));
+        }
     }
 
     #[test]

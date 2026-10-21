@@ -40,11 +40,13 @@ pub(crate) mod checkout_recovery;
 mod cleanup;
 mod handoff_ack;
 mod merge;
+mod merge_ci_truth;
 mod release;
+mod status_scope;
 pub(super) mod unwatch;
 mod watch;
 
-pub(super) use checkout::handle_checkout_repo;
+pub(crate) use checkout::handle_checkout_repo;
 #[cfg(test)]
 pub(crate) use checkout::handle_checkout_repo as handle_checkout_repo_for_test;
 pub(super) use cleanup::handle_cleanup_init_commits;
@@ -151,11 +153,25 @@ mod exact_head_watch_tests;
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod exact_head_merge_tests;
 
+// Canonical merge review-threshold enforcement — real-entry RED/GREEN tests in
+// a sibling file so the handler remains focused on the production path.
+#[cfg(test)]
+#[path = "review_threshold_merge_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod review_threshold_merge_tests;
+
 // #2812 notification-only watch — guard and contract tests in a sibling file.
 #[cfg(test)]
 #[path = "notification_only_watch_tests.rs"]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod notification_only_watch_tests;
+
+// Post-merge task-id passthrough — author-directed rework of the
+// release-before-merge ordering fix; tests in a sibling file.
+#[cfg(test)]
+#[path = "post_merge_task_id_passthrough_tests.rs"]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+mod post_merge_task_id_passthrough_tests;
 
 // #2755 repo-checkout transactional submodule provisioning — real-entry tests in
 // a sibling file (test-named ⇒ file_size_invariant-exempt; keeps checkout.rs small).

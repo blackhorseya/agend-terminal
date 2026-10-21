@@ -20,7 +20,7 @@
 //! no sweep). `AGEND_WORKTREE_PRUNE_LIVE` is ignored — a boot-time check
 //! (`warn_if_prune_live_retired`) fails LOUD if an operator still has it set.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
@@ -330,6 +330,91 @@ fn upsert_hygiene(home: &Path, key: String, title: String, evidence: serde_json:
 
 const CLEANUP_INTENT_HYGIENE_AGE: chrono::Duration = chrono::Duration::hours(24);
 
+/// t-…-241: is this episode's subject provably gone?
+///
+/// `None` means "unchanged" for every reason that is not proof of absence —
+/// an unknown key shape, a repo we could not interrogate, a branch listing
+/// that failed. That asymmetry is the whole point: a detector that closes on
+/// "could not tell" silently retires real problems, and the fleet has already
+/// been bitten by exactly that confusion (an error swallowed by
+/// `2>/dev/null` read as "no branches"). Absence is proven only by
+/// `try_exists()` answering `Ok(false)`, or by a SUCCESSFUL branch listing
+/// that does not contain the branch.
+///
+/// R1 rejected `Path::exists()` here, correctly: it "coerces errors to false"
+/// (std `path.rs`), so an EACCES on a parent directory renders a live repo
+/// indistinguishable from a deleted one — this function would then have
+/// announced `repository path no longer exists` for a repo that does, and
+/// cancelled its episode. That is the very failure this module exists to
+/// stop, so the invariant is now implemented rather than merely documented.
+fn vanished_target_reason(key: &str) -> Option<String> {
+    if let Some(repo) = key.strip_prefix("residue-fetch-degraded:") {
+        return matches!(Path::new(repo).try_exists(), Ok(false))
+            .then(|| format!("repository path no longer exists: {repo}"));
+    }
+    let rest = [
+        "residue-lifecycle-blocked:",
+        "residue-delete-failed:",
+        "residue-recovery-failed:",
+        "residue-remove-failed:",
+    ]
+    .iter()
+    .find_map(|prefix| key.strip_prefix(prefix))?;
+    // A git ref name can never contain `:` (git-check-ref-format), so the
+    // last colon always separates the repo path from the branch.
+    let (repo, branch) = rest.rsplit_once(':')?;
+    match Path::new(repo).try_exists() {
+        Ok(false) => return Some(format!("repository path no longer exists: {repo}")),
+        // Could not even determine whether the path is there.
+        Err(_) => return None,
+        Ok(true) => {}
+    }
+    match crate::git_helpers::git_cmd(Path::new(repo), &["branch", "--format=%(refname:short)"]) {
+        // Listing succeeded: absence is now a fact about the repo, not about
+        // our ability to ask it.
+        Ok(stdout) => (!stdout.lines().any(|b| b == branch))
+            .then(|| format!("branch no longer exists in {repo}: {branch}")),
+        // Could not ask — shim refusal, permissions, a repo mid-clone. Say
+        // nothing rather than retire a live problem.
+        Err(_) => None,
+    }
+}
+
+/// t-…-241: close episodes whose subject is provably gone, so they stop being
+/// re-observed forever. Measured before this ran: 335 live episodes, 59 of
+/// them pointing at a repo or branch that no longer existed.
+///
+/// Closing is safe here BECAUSE every key family below is a STATEFUL
+/// observation — the residue is still there to be seen again, so a premature
+/// close costs only counter continuity and the next sweep re-opens a fresh
+/// task (`hygiene_task::tests::done_episode_reopens_as_new_task`). A future
+/// key family that records a ONE-SHOT event would not have that property, and
+/// must not be added to `vanished_target_reason` without a different rule
+/// (R2, archfix-opus-3).
+fn close_hygiene_episodes_with_vanished_targets(home: &Path) -> usize {
+    let episodes = match crate::daemon::hygiene_task::active_episodes(home) {
+        Ok(episodes) => episodes,
+        Err(error) => {
+            tracing::warn!(%error, "hygiene revalidation: board unreadable, skipping this tick");
+            return 0;
+        }
+    };
+    let mut closed = 0;
+    for (task_id, key) in episodes {
+        let Some(reason) = vanished_target_reason(&key) else {
+            continue;
+        };
+        match crate::daemon::hygiene_task::close_episode(home, &task_id, &reason) {
+            Ok(()) => {
+                tracing::info!(key = %key, task = %task_id.0, %reason, "hygiene episode closed");
+                closed += 1;
+            }
+            Err(error) => tracing::warn!(key = %key, %error, "hygiene episode close failed"),
+        }
+    }
+    closed
+}
+
 fn surface_aged_preserved_review_intents(
     home: &Path,
     aged: &[crate::cleanup_intents::CleanupIntent],
@@ -363,6 +448,36 @@ fn surface_aged_preserved_review_intents(
     }
 }
 
+/// Return the semantic reason a repository root is owned by the daemon's
+/// workspace/review lifecycle rather than the branch-sweep lifecycle.
+///
+/// The roots are canonicalized before containment checks so a symlinked home
+/// or a relative binding cannot evade (or accidentally trigger) the boundary.
+/// A failed canonicalization is deliberately treated as "not excluded": the
+/// sweep remains fail-closed and preserves the existing formal-repository
+/// behavior instead of guessing from a path string.
+fn sweep_root_exclusion(home: &Path, repo_root: &Path) -> Option<&'static str> {
+    let repo_root = dunce::canonicalize(repo_root).ok()?;
+    let workspace_root = dunce::canonicalize(crate::paths::workspace_dir(home)).ok();
+    if workspace_root
+        .as_ref()
+        .is_some_and(|root| repo_root.starts_with(root))
+    {
+        return Some("agent_workspace_or_review_clone");
+    }
+
+    let managed_worktree_root =
+        dunce::canonicalize(crate::worktree_pool::daemon_managed_worktree_root(home)).ok();
+    if managed_worktree_root
+        .as_ref()
+        .is_some_and(|root| repo_root.starts_with(root))
+    {
+        return Some("daemon_managed_review_worktree");
+    }
+
+    None
+}
+
 pub fn sweep_from_registry(
     home: &Path,
     configs: &HashMap<String, Option<PathBuf>>,
@@ -372,9 +487,26 @@ pub fn sweep_from_registry(
         return Vec::new();
     }
 
+    let mut skipped_roots = BTreeMap::<&'static str, usize>::new();
     let repos: HashSet<PathBuf> = crate::binding::all_managed_repos(home)
         .into_iter()
+        .filter(|repo| {
+            if let Some(reason) = sweep_root_exclusion(home, repo) {
+                *skipped_roots.entry(reason).or_default() += 1;
+                false
+            } else {
+                true
+            }
+        })
         .collect();
+    if !skipped_roots.is_empty() {
+        let skipped_count: usize = skipped_roots.values().sum();
+        tracing::info!(
+            skipped_count,
+            reasons = ?skipped_roots,
+            "branch sweep skipped agent workspace/review clone roots"
+        );
+    }
     let mut active_dirs: Vec<PathBuf> = configs.values().flatten().cloned().collect();
     // Add fleet.yaml dirs as fallback for stopped agents
     active_dirs.extend(fleet_dirs.iter().cloned());
@@ -411,7 +543,31 @@ pub fn sweep_from_registry(
     let review_reconcile = crate::cleanup_intents::reconcile_terminal_review_intents(home, false);
     surface_aged_preserved_review_intents(home, &aged_review_intents, &review_reconcile);
 
+    // t-…-241: revalidate BEFORE observing, so a subject that vanished since
+    // the last tick is closed in the same tick that would have re-counted it.
+    close_hygiene_episodes_with_vanished_targets(home);
+
     let mut removed = Vec::new();
+
+    // t-…-241: `managed-repos.jsonl` only ever grows — 7 of its 24 entries
+    // were temp dirs and deleted worktrees. Sweeping one makes `fetch --prune`
+    // fail every tick, which is what kept the fetch-degraded episodes alive.
+    // Skipping (rather than deleting the entry) is deliberate: the file is the
+    // only record that a repo was ever managed, deletion is irreversible, and
+    // a path that is merely unreachable right now — an unmounted volume, a
+    // detached external disk — comes back on its own with skipping and never
+    // with deletion. Retiring entries permanently is operator hygiene, and
+    // every other destructive cleanup in this codebase is dry-run + confirm.
+    let repos: HashSet<PathBuf> = repos
+        .into_iter()
+        .filter(|repo| {
+            let live = repo.exists();
+            if !live {
+                tracing::debug!(repo = %repo.display(), "sweep: skipping managed repo whose path is gone");
+            }
+            live
+        })
+        .collect();
 
     for repo in &repos {
         // #2605: fetch runs UNCONDITIONALLY as the first step of every sweep —
@@ -484,6 +640,41 @@ pub fn sweep_from_registry(
         };
         for entry in &entries {
             let wt_path = Path::new(&entry.path);
+            let Some(agent) = crate::binding::managed_marker_agent(wt_path) else {
+                tracing::debug!(
+                    branch = %entry.branch,
+                    path = %entry.path,
+                    "skipping managed-worktree cleanup without authoritative marker owner"
+                );
+                continue;
+            };
+            let lifecycle_permit =
+                match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+                    home,
+                    &agent,
+                    crate::mcp::handlers::dispatch_hook::LifecycleOperation::Release,
+                ) {
+                    Ok(permit) => permit,
+                    Err(error) => {
+                        tracing::debug!(
+                            agent = %agent,
+                            branch = %entry.branch,
+                            path = %entry.path,
+                            %error,
+                            "skipping managed-worktree cleanup while lifecycle transaction is active"
+                        );
+                        continue;
+                    }
+                };
+            if crate::binding::managed_marker_agent(wt_path).as_deref() != Some(agent.as_str()) {
+                tracing::debug!(
+                    agent = %agent,
+                    branch = %entry.branch,
+                    path = %entry.path,
+                    "skipping managed-worktree cleanup after authoritative owner changed"
+                );
+                continue;
+            }
 
             // PR-D·D3: occupancy/marker protection (L0) delegated to the shared
             // `disposition::l0_protected` — the SAME fail-direction the classifier
@@ -540,10 +731,10 @@ pub fn sweep_from_registry(
             );
             // Route Delete through janitor with the caller-local remover, retaining
             // retry behavior and final command diagnostics.
-            let outcome = crate::daemon::janitor::dispose(
+            let outcome = crate::daemon::janitor::dispose_with_permit(
                 home,
                 crate::worktree::disposition::Disposition::Delete,
-                "",
+                &agent,
                 None,
                 || {
                     remove_worktree(
@@ -554,6 +745,7 @@ pub fn sweep_from_registry(
                         false,
                     )
                 },
+                &lifecycle_permit,
             );
             match outcome {
                 crate::daemon::janitor::DispositionOutcome::Deleted(Ok(())) => {
@@ -887,8 +1079,8 @@ fn prune_orphaned_branches_with_home(
     // can't be determined, the occupancy dimension would collapse to "nothing
     // occupied" and a branch whose worktree is merely un-enumerable could be
     // reaped — skip ALL branch pruning this tick instead (mirrors :382).
-    let wt_branches: HashSet<String> = match list_worktrees(repo_root) {
-        Ok(entries) => entries.into_iter().map(|e| e.branch).collect(),
+    let registered_worktrees: Vec<WorktreeEntry> = match list_worktrees(repo_root) {
+        Ok(entries) => entries,
         Err(()) => {
             tracing::warn!(
                 repo = %repo_root.display(),
@@ -898,6 +1090,13 @@ fn prune_orphaned_branches_with_home(
             return Vec::new();
         }
     };
+    // A registered path that no longer exists is stale metadata, not an occupied
+    // worktree; only existing paths contribute to the active-holder set.
+    let registered_worktree_branches: HashSet<String> = registered_worktrees
+        .into_iter()
+        .filter(|entry| Path::new(&entry.path).exists())
+        .map(|entry| entry.branch)
+        .collect();
 
     // W1.2: git_cmd → trimmed stdout on success; spawn-error + non-zero collapse to `Err → []`.
     let branches: Vec<String> =
@@ -917,7 +1116,7 @@ fn prune_orphaned_branches_with_home(
 
     let mut pruned = Vec::new();
     for branch in &branches {
-        if wt_branches.contains(branch) {
+        if registered_worktree_branches.contains(branch) {
             continue;
         }
         let merged = is_branch_merged(repo_root, branch);
@@ -978,7 +1177,10 @@ fn prune_orphaned_branches_with_home(
         } else {
             (None, None)
         };
-        let active_holder = match (wt_branches.contains(branch), binding_active) {
+        let active_holder = match (
+            registered_worktree_branches.contains(branch),
+            binding_active,
+        ) {
             (true, _) | (_, Some(true)) => Some(true),
             (false, Some(false)) => Some(false),
             _ => None,

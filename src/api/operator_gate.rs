@@ -177,12 +177,14 @@ pub(crate) fn capability_allows_request(
     if !capability_allows(principal, method) {
         return false;
     }
-    // `usage_limit_takeover` is an operator-only seam. Enforce that authority
+    // Takeover and manual Job recovery acknowledgement are operator-only seams. Enforce that authority
     // from the authenticated principal before the mcp_tool worker resolves
     // the spoofable payload instance or enters the mode gate.
     if principal == crate::auth_cookie::Principal::Agent
         && method == super::method::MCP_TOOL
-        && params.get("tool").and_then(Value::as_str) == Some("usage_limit_takeover")
+        && (params.get("tool").and_then(Value::as_str) == Some("usage_limit_takeover")
+            || (params.get("tool").and_then(Value::as_str) == Some("schedule")
+                && params["arguments"]["action"].as_str() == Some("resolve_recovery")))
     {
         return false;
     }
@@ -258,6 +260,11 @@ pub(crate) fn check_operation_allowed(
             "idle_watchdog_enabled",
             "hang_auto_recovery_enabled",
             "usage_limit_propagation_enabled",
+            "experimental.tool_cli_enabled",
+            // #3480: the operator-page master switch. The `config` tool has no
+            // `set` action any more (#2548), so this is defence in depth — but a
+            // switch an agent could flip is not a switch.
+            "operator_page.enabled",
         ];
         let key = params
             .get("arguments")
@@ -656,6 +663,8 @@ mod tests {
             "idle_watchdog_enabled",
             "hang_auto_recovery_enabled",
             "usage_limit_propagation_enabled",
+            "experimental.tool_cli_enabled",
+            "operator_page.enabled",
         ] {
             assert!(
                 check_operation_allowed("mcp_tool", &set_key(key), &active).is_err(),
@@ -802,6 +811,12 @@ mod tests {
     }
 
     #[test]
+    fn capability_agent_cannot_invoke_restart_lifecycle_adapters_3670() {
+        assert!(!capability_allows(P::Agent, method::DELETE));
+        assert!(!capability_allows(P::Agent, method::SPAWN));
+    }
+
+    #[test]
     fn capability_agent_cannot_invoke_usage_limit_takeover_at_request_gate() {
         for instance in ["", "forged-operator"] {
             let params = json!({
@@ -818,6 +833,28 @@ mod tests {
             P::Operator,
             method::MCP_TOOL,
             &json!({"tool": "usage_limit_takeover", "instance": ""})
+        ));
+    }
+    #[test]
+    fn capability_agent_cannot_acknowledge_job_recovery() {
+        for instance in ["", "operator", "creator"] {
+            let params = json!({"tool":"schedule","instance":instance,
+                "arguments":{"action":"resolve_recovery","cleanup_confirmed":true}});
+            assert!(!capability_allows_request(
+                P::Agent,
+                method::MCP_TOOL,
+                &params
+            ));
+            assert!(capability_allows_request(
+                P::Operator,
+                method::MCP_TOOL,
+                &params
+            ));
+        }
+        assert!(capability_allows_request(
+            P::Agent,
+            method::MCP_TOOL,
+            &json!({"tool":"schedule","arguments":{"action":"complete"}})
         ));
     }
 }

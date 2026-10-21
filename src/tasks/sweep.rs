@@ -1,7 +1,62 @@
-use super::list_all;
 use chrono::{DateTime, Duration, Utc};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::path::Path;
+
+/// Snapshot of the two authorities needed before a task owner can become an
+/// apply-capable sweep candidate.  `Some(empty)` is a healthy empty registry;
+/// `live_available = false` is an authority outage and must never be treated
+/// as an empty live set.
+#[derive(Debug, Clone)]
+pub(super) struct OwnerAuthority {
+    pub live_instances: HashSet<String>,
+    pub fleet_instances: HashSet<String>,
+    pub live_available: bool,
+    pub fleet_available: bool,
+}
+
+impl OwnerAuthority {
+    #[allow(dead_code)]
+    pub(super) fn available(
+        live_instances: HashSet<String>,
+        fleet_instances: HashSet<String>,
+    ) -> Self {
+        Self {
+            live_instances,
+            fleet_instances,
+            live_available: true,
+            fleet_available: true,
+        }
+    }
+
+    pub(super) fn unavailable(fleet_instances: HashSet<String>, fleet_available: bool) -> Self {
+        Self {
+            live_instances: HashSet::new(),
+            fleet_instances,
+            live_available: false,
+            fleet_available,
+        }
+    }
+
+    fn is_available(&self) -> bool {
+        self.live_available && self.fleet_available
+    }
+
+    pub(super) fn as_json(&self) -> serde_json::Value {
+        let diagnostic = if self.is_available() {
+            "owner_authority_available"
+        } else {
+            "owner_authority_unavailable"
+        };
+        serde_json::json!({
+            "code": diagnostic,
+            "available": self.is_available(),
+            "live_available": self.live_available,
+            "fleet_available": self.fleet_available,
+            "live_count": self.live_instances.len(),
+            "fleet_count": self.fleet_instances.len(),
+        })
+    }
+}
 
 /// State of a PR referenced by a task title/description.
 #[derive(Debug, Clone, PartialEq)]
@@ -82,6 +137,29 @@ pub(super) struct Candidate {
     pub reason: String,
     pub owner: Option<String>,
     pub pr: Option<u32>,
+    pub due_at: Option<String>,
+    pub refs: Vec<String>,
+    pub branch: Option<String>,
+    pub project_route: Option<String>,
+    pub last_activity: String,
+}
+
+fn candidate(task: &super::Task, reason: String, pr: Option<u32>, refs: Vec<String>) -> Candidate {
+    Candidate {
+        id: task.id.clone(),
+        reason,
+        owner: task.assignee.clone(),
+        pr,
+        due_at: task.due_at.clone(),
+        refs,
+        branch: task.branch.clone(),
+        project_route: task
+            .metadata
+            .get("project")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        last_activity: task.updated_at.clone(),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -89,14 +167,29 @@ pub(super) struct Categories {
     pub shipped: Vec<Candidate>,
     pub superseded: Vec<Candidate>,
     pub team_disbanded: Vec<Candidate>,
+    /// Owner-related findings that are visible to the operator but are never
+    /// admitted to `all_ids()` (configured-offline owners and strict ghosts
+    /// whose refs/status still prove live work).
+    pub owner_report_only: Vec<Candidate>,
     pub validation_leftovers: Vec<Candidate>,
     /// #2061: open/backlog tasks whose referenced issue/PR are ALL terminal,
     /// or which carry no ref and are >14d stale.
     pub stale_open: Vec<Candidate>,
+    /// H3: stale nonterminal tasks are report-only residue candidates. They
+    /// are intentionally excluded from `all_ids()` and therefore cannot enter
+    /// the cancellation apply path.
+    pub stale_nonterminal: Vec<Candidate>,
+    /// Provider failures are explicit blocking diagnostics.  They are kept
+    /// separate from candidate categories so a failed lookup cannot become an
+    /// apply-capable ID through a partial scan.
+    pub diagnostics: Vec<serde_json::Value>,
 }
 
 impl Categories {
     pub fn all_ids(&self) -> Vec<String> {
+        if !self.diagnostics.is_empty() {
+            return Vec::new();
+        }
         let mut v: Vec<String> = self
             .shipped
             .iter()
@@ -120,8 +213,11 @@ impl Categories {
             "shipped": self.shipped,
             "superseded": self.superseded,
             "team_disbanded": self.team_disbanded,
+            "owner_report_only": self.owner_report_only,
             "validation_leftovers": self.validation_leftovers,
             "stale_open": self.stale_open,
+            "stale_nonterminal": self.stale_nonterminal,
+            "diagnostics": self.diagnostics,
         })
     }
 }
@@ -131,10 +227,11 @@ impl Categories {
 /// `verified` are skipped — they're already cleaned up. Each task
 /// lands in at most one category (first match wins, order:
 /// validation_leftovers → team_disbanded → shipped/superseded →
-/// stale_open).
+/// stale_nonterminal → stale_open).
 ///
 /// `now` is parameterized so tests can fast-forward age thresholds
 /// without forging event-log timestamps.
+#[allow(dead_code)]
 pub(super) fn scan_categories(
     home: &Path,
     live_instances: &HashSet<String>,
@@ -142,11 +239,59 @@ pub(super) fn scan_categories(
     issue_lookup: IssueLookup,
     repo: Option<&str>,
     now: DateTime<Utc>,
-) -> Categories {
-    let tasks = list_all(home);
+) -> Result<Categories, super::TaskRouteError> {
+    // Compatibility seam for deterministic unit fixtures.  Production
+    // handlers use `scan_categories_with_authority` so an unavailable live
+    // registry cannot be collapsed into an empty set.
+    let fleet_instances = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .map(|config| config.instances.keys().cloned().collect())
+        .unwrap_or_default();
+    scan_categories_with_authority(
+        home,
+        &OwnerAuthority::available(live_instances.clone(), fleet_instances),
+        pr_lookup,
+        issue_lookup,
+        repo,
+        now,
+    )
+}
+
+pub(super) fn scan_categories_with_authority(
+    home: &Path,
+    authority: &OwnerAuthority,
+    pr_lookup: PrLookup,
+    issue_lookup: IssueLookup,
+    repo: Option<&str>,
+    now: DateTime<Utc>,
+) -> Result<Categories, super::TaskRouteError> {
+    scan_categories_with_authority_scoped(home, authority, pr_lookup, issue_lookup, repo, None, now)
+}
+
+pub(super) fn scan_categories_with_authority_scoped(
+    home: &Path,
+    authority: &OwnerAuthority,
+    pr_lookup: PrLookup,
+    issue_lookup: IssueLookup,
+    repo: Option<&str>,
+    scope: Option<&BTreeSet<String>>,
+    now: DateTime<Utc>,
+) -> Result<Categories, super::TaskRouteError> {
+    let tasks = crate::tasks::board_router::list_all_boards_checked(home)?
+        .into_iter()
+        .filter(|(project, _)| scope.is_none_or(|scope| scope.contains(project)))
+        .flat_map(|(project, tasks)| {
+            tasks.into_iter().map(move |mut task| {
+                task.metadata
+                    .insert("project".to_string(), serde_json::json!(project));
+                task
+            })
+        })
+        .collect::<Vec<_>>();
     let mut cats = Categories::default();
     let mut pr_cache: HashMap<u32, PrState> = HashMap::new();
     let mut issue_cache: HashMap<u32, IssueState> = HashMap::new();
+    let mut provider_errors = BTreeSet::new();
     for t in &tasks {
         if t.status.is_terminal() || t.status == crate::task_events::TaskStatus::Verified {
             continue;
@@ -154,7 +299,49 @@ pub(super) fn scan_categories(
         let age = chrono::DateTime::parse_from_rfc3339(&t.updated_at)
             .ok()
             .map(|dt| now.signed_duration_since(dt.with_timezone(&Utc)));
-        // (1) validation_leftovers — title prefix match + 1d stale.
+        // InReview and other active-work states are always report-only.  This
+        // check must precede validation and owner admission so an active task
+        // cannot enter an apply-capable category through a title/branch prefix.
+        let search_text = format!("{}\n{}", t.title, t.description);
+        if matches!(
+            t.status,
+            crate::task_events::TaskStatus::Claimed
+                | crate::task_events::TaskStatus::InProgress
+                | crate::task_events::TaskStatus::InReview
+                | crate::task_events::TaskStatus::Blocked
+        ) {
+            let Some(a) = age.filter(|a| *a > Duration::days(14)) else {
+                continue;
+            };
+            let refs = extract_refs(&search_text);
+            let ref_labels: Vec<String> = refs
+                .pr_nums
+                .iter()
+                .map(|n| format!("PR #{n}"))
+                .chain(refs.issue_nums.iter().map(|n| format!("issue #{n}")))
+                .collect();
+            if t.status == crate::task_events::TaskStatus::InReview
+                && authority.is_available()
+                && t.assignee.is_some()
+            {
+                cats.owner_report_only.push(candidate(
+                    t,
+                    "InReview owner is report-only; no cancellation admission".to_string(),
+                    refs.pr_nums.first().copied(),
+                    ref_labels.clone(),
+                ));
+            }
+            cats.stale_nonterminal.push(candidate(
+                t,
+                format!("{} task {}d stale", t.status, a.num_days()),
+                refs.pr_nums.first().copied(),
+                ref_labels,
+            ));
+            continue;
+        }
+        // (1) validation_leftovers — title prefix match + 1d stale.  Terminal
+        // tasks already returned above; only non-active validation residue is
+        // eligible for this apply-capable category.
         let title_lc = t.title.to_lowercase();
         let is_validation = title_lc.starts_with("val-")
             || title_lc.starts_with("canary-")
@@ -167,29 +354,120 @@ pub(super) fn scan_categories(
         if is_validation {
             if let Some(a) = age {
                 if a > Duration::days(1) {
-                    cats.validation_leftovers.push(Candidate {
-                        id: t.id.clone(),
-                        reason: format!("validation/canary title prefix, {}d stale", a.num_days()),
-                        owner: t.assignee.clone(),
-                        pr: None,
-                    });
+                    cats.validation_leftovers.push(candidate(
+                        t,
+                        format!("validation/canary title prefix, {}d stale", a.num_days()),
+                        None,
+                        vec![],
+                    ));
                     continue;
                 }
             }
         }
-        // (2) team_disbanded — owner not in live fleet + 30d stale.
-        if let (Some(owner), Some(a)) = (t.assignee.as_ref(), age) {
-            if !live_instances.contains(owner) && a > Duration::days(30) {
-                cats.team_disbanded.push(Candidate {
-                    id: t.id.clone(),
-                    reason: format!("owner '{owner}' not in live fleet, {}d stale", a.num_days()),
-                    owner: Some(owner.clone()),
-                    pr: None,
-                });
+        // No owner-bearing task may reach an apply-capable category while the
+        // live or fleet authority is unavailable.  Unassigned tasks still
+        // flow through the independent non-owner categories below.
+        if t.assignee.is_some() && !authority.is_available() {
+            continue;
+        }
+        // A configured-but-offline owner is a soft ghost.  Keep it visible for
+        // operator diagnosis, but never let shipped/superseded/stale-open
+        // admission cancel it during the same sweep.
+        if let Some(owner) = t.assignee.as_ref() {
+            if super::orphan::classify_owner(
+                owner,
+                &authority.live_instances,
+                &authority.fleet_instances,
+            ) == super::orphan::OwnerClassification::Soft
+            {
+                cats.owner_report_only.push(candidate(
+                    t,
+                    format!("owner '{owner}' is configured but offline; report-only"),
+                    None,
+                    vec![],
+                ));
                 continue;
             }
         }
-        let search_text = format!("{}\n{}", t.title, t.description);
+        // (2) team_disbanded — only a fully available authority may admit a
+        // strict owner, and refs must prove there is no live work first.
+        if let (Some(owner), Some(a)) = (t.assignee.as_ref(), age) {
+            if a > Duration::days(30) {
+                match super::orphan::classify_owner(
+                    owner,
+                    &authority.live_instances,
+                    &authority.fleet_instances,
+                ) {
+                    super::orphan::OwnerClassification::Live => {}
+                    // Soft owners are handled by the report-only guard above;
+                    // keep this arm exhaustive if that guard changes later.
+                    super::orphan::OwnerClassification::Soft => continue,
+                    super::orphan::OwnerClassification::Strict => {
+                        let refs = extract_refs(&search_text);
+                        let ref_labels = refs
+                            .pr_nums
+                            .iter()
+                            .map(|n| format!("PR #{n}"))
+                            .chain(refs.issue_nums.iter().map(|n| format!("issue #{n}")))
+                            .collect::<Vec<_>>();
+                        let refs_terminal = if refs.is_empty() {
+                            !refs.saw_token
+                        } else if let Some(repo) = repo {
+                            refs.pr_nums.iter().all(|&n| {
+                                matches!(
+                                    pr_cache.entry(n).or_insert_with(|| {
+                                        match pr_lookup(repo, n) {
+                                            Ok(state) => state,
+                                            Err(error) => {
+                                                provider_errors
+                                                    .insert(format!("{repo}: PR #{n}: {error}"));
+                                                PrState::Unknown
+                                            }
+                                        }
+                                    }),
+                                    PrState::Merged { .. } | PrState::Closed
+                                )
+                            }) && refs.issue_nums.iter().all(|&n| {
+                                *issue_cache.entry(n).or_insert_with(|| {
+                                    match issue_lookup(repo, n) {
+                                        Ok(state) => state,
+                                        Err(error) => {
+                                            provider_errors
+                                                .insert(format!("{repo}: issue #{n}: {error}"));
+                                            IssueState::Unknown
+                                        }
+                                    }
+                                }) == IssueState::Closed
+                            })
+                        } else {
+                            false
+                        };
+                        if refs_terminal {
+                            cats.team_disbanded.push(candidate(
+                                t,
+                                format!(
+                                    "owner '{owner}' not in live fleet, {}d stale",
+                                    a.num_days()
+                                ),
+                                refs.pr_nums.first().copied(),
+                                ref_labels,
+                            ));
+                        } else {
+                            cats.owner_report_only.push(candidate(
+                                t,
+                                format!(
+                                    "owner '{owner}' has unresolved/live work refs, {}d stale; report-only",
+                                    a.num_days()
+                                ),
+                                refs.pr_nums.first().copied(),
+                                ref_labels,
+                            ));
+                        }
+                        continue;
+                    }
+                }
+            }
+        }
         // (3) shipped / (4) superseded — first PR ref + query. Unchanged
         // predicates; only a `continue` is added after each push so an
         // already-bucketed task is not re-examined by the new stale_open arm
@@ -198,32 +476,38 @@ pub(super) fn scan_categories(
             if let Some(pr_num) = extract_pr_number(&search_text) {
                 let state = pr_cache
                     .entry(pr_num)
-                    .or_insert_with(|| pr_lookup(repo, pr_num).unwrap_or(PrState::Unknown))
+                    .or_insert_with(|| match pr_lookup(repo, pr_num) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            provider_errors.insert(format!("{repo}: PR #{pr_num}: {error}"));
+                            PrState::Unknown
+                        }
+                    })
                     .clone();
                 match state {
                     PrState::Merged { merged_at } => {
                         if let Some(a) = age {
                             if a > Duration::days(7) {
-                                cats.shipped.push(Candidate {
-                                    id: t.id.clone(),
-                                    reason: format!(
+                                cats.shipped.push(candidate(
+                                    t,
+                                    format!(
                                         "PR #{pr_num} merged at {merged_at}, task {}d stale",
                                         a.num_days()
                                     ),
-                                    owner: t.assignee.clone(),
-                                    pr: Some(pr_num),
-                                });
+                                    Some(pr_num),
+                                    vec![format!("PR #{pr_num}")],
+                                ));
                                 continue;
                             }
                         }
                     }
                     PrState::Closed => {
-                        cats.superseded.push(Candidate {
-                            id: t.id.clone(),
-                            reason: format!("PR #{pr_num} closed without merge"),
-                            owner: t.assignee.clone(),
-                            pr: Some(pr_num),
-                        });
+                        cats.superseded.push(candidate(
+                            t,
+                            format!("PR #{pr_num} closed without merge"),
+                            Some(pr_num),
+                            vec![format!("PR #{pr_num}")],
+                        ));
                         continue;
                     }
                     PrState::Open | PrState::Unknown => {}
@@ -254,12 +538,12 @@ pub(super) fn scan_categories(
             if !refs.saw_token {
                 if let Some(a) = age {
                     if a > Duration::days(14) {
-                        cats.stale_open.push(Candidate {
-                            id: t.id.clone(),
-                            reason: format!("no PR/issue ref, open {}d stale", a.num_days()),
-                            owner: t.assignee.clone(),
-                            pr: None,
-                        });
+                        cats.stale_open.push(candidate(
+                            t,
+                            format!("no PR/issue ref, open {}d stale", a.num_days()),
+                            None,
+                            vec![],
+                        ));
                     }
                 }
             }
@@ -274,28 +558,56 @@ pub(super) fn scan_categories(
             matches!(
                 pr_cache
                     .entry(n)
-                    .or_insert_with(|| pr_lookup(repo, n).unwrap_or(PrState::Unknown)),
+                    .or_insert_with(|| match pr_lookup(repo, n) {
+                        Ok(state) => state,
+                        Err(error) => {
+                            provider_errors.insert(format!("{repo}: PR #{n}: {error}"));
+                            PrState::Unknown
+                        }
+                    }),
                 PrState::Merged { .. } | PrState::Closed
             )
         }) && refs.issue_nums.iter().all(|&n| {
             *issue_cache
                 .entry(n)
-                .or_insert_with(|| issue_lookup(repo, n).unwrap_or(IssueState::Unknown))
+                .or_insert_with(|| match issue_lookup(repo, n) {
+                    Ok(state) => state,
+                    Err(error) => {
+                        provider_errors.insert(format!("{repo}: issue #{n}: {error}"));
+                        IssueState::Unknown
+                    }
+                })
                 == IssueState::Closed
         });
         if all_terminal {
-            cats.stale_open.push(Candidate {
-                id: t.id.clone(),
-                reason: format!(
+            let ref_labels = refs
+                .pr_nums
+                .iter()
+                .map(|n| format!("PR #{n}"))
+                .chain(refs.issue_nums.iter().map(|n| format!("issue #{n}")))
+                .collect();
+            cats.stale_open.push(candidate(
+                t,
+                format!(
                     "all referenced issue/PR terminal (PR {:?}, issue {:?})",
                     refs.pr_nums, refs.issue_nums
                 ),
-                owner: t.assignee.clone(),
-                pr: refs.pr_nums.first().copied(),
-            });
+                refs.pr_nums.first().copied(),
+                ref_labels,
+            ));
         }
     }
-    cats
+    cats.diagnostics = provider_errors
+        .into_iter()
+        .map(|evidence| {
+            serde_json::json!({
+                "code": "PROVIDER_UNAVAILABLE",
+                "repository": repo,
+                "evidence": evidence,
+            })
+        })
+        .collect();
+    Ok(cats)
 }
 
 /// Extract the first `PR #<digits>` (or `PR <digits>`) reference

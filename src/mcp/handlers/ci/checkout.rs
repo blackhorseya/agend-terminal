@@ -4,7 +4,10 @@ use serde_json::{json, Value};
 use std::path::Path;
 // #2755 R3: response-mapping + marker-durability helpers live in a sibling module to
 // keep this handler under the LOC ceiling (call sites below are unchanged).
-use super::checkout_helpers::{rollback_response, sync_marker_contents, validate_expected_head};
+use super::checkout_helpers::{
+    acquire_bind_lifecycle_permit, recover_stale_checkout_txn, rollback_response,
+    stale_worktree_dir_response, sync_marker_contents, validate_expected_head,
+};
 
 use super::checkout_disposable::CheckoutPurpose;
 pub(crate) use super::checkout_helpers::checkout_source;
@@ -37,26 +40,9 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         Ok(purpose) => purpose,
         Err(error) => return error,
     };
-    // The bind transaction owns the per-agent lifecycle authority before any
-    // provisioning preflight. Keep this permit through branch locking,
-    // bind_full, commit, and exact rollback so checkout cannot race release or
-    // rebase at the release→bind gap.
-    let lifecycle_permit = if bind {
-        match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
-            home,
-            instance_name,
-            crate::mcp::handlers::dispatch_hook::LifecycleOperation::Bind,
-        ) {
-            Ok(permit) => Some(permit),
-            Err(error) => {
-                return json!({
-                    "error": format!("checkout bind refused: {error}"),
-                    "code": "lifecycle_conflict",
-                });
-            }
-        }
-    } else {
-        None
+    let lifecycle_permit = match acquire_bind_lifecycle_permit(home, instance_name, bind) {
+        Ok(permit) => permit,
+        Err(error) => return error,
     };
     if bind {
         if let Err(e) = crate::agent_ops::ensure_not_protected_json(branch) {
@@ -69,6 +55,9 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
             Ok(pair) => pair,
             Err(e) => return e,
         };
+    if source != source_path {
+        super::checkout_path::warn_legacy_raw_identity(home, instance_name, source, &source_path);
+    }
     let target =
         match super::checkout_path::resolve_worktree_target(home, instance_name, &source_path) {
             Ok(target) => target,
@@ -100,6 +89,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     // `d-20260514102305998399-0` scope.
     let mut auto_created_branch = false;
     let mut fetch_attempted = false;
+    // #3546: false ⟺ this checkout made no claim about any base.
+    let mut base_from_stale_view = false;
     if bind {
         let src = Path::new(&source_path);
         // #2703: omitted `from_ref` follows the repo default (`origin/<default_branch>`).
@@ -110,16 +101,20 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 .map(str::to_owned)
                 .unwrap_or_else(|| format!("origin/{}", crate::git_helpers::default_branch(src)))
         });
-        match crate::mcp::handlers::dispatch_hook::ensure_branch_exists(
+        match crate::mcp::handlers::dispatch_hook::ensure_branch_exists_provisioned(
             home,
             src,
             branch,
             &creation_ref,
             instance_name,
         ) {
-            Ok((created, fetched)) => {
+            Ok(provision) => {
+                let created = provision.created;
                 auto_created_branch = created;
-                fetch_attempted = fetched;
+                fetch_attempted = provision.fetch_attempted;
+                // #3546: the caller must learn this HERE — by the time it shows
+                // up in binding_state the tree is already in someone's hands.
+                base_from_stale_view = provision.base_from_stale_view;
                 if checkout_purpose == Some(CheckoutPurpose::DisposableReview) && !created {
                     return json!({
                         "error": format!("disposable review branch '{branch}' was not created by this checkout"),
@@ -173,9 +168,9 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     } else {
         None
     };
+    let worktree_path_str = worktree_dir.display().to_string();
     // #2755: serialize reuse and fresh provision on the target path; journal + lock
     // remain outside the worktree so rollback cannot delete recovery state.
-    let worktree_path_str = worktree_dir.display().to_string();
     let path_lock = match super::checkout_txn::acquire_path_lock(home, &worktree_dir, &mangled) {
         Ok(g) => g,
         Err(e) => {
@@ -205,22 +200,27 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     let txn_now = chrono::Utc::now();
     // Replay a journal left by a CRASHED prior provision of this path (removes a
     // stale worktree so a fresh add — or the reuse check below — sees clean state).
-    if let Err(e) = super::checkout_txn::recover_stale(
+    if let Err(e) = recover_stale_checkout_txn(
         home,
         &journal_key,
         &worktree_dir,
-        &source_canonical.display().to_string(),
+        &source_canonical,
         txn_now,
-        || {
-            crate::git_helpers::git_bypass(
-                Path::new(&source_path),
-                &["worktree", "remove", "--force", &worktree_path_str],
-            )
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        },
     ) {
         return json!({"error": redact_paths(&e), "code": "stale_txn_rollback", "branch": branch});
+    }
+    if bind {
+        if let Some(response) = stale_worktree_dir_response(
+            home,
+            &worktree_dir,
+            Path::new(&source_path),
+            instance_name,
+            branch,
+            args["expected_head"].as_str().unwrap_or(""),
+            auto_created_branch,
+        ) {
+            return response;
+        }
     }
     if bind {
         // #1882: cross-agent P0-1.5 reject UNDER the lock — another agent holding
@@ -249,7 +249,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 .map(std::path::PathBuf::from)
                 .filter(|p| p.exists());
             if same_branch {
-                if let Some(wt) = live_wt {
+                if let Some(wt) = live_wt.clone() {
                     // #2755: the full fail-closed reuse contract (deadlock-safe exact-path
                     // lock transfer, CAS re-read, canonical daemon-managed provenance, then
                     // sync-to-final-HEAD → strict init → gitlink verify) lives in the sibling
@@ -283,19 +283,18 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     }
                     return reuse_resp;
                 }
-                let existing_task_id = existing
-                    .get("task_id")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or_default();
-                if !existing_task_id.is_empty() {
-                    return json!({
-                        "error": format!(
-                            "stale binding for branch '{branch}' points at a missing worktree - release first before checkout"
-                        ),
-                        "code": "stale_binding",
-                        "branch": branch,
-                    });
-                }
+            }
+            // #3550: the agent's global binding can block this provision —
+            // either stale on this branch or live on a different branch.
+            if let Some(resp) = super::checkout_helpers::binding_mismatch_response(
+                &existing,
+                branch,
+                live_wt.as_deref(),
+                Path::new(&source_path),
+                args["expected_head"].as_str().unwrap_or(""),
+                auto_created_branch,
+            ) {
+                return resp;
             }
         }
     }
@@ -304,14 +303,8 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
     // lands on the named branch, #778.)
     // Bounded worktree rollback (LOCAL git via bypass), reused by every failure
     // path below so each checked-save failure leaves no orphan.
-    let remove_worktree = || {
-        crate::git_helpers::git_bypass(
-            Path::new(&source_path),
-            &["worktree", "remove", "--force", &worktree_path_str],
-        )
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    };
+    let remove_worktree =
+        || super::checkout_helpers::remove_worktree(Path::new(&source_path), &worktree_path_str);
     // Prepared: durably journal the intent BEFORE any filesystem side effect. A
     // failed save here is fatal-but-clean (no side effect yet).
     let mut journal = super::checkout_txn::Journal::prepared(
@@ -570,6 +563,7 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     &source_canonical,
                     true, // #2158 GR1: agent self-claim (repo checkout bind:true) → notify operator
                     provenance,
+                    base_from_stale_view, // #3546
                 ) {
                     // #1310: rollback worktree on binding failure to prevent orphans
                     tracing::warn!(
@@ -647,6 +641,11 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                 resp["bound"] = json!(true);
                 resp["ci_watch_armed"] = json!(false);
                 resp["auto_created_branch"] = json!(auto_created_branch);
+                // #3546: present only when true — a healthy provision leaves the
+                // response byte-identical for existing readers.
+                if base_from_stale_view {
+                    resp["base_from_stale_view"] = json!(true);
+                }
                 resp["fetch_attempted"] = json!(fetch_attempted);
                 if checkout_purpose == Some(CheckoutPurpose::DisposableReview) {
                     resp["checkout_purpose"] = json!("disposable_review");

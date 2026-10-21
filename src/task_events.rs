@@ -31,6 +31,8 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+pub mod catalog;
+
 /// Persisted-envelope schema version. Bumped only on changes that older
 /// readers cannot interpret. Forward-compat: v(N) reader rejects v(N+1)
 /// envelopes (fail-closed). Backward-compat: v(N) reader accepts v(<=N).
@@ -51,8 +53,9 @@ use std::path::{Path, PathBuf};
 /// SCHEMA_VERSION` check in [`replay`]. v2 readers accept v1 envelopes
 /// (the new `Created` fields default to `None` / `Vec::new()`).
 /// v3 (#3279) adds the typed [`TaskEvent::Superseded`] terminal transition.
-/// Older readers must reject rather than silently fold it as an active task.
-pub const SCHEMA_VERSION: u32 = 3;
+/// v4 (#3584) adds the optional typed reconciliation proof to that event.
+/// Older readers must reject rather than silently fold either form as an active task.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Hot-file event count [`compact`] trims the hot log back down to.
 pub const COMPACTION_KEEP: usize = 10_000;
@@ -275,6 +278,17 @@ pub enum TaskEvent {
         tags: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         parent_id: Option<TaskId>,
+        /// The exact decision whose authority resolved this task at create
+        /// time. Additive for legacy Created envelopes.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        governing_decision_id: Option<String>,
+        /// Typed review threshold resolved atomically with Created.
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            with = "crate::daemon::pr_state::review_class_serde"
+        )]
+        review_class: Option<crate::daemon::pr_state::ReviewClass>,
     },
     Claimed {
         task_id: TaskId,
@@ -299,6 +313,13 @@ pub enum TaskEvent {
         by: InstanceName,
         reason: String,
     },
+    /// Exact operator settlement: status and audit proof are one durable event.
+    /// Unlike ordinary cancellation, this never changes children.
+    OperatorSettled {
+        task_id: TaskId,
+        #[serde(flatten)]
+        proof: OperatorSettlement,
+    },
     /// #3279: terminal predecessor relation created atomically with its
     /// successor on the same board. Distinct from Cancelled so replay and
     /// operators retain why the work item ended and the exact successor ID.
@@ -306,6 +327,8 @@ pub enum TaskEvent {
         task_id: TaskId,
         by: InstanceName,
         successor_id: TaskId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        proof: Option<SupersessionReconciliationProof>,
     },
     Linked {
         task_id: TaskId,
@@ -434,6 +457,7 @@ impl TaskEvent {
             | TaskEvent::Verified { task_id, .. }
             | TaskEvent::Done { task_id, .. }
             | TaskEvent::Cancelled { task_id, .. }
+            | TaskEvent::OperatorSettled { task_id, .. }
             | TaskEvent::Superseded { task_id, .. }
             | TaskEvent::Linked { task_id, .. }
             | TaskEvent::Blocked { task_id, .. }
@@ -461,6 +485,7 @@ impl TaskEvent {
             TaskEvent::Verified { .. } => "verified",
             TaskEvent::Done { .. } => "done",
             TaskEvent::Cancelled { .. } => "cancelled",
+            TaskEvent::OperatorSettled { .. } => "operator_settled",
             TaskEvent::Superseded { .. } => "superseded",
             TaskEvent::Linked { .. } => "linked",
             TaskEvent::Blocked { .. } => "blocked",
@@ -633,12 +658,114 @@ impl TaskStatus {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct HistoryEntry {
     pub seq: u64,
     pub timestamp: String,
     pub instance: InstanceName,
     pub kind: &'static str,
+}
+
+impl<'de> Deserialize<'de> for HistoryEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        struct OwnedHistoryEntry {
+            seq: u64,
+            timestamp: String,
+            instance: InstanceName,
+            kind: String,
+        }
+
+        let entry = OwnedHistoryEntry::deserialize(deserializer)?;
+        let kind = match entry.kind.as_str() {
+            "created" => "created",
+            "claimed" => "claimed",
+            "in_progress" => "in_progress",
+            "verified" => "verified",
+            "done" => "done",
+            "cancelled" => "cancelled",
+            "operator_settled" => "operator_settled",
+            "superseded" => "superseded",
+            "linked" => "linked",
+            "blocked" => "blocked",
+            "unblocked" => "unblocked",
+            "reopened" => "reopened",
+            "released" => "released",
+            "moved_to_backlog" => "moved_to_backlog",
+            "moved_to_review" => "moved_to_review",
+            "task_close_proposed" => "task_close_proposed",
+            "owner_assigned" => "owner_assigned",
+            "priority_changed" => "priority_changed",
+            "description_updated" => "description_updated",
+            "tags_set" => "tags_set",
+            "result_set" => "result_set",
+            "metadata_set" => "metadata_set",
+            "branch_linked" => "branch_linked",
+            unknown => {
+                return Err(serde::de::Error::custom(format!(
+                    "unknown task history kind: {unknown}"
+                )))
+            }
+        };
+        Ok(Self {
+            seq: entry.seq,
+            timestamp: entry.timestamp,
+            instance: entry.instance,
+            kind,
+        })
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OperatorSettlementTarget {
+    Done,
+    Cancelled,
+}
+
+impl OperatorSettlementTarget {
+    pub fn status(self) -> TaskStatus {
+        match self {
+            Self::Done => TaskStatus::Done,
+            Self::Cancelled => TaskStatus::Cancelled,
+        }
+    }
+}
+
+/// Latest proof is bounded in the projection; older operations stay in the log.
+/// This is replay data, not an authorization token for a public handler.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OperatorSettlement {
+    pub operation_id: String,
+    pub preview_digest: String,
+    pub by: InstanceName,
+    pub holder_instance: Option<InstanceName>,
+    pub target: OperatorSettlementTarget,
+    pub result: String,
+}
+
+/// Durable proof for the operator-only orphan predecessor reconciliation path.
+/// The proof is deliberately part of the typed event rather than a free-form
+/// audit line, so retries can distinguish the same operation from a conflicting
+/// successor after a restart.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupersessionReconciliationProof {
+    pub operation_id: String,
+    pub preview_digest: String,
+    pub mapping_digest: String,
+    pub board: String,
+    pub audit_reason: String,
+    pub predecessor_created_at: String,
+    pub replacement_created_at: String,
+    pub replacement_terminal_event_instance: String,
+    pub replacement_terminal_event_seq: u64,
+    pub replacement_record_sha256: String,
+    pub replacement_evidence_sha256: String,
+    pub actor_digest: String,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -665,6 +792,8 @@ pub struct TaskRecord {
     /// #3279: exact typed successor for a terminal Superseded predecessor.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub superseded_by: Option<TaskId>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_operator_settlement: Option<OperatorSettlement>,
     pub branch: Option<String>,
     /// Sprint 55 P0-C — opt-out flag for daemon auto-bind on dispatch.
     /// `Some(false)` means RCA/audit/design class; auto-bind was skipped.
@@ -781,6 +910,8 @@ impl TaskBoardState {
                 eta_secs,
                 tags,
                 parent_id,
+                governing_decision_id,
+                review_class,
                 ..
             } => {
                 self.apply_created(
@@ -799,6 +930,8 @@ impl TaskBoardState {
                     eta_secs,
                     tags,
                     parent_id,
+                    governing_decision_id,
+                    review_class,
                 );
             }
             TaskEvent::Claimed { by, .. } => {
@@ -810,6 +943,14 @@ impl TaskBoardState {
             }
             TaskEvent::Done { source, .. } => self.apply_done(task_id, touch_at, source),
             TaskEvent::Cancelled { .. } => self.apply_cancelled(task_id, touch_at),
+            TaskEvent::OperatorSettled { proof, .. } => {
+                if let Some(task) = self.tasks.get_mut(task_id) {
+                    task.status = proof.target.status();
+                    task.result = Some(proof.result.clone());
+                    task.updated_at = touch_at.to_string();
+                    task.last_operator_settlement = Some(proof.clone());
+                }
+            }
             TaskEvent::Superseded { successor_id, .. } => {
                 self.apply_superseded(task_id, touch_at, successor_id)
             }
@@ -889,10 +1030,24 @@ impl TaskBoardState {
         eta_secs: &Option<i64>,
         tags: &[String],
         parent_id: &Option<TaskId>,
+        governing_decision_id: &Option<String>,
+        review_class: &Option<crate::daemon::pr_state::ReviewClass>,
     ) {
-        self.tasks
-            .entry(task_id.clone())
-            .or_insert_with(|| TaskRecord {
+        self.tasks.entry(task_id.clone()).or_insert_with(|| {
+            let mut metadata = BTreeMap::new();
+            if let Some(decision_id) = governing_decision_id {
+                metadata.insert(
+                    "governing_decision_id".to_string(),
+                    serde_json::json!(decision_id),
+                );
+            }
+            if let Some(class) = review_class {
+                metadata.insert(
+                    "review_class".to_string(),
+                    serde_json::json!(class.as_token()),
+                );
+            }
+            TaskRecord {
                 id: task_id.clone(),
                 title: title.to_string(),
                 description: description.to_string(),
@@ -910,14 +1065,16 @@ impl TaskBoardState {
                 routed_to: routed_to.clone(),
                 result: None,
                 superseded_by: None,
+                last_operator_settlement: None,
                 branch: branch.clone(),
                 bind: *bind,
                 started_at: None,
                 eta_secs: *eta_secs,
                 tags: tags.to_vec(),
                 parent_id: parent_id.clone(),
-                metadata: BTreeMap::new(),
-            });
+                metadata,
+            }
+        });
     }
 
     fn apply_simple_status(&mut self, task_id: &TaskId, touch_at: &str, status: TaskStatus) {
@@ -1116,35 +1273,16 @@ fn log_path(board: &Path) -> PathBuf {
     board.join(format!("{LOG_NAME}.jsonl"))
 }
 
-fn archive_dir(board: &Path) -> PathBuf {
-    board.join("task_events_archive")
+pub(crate) fn board_event_lock_path(board: &Path) -> PathBuf {
+    log_path(board).with_extension("jsonl.lock")
 }
 
-/// CR-2026-06-14 (#2212 orphan-prune follow-up): does `board` have ANY on-disk
-/// event bytes — a non-empty hot log or a non-empty archive segment?
-///
-/// `replay_at` SKIPS corrupt (non-JSON) lines (#1988 half-write tolerance), so a
-/// board whose ENTIRE log is garbage replays to `Ok(empty)` — indistinguishable
-/// BY STATE from a board that genuinely holds no tasks (terminal tasks stay in
-/// `state.tasks`, so a readable non-empty board always replays ≥1 task). The
-/// orphan-prune ([`crate::tasks::board_router::live_task_ids`]) uses this to
-/// disambiguate: an empty replay WITH on-disk bytes is an unreadable/corrupt
-/// board, not an empty one, so its index entries must NOT be treated as orphans.
-/// Cheap O(1) metadata stats; no parse.
-pub(crate) fn board_has_event_bytes(board: &Path) -> bool {
-    let nonempty = |p: &Path| std::fs::metadata(p).map(|m| m.len() > 0).unwrap_or(false);
-    if nonempty(&log_path(board)) {
-        return true;
-    }
-    if let Ok(entries) = std::fs::read_dir(archive_dir(board)) {
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|x| x.to_str()) == Some("jsonl") && nonempty(&p) {
-                return true;
-            }
-        }
-    }
-    false
+pub(crate) fn acquire_board_set_lock(home: &Path) -> anyhow::Result<crate::store::FileFlockGuard> {
+    crate::store::acquire_file_lock(&home.join(".locks/task-board-set.lock"))
+}
+
+fn archive_dir(board: &Path) -> PathBuf {
+    board.join("task_events_archive")
 }
 
 /// Append one event, returning the newly assigned monotonic seq#.
@@ -1188,51 +1326,15 @@ pub(crate) fn append_batch_at(
     instance: &InstanceName,
     events: Vec<TaskEvent>,
 ) -> anyhow::Result<Vec<u64>> {
-    if events.is_empty() {
-        return Ok(Vec::new());
+    match catalog::commit_at(board, instance, |_| Ok(events))? {
+        Ok(seqs) => Ok(seqs),
+        Err(reason) => anyhow::bail!("fixed task-event commit rejected: {reason}"),
     }
-    let instance = instance.clone();
-    let count = events.len();
-    let mut seqs: Vec<u64> = Vec::with_capacity(count);
-    let now = chrono::Utc::now().to_rfc3339();
-
-    // Sprint 46 P3: resolve emitter's InstanceId for audit trail.
-    let emitter_id = match crate::agent::resolve_instance(board, instance.as_str()) {
-        Ok((id, _)) => Some(id.full()),
-        Err(e) => {
-            tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
-            None
-        }
-    };
-
-    let mut hot_lines = 0usize;
-    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
-        let (start_seq, pre_lines) = next_seq_under_lock(board, log_path, &instance, count as u64)?;
-        hot_lines = pre_lines;
-        let mut lines = Vec::with_capacity(count);
-        for (i, event) in events.into_iter().enumerate() {
-            let seq = start_seq + i as u64;
-            seqs.push(seq);
-            let envelope = TaskEventEnvelope {
-                schema_version: SCHEMA_VERSION,
-                seq,
-                timestamp: now.clone(),
-                instance: instance.clone(),
-                emitter_id: emitter_id.clone(),
-                event,
-            };
-            lines.push(serde_json::to_string(&envelope)?);
-        }
-        Ok(lines)
-    })?;
-    invalidate_replay_cache();
-    maybe_compact_events(board, hot_lines + count);
-    Ok(seqs)
 }
 
 /// Batch variant of [`append_checked`] (#1868): append ALL `events` atomically
-/// iff `precondition` — evaluated under the append lock against a FRESH on-disk
-/// replay — returns `Ok`. Closes the same TOCTOU as [`append_checked`] for the
+/// iff `precondition` — evaluated under the append lock against a fresh catalog
+/// snapshot — returns `Ok`. Closes the same TOCTOU as [`append_checked`] for the
 /// multi-event `update` arm (a status transition plus priority/desc/tags/owner
 /// events emitted as one batch). On precondition failure NO event is written and
 /// the reason is returned as `Ok(Err(reason))`; the outer `Err` is reserved for
@@ -1269,61 +1371,16 @@ pub(crate) fn append_batch_checked_at<F>(
 where
     F: FnOnce(&TaskBoardState) -> Result<(), String>,
 {
-    if events.is_empty() {
-        return Ok(Ok(Vec::new()));
-    }
-    let instance = instance.clone();
-    let count = events.len();
-    let mut seqs: Vec<u64> = Vec::with_capacity(count);
-    let now = chrono::Utc::now().to_rfc3339();
-    let emitter_id = match crate::agent::resolve_instance(board, instance.as_str()) {
-        Ok((id, _)) => Some(id.full()),
-        Err(e) => {
-            tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
-            None
-        }
-    };
-
-    let mut rejection: Option<String> = None;
-    let mut hot_lines = 0usize;
-    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
-        // FRESH replay under the lock — authoritative committed history.
-        let state = replay_uncached(board)?;
-        if let Err(reason) = precondition(&state) {
-            rejection = Some(reason);
-            return Ok(Vec::new()); // empty ⇒ no write
-        }
-        let (start_seq, pre_lines) = next_seq_under_lock(board, log_path, &instance, count as u64)?;
-        hot_lines = pre_lines;
-        let mut lines = Vec::with_capacity(count);
-        for (i, event) in events.into_iter().enumerate() {
-            let seq = start_seq + i as u64;
-            seqs.push(seq);
-            let envelope = TaskEventEnvelope {
-                schema_version: SCHEMA_VERSION,
-                seq,
-                timestamp: now.clone(),
-                instance: instance.clone(),
-                emitter_id: emitter_id.clone(),
-                event,
-            };
-            lines.push(serde_json::to_string(&envelope)?);
-        }
-        Ok(lines)
-    })?;
-
-    if let Some(reason) = rejection {
-        return Ok(Err(reason));
-    }
-    invalidate_replay_cache();
-    maybe_compact_events(board, hot_lines + count);
-    Ok(Ok(seqs))
+    catalog::commit_at(board, instance, |state| {
+        precondition(state)?;
+        Ok(events)
+    })
 }
 
-/// #2760 R2: append events that are **COMPUTED from the FRESH on-disk replay under
+/// #2760 R2: append events that are **COMPUTED from the fresh catalog snapshot under
 /// the append lock**. Unlike [`append_batch_checked_at`] (which GATES a fixed event
 /// set with a precondition), `compute(&state)` both re-validates authorization AND
-/// builds the events against the authoritative committed history — so a caller can
+/// builds the events against the authoritative committed state — so a caller can
 /// re-evaluate an ACL/governance policy, or build an idempotent UNION (e.g. the
 /// `plan_acks` list), against state that no concurrent writer can change between the
 /// decision and the write. This closes the authorization/predicate TOCTOU that a
@@ -1332,7 +1389,7 @@ where
 ///
 /// `compute` returns `Err(reason)` to REFUSE (no write; `Ok(Err(reason))`), an EMPTY
 /// vec for a computed no-op (idempotent; `Ok(Ok(vec![]))`), or the events to append.
-/// The outer `Err` is reserved for IO/replay failures. No `api::call` under the lock
+/// The outer `Err` is reserved for storage failures. No `api::call` under the lock
 /// (#1629) — `compute` must be pure decision + event construction.
 pub(crate) fn append_batch_computed_at<F>(
     board: &Path,
@@ -1342,80 +1399,23 @@ pub(crate) fn append_batch_computed_at<F>(
 where
     F: FnOnce(&TaskBoardState) -> Result<Vec<TaskEvent>, String>,
 {
-    let instance = instance.clone();
-    let now = chrono::Utc::now().to_rfc3339();
-    let emitter_id = match crate::agent::resolve_instance(board, instance.as_str()) {
-        Ok((id, _)) => Some(id.full()),
-        Err(e) => {
-            tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
-            None
-        }
-    };
-
-    let mut rejection: Option<String> = None;
-    let mut seqs: Vec<u64> = Vec::new();
-    let mut hot_lines = 0usize;
-    let mut appended = 0usize;
-    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
-        // FRESH replay under the lock — authoritative committed history.
-        let state = replay_uncached(board)?;
-        let events = match compute(&state) {
-            Ok(events) => events,
-            Err(reason) => {
-                rejection = Some(reason);
-                return Ok(Vec::new()); // empty ⇒ no write
-            }
-        };
-        if events.is_empty() {
-            return Ok(Vec::new()); // computed no-op (e.g. already-acked)
-        }
-        let count = events.len();
-        appended = count;
-        let (start_seq, pre_lines) = next_seq_under_lock(board, log_path, &instance, count as u64)?;
-        hot_lines = pre_lines;
-        let mut lines = Vec::with_capacity(count);
-        for (i, event) in events.into_iter().enumerate() {
-            let seq = start_seq + i as u64;
-            seqs.push(seq);
-            let envelope = TaskEventEnvelope {
-                schema_version: SCHEMA_VERSION,
-                seq,
-                timestamp: now.clone(),
-                instance: instance.clone(),
-                emitter_id: emitter_id.clone(),
-                event,
-            };
-            lines.push(serde_json::to_string(&envelope)?);
-        }
-        Ok(lines)
-    })?;
-
-    if let Some(reason) = rejection {
-        return Ok(Err(reason));
-    }
-    if appended > 0 {
-        invalidate_replay_cache();
-        maybe_compact_events(board, hot_lines + appended);
-    }
-    Ok(Ok(seqs))
+    catalog::commit_at(board, instance, compute)
 }
 
 /// Append `event` atomically iff `precondition` — evaluated under the append
-/// lock against a FRESH on-disk replay — returns `Ok`. This closes the TOCTOU
+/// lock against a fresh catalog snapshot — returns `Ok`. This closes the TOCTOU
 /// where a caller validates task state, then appends after a concurrent writer
 /// has already mutated it (e.g. #t-21: two agents claiming the same Open task,
 /// both seeing it Open before either appends, both succeeding).
 ///
 /// The precondition runs inside the SAME critical section as the write, so the
-/// state it inspects is the authoritative committed history: any racing writer
+/// state it inspects is the authoritative committed state: any racing writer
 /// either committed before us (and is visible) or is blocked waiting for the
 /// lock (and will re-validate against OUR committed event next).
 ///
 /// On precondition failure NO event is written; the rejection reason is
-/// returned as `Ok(Err(reason))`. The outer `Err` is reserved for IO / replay
-/// failures. Replay/append semantics are otherwise unchanged — this reuses
-/// `replay_uncached` (lock-free) for the read and the same seq/cache plumbing
-/// as [`append_batch`].
+/// returned as `Ok(Err(reason))`. The outer `Err` is reserved for storage failures.
+/// Append semantics and sequence allocation are otherwise unchanged.
 // #2117 P1: non-test callers route via `append_checked_at` (board-resolved); this
 // home-default wrapper is retained for the symmetric storage API + test callers.
 #[allow(dead_code)]
@@ -1446,50 +1446,11 @@ pub(crate) fn append_checked_at<F>(
 where
     F: FnOnce(&TaskBoardState) -> Result<(), String>,
 {
-    let instance = instance.clone();
-    let now = chrono::Utc::now().to_rfc3339();
-    let emitter_id = match crate::agent::resolve_instance(board, instance.as_str()) {
-        Ok((id, _)) => Some(id.full()),
-        Err(e) => {
-            tracing::debug!(instance = %instance, error = %e, "emitter ID resolution failed");
-            None
-        }
-    };
-
-    let mut assigned_seq: Option<u64> = None;
-    let mut rejection: Option<String> = None;
-    let mut hot_lines = 0usize;
-
-    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
-        // FRESH replay under the lock — authoritative committed history.
-        let state = replay_uncached(board)?;
-        if let Err(reason) = precondition(&state) {
-            rejection = Some(reason);
-            return Ok(Vec::new()); // empty ⇒ no write
-        }
-        let (seq, pre_lines) = next_seq_under_lock(board, log_path, &instance, 1)?;
-        assigned_seq = Some(seq);
-        hot_lines = pre_lines;
-        let envelope = TaskEventEnvelope {
-            schema_version: SCHEMA_VERSION,
-            seq,
-            timestamp: now.clone(),
-            instance: instance.clone(),
-            emitter_id: emitter_id.clone(),
-            event,
-        };
-        Ok(vec![serde_json::to_string(&envelope)?])
-    })?;
-
-    if let Some(reason) = rejection {
-        return Ok(Err(reason));
-    }
-    invalidate_replay_cache();
-    maybe_compact_events(board, hot_lines + 1);
-    if let Some(seq) = assigned_seq {
-        return Ok(Ok(seq));
-    }
-    Ok(Ok(0))
+    catalog::commit_at(board, instance, |state| {
+        precondition(state)?;
+        Ok(vec![event])
+    })
+    .map(|outcome| outcome.map(|seqs| seqs.into_iter().next().unwrap_or(0)))
 }
 
 /// #1873: append a DAEMON-originated →Done write (auto-close / sweep) iff the task
@@ -1547,78 +1508,36 @@ pub(crate) fn append_done_if_legal_at(
     }
 }
 
-/// Tail-scan the hot log for the highest seq# this instance has emitted.
-/// Returns `(max_seq, nonblank_line_count)` — the line count is folded into the
-/// SAME scan (free) so the append path can hand it to [`maybe_compact_events`] as
-/// a hysteresis hint, avoiding a second full read of the hot log per append.
-/// Best-effort: malformed lines are skipped because [`replay`] is the
-/// strict reader; here we just need the high-water mark.
-///
-/// H10 (CR-2026-06-14): ALWAYS scan the on-disk hot log — never short-circuit on
-/// a process-local cache. Every caller runs inside an `append_lines_under_lock`
-/// closure (under the cross-process append flock), but a cache is process-local:
-/// a high-water mark cached before ANOTHER process (e.g. the daemon's
-/// auto_close/sweep/lifecycle vs the MCP `tasks::handle`) appended the same
-/// instance is a STALE high-water → the next append here would mint a seq `<=` an
-/// already-persisted one, and replay's idempotency skip (`seq <= last_seen`)
-/// would SILENTLY DROP the real task transition. The on-disk file is the only
-/// source of truth all appenders share. The scan is cheap because task-event
-/// appends are agent/human-paced (not a hot loop), batches share one scan, and
-/// `compact_at` (now wired via [`maybe_compact_events`]) bounds the hot log to
-/// `COMPACTION_KEEP`. Because compaction ARCHIVES the older slice OUT of the hot
-/// log, this hot-only scan no longer sees an instance whose events were all
-/// archived — so callers go through [`next_seq_under_lock`], which maxes this
-/// scan with the per-instance seq sidecar (which survives compaction) to keep
-/// the high-water correct. A cross-process-correct approach must re-read on
-/// change anyway; the previous process-local cache was O(1) only by trusting
-/// stale cross-process state — the exact bug avoided here.
+// ── Per-instance seq high-water sidecar (retention seq-safety) ────────
+//
+// The sidecar survives compaction and is read under the cross-process append
+// flock. Missing/corrupt state is rebuilt once from the authoritative history.
+#[cfg(test)]
 fn max_seq_for_instance(log_path: &Path, instance: &InstanceName) -> anyhow::Result<(u64, usize)> {
     let content = match std::fs::read_to_string(log_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
-        Err(e) => return Err(e.into()),
+        Ok(content) => content,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(err) => return Err(err.into()),
     };
-    let mut max = 0u64;
-    let mut lines = 0usize;
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
+    let mut max = 0;
+    let mut lines = 0;
+    for line in content.lines().filter(|line| !line.trim().is_empty()) {
         lines += 1;
-        if let Ok(env) = serde_json::from_str::<TaskEventEnvelope>(line) {
-            if &env.instance == instance && env.seq > max {
-                max = env.seq;
+        if let Ok(envelope) = serde_json::from_str::<TaskEventEnvelope>(line) {
+            if &envelope.instance == instance {
+                max = max.max(envelope.seq);
             }
         }
     }
     Ok((max, lines))
 }
 
-// ── Per-instance seq high-water sidecar (retention seq-safety) ────────
-//
-// `compact_at` archives the older slice of the hot log, but
-// `max_seq_for_instance` scans ONLY the hot log (H10's cross-process
-// contract). So once ALL of an instance's events have been archived, the
-// hot scan returns 0 and the next append would mint a seq `<=` an
-// already-persisted one — replay's idempotency skip (`seq <= last_seen`)
-// would then SILENTLY DROP the real transition. (This is exactly why
-// `compact` was left dead: an unbounded hot log keeps the full history in
-// one file, so the hot scan was always complete.)
-//
-// Fix: persist a per-instance high-water in a small sidecar that survives
-// compaction. It is a DERIVED CACHE of the authoritative event log, not a
-// new source of truth — any load failure (missing / corrupt) rebuilds it
-// from a full hot+archive scan, so it can never wedge. The committed
-// high-water is `max(sidecar, hot-scan)`: the hot-scan term keeps it
-// crash-safe (a crash between the sidecar write and the hot append leaves
-// the sidecar AHEAD, never behind → at worst a seq gap, never a collision).
 fn seq_sidecar_path(board: &Path) -> PathBuf {
     board.join(format!("{LOG_NAME}_seq.json"))
 }
 
 /// Best-effort scan of hot log + every archive segment for the max seq per
-/// instance. Lenient parse (skip torn lines — replay is the strict reader),
-/// mirroring [`max_seq_for_instance`]. Used to (re)build the sidecar.
+/// instance. Used only to (re)build a missing or corrupt sidecar.
 fn scan_seq_highwater(board: &Path) -> BTreeMap<String, u64> {
     let mut hw: BTreeMap<String, u64> = BTreeMap::new();
     let mut absorb = |path: &Path| {
@@ -1669,233 +1588,87 @@ fn write_seq_highwater(board: &Path, hw: &BTreeMap<String, u64>) -> anyhow::Resu
 }
 
 /// Compute the start seq for `instance`'s batch of `count` events and persist
-/// the bumped high-water — all under the caller's append lock. The high-water
-/// is `max(sidecar, hot-scan)` (archive-safe + crash-safe). The sidecar is
+/// the bumped high-water — all under the caller's append lock. The sidecar is
 /// written BEFORE the caller appends the lines, so a crash can only leave it
 /// ahead of the hot log (a harmless seq gap), never behind (a collision →
 /// silent replay drop).
 ///
-/// Returns `(start_seq, hot_lines_pre_append)`: the second value is the hot-log
-/// line count from the same scan, which the caller adds `count` to and hands to
-/// [`maybe_compact_events`] as the post-append hysteresis hint (so the common
-/// path needs no extra hot-log read).
 fn next_seq_under_lock(
     board: &Path,
-    log_path: &Path,
     instance: &InstanceName,
     count: u64,
-) -> anyhow::Result<(u64, usize)> {
+    catalog_floor: u64,
+) -> anyhow::Result<u64> {
     let mut hw = load_seq_highwater(board);
-    let (hot_max, hot_lines) = max_seq_for_instance(log_path, instance)?;
-    let prev = hw.get(instance.as_str()).copied().unwrap_or(0).max(hot_max);
+    let prev = hw
+        .get(instance.as_str())
+        .copied()
+        .unwrap_or(0)
+        .max(catalog_floor);
     let start = prev + 1;
     hw.insert(instance.as_str().to_string(), start + count - 1);
     write_seq_highwater(board, &hw)?;
-    Ok((start, hot_lines))
+    Ok(start)
 }
 
-// ── Replay cache ─────────────────────────────────────────────────────
-// Read-side cache: avoids full-file replay when nothing has changed.
-// Keyed on (home, generation, file_len, mtime_ns):
-// - generation: process-wide monotonic counter, catches in-process
-//   concurrent appends (fixes Linux ext4 mtime ms-granularity flake)
-// - file_len + mtime_ns: catch external modifications (cross-process
-//   writes, compaction, tests truncating the log)
+// ── Catalog-backed projection reads ───────────────────────────────
 
-static REPLAY_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-type ReplayCacheKey = (std::path::PathBuf, u64, u64, i64);
-
-struct ReplayCacheEntry {
-    key: ReplayCacheKey,
-    state: TaskBoardState,
+/// Return the default board's bounded catalog projection.
+pub fn projected_state(home: &Path) -> anyhow::Result<TaskBoardState> {
+    projected_state_at(&board_root(home, DEFAULT_PROJECT))
 }
 
-// #2117 P0: per-board-keyed map (was a single global `Option`). The map key is
-// the board root; the entry's `key` field still carries the full freshness tuple
-// (path, generation, len, mtime). Single-board (default) keeps exactly one entry
-// → byte-identical; P1 multi-board can't cross-contaminate state between boards.
-static REPLAY_CACHE: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashMap<PathBuf, ReplayCacheEntry>>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
-fn replay_cache_key(board: &Path) -> ReplayCacheKey {
-    let gen = REPLAY_GENERATION.load(std::sync::atomic::Ordering::Acquire);
-    let log = log_path(board);
-    let (log_len, mtime_ns) = std::fs::metadata(&log)
-        .ok()
-        .map(|m| {
-            let len = m.len();
-            let mtime = m
-                .modified()
-                .ok()
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .map(|d| d.as_nanos() as i64)
-                .unwrap_or(0);
-            (len, mtime)
-        })
-        .unwrap_or((0, 0));
-    (board.to_path_buf(), gen, log_len, mtime_ns)
+/// Board-root variant of [`projected_state`]. This compatibility-shaped view
+/// does not scan event history; the catalog remains the authority.
+pub(crate) fn projected_state_at(board: &Path) -> anyhow::Result<TaskBoardState> {
+    let (home, board_id) = catalog::board_identity(board)?;
+    catalog::for_home(&home)
+        .board_state(&board_id)
+        .map_err(|error| anyhow::anyhow!("task catalog is unreadable: {error:?}"))
 }
 
-pub fn invalidate_replay_cache() {
-    REPLAY_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+/// #3668: strictly fold a board straight from disk. The catalog deliberately
+/// excludes `boards-retired/`, so [`projected_state_at`] cannot see a retired
+/// board (its path has no `boards/` parent). This read-only view exists ONLY so
+/// `board_unretire` can disclose which non-terminal tasks a reversal would
+/// reactivate; routing and mutation keep using the catalog authority.
+pub(crate) fn disk_state_at(board: &Path) -> anyhow::Result<TaskBoardState> {
+    replay_strict_at_incumbent(board)
+        .map_err(|error| anyhow::anyhow!("{}: {}", error.path.display(), error.cause))
 }
 
-// ── Replay: strict reader (forward-compat fail-closed) ─────────────
-
-/// Fold the entire on-disk event history (archive + hot file) into a
-/// `TaskBoardState`. Strict: any envelope whose `schema_version` exceeds
-/// [`SCHEMA_VERSION`] aborts the replay (forward-compat fail-closed),
-/// and any line that fails to deserialize as a known [`TaskEvent`]
-/// variant aborts (per dev-reviewer-2 must-have: replay must NOT silently
-/// skip unknown envelopes).
-/// #1990 item 4: process-global once-per-boot latch. The per-tick task-board
-/// readers (cron gate in `cron_tick.rs`, idle watchdog) swallow a fail-closed
-/// replay error into a read-gate, so without this the board silently freezes and
-/// the operator has no cause to look at. Boot-scoped (a restart re-alerts — the
-/// cause either healed or still blocks).
-static REPLAY_FAILCLOSED_EVENT_EMITTED: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
-
-/// #1990 item 4 (follows the #1972 crash-budget surface pattern): when [`replay`]
-/// fail-closes on a forward-incompatible record (#1992 — a future-version or
-/// unknown-variant envelope), make it OPERATOR-VISIBLE. The daemon keeps running
-/// while the per-tick callers swallow the `Err`, so an operator otherwise sees a
-/// frozen task board with no explanation. The fix is dual: ERROR-log every
-/// occurrence (greppable) and emit ONE `event_log` entry per boot (latched so
-/// per-tick callers can't spam). Observation only: the fail-closed `Err` still
-/// propagates unchanged, so no recovery semantics change (same discipline as
-/// #1972). A transient IO error (not the "fail-closed" class) is left alone.
-///
-/// Classification is by the `"fail-closed"` substring of the error — a contract
-/// pinned at `read_envelopes_strict`'s two `bail!` sites; keep them in lockstep.
-/// Known limitation (#1990 item 4, reviewer-2 minor 2): only failures that flow
-/// through [`replay`] are surfaced; the timeline queries `envelopes_for_task` /
-/// `stream_envelopes` fail-close without surfacing. The board-freeze alert here
-/// is the primary operator signal, so that narrower timeline-query gap is
-/// accepted rather than expanding scope.
-fn surface_failclosed_replay_once(board: &Path, err: &anyhow::Error) {
-    let msg = err.to_string();
-    // stringly-allow: `err` is an `anyhow::Error` from replay with no typed
-    // variant for the fail-closed condition; the message text is the only signal
-    // for the once-per-boot board-freeze alert gate.
-    if !msg.contains("fail-closed") {
-        return;
-    }
-    tracing::error!(
-        error = %msg,
-        "task-board replay FAIL-CLOSED — the board will not advance until resolved (upgrade the daemon to a version that understands this log, or quarantine the offending record)"
-    );
-    if !REPLAY_FAILCLOSED_EVENT_EMITTED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-        crate::event_log::log(
-            board,
-            "task_replay_fail_closed",
-            "task-board",
-            &format!(
-                "task-board replay fail-closed — the board is frozen until resolved: {msg}. \
-                 Fix: upgrade the daemon to a version that understands this log, or quarantine \
-                 the offending record. Further failures this boot log at error level only."
-            ),
-        );
-    }
-}
-
+// Test-only compatibility names keep the historical behavioral suite useful
+// without restoring a production replay authority path.
+#[cfg(test)]
 pub fn replay(home: &Path) -> anyhow::Result<TaskBoardState> {
     replay_at(&board_root(home, DEFAULT_PROJECT))
 }
 
-/// #2117 board-root variant of [`replay`].
+#[cfg(test)]
 pub(crate) fn replay_at(board: &Path) -> anyhow::Result<TaskBoardState> {
-    let key = replay_cache_key(board);
-    {
-        let cache = REPLAY_CACHE.lock();
-        if let Some(entry) = cache.get(board) {
-            if entry.key == key {
-                return Ok(entry.state.clone());
-            }
-        }
-    }
-
-    let state = match replay_uncached(board) {
-        Ok(s) => s,
-        Err(e) => {
-            // #1990 item 4: surface the fail-closed stall before the per-tick
-            // caller swallows the Err into a read-gate.
-            surface_failclosed_replay_once(board, &e);
-            return Err(e);
-        }
-    };
-
-    REPLAY_CACHE.lock().insert(
-        board.to_path_buf(),
-        ReplayCacheEntry {
-            key,
-            state: state.clone(),
-        },
-    );
-
-    Ok(state)
+    replay_strict_at_incumbent(board)
+        .map_err(|error| anyhow::anyhow!("{}: {}", error.path.display(), error.cause))
 }
 
-fn replay_uncached(board: &Path) -> anyhow::Result<TaskBoardState> {
-    let mut state = TaskBoardState::default();
+#[cfg(test)]
+pub(crate) fn invalidate_replay_cache() {}
 
-    let archive_dir = archive_dir(board);
-    if archive_dir.is_dir() {
-        let mut archives: Vec<PathBuf> = std::fs::read_dir(&archive_dir)?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jsonl"))
-            .collect();
-        archives.sort();
-        for path in archives {
-            let mut envelopes = Vec::new();
-            read_envelopes_strict(&path, &mut envelopes)?;
-            sort_envelopes(&mut envelopes);
-            for env in &envelopes {
-                state.apply(env);
-            }
-        }
-    }
-
-    let log_path = log_path(board);
-    if log_path.exists() {
-        let mut envelopes = Vec::new();
-        read_envelopes_strict(&log_path, &mut envelopes)?;
-        sort_envelopes(&mut envelopes);
-        for env in &envelopes {
-            state.apply(env);
-        }
-    }
-
-    Ok(state)
-}
-
-// ── #2760 item 1: router-only STRICT replay (route-local complete-record proof) ──
+// ── Strict historical fold for catalog build, scrub, and tests ──
 //
-// `replay_uncached` (above) is the FLEET-WIDE reader: it SKIPS a non-JSON line as a
-// tolerated half-write (#1988) and serves the rest. That leniency is right for a
-// display/list read but WRONG for the per-id ROUTER authority: a skipped record
-// could be the very `Created`/`Cancelled` event that decides whether the target id
-// lives on THIS board, so a silent skip turns a real hit into a false miss (or a
-// real duplicate into a false unique). `replay_strict_at` is the router-ONLY reader
-// that fails closed instead:
+// Production authority reads use `task_events::catalog`. This scanner remains
+// only for the catalog's bounded rebuild path and forensic regression tests. It:
 //   - ANY complete (newline-terminated) malformed record — non-JSON, a
 //     `schema_version` newer than supported, or a well-formed-but-undeserializable
-//     envelope — is a hard `StrictReplayError` (the router maps it to `Unreadable`).
+//     envelope — is a hard `StrictReplayError`.
 //   - ONLY a final unterminated EOF fragment on the LIVE log is tolerable: a crash
 //     mid-`append_lines_under_lock` (append-in-place, no tmp+rename) leaves exactly
 //     such a torn tail. It is repaired ONCE under the SAME writer lock (quarantine +
 //     truncate-to-last-newline + fsync), then the scan re-runs on the clean file.
 //   - Archives are written tmp+rename (atomic), so a torn tail there is real
 //     corruption, NOT a repairable fragment → `StrictReplayError`.
-// The fleet-wide `replay`/`replay_uncached`/`read_envelopes_strict` path is
-// deliberately UNCHANGED (this is additive — no fleet-wide behaviour change).
+// Authority never calls this on a warm query.
 
-/// #2760 item 1: why the router-only strict replay refused to anchor a route — the
-/// board's committed history could not be proven complete. The router maps this to
-/// [`crate::tasks::TaskRouteError::Unreadable`].
+/// Why a strict historical fold could not prove the committed history complete.
 #[derive(Debug)]
 pub(crate) struct StrictReplayError {
     pub path: PathBuf,
@@ -1944,9 +1717,8 @@ enum StrictScan {
     LiveFragment,
 }
 
-/// One strict scan of `board` (archives then live log), no repair. Mirrors
-/// [`replay_uncached`]'s per-file sort+apply so a corruption-free board yields the
-/// SAME state as the lenient reader.
+/// One strict scan of `board` (archives then live log), no repair. This is the
+/// rebuild/test path; production reads use the catalog.
 fn replay_strict_scan(board: &Path) -> Result<StrictScan, StrictReplayError> {
     let mut state = TaskBoardState::default();
     let malformed = |path: &Path, cause: String| StrictReplayError {
@@ -2017,8 +1789,7 @@ fn replay_strict_scan(board: &Path) -> Result<StrictScan, StrictReplayError> {
     Ok(StrictScan::Complete(state))
 }
 
-/// #2760 item 1: the router-only strict replay. See the module comment above.
-pub(crate) fn replay_strict_at(board: &Path) -> Result<TaskBoardState, StrictReplayError> {
+fn replay_strict_at_incumbent(board: &Path) -> Result<TaskBoardState, StrictReplayError> {
     match replay_strict_scan(board)? {
         StrictScan::Complete(state) => Ok(state),
         StrictScan::LiveFragment => {
@@ -2084,7 +1855,6 @@ fn repair_live_trailing_fragment(board: &Path) -> Result<(), StrictReplayError> 
     f.sync_all()
         .map_err(|e| err(format!("fsync after truncate: {e}")))?;
     crate::store::fsync_parent_dir(&path);
-    invalidate_replay_cache();
     tracing::warn!(
         tag = "#2760-eof-fragment-repaired",
         board = %board.display(),
@@ -2307,7 +2077,6 @@ pub fn recover_half_writes(home: &Path) {
 
 /// #2117 board-root variant of [`recover_half_writes`].
 pub(crate) fn recover_half_writes_at(board: &Path) {
-    use std::io::Write;
     let path = log_path(board);
     if !path.exists() {
         return;
@@ -2319,8 +2088,15 @@ pub(crate) fn recover_half_writes_at(board: &Path) {
     let Ok(_lock) = crate::store::acquire_file_lock(&lock_path) else {
         return;
     };
+    recover_half_writes_under_lock(board);
+}
+
+/// Variant for the catalog commit path, which already holds the board writer lock.
+pub(crate) fn recover_half_writes_under_lock(board: &Path) -> bool {
+    use std::io::Write;
+    let path = log_path(board);
     let Ok(content) = std::fs::read_to_string(&path) else {
-        return;
+        return false;
     };
     let mut kept: Vec<&str> = Vec::new();
     let mut bad: Vec<&str> = Vec::new();
@@ -2335,7 +2111,7 @@ pub(crate) fn recover_half_writes_at(board: &Path) {
         }
     }
     if bad.is_empty() {
-        return;
+        return false;
     }
     // Forensics: quarantine only the corrupt line(s) — never silently destroy.
     let ts = chrono::Utc::now().format("%Y%m%dT%H%M%SZ").to_string();
@@ -2380,6 +2156,7 @@ pub(crate) fn recover_half_writes_at(board: &Path) {
             "recovered corrupt task-event line(s) — quarantined + hot log rewritten with good lines only"
         );
     }
+    rewrite.is_ok()
 }
 
 // ── Compaction ─────────────────────────────────────────────────────
@@ -2411,43 +2188,12 @@ pub(crate) fn compact_at(board: &Path) -> anyhow::Result<()> {
 /// per-instance seq sidecar is independent of this rewrite, so an instance whose
 /// events are all archived keeps a correct seq high-water ([`next_seq_under_lock`]).
 fn compact_at_with_keep(board: &Path, keep: usize) -> anyhow::Result<()> {
-    let log_path = log_path(board);
-    if !log_path.exists() {
-        return Ok(());
-    }
-    let suffix = chrono::Utc::now().format("%Y%m%dT%H%M%S%6fZ").to_string();
+    catalog::compact_at_with_keep(board, keep)
+}
 
-    crate::event_log::append_lines_under_lock(board, LOG_NAME, |log_path| {
-        let content = std::fs::read_to_string(log_path)?;
-        let lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-        if lines.len() <= keep {
-            return Ok(Vec::new());
-        }
-        let split = lines.len() - keep;
-        let archived: String = lines[..split].iter().map(|l| format!("{l}\n")).collect();
-        let kept: String = lines[split..].iter().map(|l| format!("{l}\n")).collect();
-
-        let archive = archive_dir(
-            log_path
-                .parent()
-                .ok_or_else(|| anyhow::anyhow!("log_path has no parent"))?,
-        );
-        std::fs::create_dir_all(&archive)?;
-        let archive_path = archive.join(format!("task_events.{suffix}.jsonl"));
-        crate::store::atomic_write(&archive_path, archived.as_bytes())?;
-        crate::store::atomic_write(log_path, kept.as_bytes())?;
-        // S1: compaction just rewrote (shrank) the hot log. Invalidate the
-        // replay cache so the next reader replays the compacted file instead of
-        // a stale entry — mirrors every append path (:1124/:1211/:1297). Today
-        // this is correct-by-ACCIDENT (the shorter file changes the
-        // `(len, mtime)` cache key → key miss); the explicit bump makes it
-        // correct-by-CONTRACT and survives any future cache-key change.
-        invalidate_replay_cache();
-        // We've already rewritten the hot file — return no extra lines
-        // to append. (H10: no SEQ_CACHE to invalidate — `max_seq_for_instance`
-        // always re-scans the on-disk file, so the atomic replace is observed.)
-        Ok(Vec::new())
-    })
+#[cfg(test)]
+pub(crate) fn compact_with_keep_for_test(board: &Path, keep: usize) -> anyhow::Result<()> {
+    compact_at_with_keep(board, keep)
 }
 
 /// Opportunistic, non-fatal hot-log compaction after an append (mirrors

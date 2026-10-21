@@ -15,6 +15,63 @@ fn tmp_home_for_create_instance_team(tag: &str) -> std::path::PathBuf {
     home
 }
 
+#[test]
+#[allow(clippy::unwrap_used)]
+fn start_instance_rejects_missing_env_source_with_structured_error_3540_r1() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = tmp_home_for_create_instance_team("missing-env-source");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  guarded:\n    backend: claude\n    env:\n      DESTINATION_TOKEN:\n        from_env: AGEND_TEST_MISSING_ENV_3540_R1\n",
+    )
+    .unwrap();
+
+    let result = handle_start_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "guarded"}),
+        None,
+    );
+
+    assert_eq!(result["code"], "env_source_missing", "{result}");
+    assert!(
+        result["error"]
+            .as_str()
+            .is_some_and(|message| message.contains("DESTINATION_TOKEN")
+                && message.contains("AGEND_TEST_MISSING_ENV_3540_R1")),
+        "the refusal must identify only the destination and source names: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn restart_with_runtime_missing_predecessor_refuses_caller_identity_3649() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = tmp_home_for_create_instance_team("restart-authority-missing");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  dev:\n    backend: claude\n    args: []\n",
+    )
+    .unwrap();
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    let requested = crate::types::InstanceRef::new(crate::types::InstanceId::new(), 1);
+    let result = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({
+            "instance": "dev",
+            "mode": "resume",
+            "force": true,
+            "old_instance_ref": requested,
+        }),
+        Some(&runtime),
+    );
+    assert_eq!(
+        result["code"], "restart_identity_unavailable",
+        "runtime authority must refuse when the predecessor is absent: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// #2454 residual RED: pure generated-member team mode must route a live MCP
 /// RuntimeContext directly to the merged typed CREATE_TEAM owner. The missing
 /// owner wire-up currently tries the API socket and therefore reports its
@@ -189,6 +246,95 @@ fn full_delete_rejects_invalid_name_before_permit_or_mutation_2855() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3696 RED: the real MCP delete entry must leave an exact signed binding and
+/// a durable recovery fence when release encounters a markerless worktree.
+/// This deliberately exercises `handle_delete_instance`, not the lifecycle
+/// helper directly, and does not manually remove the residual worktree.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn markerless_delete_preserves_binding_for_operator_recovery_3696() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = tmp_home_for_create_instance_team("markerless-delete-3696");
+    let instance = "markerless-delete";
+    let branch = "review/markerless-delete";
+    let source_repo = home.join("source-repo");
+    let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
+        .join(instance)
+        .join("review-markerless-delete");
+    std::fs::create_dir_all(&source_repo).unwrap();
+    std::fs::create_dir_all(&worktree).unwrap();
+    std::fs::write(worktree.join("residual.txt"), b"preserve this payload").unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!("instances:\n  {instance}:\n    backend: claude\n"),
+    )
+    .unwrap();
+    crate::binding::bind_full(&home, instance, "", branch, &worktree, &source_repo, false)
+        .expect("bind markerless delete fixture");
+    let binding_path = crate::paths::binding_path(&home, instance);
+    let signature_path = crate::paths::runtime_dir(&home)
+        .join(instance)
+        .join("binding.json.sig");
+    let binding_before = std::fs::read(&binding_path).unwrap();
+    let signature_before = std::fs::read(&signature_path).unwrap();
+
+    let result = handle_delete_instance(&home, &serde_json::json!({"instance": instance}), &None);
+
+    assert_eq!(result["code"], "recovery_required", "{result}");
+    assert!(result["error"]
+        .as_str()
+        .is_some_and(|error| { error.contains("markerless") || error.contains("recovery") }));
+    assert_eq!(std::fs::read(&binding_path).unwrap(), binding_before);
+    assert_eq!(std::fs::read(&signature_path).unwrap(), signature_before);
+    assert!(
+        worktree.exists(),
+        "the operator recovery target must remain"
+    );
+    assert!(
+        crate::agent::deleting::is_deleting(&home, instance),
+        "a recovery-required tombstone must fence same-name reuse"
+    );
+    let tombstone = home
+        .join("deletion-recovery")
+        .join(format!("{instance}.json"));
+    let tombstone_body: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&tombstone).unwrap()).unwrap();
+    assert_eq!(tombstone_body["state"], "recovery_required");
+    assert_eq!(tombstone_body["instance"], instance);
+    assert_eq!(tombstone_body["branch"], branch);
+    let report = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        &home,
+        "operator",
+        "archive markerless residual",
+        instance,
+        branch,
+        &worktree,
+        &source_repo,
+    )
+    .expect("tombstone-authorized operator recovery");
+    assert_eq!(
+        std::fs::read(report.archive.join("residual.txt")).unwrap(),
+        b"preserve this payload"
+    );
+    let retry = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        &home,
+        "operator",
+        "idempotent retry",
+        instance,
+        branch,
+        &worktree,
+        &source_repo,
+    )
+    .expect("recovery retry should return the same archive");
+    assert_eq!(retry.archive, report.archive);
+    assert!(crate::binding::read(&home, instance).is_none());
+    assert!(!crate::worktree_pool::daemon_managed_worktree_root(&home)
+        .join(instance)
+        .exists());
+    assert!(!crate::agent::deleting::is_deleting(&home, instance));
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 fn delete_instance_denies_non_owner_non_orchestrator_audit2_002() {
@@ -254,6 +400,8 @@ fn seed_claimed_task(home: &std::path::Path, assignee: &str) {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             TaskEvent::Claimed {
                 task_id: tid,
@@ -578,6 +726,67 @@ fn dirty_worktree(tag: &str) -> std::path::PathBuf {
 }
 
 #[allow(clippy::unwrap_used, clippy::expect_used)]
+fn marker_only_worktree(tag: &str) -> std::path::PathBuf {
+    let wt = std::env::temp_dir().join(format!(
+        "agend-3617-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&wt).unwrap();
+    let status = std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&wt)
+        .env("AGEND_GIT_BYPASS", "1")
+        .status()
+        .expect("git init");
+    assert!(status.success(), "git init failed");
+    // No .gitignore: the marker is intentionally visible as root `?? .agend-managed`.
+    std::fs::write(wt.join(crate::worktree_pool::MANAGED_MARKER), "agent=dev\n").unwrap();
+    wt
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn tracked_marker_worktree(tag: &str) -> std::path::PathBuf {
+    let wt = std::env::temp_dir().join(format!(
+        "agend-3617-tracked-{tag}-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&wt).unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&wt)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git")
+    };
+    assert!(git(&["init", "-b", "main"]).status.success());
+    std::fs::write(wt.join(crate::worktree_pool::MANAGED_MARKER), "agent=dev\n").unwrap();
+    assert!(git(&["add", crate::worktree_pool::MANAGED_MARKER])
+        .status
+        .success());
+    assert!(git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-m",
+        "track marker"
+    ])
+    .status
+    .success());
+    wt
+}
+
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 fn bind_worktree(home: &std::path::Path, agent: &str, wt: &std::path::Path) {
     let dir = crate::paths::runtime_dir(home).join(agent);
     std::fs::create_dir_all(&dir).unwrap();
@@ -640,6 +849,102 @@ fn fresh_restart_guards_uncommitted_worktree_2476() {
     std::fs::remove_dir_all(&wt).ok();
 }
 
+/// #3617: a fresh restart must not mistake the daemon's regenerable marker
+/// for stranded user work when the marker is the only dirty path.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn fresh_restart_allows_marker_only_worktree_3617() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3617-home-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    let wt = marker_only_worktree("marker-only");
+    bind_worktree(&home, "dev", &wt);
+
+    let result = handle_restart_instance(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh"}),
+    );
+    assert_ne!(
+        result["code"], "uncommitted_work_at_risk",
+        "marker-only dirt must pass the fresh-restart guard: {result}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&wt).ok();
+}
+
+/// #3617: tracked marker edits are user work, even though the path matches
+/// the daemon's regenerable marker name. Cover unstaged, staged, and deleted
+/// tracked-marker states through the real fresh-restart entry point.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn fresh_restart_refuses_tracked_marker_worktree_3617() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3617-tracked-home-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  dev:\n    backend: claude\n",
+    )
+    .unwrap();
+    let wt = tracked_marker_worktree("tracked");
+    bind_worktree(&home, "dev", &wt);
+
+    std::fs::write(wt.join(crate::worktree_pool::MANAGED_MARKER), "changed\n").unwrap();
+    let modified = handle_restart_instance(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh"}),
+    );
+    assert_eq!(
+        modified["code"], "uncommitted_work_at_risk",
+        "got: {modified}"
+    );
+
+    let add = std::process::Command::new("git")
+        .args(["add", crate::worktree_pool::MANAGED_MARKER])
+        .current_dir(&wt)
+        .env("AGEND_GIT_BYPASS", "1")
+        .status()
+        .unwrap();
+    assert!(add.success(), "git add failed");
+    let staged = handle_restart_instance(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh"}),
+    );
+    assert_eq!(staged["code"], "uncommitted_work_at_risk", "got: {staged}");
+
+    let deleted = std::process::Command::new("git")
+        .args(["rm", "-f", crate::worktree_pool::MANAGED_MARKER])
+        .current_dir(&wt)
+        .env("AGEND_GIT_BYPASS", "1")
+        .status()
+        .unwrap();
+    assert!(deleted.success(), "git rm failed");
+    let removed = handle_restart_instance(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh"}),
+    );
+    assert_eq!(
+        removed["code"], "uncommitted_work_at_risk",
+        "got: {removed}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&wt).ok();
+}
+
 /// A real fresh-restart entry point must requeue, rather than process, the
 /// previous session's unconfirmed delivering rows. This pins #3228's visible
 /// recovery policy: #159's old settle path would have stamped `read_at` and
@@ -696,7 +1001,7 @@ fn fresh_restart_requeues_unconfirmed_inbox_rows_3228() {
 #[test]
 fn restart_spawn_params_carries_same_tab_fresh() {
     let env = HashMap::new();
-    let p = restart_spawn_params("dev", "claude", &[], None, &env, "fresh");
+    let p = restart_spawn_params("dev", "claude", &[], None, &env, "fresh", "r1", None);
     assert_eq!(p["layout"], "same-tab");
     // fresh must NOT request a resume.
     assert!(p.get("mode").is_none());
@@ -707,11 +1012,83 @@ fn restart_spawn_params_carries_same_tab_fresh() {
 #[test]
 fn restart_spawn_params_carries_same_tab_resume() {
     let env = HashMap::new();
-    let p = restart_spawn_params("dev", "claude", &[], None, &env, "resume");
+    let p = restart_spawn_params("dev", "claude", &[], None, &env, "resume", "r1", None);
     assert_eq!(p["layout"], "same-tab");
     assert_eq!(p["mode"], "resume");
     // resume preserves context → must NOT self-kick.
     assert!(p.get("self_kick_on_ready").is_none());
+}
+
+#[test]
+fn restart_spawn_params_carries_restart_correlation_3649() {
+    let env = HashMap::new();
+    let p = restart_spawn_params(
+        "dev",
+        "claude",
+        &[],
+        None,
+        &env,
+        "resume",
+        "restart-3649",
+        Some(crate::types::InstanceRef::new(
+            crate::types::InstanceId::new(),
+            7,
+        )),
+    );
+    assert!(p["restart_id"]
+        .as_str()
+        .is_some_and(|restart_id| !restart_id.is_empty()));
+    assert!(p["old_instance_ref"].is_object());
+}
+
+#[test]
+fn restart_admission_is_one_slot_and_drops_on_terminal_cleanup_3649() {
+    let home = std::env::temp_dir().join(format!(
+        "restart-admission-{}",
+        crate::types::InstanceId::new()
+    ));
+    let first = super::restart_prep::try_admit_restart(&home, "dev", "restart-a")
+        .expect("first request admitted");
+    assert!(super::restart_prep::try_admit_restart(&home, "dev", "restart-a").is_err());
+    assert!(super::restart_prep::try_admit_restart(&home, "dev", "restart-b").is_err());
+    drop(first);
+    assert!(super::restart_prep::try_admit_restart(&home, "dev", "restart-b").is_ok());
+}
+
+#[test]
+fn concurrent_restart_admission_has_one_winner_per_target_3649() {
+    let home = std::env::temp_dir().join(format!(
+        "restart-admission-concurrent-{}",
+        crate::types::InstanceId::new()
+    ));
+    let home = &home;
+    let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+    // Join every contender before dropping any successful guard. Dropping the
+    // first winner while later handles are still being joined turns this test
+    // into a scheduling race: a delayed contender can acquire the slot after
+    // the first restart has already been cleaned up.
+    let admissions = std::thread::scope(|scope| {
+        let handles = (0..8)
+            .map(|index| {
+                let barrier = std::sync::Arc::clone(&barrier);
+                scope.spawn(move || {
+                    barrier.wait();
+                    super::restart_prep::try_admit_restart(home, "dev", &format!("restart-{index}"))
+                        .ok()
+                })
+            })
+            .collect::<Vec<_>>();
+        handles
+            .into_iter()
+            .map(|handle| handle.join().expect("admission worker panicked"))
+            .collect::<Vec<_>>()
+    });
+    let winners = admissions
+        .iter()
+        .filter(|admission| admission.is_some())
+        .count();
+    assert_eq!(winners, 1);
+    drop(admissions);
 }
 
 /// must-follow ②: the self-kick flag is INDEPENDENT — set ONLY by the
@@ -724,10 +1101,10 @@ fn restart_spawn_params_carries_same_tab_resume() {
 fn self_kick_flag_set_only_by_fresh_restart_fail_safe_default() {
     let env = HashMap::new();
     // fresh restart → flag present + true.
-    let fresh = restart_spawn_params("dev", "claude", &[], None, &env, "fresh");
+    let fresh = restart_spawn_params("dev", "claude", &[], None, &env, "fresh", "r1", None);
     assert!(fresh["self_kick_on_ready"].as_bool().unwrap_or(false));
     // resume restart → no flag → reads false.
-    let resume = restart_spawn_params("dev", "claude", &[], None, &env, "resume");
+    let resume = restart_spawn_params("dev", "claude", &[], None, &env, "resume", "r1", None);
     assert!(!resume["self_kick_on_ready"].as_bool().unwrap_or(false));
     // a generic spawn-params object (the initial-fleet / create_instance shape,
     // which also maps to SpawnMode::Fresh) carries no flag → reads false.
@@ -929,6 +1306,71 @@ fn operator_has_live_draft_reflects_unsent_keystrokes() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// #3663: type-then-clear through the REAL restart entry — a stale unsent
+/// draft PLUS a newer TUI-observed empty box must reach the SPAWN boundary
+/// without the 60s draft-grace block. Runs the entry on a scoped thread with
+/// a 15s join budget: at base the gate defers 60s (timeout → RED); with the
+/// fix the gate fast-passes and the entry reaches SPAWN in ~1s (GREEN).
+/// Asserts at the real SPAWN boundary (`LAST_SPAWN_ARGS`), not on the pure
+/// gate: the contract is about the restart actually proceeding.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn restart_entry_reaches_spawn_when_box_cleared_after_typing_3663() {
+    use crate::mcp::handlers::instance_state::spawn::LAST_SPAWN_ARGS;
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude("3663-cleared", "[]");
+    // Stale unsent draft (typed 30s ago, outside the 1.5s typing window) +
+    // a newer cleared observation (literal key: RED compiles against base).
+    let now = chrono::Utc::now().timestamp_millis();
+    crate::agent_ops::save_metadata(
+        &home,
+        "dev",
+        "last_input_epoch_ms",
+        serde_json::json!(now - 30_000),
+    );
+    crate::agent_ops::save_metadata(
+        &home,
+        "dev",
+        "last_submit_epoch_ms",
+        serde_json::json!(now - 60_000),
+    );
+    // Setup check (holds at RED and GREEN): the stale draft alone defers.
+    assert!(
+        crate::inbox::notify::operator_has_live_draft(&home, "dev"),
+        "setup: the stale unsent draft alone must read as a live draft"
+    );
+    // The TUI observes the visibly empty box (literal key: RED compiles).
+    crate::agent_ops::save_metadata(
+        &home,
+        "dev",
+        "last_cleared_epoch_ms",
+        serde_json::json!(now - 5_000),
+    );
+    *LAST_SPAWN_ARGS.lock() = None;
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            let resp = handle_restart_instance_with_runtime(
+                &home,
+                &serde_json::json!({"instance": "dev", "mode": "fresh", "force": false}),
+                Some(&runtime),
+            );
+            done_tx.send(resp).ok();
+        });
+        let resp = done_rx
+            .recv_timeout(std::time::Duration::from_secs(15))
+            .expect(
+            "#3663: the restart entry must return within 15s (a 60s draft-grace block is the bug)",
+        );
+        assert!(
+            LAST_SPAWN_ARGS.lock().is_some(),
+            "#3663: a cleared box must let the restart reach SPAWN; got {resp}"
+        );
+    });
+    std::fs::remove_dir_all(&home).ok();
+}
+
 #[test]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 fn await_unsent_draft_or_grace_returns_fast_without_a_draft() {
@@ -944,5 +1386,741 @@ fn await_unsent_draft_or_grace_returns_fast_without_a_draft() {
     ));
     std::fs::create_dir_all(&home).unwrap();
     await_unsent_draft_or_grace(&home, "a", false);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3416 RED: the creator force-delete audit is a FAIL-CLOSED gate — it already
+/// refuses the destructive delete when the audit write errors. Once the append is
+/// serialized behind the companion lock, "cannot write the audit" also covers
+/// "another writer holds the lock past the bounded retry budget". Holding the lock
+/// must therefore produce an explicit refusal AND leave no record behind; a silent
+/// unlocked fallback would defeat the whole point of serializing.
+///
+/// The lock holder is a second `File` in THIS process on purpose: `flock(2)`
+/// associates the lock with the open file description rather than the process, so
+/// two independent `open()` calls conflict exactly as two processes would. That
+/// keeps the test single-process and free of any sleep or scheduling assumption.
+///
+/// Pre-fix this FAILS in both directions: nothing consults the lock, so the delete
+/// succeeds and the audit line is appended.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn delete_instance_creator_force_refuses_while_audit_lock_is_held() {
+    let home = tmp_home_for_creator_acl("audit-lock-held");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  victim:\n    created_by: creator\n",
+    )
+    .unwrap();
+    seed_claimed_task(&home, "victim");
+
+    let lock_path = home.join("fleet_events.jsonl.lock");
+    let holder = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(&lock_path)
+        .unwrap();
+    // Explicit trait syntax: Rust 1.89 stabilized an inherent `File::lock` with the
+    // same name and the MSRV gate fires if the inherent one is selected.
+    fs4::FileExt::lock(&holder).unwrap();
+
+    let creator = crate::identity::Sender::new("creator");
+    let resp = handle_delete_instance(
+        &home,
+        &serde_json::json!({
+            "instance": "victim",
+            "force": true,
+            "force_reason": "retiring my own spawn to change its model",
+        }),
+        &creator,
+    );
+
+    let err = resp["error"].as_str().unwrap_or_default();
+    assert!(
+        err.contains("audit"),
+        "force-delete must REFUSE while the audit lock is held (fail-closed), got: {resp}"
+    );
+
+    let events_path = home.join("fleet_events.jsonl");
+    let written = std::fs::read_to_string(&events_path).unwrap_or_default();
+    assert!(
+        written.trim().is_empty(),
+        "no unlocked fallback append may occur while the lock is held, found: {written}"
+    );
+
+    fs4::FileExt::unlock(&holder).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3414 helper: a fleet.yaml with one Claude instance whose stored args carry
+/// the exact production pin observed on `claude-aef7c0`.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn home_with_pinned_claude(tag: &str, args_yaml: &str) -> std::path::PathBuf {
+    let home = tmp_home_for_create_instance_team(tag);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!("instances:\n  dev:\n    backend: claude\n    args: {args_yaml}\n"),
+    )
+    .unwrap();
+    home
+}
+
+/// #3414 RED: `restart_instance mode=fresh` is a statement about the SESSION,
+/// not merely about the preset. The observed `--resume <uuid>` in the stored
+/// args reached the SPAWN boundary verbatim on every fresh restart, so the
+/// agent reattached to the same conversation while the daemon reported
+/// `mode=fresh spawned=true`.
+///
+/// Asserted at the real SPAWN boundary through the production entry, not on
+/// the pure sanitizer: the contract is about the argv actually handed over.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn fresh_restart_strips_session_pin_at_spawn_boundary_3414() {
+    use crate::mcp::handlers::instance_state::spawn::LAST_SPAWN_ARGS;
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude(
+        "3414-strip",
+        "[\"--resume\", \"cb80bb9d-3613-4c0d-9097-788b1941f5db\", \"--model\", \"claude-opus-5\"]",
+    );
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    *LAST_SPAWN_ARGS.lock() = None;
+
+    let _ = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+        Some(&runtime),
+    );
+
+    let observed = LAST_SPAWN_ARGS
+        .lock()
+        .clone()
+        .expect("fresh restart must reach the SPAWN boundary");
+    assert!(
+        !observed.contains("--resume"),
+        "#3414: mode=fresh must not hand a session pin to SPAWN; got {observed:?}"
+    );
+    assert!(
+        !observed.contains("cb80bb9d-3613-4c0d-9097-788b1941f5db"),
+        "#3414: the pinned session id must not survive a fresh restart; got {observed:?}"
+    );
+    assert!(
+        observed.contains("--model claude-opus-5"),
+        "#3414: unrelated flags must be preserved verbatim; got {observed:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3414 RED (fail-closed): a malformed session selector must refuse BEFORE any
+/// destructive step. `--resume` with no value is unresolvable, and guessing
+/// would either strand the operator on the old session or drop a real value —
+/// so the restart is refused and the live instance is left untouched.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn malformed_session_selector_refuses_without_deleting_3414() {
+    use crate::mcp::handlers::instance_state::spawn::LAST_SPAWN_ARGS;
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    // `--resume=` (explicit `=`, nothing after) is genuinely unresolvable.
+    // A BARE `--resume` is NOT malformed — `claude --help` declares
+    // `-r, --resume [value]`, so the bare form is a legal picker.
+    let home = home_with_pinned_claude("3414-noDelete", "[\"--resume=\"]");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    *LAST_SPAWN_ARGS.lock() = None;
+
+    let refused = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+        Some(&runtime),
+    );
+
+    assert_eq!(
+        refused["code"], "fresh_session_args_invalid",
+        "#3414: malformed selector must fail closed with a structured code: {refused}"
+    );
+    assert_eq!(
+        refused["reason"], "missing_required_value",
+        "#3414: the refusal must name WHY, not just that it refused: {refused}"
+    );
+    assert_eq!(
+        refused["token"], "--resume=",
+        "#3414: the refusal must name WHICH token blocked it: {refused}"
+    );
+    assert!(
+        LAST_SPAWN_ARGS.lock().is_none(),
+        "#3414: a refused preflight must never reach SPAWN"
+    );
+
+    // The live instance must survive: preflight runs before DELETE.
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("fleet.yaml must survive a refused restart");
+    assert!(
+        fleet.instances.contains_key("dev"),
+        "#3414: a refused fresh restart must not delete the instance it refused to restart"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3414 RED (preflight side-effect): malformed fresh args must be rejected
+/// before operator-recovery bookkeeping runs. The old ordering cleared the
+/// persisted `failed_escalated` latch before the typed sanitizer, changing the
+/// escalation store even though the restart was refused.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn malformed_session_selector_preserves_escalation_runtime_3414() {
+    use crate::mcp::handlers::instance_state::spawn::LAST_SPAWN_ARGS;
+
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude("3414-preflight-side-effect", "[\"--resume=\"]");
+    crate::daemon::escalation_persist::persist(
+        &home,
+        "dev",
+        &crate::health::PersistedEscalation {
+            total_crashes: 4,
+            crash_times_epoch_ms: vec![111, 222],
+            last_crash_notification_epoch_ms: Some(333),
+            last_hung_notification_epoch_ms: Some(444),
+            hung_since_epoch_ms: Some(555),
+            failed_escalated: true,
+        },
+    );
+    let escalation_path = home.join("health_escalation.json");
+    let escalation_before = std::fs::read(&escalation_path).expect("escalation store");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+    *LAST_SPAWN_ARGS.lock() = None;
+
+    let refused = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+        Some(&runtime),
+    );
+
+    assert_eq!(refused["code"], "fresh_session_args_invalid");
+    assert_eq!(
+        std::fs::read(&escalation_path).expect("escalation store after refusal"),
+        escalation_before,
+        "#3414: rejected preflight must not rewrite escalation persistence"
+    );
+    assert!(
+        !crate::agent::deleting::is_deleting(&home, "dev"),
+        "#3414: rejected preflight must not enter the delete window"
+    );
+    assert!(
+        LAST_SPAWN_ARGS.lock().is_none(),
+        "#3414: rejected preflight must not reach SPAWN or arm self-kick"
+    );
+    assert!(
+        runtime.registry.lock().is_empty(),
+        "#3414: rejected preflight must not mutate runtime registry state"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3414 D2 helper: a self-kick delivery the OLD session accepted but never
+/// acknowledged, recorded far enough in the past to be past the watchdog's
+/// acknowledgement window.
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn seed_overdue_self_kick_receipt(home: &std::path::Path, instance: &str) {
+    let store = crate::transport::ReceiptStore::for_instance(home, instance).expect("store");
+    let mut envelope = crate::transport::DeliveryEnvelope::new(
+        instance,
+        crate::transport::SessionLocator::claude(
+            "http://127.0.0.1:1/".to_string(),
+            "dead-session".to_string(),
+            "token".to_string(),
+        ),
+        crate::transport::DeliveryKind::Notification,
+        "[AGEND-RESUME] recover your own state",
+        None,
+    );
+    envelope.self_kick = true;
+    store.record_queued(&envelope).expect("queued");
+    let mut accepted = crate::transport::DeliveryReceipt::for_state(
+        &envelope,
+        crate::transport::DeliveryState::ProtocolAccepted,
+    );
+    accepted.recorded_at = "2020-01-01T00:00:00Z".to_string();
+    store.record(accepted).expect("accepted");
+}
+
+/// #3414 RED (D2): `mode=fresh` destroys the session, so every transport
+/// delivery receipt keyed to it becomes unresolvable — the consumer that owed
+/// the acknowledgement no longer exists. Restart deletes through
+/// `delete_instance_under_guard`, whose contract is that the CALLER already
+/// owns the `DeleteFence` fronting the transport delivery cleanup; restart
+/// owned none, so the dead session's `ProtocolAccepted` self-kick survived and
+/// the watchdog escalated it to every channel as an unacknowledged delivery on
+/// an instance the operator had deliberately restarted.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn fresh_restart_clears_dead_session_self_kick_receipt_3414() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude("3414-d2-fresh", "[]");
+    seed_overdue_self_kick_receipt(&home, "dev");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+
+    let _ = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "fresh", "force": true}),
+        Some(&runtime),
+    );
+
+    let store = crate::transport::ReceiptStore::for_instance(&home, "dev").expect("store");
+    assert!(
+        store.pending_deliveries().expect("pending").is_empty(),
+        "#3414: a fresh restart must not leave a nonterminal receipt keyed to the session it destroyed"
+    );
+    assert_eq!(
+        crate::transport::claude_channel::self_kick_watchdog_pass(&home, "dev", &|_| None)
+            .expect("watchdog")
+            .len(),
+        0,
+        "#3414: the watchdog must not escalate an acknowledgement the operator's fresh restart made impossible"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3414 D2 negative control: `mode=resume` restores the SAME session, so its
+/// receipts stay resolvable and must survive. This pins the cleanup to the
+/// fresh path rather than making restart a blanket delivery-state wipe.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn resume_restart_preserves_live_session_receipt_3414() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = home_with_pinned_claude("3414-d2-resume", "[]");
+    seed_overdue_self_kick_receipt(&home, "dev");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+
+    let _ = handle_restart_instance_with_runtime(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "resume", "force": true}),
+        Some(&runtime),
+    );
+
+    let store = crate::transport::ReceiptStore::for_instance(&home, "dev").expect("store");
+    assert_eq!(
+        store.pending_deliveries().expect("pending").len(),
+        1,
+        "#3414: a resume restart keeps the session, so its pending receipt must not be discarded"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3418 RED: `create_instance` persists a DURABLE fleet.yaml entry — including
+/// `args`, which per #3414 shapes every future spawn of that instance
+/// indefinitely — and currently logs nothing at all. Every neighbouring
+/// lifecycle operation logs a structured line (`restart_instance` even logs an
+/// operator-supplied reason while mutating nothing durable), so instance
+/// provenance is the one lifecycle fact unrecoverable from daemon state.
+///
+/// Drives the REAL `handle_create_instance` entry through the existing
+/// `SPAWN_OVERRIDE` seam so the create SUCCEEDS end to end. Success matters:
+/// a failed spawn calls `rollback_fleet_entry_on_failure`, which removes the
+/// entry again — so the log must describe an entry that actually survived, not
+/// merely one that was briefly written. The surviving entry is asserted below
+/// before any log assertion, so a passing test cannot be vacuous.
+#[test]
+#[tracing_test::traced_test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn create_instance_logs_persisted_provenance_3418() {
+    use crate::mcp::handlers::instance_state::spawn::SPAWN_OVERRIDE;
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = tmp_home_for_create_instance_team("3418-provenance");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+
+    fn spawn_ok(_: &std::path::Path, _: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({"ok": true, "result": {"topic_id": null}}))
+    }
+    *SPAWN_OVERRIDE.lock() = Some((home.clone(), spawn_ok));
+
+    let result = handle_create_instance(
+        &home,
+        &serde_json::json!({
+            "name": "prov-3418",
+            "backend": "claude",
+            "args": "--resume cb80bb9d-3613-4c0d-9097-788b1941f5db",
+            "topic_binding": "skip"
+        }),
+        "creator-3418",
+        Some(&runtime),
+    );
+    *SPAWN_OVERRIDE.lock() = None;
+
+    // The entry must have SURVIVED (no rollback), otherwise the log assertions
+    // below would be asserting provenance for an instance that does not exist.
+    let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .expect("create path must persist the fleet.yaml entry");
+    let entry = fleet
+        .instances
+        .get("prov-3418")
+        .unwrap_or_else(|| panic!("durable entry must survive a successful create: {result}"));
+    assert_eq!(
+        entry.args,
+        vec![
+            "--resume".to_string(),
+            "cb80bb9d-3613-4c0d-9097-788b1941f5db".to_string()
+        ],
+        "precondition: args are persisted as split tokens"
+    );
+
+    // Assert on a marker unique to THIS log. A bare "create_instance" substring
+    // would be satisfied by the test's own span name, and a bare "prov-3418" by
+    // the pre-existing `fleet::persist` line — neither would prove the new log.
+    assert!(
+        logs_contain("create_instance persisted"),
+        "#3418: the durable fleet.yaml write must emit a structured create_instance log"
+    );
+    assert!(
+        logs_contain("name=prov-3418"),
+        "#3418: the log must name the instance it persisted"
+    );
+    assert!(
+        logs_contain("backend=claude"),
+        "#3418: the log must record the backend as persisted"
+    );
+    assert!(
+        logs_contain("caller=creator-3418"),
+        "#3418: the log must record the caller, so provenance is answerable from daemon state"
+    );
+    assert!(
+        logs_contain("cb80bb9d-3613-4c0d-9097-788b1941f5db"),
+        "#3418: the log must carry the args AS PERSISTED — that value is what \
+         silently changed restart behaviour for days in #3414"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RAII cleanup for the `SPAWN_OVERRIDE` test seam. The positive test above
+/// clears the override before its assertions, so it cannot leak; the negative
+/// test below asserts on absence and would leak the override into every later
+/// test in this binary if an assertion panicked first.
+struct SpawnOverrideGuard;
+
+impl Drop for SpawnOverrideGuard {
+    fn drop(&mut self) {
+        *crate::mcp::handlers::instance_state::spawn::SPAWN_OVERRIDE.lock() = None;
+    }
+}
+
+/// #3418 negative direction: the success marker must NOT be emitted when the
+/// create does not survive. A failed SPAWN calls `rollback_fleet_entry_on_failure`
+/// (spawn.rs:457) and removes the entry again, so a log claiming persistence
+/// would be asserting a state that was undone — the same unverified-assertion
+/// class as #3415. This pins the placement decision itself: move the
+/// `tracing::info!` up to the `add_instance_to_yaml` boundary and this fails.
+///
+/// Uses the same `SPAWN_OVERRIDE` seam as the positive test, returning
+/// `ok:false` so the real rollback arm runs rather than a synthetic one.
+#[test]
+#[tracing_test::traced_test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn create_instance_logs_no_provenance_when_rolled_back_3418() {
+    use crate::mcp::handlers::instance_state::spawn::SPAWN_OVERRIDE;
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = tmp_home_for_create_instance_team("3418-rollback");
+    let runtime = crate::mcp::handlers::minimal_test_runtime();
+
+    fn spawn_refused(
+        _: &std::path::Path,
+        _: &serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        Ok(serde_json::json!({"ok": false, "error": "spawn refused (3418 negative path)"}))
+    }
+    *SPAWN_OVERRIDE.lock() = Some((home.clone(), spawn_refused));
+    let _override_cleanup = SpawnOverrideGuard;
+
+    let result = handle_create_instance(
+        &home,
+        &serde_json::json!({
+            "name": "rolled-3418",
+            "backend": "claude",
+            "args": "--resume ffffffff-0000-0000-0000-000000000000",
+            "topic_binding": "skip"
+        }),
+        "creator-3418-neg",
+        Some(&runtime),
+    );
+
+    assert!(
+        result["error"].is_string(),
+        "precondition: a refused SPAWN must surface an error, got {result}"
+    );
+
+    // The entry must be GONE — this is what makes the log-absence assertion
+    // meaningful rather than vacuous.
+    let entry_present = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home))
+        .map(|fleet| fleet.instances.contains_key("rolled-3418"))
+        .unwrap_or(false);
+    assert!(
+        !entry_present,
+        "precondition: a refused SPAWN must roll the fleet.yaml entry back"
+    );
+
+    assert!(
+        !logs_contain("create_instance persisted"),
+        "#3418: the success marker must NOT be emitted for a create that was \
+         rolled back — logging provenance for an entry that no longer exists is \
+         the #3415 unverified-assertion class"
+    );
+    assert!(
+        !logs_contain("caller=creator-3418-neg"),
+        "#3418: no provenance fields may leak from the rolled-back create"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// r2 correction 2 (spawn half): when `worktree::create` fails closed, the spawn
+/// path must NOT continue on the original `work_dir`. Before this fix
+/// `if let Some(info) = create(...)` simply skipped the assignment, so the agent
+/// launched and persisted against the SOURCE REPO instead of the worktree it
+/// asked for — a silent fallback that hands an agent the wrong tree.
+///
+/// The strongest single assertion is that the launch closure never runs: it
+/// captures no-launch AND no-fallback at once, since a fallback would have
+/// spawned with the original directory.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn spawn_fails_closed_when_worktree_creation_fails_no_launch_no_persist() {
+    let home = tmp_home_for_create_instance_team("spawn-wt-failclosed");
+    let repo = home.join("workspace").join("agent-repo");
+    std::fs::create_dir_all(&repo).unwrap();
+
+    let git = |dir: &std::path::Path, args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .env("GIT_ALLOW_PROTOCOL", "file:https:ssh")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .unwrap()
+            .success()
+    };
+
+    // A submodule source that we then DELETE, so `init_submodules_strict` fails
+    // and `create` fail-closes. This is the same shape as the worktree-level RED.
+    let sub = home.join("sub-src");
+    std::fs::create_dir_all(&sub).unwrap();
+    assert!(git(&sub, &["init", "--quiet", "-b", "main"]));
+    std::fs::write(sub.join("payload.txt"), "nested\n").unwrap();
+    assert!(git(&sub, &["add", "payload.txt"]));
+    assert!(git(
+        &sub,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "init"
+        ]
+    ));
+
+    assert!(git(&repo, &["init", "--quiet", "-b", "main"]));
+    assert!(git(
+        &repo,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            &sub.display().to_string(),
+            "vendor/dep"
+        ]
+    ));
+    assert!(git(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "super"
+        ]
+    ));
+    std::fs::remove_dir_all(&sub).expect("remove submodule source");
+
+    let fleet_path = crate::fleet::fleet_yaml_path(&home);
+    if let Some(parent) = fleet_path.parent() {
+        std::fs::create_dir_all(parent).ok();
+    }
+    std::fs::write(&fleet_path, "instances: {}\n").unwrap();
+
+    let launched = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let seen = launched.clone();
+    let spawn_fn = move |_h: &std::path::Path,
+                         _req: &serde_json::Value|
+          -> anyhow::Result<serde_json::Value> {
+        seen.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(serde_json::json!({"ok": true}))
+    };
+
+    let result = crate::mcp::handlers::instance_state::spawn::spawn_single_instance_impl(
+        &home,
+        "spawner",
+        &serde_json::json!({
+            "name": "wt-agent",
+            "backend": "claude",
+            "working_directory": repo.display().to_string(),
+            "branch": "feat/submod-fail"
+        }),
+        &spawn_fn,
+        None,
+    );
+
+    assert!(
+        result.get("error").is_some(),
+        "worktree creation failed, so the spawn must fail closed: {result}"
+    );
+    assert!(
+        !launched.load(std::sync::atomic::Ordering::SeqCst),
+        "no launch: the backend must never be spawned on the fallback work_dir"
+    );
+    let fleet_text = std::fs::read_to_string(&fleet_path).unwrap_or_default();
+    assert!(
+        !fleet_text.contains("wt-agent"),
+        "no persist: the instance must not reach fleet.yaml. Got: {fleet_text}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3538: a `mode=resume` restart on a managed Codex instance with no thread
+/// must fail closed BEFORE any destructive step — `resume_unavailable`,
+/// `spawned:false`, live instance untouched.
+///
+/// PR #3544 R1 (B1): "untouched" is pinned by the ESCALATION store, not by
+/// fleet.yaml. The runtime DELETE needs a daemon this harness has no way to
+/// reach, so the fleet entry survives whatever the gate does — that assertion
+/// cannot fail and cannot detect a misplaced gate. `clear_failed_escalated`
+/// (`mod.rs`, right after the gate) is the FIRST step on the restart path that
+/// mutates state a unit test can observe, and only when the store already
+/// exists (`escalation_persist::clear_failed_escalated` returns early with no
+/// store). Seeding one is what makes this test go red if the gate is ever
+/// moved below it.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn resume_restart_without_codex_thread_fails_closed_3538() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3538-gate-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  cx:\n    backend: codex\n",
+    )
+    .unwrap();
+    // Seed the first observable mutation's target: the gate must return before
+    // `clear_failed_escalated` flips this latch back to false.
+    crate::daemon::escalation_persist::persist(
+        &home,
+        "cx",
+        &crate::health::PersistedEscalation {
+            total_crashes: 0,
+            crash_times_epoch_ms: vec![],
+            last_crash_notification_epoch_ms: None,
+            last_hung_notification_epoch_ms: None,
+            hung_since_epoch_ms: None,
+            failed_escalated: true,
+        },
+    );
+    // No locator file under home → thread-less → gate must fire.
+    let r = handle_restart_instance(
+        &home,
+        &serde_json::json!({"instance": "cx", "mode": "resume", "reason": "probe"}),
+    );
+    assert_eq!(r["code"], "resume_unavailable", "got: {r}");
+    assert_eq!(r["spawned"], false, "got: {r}");
+    let fleet_text =
+        std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap_or_default();
+    assert!(
+        fleet_text.contains("cx:"),
+        "the refused restart must not have rewritten fleet.yaml: {fleet_text}"
+    );
+    let escalation = crate::daemon::escalation_persist::load_for(&home, "cx")
+        .expect("the seeded escalation record must survive a refused restart");
+    assert!(
+        escalation.failed_escalated,
+        "a REFUSED resume restart must not have cleared escalation state"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3538: `set_model` with `restart:true` on a thread-less Codex instance
+/// persists the intent but reports the resume failure explicitly —
+/// `persisted:true, restart_ok:false` (existing split contract), never a
+/// silent `restart_ok:true` fresh session.
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn set_model_restart_without_codex_thread_reports_split_outcome_3538() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-3538-setmodel-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos()
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  cx:\n    backend: codex\n",
+    )
+    .unwrap();
+    let r = super::set_model::handle_set_model(
+        &home,
+        &serde_json::json!({"instance": "cx", "model": "o3", "restart": true}),
+        &None,
+    );
+    assert_eq!(r["persisted"], true, "intent must persist: {r}");
+    assert_eq!(
+        r["restart_ok"], false,
+        "resume-unavailable restart must not claim success: {r}"
+    );
+    assert!(
+        r["restart_error"]
+            .as_str()
+            .is_some_and(|e| e.contains("resume")),
+        "error must name the resume failure: {r}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Restart/TUI 交接斷層 RED：`restart_instance` 回報只有 process 層的
+/// `spawned`，不驗證 TUI 側是否接管（新 port 有無 client 連上）。20:24
+/// 事件：daemon 側 `spawned=true`、新 TUI socket 就緒，但 app 側全程無
+/// 接管、pane 沒動靜，而 `set_model restart:true` 照樣報
+/// `restart_ok:true` 誤導。修法（decision d-20260914132854706907-6）：
+/// 回報必須攜帶 `tui_handoff` 交接確認，spawn 失敗時為 false。
+#[test]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
+fn restart_report_carries_tui_handoff_false_when_spawn_fails() {
+    let home = tmp_home_for_create_instance_team("tui-handoff-red");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  dev:\n    backend: /definitely-missing-agent-binary-tuihandoff\n",
+    )
+    .unwrap();
+    let r = handle_restart_instance(
+        &home,
+        &serde_json::json!({"instance": "dev", "mode": "resume", "reason": "tui-handoff-red"}),
+    );
+    assert_eq!(
+        r["tui_handoff"], false,
+        "交接未確認時回報必須攜帶 tui_handoff:false，got: {r}"
+    );
+    assert!(
+        r["error"].as_str().is_some_and(|error| !error.is_empty()),
+        "spawn failure must be terminal and carry an error: {r}"
+    );
     std::fs::remove_dir_all(&home).ok();
 }

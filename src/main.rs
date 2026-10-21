@@ -10,14 +10,22 @@ mod admin;
 mod agent;
 mod agent_ops;
 mod agy_workspace;
+// Windows ships the thin client but still compiles daemon support for shared
+// types and tests, so production reachability intentionally differs there.
+#[cfg_attr(windows, allow(dead_code))]
 mod api;
 mod api_activity_probe;
 mod app;
 mod auth_cookie;
 mod backend;
+mod backend_effort;
 mod backend_harness;
+mod backend_inject;
+#[cfg(test)]
+mod backend_inject_tests;
 mod backend_model;
 mod backend_profile;
+mod backend_session;
 mod background_guidance;
 mod behavioral;
 mod binding;
@@ -30,8 +38,10 @@ mod channel;
 mod claim_verifier;
 mod cleanup_intents;
 mod cli;
+mod cli_stop;
 mod config_integrity;
 mod connect;
+#[cfg_attr(windows, allow(dead_code))]
 mod daemon;
 mod daemon_config;
 mod decisions;
@@ -47,6 +57,7 @@ mod framing;
 mod git_helpers;
 mod git_worktree;
 mod github_token;
+#[cfg_attr(windows, allow(dead_code))]
 mod health;
 mod identity;
 mod image_paste;
@@ -56,11 +67,13 @@ mod instructions;
 mod integrity_core;
 mod invariant_inputs;
 mod ipc;
+mod jsonl_retention;
 mod keybinds;
 mod layout;
 mod logging;
 mod mcp;
 mod mcp_config;
+mod mcp_wire;
 pub(crate) mod merge_receipt;
 mod mouse_forward;
 mod notification_queue;
@@ -71,31 +84,44 @@ mod protected_refs;
 mod protocol;
 mod provider_detect;
 mod quickstart;
+mod ready;
 mod render;
+#[cfg_attr(windows, allow(dead_code))]
 mod reply_ledger;
+#[cfg_attr(windows, allow(dead_code))]
+mod resource_limits;
 mod review_receipt;
 #[cfg(test)]
 mod review_repro_test_util;
 mod runtime;
 pub mod runtime_config;
 pub(crate) mod runtime_controls;
+mod schedule_jobs;
 mod schedules;
 mod scm;
+#[cfg_attr(windows, allow(dead_code))]
 mod sent_ledger;
 mod service;
 mod shared_async;
 mod skills;
 mod snapshot;
+#[cfg_attr(windows, allow(dead_code))]
 mod state;
 mod status_summary;
 mod store;
 mod sync_audit;
 mod task_events;
+#[cfg_attr(windows, allow(dead_code))]
 mod tasks;
 mod team_ops;
+#[cfg(test)]
+mod team_ops_tests;
+mod team_order;
+mod team_view;
 mod teams;
 mod thread_census;
 mod token_cost;
+mod tool_cli;
 mod transport;
 #[cfg(feature = "tray")]
 mod tray;
@@ -109,7 +135,7 @@ mod worktree_cleanup;
 #[allow(dead_code)]
 mod worktree_pool;
 
-use clap::{Parser, Subcommand};
+use clap::{error::ErrorKind, Parser, Subcommand};
 use std::path::PathBuf;
 
 /// Cross-platform user home directory with temp_dir fallback.
@@ -349,6 +375,32 @@ enum Commands {
         #[arg(long)]
         instance: String,
     },
+    /// Experimental generic MCP tool front end. The daemon-side fence is
+    /// closed by default; enable it only in an isolated test environment.
+    #[command(hide = true, name = "tool")]
+    Tool {
+        /// MCP tool name, or `list` / `schema` for live discovery.
+        #[arg(value_name = "NAME", index = 1)]
+        name: Option<String>,
+        /// Tool name following the `schema` discovery command.
+        #[arg(value_name = "SCHEMA_NAME", index = 2)]
+        second_name: Option<String>,
+        /// Action passed through as the JSON `action` argument.
+        #[arg(long)]
+        action: Option<String>,
+        /// JSON object, `-` for stdin, or `@FILE`.
+        #[arg(long, value_name = "JSON|-|@FILE")]
+        json: Option<String>,
+        /// String-valued argument override. Repeat for multiple arguments.
+        #[arg(long = "arg", value_name = "K=V")]
+        args: Vec<String>,
+        /// Daemon home directory (defaults to `$AGEND_HOME`).
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Caller-supplied UUID for safe state-check/resend workflows.
+        #[arg(long)]
+        request_id: Option<String>,
+    },
     /// Send input to an agent
     Inject {
         /// Agent name
@@ -394,8 +446,19 @@ enum Commands {
         #[arg(long = "app-restart-requester", hide = true)]
         app_restart_requester: Option<String>,
     },
-    /// Stop the daemon
-    Stop,
+    /// Stop the daemon. Waits (bounded) for the daemon process to exit, then
+    /// lists reparented processes that look agend-related without touching
+    /// them (#3539).
+    Stop {
+        /// Return as soon as the daemon accepts the request; do not wait for
+        /// the process to exit (the pre-#3539 behaviour).
+        #[arg(long)]
+        no_wait: bool,
+        /// Upper bound, in seconds, on the wait for the daemon to exit. Exits
+        /// non-zero if the daemon is still running at the bound.
+        #[arg(long, default_value_t = 30)]
+        timeout: u64,
+    },
     /// Kill an agent
     Kill {
         /// Agent name
@@ -493,6 +556,35 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum AdminCommands {
+    /// Acknowledge externally completed Job cleanup from an operator shell.
+    ResolveJobRecovery {
+        /// Run requiring manual recovery.
+        run_id: String,
+        /// Current attempt number shown by schedule runs.
+        #[arg(long)]
+        attempt: u32,
+        /// Confirm all worker/tools stopped and delivery outcomes reconciled.
+        #[arg(long, required = true)]
+        cleanup_confirmed: bool,
+        /// Nonempty audit note describing the external cleanup.
+        #[arg(long)]
+        result: String,
+    },
+    /// Preview one exact task settlement; returns a 15-minute confirmation.
+    TaskSettlementPreview {
+        #[arg(long)]
+        task_id: String,
+        #[arg(long, value_parser = ["done", "cancelled"])]
+        target: String,
+        /// Nonempty explanation recorded with the settlement.
+        #[arg(long)]
+        result: String,
+    },
+    /// Apply an operator preview token; never performs inline worktree cleanup.
+    TaskSettlementApply {
+        #[arg(long)]
+        confirmation: String,
+    },
     /// Delete local branches whose PRs have been merged (squash-merge safe).
     /// Default: --dry-run (preview only). Pass --yes to actually delete.
     CleanupBranches {
@@ -555,6 +647,24 @@ enum AdminCommands {
         /// the default `https://api.github.com`.
         #[arg(long)]
         api_base_url: Option<String>,
+        /// Retire a previously observed provenance mapping after operator review.
+        /// Repeat the flag to acknowledge multiple `project|repo|api` keys.
+        #[arg(long = "acknowledge-provenance")]
+        acknowledge_provenance: Vec<String>,
+        /// Acknowledge an explicitly named project board whose provenance is
+        /// intentionally unmapped. This records only the project id; it does
+        /// not infer a repository or change task-board routing.
+        #[arg(long = "acknowledge-manual-unmapped")]
+        acknowledge_manual_unmapped: Option<String>,
+        /// Operator identity for a manual-unmapped acknowledgement.
+        #[arg(long = "provenance-actor")]
+        provenance_actor: Option<String>,
+        /// Audited reason for a manual-unmapped acknowledgement.
+        #[arg(long = "provenance-reason")]
+        provenance_reason: Option<String>,
+        /// Preview a manual-unmapped acknowledgement without writing state.
+        #[arg(long = "provenance-dry-run")]
+        provenance_dry_run: bool,
     },
     /// #2548: list Phase 4 GC candidates (released, past-grace, daemon-managed
     /// worktrees) without deleting them. Non-destructive. Moved from the
@@ -563,6 +673,34 @@ enum AdminCommands {
         /// Output format.
         #[arg(long, default_value = "human")]
         format: String,
+    },
+    /// Recover one exact markerless bound worktree after a timed-out release.
+    ///
+    /// This is an operator-only, fail-closed path: it archives the residual
+    /// directory before clearing the exact binding. Normal release and GC
+    /// continue to refuse markerless targets.
+    RecoverWorktree {
+        /// Bound instance name.
+        #[arg(long)]
+        instance: String,
+        /// Branch recorded by the binding.
+        #[arg(long)]
+        branch: String,
+        /// Residual worktree directory to archive.
+        #[arg(long)]
+        worktree: std::path::PathBuf,
+        /// Source repository recorded by the binding.
+        #[arg(long)]
+        source_repo: std::path::PathBuf,
+        /// Operator identity recorded in the recovery manifest.
+        #[arg(long)]
+        actor: String,
+        /// Nonempty audit reason recorded in the recovery manifest.
+        #[arg(long)]
+        audit_reason: String,
+        /// Required confirmation for this destructive archive operation.
+        #[arg(long)]
+        yes: bool,
     },
     /// #2548: on-demand token usage + estimated USD cost from Claude Code /
     /// Codex session transcripts. Moved from the `tokens` MCP tool (zero calls
@@ -792,7 +930,23 @@ fn main() -> anyhow::Result<()> {
     let process_entry = std::time::Instant::now();
     load_dotenv();
 
-    let cli = Cli::parse();
+    // `tool` owns its own exit-code contract (usage is 3, not clap's usual 2)
+    // so malformed tool invocations are handled by the generic front end.
+    let tool_requested = std::env::args().nth(1).as_deref() == Some("tool");
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error)
+            if tool_requested
+                && !matches!(
+                    error.kind(),
+                    ErrorKind::DisplayHelp | ErrorKind::DisplayVersion
+                ) =>
+        {
+            tool_cli::print_usage_error(error.to_string());
+            std::process::exit(3);
+        }
+        Err(error) => error.exit(),
+    };
 
     // App mode redirects tracing to a log file (stderr is owned by ratatui).
     // The daemon child path (`start --foreground`, including the spawn_detached
@@ -884,6 +1038,9 @@ fn main() -> anyhow::Result<()> {
             // to register with the supervisor in detached mode), so the
             // detach branch only fires when a fleet path is in play.
             let force_foreground = foreground || !agents.is_empty();
+            if force_foreground {
+                resource_limits::raise_daemon_nofile_limit();
+            }
 
             // Wave 1 CLI consolidation: `--agents` subsumes the former
             // `daemon` subcommand. When provided, skip fleet loading and
@@ -1097,6 +1254,31 @@ fn main() -> anyhow::Result<()> {
         Some(Commands::ChannelBridge { instance }) => {
             transport::claude_channel::run_channel_server(&home, &instance)?;
         }
+        Some(Commands::Tool {
+            name,
+            second_name,
+            action,
+            json,
+            args,
+            home: tool_home,
+            request_id,
+        }) => {
+            let code = tool_cli::run(
+                &home,
+                tool_cli::ToolArgs {
+                    name,
+                    second_name,
+                    action,
+                    json,
+                    args,
+                    home: tool_home,
+                    request_id,
+                },
+            );
+            if code != 0 {
+                std::process::exit(code);
+            }
+        }
         Some(Commands::Inject { name, text }) => {
             let text = text.join(" ");
             if text.is_empty() {
@@ -1114,13 +1296,17 @@ fn main() -> anyhow::Result<()> {
                 Err(_) => daemon_not_running_hint(),
             }
         }
-        Some(Commands::Stop) => {
-            match api::call(&home, &serde_json::json!({"method": api::method::SHUTDOWN})) {
-                Ok(resp) if resp["ok"].as_bool() == Some(true) => {
-                    println!("Daemon shutdown initiated.")
+        Some(Commands::Stop { no_wait, timeout }) => {
+            let opts = cli_stop::StopOptions {
+                wait: !no_wait,
+                timeout: std::time::Duration::from_secs(timeout),
+            };
+            match cli_stop::run_stop(&home, opts)? {
+                cli_stop::StopOutcome::NotRunning => daemon_not_running_hint(),
+                cli_stop::StopOutcome::TimedOut | cli_stop::StopOutcome::Unconfirmed => {
+                    std::process::exit(1)
                 }
-                Ok(_) => eprintln!("Shutdown request failed."),
-                Err(_) => daemon_not_running_hint(),
+                cli_stop::StopOutcome::Initiated | cli_stop::StopOutcome::Exited => {}
             }
         }
         Some(Commands::List { json, detailed }) => {
@@ -1274,6 +1460,60 @@ fn main() -> anyhow::Result<()> {
             }
         }
         Some(Commands::Admin { command }) => match command {
+            AdminCommands::ResolveJobRecovery {
+                run_id,
+                attempt,
+                cleanup_confirmed,
+                result,
+            } => {
+                // Match existing operator CLI authentication without promoting
+                // ordinary agent-launched commands to the operator principal.
+                // Same-UID secret isolation remains the existing auth boundary.
+                anyhow::ensure!(
+                    std::env::var_os("AGEND_INSTANCE_NAME").is_none_or(|name| name.is_empty()),
+                    "resolve-job-recovery is operator-only; run it from an operator shell"
+                );
+                let args = serde_json::json!({
+                    "action": "resolve_recovery", "run_id": run_id,
+                    "attempt_id": attempt, "cleanup_confirmed": cleanup_confirmed,
+                    "result": result,
+                });
+                // api::call authenticates with the existing Operator credential;
+                // the daemon still checks principal and sender before mutation.
+                let response =
+                    api::call(&home, &mcp_wire::mcp_tool_envelope("", "schedule", &args))?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                anyhow::ensure!(
+                    mcp_wire::classify_response(&response) == mcp_wire::ResponseClass::Ok,
+                    "recovery resolution refused or indeterminate; inspect the response above"
+                );
+            }
+            AdminCommands::TaskSettlementPreview {
+                task_id,
+                target,
+                result,
+            } => {
+                let response = api::call(
+                    &home,
+                    &serde_json::json!({
+                        "method":"task_settlement_preview", "params":{
+                            "task_id":task_id,"target":target,"result":result
+                        }
+                    }),
+                )?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                anyhow::ensure!(response["ok"] == true, "task settlement preview refused");
+            }
+            AdminCommands::TaskSettlementApply { confirmation } => {
+                let response = api::call(
+                    &home,
+                    &serde_json::json!({
+                        "method":"task_settlement_apply", "params":{"confirmation":confirmation}
+                    }),
+                )?;
+                println!("{}", serde_json::to_string_pretty(&response)?);
+                anyhow::ensure!(response["ok"] == true, "task settlement apply refused");
+            }
             AdminCommands::CleanupBranches { yes } => {
                 let repo = std::env::current_dir()?;
                 let checks = admin::analyze_branches(&repo);
@@ -1406,8 +1646,23 @@ fn main() -> anyhow::Result<()> {
                 dry_run,
                 no_dry_run,
                 api_base_url,
+                acknowledge_provenance,
+                acknowledge_manual_unmapped,
+                provenance_actor,
+                provenance_reason,
+                provenance_dry_run,
             } => {
                 let mut args = serde_json::json!({});
+                if let Some(project_id) = acknowledge_manual_unmapped {
+                    args["acknowledge_manual_unmapped"] = serde_json::json!(project_id);
+                    if let Some(actor) = provenance_actor {
+                        args["provenance_actor"] = serde_json::json!(actor);
+                    }
+                    if let Some(reason) = provenance_reason {
+                        args["provenance_reason"] = serde_json::json!(reason);
+                    }
+                    args["provenance_dry_run"] = serde_json::json!(provenance_dry_run);
+                }
                 if let Some(repo) = repository {
                     args["repository"] = serde_json::json!(repo);
                 }
@@ -1424,6 +1679,9 @@ fn main() -> anyhow::Result<()> {
                 if let Some(url) = api_base_url {
                     args["api_base_url"] = serde_json::json!(url);
                 }
+                if !acknowledge_provenance.is_empty() {
+                    args["acknowledge_provenance"] = serde_json::json!(acknowledge_provenance);
+                }
                 let result = daemon::task_sweep::handle_task_sweep_config(&home, &args);
                 println!(
                     "{}",
@@ -1438,6 +1696,24 @@ fn main() -> anyhow::Result<()> {
                     serde_json::to_string_pretty(&result).unwrap_or_else(|_| result.to_string())
                 );
             }
+            AdminCommands::RecoverWorktree {
+                instance,
+                branch,
+                worktree,
+                source_repo,
+                actor,
+                audit_reason,
+                yes,
+            } => cli::run_admin_recover_worktree(
+                &home,
+                &instance,
+                &branch,
+                &worktree,
+                &source_repo,
+                &actor,
+                &audit_reason,
+                yes,
+            )?,
             AdminCommands::Tokens {
                 action,
                 group_by,
@@ -1659,6 +1935,13 @@ fn daemon_not_running_hint() {
     eprintln!("Daemon is not running.");
     eprintln!("  Start it with:  agend-terminal start");
     eprintln!("  Or first setup: agend-terminal quickstart");
+    // #3499: if it WAS running and died unexpectedly, "just start it again"
+    // is a dead end for diagnosing why. Point at the two places that answer
+    // that: `doctor` for a live health check, and the daemon's own log for
+    // its last words before it exited.
+    eprintln!("  Did it die unexpectedly?");
+    eprintln!("    Diagnose with: agend-terminal doctor");
+    eprintln!("    Check the log: $AGEND_HOME/daemon.log");
 }
 
 fn list_running_agents(home: &std::path::Path) {
@@ -1720,6 +2003,42 @@ mod tests {
             s.contains(".agend") || s.contains("agend"),
             "home_dir should contain 'agend': {s}"
         );
+    }
+
+    #[test]
+    fn operator_settlement_3553_cli_commands_parse() {
+        assert!(Cli::try_parse_from([
+            "agend-terminal",
+            "admin",
+            "task-settlement-preview",
+            "--task-id",
+            "t-exact",
+            "--target",
+            "cancelled",
+            "--result",
+            "duplicate confirmed",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "agend-terminal",
+            "admin",
+            "task-settlement-apply",
+            "--confirmation",
+            "opaque-token",
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from([
+            "agend-terminal",
+            "admin",
+            "task-settlement-preview",
+            "--task-id",
+            "t-exact",
+            "--target",
+            "claimed",
+            "--result",
+            "invalid target",
+        ])
+        .is_err());
     }
 
     #[test]

@@ -9,9 +9,10 @@ pub use watchdog::WatchdogConfig;
 #[allow(unused_imports)]
 pub use persist::{
     add_instance_to_yaml, add_instances_to_yaml, add_team_to_yaml, duplicate_identity_owner_before,
-    migrate_teams_json_to_yaml, remove_instance_from_yaml, remove_instances_from_yaml,
-    remove_team_from_yaml, update_channel_telegram_group_id, update_instance_field,
-    update_team_in_yaml, workspace_identity_collision, TeamWriteOutcome,
+    insert_new_instances_to_yaml, migrate_teams_json_to_yaml, remove_instance_from_yaml,
+    remove_instances_from_yaml, remove_instances_from_yaml_for_generation, remove_team_from_yaml,
+    update_channel_telegram_group_id, update_instance_field, update_team_in_yaml,
+    workspace_identity_collision, TeamWriteOutcome,
 };
 
 use crate::backend::Backend;
@@ -37,7 +38,7 @@ struct FleetCacheEntry {
     config: Arc<FleetConfig>,
 }
 
-fn invalidate_cache() {
+pub(crate) fn invalidate_cache() {
     let mut guard = FLEET_CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *guard = None;
 }
@@ -108,6 +109,52 @@ pub fn team_orchestrator_for(home: &Path, member: &str) -> Option<String> {
                 .find(|t| t.members.iter().any(|m| m == member))
                 .and_then(|t| t.orchestrator.clone())
         })
+}
+
+/// #3480: which team owns `member`, three ways.
+///
+/// [`team_orchestrator_for`] answers with whichever team a `.values().find(...)`
+/// scan reaches first, i.e. with HashMap iteration order when an instance is
+/// listed by more than one team. That is acceptable for the watchdog escalation
+/// it was written for and unacceptable for an authority decision, which must
+/// refuse rather than pick. Kept separate so the existing callers are untouched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwningTeam {
+    /// Exactly one team lists the member, with that team's declared
+    /// orchestrator (`None` when the team declares none).
+    Sole {
+        team: String,
+        orchestrator: Option<String>,
+    },
+    /// More than one team lists the member, so no single orchestrator exists.
+    /// Team names are sorted so the refusal is reproducible.
+    Ambiguous { teams: Vec<String> },
+    /// No team lists the member — including when fleet.yaml cannot be read.
+    None,
+}
+
+/// Resolve the team(s) that list `member`. Fails closed: an unreadable
+/// fleet.yaml is [`OwningTeam::None`], which grants nothing.
+pub fn owning_team_for(home: &Path, member: &str) -> OwningTeam {
+    let Ok(config) = FleetConfig::load(&fleet_yaml_path(home)) else {
+        return OwningTeam::None;
+    };
+    let mut owning: Vec<(&String, &TeamConfig)> = config
+        .teams
+        .iter()
+        .filter(|(_, team)| team.members.iter().any(|m| m == member))
+        .collect();
+    owning.sort_by(|left, right| left.0.cmp(right.0));
+    match owning.as_slice() {
+        [] => OwningTeam::None,
+        [(name, team)] => OwningTeam::Sole {
+            team: (*name).clone(),
+            orchestrator: team.orchestrator.clone(),
+        },
+        _ => OwningTeam::Ambiguous {
+            teams: owning.iter().map(|(name, _)| (*name).clone()).collect(),
+        },
+    }
 }
 
 /// #1989: the fleet.yaml schema version this daemon reads and writes. Bump
@@ -381,6 +428,34 @@ fn default_discord_bot_token_env() -> String {
     "AGEND_DISCORD_BOT_TOKEN".to_string()
 }
 
+/// A fleet environment value is either stored literally or read from the
+/// daemon's environment when an instance is resolved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum FleetEnvValue {
+    Literal(String),
+    FromEnv { from_env: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnvResolveError {
+    pub instance: String,
+    pub destination: String,
+    pub source: String,
+}
+
+impl std::fmt::Display for EnvResolveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "fleet env source '{}' for destination '{}' is missing or is not valid Unicode",
+            self.source, self.destination
+        )
+    }
+}
+
+impl std::error::Error for EnvResolveError {}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstanceDefaults {
     /// Backend preset name (e.g., "claude", "kiro-cli").
@@ -392,9 +467,13 @@ pub struct InstanceDefaults {
     /// Symbolic model tier key looked up in `model_tiers` (#2477).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_tier: Option<String>,
+    /// Fleet-wide default reasoning-effort level (#3541). Instance-level
+    /// `effort:` wins; empty string normalizes to `None` at resolve time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     pub ready_pattern: Option<String>,
     #[serde(default)]
-    pub env: HashMap<String, String>,
+    pub env: HashMap<String, FleetEnvValue>,
     pub cols: Option<u16>,
     pub rows: Option<u16>,
     pub instructions: Option<String>,
@@ -463,6 +542,9 @@ pub struct InstanceConfig {
     /// Drives the `delete_instance` creator-ACL path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub created_by: Option<String>,
+    /// Opaque deployment generation used to guard rollback and owned-workdir cleanup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deployment_generation: Option<String>,
     /// Backend preset name — overrides defaults.backend.
     pub backend: Option<Backend>,
     pub command: Option<String>,
@@ -489,7 +571,7 @@ pub struct InstanceConfig {
     pub repo: Option<String>,
     pub ready_pattern: Option<String>,
     #[serde(default)]
-    pub env: HashMap<String, String>,
+    pub env: HashMap<String, FleetEnvValue>,
     /// #1440: per-instance env keys to pass through under `AGEND_ENV_ISOLATION`
     /// (additive with fleet-level [`FleetConfig::passthrough_env`]). Still
     /// `is_sensitive_env_key`-gated.
@@ -514,6 +596,12 @@ pub struct InstanceConfig {
     /// without hard-coding backend model IDs on every instance.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub model_tier: Option<String>,
+    /// Reasoning-effort level (e.g. "low", "medium", "high"). Passed as
+    /// `--effort` (Claude/Agy) or `-c model_reasoning_effort="…"` (Codex).
+    /// Backends without a declared effort capability skip it with a warning
+    /// (#3541). Empty string normalizes to `None` at resolve time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Optional per-instance context-alert threshold override. When absent,
     /// the effective global runtime threshold applies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -675,6 +763,20 @@ impl FleetConfig {
         Ok((*Self::load_arc(path)?).clone())
     }
 
+    /// Load a normalized fleet snapshot without performing ID backfill writes.
+    /// The caller must hold [`persist::acquire_fleet_lock`] across this read
+    /// and any dependent mutation. This avoids recursively acquiring the fleet
+    /// lock from `backfill_ids` when a caller needs one atomic read/decide/write.
+    pub fn load_snapshot_under_lock(path: &Path) -> Result<Self> {
+        let content = std::fs::read_to_string(path)
+            .with_context(|| format!("Failed to read fleet config: {}", path.display()))?;
+        let mut config: FleetConfig = serde_yaml_ng::from_str(&content)
+            .with_context(|| format!("Failed to parse fleet config: {}", path.display()))?;
+        config.normalize();
+        config.home = path.parent().map(|p| p.to_path_buf());
+        Ok(config)
+    }
+
     /// #1989: resolved schema version — an omitted `schema_version:` means 1.
     pub fn effective_schema_version(&self) -> u32 {
         self.schema_version.unwrap_or(1)
@@ -810,7 +912,35 @@ impl FleetConfig {
     /// the binary path to spawn — useful for users pointing a preset at a
     /// custom-built binary (`backend: claude` + `command: /opt/claude-v2/claude`).
     pub fn resolve_instance(&self, name: &str) -> Option<ResolvedInstance> {
+        match self.resolve_instance_checked(name) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::error!(
+                    instance = %error.instance,
+                    destination = %error.destination,
+                    source = %error.source,
+                    "fleet env source is missing or is not valid Unicode; refusing instance resolution"
+                );
+                None
+            }
+        }
+    }
+
+    /// Resolve an instance while distinguishing an absent fleet entry from an
+    /// environment source that could not be read.
+    pub fn resolve_instance_checked(
+        &self,
+        name: &str,
+    ) -> std::result::Result<Option<ResolvedInstance>, EnvResolveError> {
         resolve::resolve_instance(self, name)
+    }
+
+    pub(crate) fn resolve_env_value(
+        &self,
+        name: &str,
+        destination: &str,
+    ) -> std::result::Result<Option<String>, EnvResolveError> {
+        resolve::resolve_env_value(self, name, destination)
     }
 
     /// Get all instance names.
@@ -931,6 +1061,9 @@ pub struct ResolvedInstance {
     pub topic_id: Option<i32>,
     pub git_branch: Option<String>,
     pub model: Option<String>,
+    /// #3541: resolved reasoning-effort level (instance > defaults > None;
+    /// empty string normalizes to None in `resolve.rs`).
+    pub effort: Option<String>,
     pub worktree: Option<bool>,
     pub instructions: Option<String>,
     /// Sprint 54 P1-B Bug 2 fix: resolved source repository path. See
@@ -979,6 +1112,8 @@ pub struct InstanceYamlEntry {
     pub model: Option<String>,
     /// #2477: symbolic model tier mirror of [`InstanceConfig::model_tier`].
     pub model_tier: Option<String>,
+    /// #3541: reasoning-effort mirror of [`InstanceConfig::effort`].
+    pub effort: Option<String>,
     /// Sprint 56 Track E (#450): process env mirror of
     /// [`InstanceConfig::env`]. Same `Option` semantics as `args`:
     /// `None` = no override, `Some(empty)` = explicit empty map.
@@ -1013,6 +1148,8 @@ pub struct InstanceYamlEntry {
     /// Mirror of [`InstanceConfig::created_by`] — the identified caller that
     /// ran `create_instance`, written at spawn time.
     pub created_by: Option<String>,
+    /// Opaque token tying a deployed fleet row to its materialization generation.
+    pub deployment_generation: Option<String>,
     /// Mirror of [`InstanceConfig::context_alert_pct`].
     pub context_alert_pct: Option<f32>,
     /// Mirror of [`InstanceConfig::context_handoff_pct`].

@@ -36,13 +36,20 @@ pub(crate) fn def_reply() -> Value {
         }, "required": []}})
 }
 
+pub(crate) fn def_operator_page() -> Value {
+    json!({"name": "operator_page", "description": "#3480: page the OPERATOR on their Telegram, independent of any inbound channel binding — for milestones the operator explicitly asked to be told about while away or asleep. Orchestrator-only: only the current orchestrator of your team may call it; every other agent must ask its own orchestrator. Off by default and enabled only by the operator (`agend-terminal admin config-set operator_page.enabled true`), capped at 3 pages per orchestrator per rolling hour with the excess DROPPED, never queued — a refusal carries `retry_after_secs` so you can fall back to writing the milestone into SESSION-HANDOFF.md. Pages are NOT suppressed by operator Away/Sleep mode (that is the point); the switch is how the operator silences them. Plain text only, capped at 1000 characters, and always prefixed with your instance name.",
+        "inputSchema": {"type": "object", "properties": {
+            "message": {"type": "string", "description": "The page text. Plain text, no formatting passthrough; truncated at 1000 characters. Every control character (Cc), every Unicode White_Space character including NBSP, and every character with no visible rendering (category Cf such as ZWSP and the bidi overrides, plus the Default_Ignorable_Code_Point set such as CGJ U+034F and the variation selectors) is normalised to an ordinary space, so the page is one line. Your instance name is prefixed automatically inside the daemon's `[operator-page from …]` marker, so do not repeat it — and the body may NOT contain that marker itself: a body that still carries it after normalisation (in any case, or spelled with a look-alike space or an invisible character) is refused with `marker_in_body`, spends no rate slot, and is logged. A marker spelled with HOMOGLYPHS (Cyrillic о for Latin o) is NOT detected and IS delivered; because the body is one line and the daemon's prefix is always first, such a forgery can only appear mid-line after the genuine prefix."}
+        }, "required": ["message"]}})
+}
+
 pub(crate) fn def_download_attachment() -> Value {
     json!({"name": "download_attachment", "description": "Download a file attachment (telegram multimedia: images, audio, documents). Returns local path. Requires daemon API.",
         "inputSchema": {"type": "object", "properties": {"file_id": {"type": "string"}}, "required": ["file_id"]}})
 }
 
 pub(crate) fn def_send() -> Value {
-    json!({"name": "send", "description": "Send a message to another instance or broadcast to multiple. Replaces send_to_instance/delegate_task/report_result/request_information/broadcast. Sprint 58 Wave 4 PR-1: kind=task dispatches MUST include task_id (call task action=create first to obtain a 't-...' id).",
+    json!({"name": "send", "description": "Send a message to another instance or broadcast to multiple. Replaces send_to_instance/delegate_task/report_result/request_information/broadcast. Sprint 58 Wave 4 PR-1: broadcast kind=task dispatches MUST include task_id; the current single-target compatibility path may auto-create one when omitted (explicit task action=create remains the stable contract).",
         "inputSchema": {"type": "object", "properties": {
             "instance": {"type": "string", "description": "Name of the existing instance to send to (single recipient)"},
             "instances": {"type": "array", "items": {"type": "string"}, "description": "Names of existing instances to broadcast to (broadcast mode)"},
@@ -50,7 +57,7 @@ pub(crate) fn def_send() -> Value {
             "tags": {"type": "array", "items": {"type": "string"}, "description": "Tags filter (broadcast mode)"},
             "message": {"type": "string", "description": "Canonical message text routed to the corresponding task, report, or query handler. Required unless message_from_file is provided."},
             "message_from_file": {"type": "string", "description": "Path to a text file whose contents become the message. Overrides 'message' when both are provided. Must be an absolute path to a regular UTF-8 text file (max 1 MiB)."},
-            "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"], "description": "Message kind (determines behavior). NOTE: kind=task requires task_id (Sprint 58 Wave 4 PR-1 anti-stall contract)."},
+            "request_kind": {"type": "string", "enum": ["query", "task", "report", "update"], "description": "Message kind (determines behavior). Broadcast kind=task requires task_id; single-target kind=task may auto-create one when omitted (Sprint 58 Wave 4 PR-1 anti-stall contract)."},
             "report_purpose": {"type": "string", "enum": ["task_result", "analysis_decision", "source_spike", "rca", "code_review"], "description": "Typed purpose for request_kind=report. New report callers should always set it. Missing legacy values remain ordinary LegacyUntyped reports with zero code-review authority."},
             "code_review": {"type": "object", "additionalProperties": false, "properties": {
                 "assignment_id": {"type": "string", "description": "Exact assignment generation UUID delivered by a typed review_assignment."},
@@ -59,7 +66,7 @@ pub(crate) fn def_send() -> Value {
             }, "required": ["assignment_id", "verdict", "evidence_digest"], "description": "Non-authoritative code-review request. Valid only with report_purpose=code_review; the API sink derives and validates the exact repo/PR/task/full-head/class/slot/reviewer subject from the still-active assignment."},
             "success_criteria": {"type": "string", "description": "For task delegation"},
             "context": {"type": "string"},
-            "task_id": {"type": "string", "description": "Task board ID for correlation. REQUIRED when request_kind=task — caller must obtain via `task action=create` and reference the resulting `t-...` id, closing the Wave 3 PR-1 dispatch protocol gap."},
+            "task_id": {"type": "string", "description": "Task board ID for correlation. REQUIRED for broadcast request_kind=task. Single-target task dispatch may auto-create one when omitted; callers should use task action=create first for the stable, auditable flow."},
             "correlation_id": {"type": "string"},
             "parent_id": {"type": "string"},
             "thread_id": {"type": "string"},
@@ -68,12 +75,15 @@ pub(crate) fn def_send() -> Value {
             "second_reviewer": {"type": "boolean", "description": "Signal dual review (§3.5)"},
             "second_reviewer_reason": {"type": "string"},
             "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#2745: durable review threshold for a PR-producing (branch) dispatch — `single` (§3.6, one VERIFIED) or `dual` (§3.5, two distinct VERIFIED). Fail-closed AUTHORITY: a merge-authority (branch) dispatch is REJECTED unless the referenced or auto-created task carries a resolvable review_class. On an auto-create dispatch (empty task_id) this value seeds the created task's metadata; when task_id references an existing task, that task's review_class metadata is the authority and must not be contradicted (second_reviewer=true is consistency-evidence only: single+true is a mismatch → reject)."},
+            "governing_decision_id": {"type": "string", "description": "#3419: exact active unsuperseded leaf decision governing the auto-created task; creation resolves and persists its typed review authority atomically."},
             "plan_ack_required": {"type": "integer", "description": "#2249 pre-work alignment gate: number of distinct non-assignee acks a plan (set via `task action=metadata_set metadata_key=plan`) needs before the task may transition to in_progress. 0 (default) = gate off, byte-identical to pre-#2249 behavior. Only meaningful when this send auto-creates a task (empty task_id) — forwarded into that task's create; ignored when task_id references an existing task."},
             "plan_ack_reason": {"type": "string", "description": "Required non-empty when plan_ack_required > 0 (mirrors second_reviewer_reason)."},
             "review_assignment": {"type": "boolean", "description": "t-…-17/task66: mark this dispatch a DURABLE typed reviewer assignment (fail-closed). Requires explicit task_id, branch, nonzero pr_number, and exact full reviewed_head matching current PR state. Authority = the sole current orchestrator of the exactly-one owning team; the reviewer target must differ from review_author."},
+            "repository": {"type": "string", "description": "#3479: review_assignment dispatches — explicit `owner/repo` slug for the assignment's repo/ACL resolve. Consumed FIRST and canonicalized fail-closed (dispatch_hook resolve_review_assignment_repo); set it whenever the dispatch TARGET's own source_repo does not resolve to the PR's repo (cross-board reviewer). Absent → falls back to the target's resolved source_repo slug, so same-board dispatches are unchanged. Declares an input the handler has always accepted; no behavior change."},
             "pr_number": {"type": "integer", "description": "t-…-17: forge-stable PR number — MANDATORY (nonzero) when `review_assignment=true`. Binds the assignment to a specific PR generation so a merged/closed PR's assignment is durably tombstoned and a reused branch (new pr_number) is never poisoned. Rejected atomically if missing or zero on a marker dispatch."},
             "review_author": {"type": "object", "description": "t-…-17: the audited code-author principal for a `review_assignment` dispatch. EXACTLY one of `{\"agent\":\"<name>\"}` or `{\"external\":\"<login>\"}`, value non-empty (both/neither/extra keys/empty ⇒ reject). Self-review is denied when `Agent(author)` equals the reviewer target (same namespace); an `External` login is a distinct principal type and is never string-compared to the agent target."},
             "reviewed_head": {"type": "string", "description": "Display-only on reports; never code-review authority. For review_assignment=true it is required as the exact full 40/64-hex current PR head and is persisted server-side."},
+            "expected_head": {"type": "string", "description": "Optional exact full 40/64-hex commit for an untyped branch-carrying task dispatch. The new worktree must land on this commit or dispatch rejects with zero binding. Omitted preserves default-tip behavior; typed review_assignment continues to use reviewed_head."},
             "artifacts": {"type": "string"},
             "branch": {"type": "string"},
             "eta_minutes": {"type": "integer", "description": "Expected completion time in minutes"},
@@ -101,7 +111,7 @@ pub(crate) fn def_inbox() -> Value {
 }
 
 pub(crate) fn def_list_instances() -> Value {
-    json!({"name": "list_instances", "description": "List all active agent instances. Pass optional `instance` for detailed info on a single instance. #2475: compact by default — each row drops the noisy `observed_status.evidence` trail; pass `verbose:true` (or `include_evidence:true`) to include it.",
+    json!({"name": "list_instances", "description": "List all active agent instances. Pass optional `instance` for detailed info on a single instance. `observed_status` is an independent observation: `confidence: weak` means screen-only uncertainty, so its state may differ from `agent_state`; this is expected. `since_ms` is when that observed state began, not the last refresh. #2475: compact by default — each row drops the noisy `observed_status.evidence` trail; pass `verbose:true` (or `include_evidence:true`) to include it.",
     "inputSchema": {"type": "object", "properties": {
         "instance": {"type": "string", "description": "Optional: name of an existing instance for detailed info"},
         "verbose": {"type": "boolean", "description": "#2475: include the per-instance `observed_status.evidence` trail (omitted by default to keep routine polls small)."},
@@ -155,11 +165,12 @@ pub(crate) fn def_bind_topic() -> Value {
 }
 
 pub(crate) fn def_set_model() -> Value {
-    json!({"name": "set_model", "description": "#2744: persist an instance's model intent to fleet.yaml (exactly ONE of model/tier; setting one atomically clears the other). Takes effect on the next respawn unless restart:true. Backends without a declared model capability (shell/raw/custom) are rejected; an explicit model flag already in the entry's args is a hard conflict (no automatic rewriting).",
+    json!({"name": "set_model", "description": "#2744/#3541: persist an instance's model and/or effort intent to fleet.yaml (at least ONE of model/tier/effort; model and tier stay mutually exclusive, effort composes with either; setting model clears model_tier and vice versa; empty-string effort clears it). Takes effect on the next respawn unless restart:true. Backends without a declared model capability (shell/raw/custom) are rejected for model/tier; effort on a backend without an effort capability persists with an effort_unsupported_dropped warning (spawn drops it). An explicit model/effort setting already in the entry's args is a hard conflict (no automatic rewriting).",
     "inputSchema": {"type": "object", "properties": {
         "instance": {"type": "string", "description": "Fleet instance whose entry to update"},
         "model": {"type": "string", "description": "Concrete model id/alias for the declared backend. Mutually exclusive with tier."},
         "tier": {"type": "string", "description": "Symbolic key from fleet.yaml model_tiers (e.g. cheap/strong). Mutually exclusive with model."},
+        "effort": {"type": "string", "description": "Reasoning-effort level (low|medium|high|xhigh|max; per-backend range applies at spawn). Composes with model/tier or stands alone. Empty string clears the entry."},
         "restart": {"type": "boolean", "description": "Restart the instance after persisting (default false). A restart failure never rolls back the persisted intent (persisted:true, restart_ok:false)."}
     }, "required": ["instance"]}})
 }
@@ -217,7 +228,7 @@ pub(crate) fn def_pane_snapshot() -> Value {
 }
 
 pub(crate) fn def_instance() -> Value {
-    json!({"name": "instance", "description": "#2550: folded READ-ONLY alias for the per-name instance tools. action=list is `list_instances` (all active instances; pass `instance` for one instance's detail, `verbose`/`include_evidence` for the full evidence trail); action=pane_snapshot reads a target instance's PTY scrollback (ANSI stripped). Read-only only — structural lifecycle (create/delete/start/restart/move_pane) stays on the standalone tools, and the per-name `list_instances` / `pane_snapshot` tools remain available unchanged.",
+    json!({"name": "instance", "description": "#2550: folded READ-ONLY alias for the per-name instance tools. action=list is `list_instances`; its `observed_status` is independent, and `confidence: weak` means screen-only uncertainty whose state may differ from `agent_state`. `since_ms` is when that observed state began, not the last refresh. Pass `instance` for one instance's detail or `verbose`/`include_evidence` for the full evidence trail. action=pane_snapshot reads a target instance's PTY scrollback (ANSI stripped). Structural lifecycle stays on the standalone tools.",
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["list", "pane_snapshot"]},
             "instance": {"type": "string", "description": "action=list: optional — return detail for this one instance. action=pane_snapshot: required — the instance to snapshot."},
@@ -230,13 +241,14 @@ pub(crate) fn def_instance() -> Value {
 }
 
 pub(crate) fn def_decision() -> Value {
-    json!({"name": "decision", "description": "Manage decisions. Actions: post, list, update, answer, archive_batch. Listing is bounded and cursor-paginated; audit_history is a separate view. archive_batch is dry-run-first and requires an actor-bound confirmation token for apply.",
+    json!({"name": "decision", "description": "Manage decisions. Actions: post, list, get, update, answer, archive_batch. `get` returns one full record by id. Listing is bounded, cursor-paginated, and terse by default; use verbose:true for full content or fields:\"minimal\" for id/title/author/status/tags/created_at/archived only. Decision minimal retains created_at for chronological context; task minimal omits it for lighter routine polling. audit_history is a separate view. archive_batch is dry-run-first and requires an actor-bound confirmation token for apply.",
         "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["post", "list", "update", "answer", "archive_batch"]},
+            "action": {"type": "string", "enum": ["post", "list", "get", "update", "answer", "archive_batch"]},
             "title": {"type": "string"}, "content": {"type": "string", "description": "Decision body (alias: text — #2037). For a question, the prompt text."}, "text": {"type": "string", "description": "Alias of `content` (#2037)."},
             "scope": {"type": "string", "enum": ["project", "fleet"]},
+            "review_class": {"type": "string", "enum": ["single", "dual"], "description": "Create-only typed review authority for tasks governed by this decision."},
             "tags": {"type": "array", "items": {"type": "string"}},
-            "ttl_days": {"type": "number"}, "supersedes": {"type": "string"},
+            "ttl_days": {"type": "number"}, "supersedes": {"type": "string", "description": "post: decision ID being replaced; update: #3507 guarded retroactive link to an existing decision"},
             "id": {"type": "string"}, "archive": {"type": "boolean"},
             "include_archived": {"type": "boolean"},
             "view": {"type": "string", "enum": ["live", "audit_history"]},
@@ -248,6 +260,8 @@ pub(crate) fn def_decision() -> Value {
             "limit": {"type": "integer", "minimum": 1, "maximum": 500},
             "scan_budget": {"type": "integer", "minimum": 1, "maximum": 5000},
             "cursor": {"type": "string", "description": "Opaque cursor returned by the preceding list page."},
+            "verbose": {"type": "boolean", "description": "list: return complete content. Default false caps content at about 200 characters; get is always full."},
+            "fields": {"type": "string", "enum": ["full", "minimal"], "description": "list: minimal keeps only id, title, author, status, tags, created_at, and archived. Unlike task minimal, decision minimal retains created_at because chronological context is part of decision review."},
             "apply": {"type": "boolean", "description": "archive_batch only: false/omitted previews; true applies an exact confirmation."},
             "confirm_token": {"type": "string", "description": "archive_batch apply: opaque actor-bound token from dry-run."},
             "confirm_ids": {"type": "array", "items": {"type": "string"}},
@@ -262,9 +276,9 @@ pub(crate) fn def_decision() -> Value {
 }
 
 pub(crate) fn def_task() -> Value {
-    json!({"name": "task", "description": "Manage task board. Actions: create, list, get, claim, done, update, sweep, health, activity, metadata_set, metadata_get, ack_plan. #2475: `get` returns ONE task's FULL record by `id` (companion to the terse-by-default `list`); `list` accepts `fields:\"minimal\"` to project rows down to id/title/status/assignee/priority. #806: default list trims to actionable statuses (open/claimed/in_progress/blocked); pass include_history=true to surface done/cancelled. `sweep` is operator-triggered manual hygiene (5 stale-task categories with dry-run + confirm_ids round-trip). #830: `health` is a one-shot board-hygiene snapshot — totals + by_status + ghost_owners + stale_claims + age aggregates + recommendations array. #2249: `ack_plan` records a non-assignee's ack of the task's `plan` metadata (idempotent); required before `in_progress` when the task was created with `plan_ack_required > 0`.",
+    json!({"name": "task", "description": "Manage task board. Actions: create, list, get, claim, done, update, sweep, board_sweep, board_unretire, health, activity, metadata_set, metadata_get, ack_plan, orphan_reconcile_preview, orphan_reconcile_apply. #2475: `get` returns ONE task's FULL record by `id` (companion to the terse-by-default `list`); `list` accepts `fields:\"minimal\"` to project rows down to id/title/status/assignee/priority. #806: default list trims to actionable statuses (open/claimed/in_progress/blocked); pass include_history=true to surface done/cancelled. `sweep` is operator-triggered manual hygiene (5 stale-task categories with dry-run + confirm_ids round-trip). `board_sweep` safely retires unreferenced boards with no live tasks using the same dry-run + confirm_ids + audit_reason contract; it moves data to boards-retired instead of deleting it. #3668: `board_unretire` is the symmetric, audited reversal — the dry-run lists `boards-retired/` candidates (with the non-terminal tasks a reversal would reactivate and any blocker), `apply=true` + confirm_ids + audit_reason moves them back to `boards/`, and a live board already owning the id fails closed. #830: `health` is a one-shot board-hygiene snapshot — totals + by_status + ghost_owners + stale_claims + age aggregates + recommendations array. #2249: `ack_plan` records a non-assignee's ack of the task's `plan` metadata (idempotent); required before `in_progress` when the task was created with `plan_ack_required > 0`.",
         "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["create", "list", "get", "claim", "done", "update", "sweep", "health", "activity", "metadata_set", "metadata_get", "ack_plan"]},
+            "action": {"type": "string", "enum": ["create", "list", "get", "claim", "done", "update", "sweep", "board_sweep", "board_unretire", "health", "activity", "metadata_set", "metadata_get", "ack_plan", "orphan_reconcile_preview", "orphan_reconcile_apply"]},
             "title": {"type": "string"}, "description": {"type": "string"},
             "priority": {"type": "string", "enum": ["low", "normal", "high", "urgent"]},
             "assignee": {"type": "string"}, "depends_on": {"type": "array", "items": {"type": "string"}}, "parent_id": {"type": "string", "description": "Parent task ID for subtask composition (A is composed of B,C,D). Complementary to depends_on (execution order)."},
@@ -278,8 +292,6 @@ pub(crate) fn def_task() -> Value {
             "limit": {"type": "integer", "description": "#806: cap `list` response to N newest-first entries (sort by updated_at desc)."},
             "due_at": {"type": "string", "description": "ISO 8601 deadline for the task"},
             "branch": {"type": "string", "description": "Git branch the implementer should work on"},
-            "force": {"type": "boolean", "description": "#808: bypass ownership ACL on done/update for historical ghost-owned cleanup. Requires non-empty force_reason."},
-            "force_reason": {"type": "string", "description": "#808: required when force=true. Logged to event-log.jsonl and embedded in the per-task event's reason field for audit."},
             "apply": {"type": "boolean", "description": "#806 sweep: when false (default), returns dry-run plan; when true, emits Cancelled for the confirm_ids subset."},
             "confirm_ids": {"type": "array", "items": {"type": "string"}, "description": "#806 sweep apply=true: subset of candidate_ids from prior dry-run to actually cancel."},
             "audit_reason": {"type": "string", "description": "#806 sweep apply=true: required audit text recorded in event-log.jsonl + per-task Cancelled.reason."},
@@ -288,11 +300,16 @@ pub(crate) fn def_task() -> Value {
             "metadata_value": {"description": "Value for metadata_set action (any JSON type)."},
             "bind": {"type": "boolean", "description": "#1933: create only — opt OUT of the daemon's auto-bind-on-dispatch (default true). Set false to leave the assignee unbound. Consumed in tasks/handler.rs (TaskEvent::Created.bind)."},
             "eta_secs": {"type": "integer", "description": "#1933: create only — task stall-watchdog ETA in seconds; the daemon flags the task as stalled once this budget elapses. Consumed in tasks/handler.rs (TaskEvent::Created.eta_secs)."},
-            "project": {"type": "string", "description": "#2117 P1: target project board. create: route the task to this project (default: the caller's current project, derived from its team's source_repo). list: show this project, or `all` to aggregate every board."},
+            "project": {"type": "string", "description": "#2117 P1/#3316: target project board. create: route the task to this project (default: caller's current project; team.project_id override wins, otherwise source_repo-derived). list: show this named board, or `all` to aggregate every board."},
             "scope": {"type": "string", "enum": ["fleet"], "description": "#2117 P1: list scope. `fleet` aggregates tasks across ALL project boards (each task tagged with its project id). Equivalent to `project=all`."},
             "plan_ack_required": {"type": "integer", "description": "#2249 pre-work alignment gate: create only — number of distinct non-assignee `ack_plan` calls needed before this task may transition to in_progress. 0 (default) = gate off, byte-identical to pre-#2249 behavior."},
             "plan_ack_reason": {"type": "string", "description": "#2249: create only — required non-empty when plan_ack_required > 0 (mirrors second_reviewer_reason)."},
-            "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#2745: create only — durable review-threshold AUTHORITY for a PR-producing task. `single` (§3.6) or `dual` (§3.5). Persisted into Task.metadata; the dispatch/poll fail-closed gate reads it (absent/unknown → Unresolved → the merge-authority dispatch is rejected + the poller emits a [review-class-unresolved] re-arm diagnostic, never a silent default)."}
+            "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#2745: create only — durable review-threshold AUTHORITY for a PR-producing task. `single` (§3.6) or `dual` (§3.5). Persisted into Task.metadata; the dispatch/poll fail-closed gate reads it (absent/unknown → Unresolved → the merge-authority dispatch is rejected + the poller emits a [review-class-unresolved] re-arm diagnostic, never a silent default)."},
+            "governing_decision_id": {"type": "string", "description": "#3419: create only — exact active unsuperseded leaf decision governing this task; its typed review authority is inherited atomically when review_class is omitted."},
+            "decision_id": {"type": "string", "description": "orphan_reconcile_preview/apply: exact governing decision id."},
+            "board": {"type": "string", "description": "orphan_reconcile_preview/apply: exact project board."},
+            "mappings": {"type": "array", "description": "orphan_reconcile_preview: exact frozen predecessor-to-replacement mapping set.", "items": {"type": "object", "properties": {"predecessor_id": {"type": "string"}, "replacement_id": {"type": "string"}}, "required": ["predecessor_id", "replacement_id"]}},
+            "confirmation": {"type": "string", "description": "orphan_reconcile_apply: actor-bound preview confirmation token."}
         }, "required": ["action"]}})
 }
 
@@ -317,13 +334,39 @@ pub(crate) fn def_team() -> Value {
 }
 
 pub(crate) fn def_schedule() -> Value {
-    json!({"name": "schedule", "description": "Manage schedules. Actions: create, list, update, delete.",
+    json!({"name": "schedule", "description": "Manage schedules. Instance reminders or daemon-owned jobs. Actions: create, list, update, delete, runs, complete, deliver, resolve_recovery.",
         "inputSchema": {"type": "object", "properties": {
-            "action": {"type": "string", "enum": ["create", "list", "update", "delete"]},
+            "action": {"type": "string", "enum": ["create", "list", "update", "delete", "runs", "complete", "deliver", "resolve_recovery"]},
             "id": {"type": "string"},
+            "run_id": {"type": "string", "description": "Job run to complete, deliver, or resolve recovery."},
+            "cleanup_confirmed": {"type": "boolean", "description": "resolve_recovery only: operator confirms worker/tools stopped, delivery reconciled, and worker deleted. Never authorizes automatic retry."},
+            "attempt_id": {"type": "integer", "minimum": 1, "description": "Current attempt number required for complete and deliver."},
+            "result": {"type": "string", "description": "Completion result and artifact locations."},
+            "job": {"type": "object", "additionalProperties": false, "description": "Create a daemon-owned job instead of targeting an instance. Mode is immutable; updates affect future runs. No automatic replacement after spawn intent; manual recovery is required even after successful execution when descendant cleanup cannot be proven.", "properties": {
+                "backends": {"type": "array", "minItems": 1, "uniqueItems": true, "description": "Ordered candidates for failures before spawn intent only; never fallback after an attempt may have launched.", "items": {"type": "string", "enum": ["claude", "codex", "kiro-cli", "opencode", "antigravity-cli", "grok"]}},
+                "artifact_directory": {"type": "string", "description": "Absolute persistent artifact directory, separate from worker workspaces preserved while recovery is required."},
+                "timeout_secs": {"type": "integer", "minimum": 60, "maximum": 86400, "default": 3600, "description": "Run deadline; a launched attempt requires manual recovery when exceeded."},
+                "max_attempts": {"type": "integer", "minimum": 1, "maximum": 10, "default": 3, "description": "Attempt limit for pre-launch failures only."},
+                "retry_delay_secs": {"type": "integer", "minimum": 1, "maximum": 3600, "default": 60, "description": "Delay between retries before spawn intent; no post-launch retries."},
+                "output_context": {"type": "string", "description": "Stable delivery instructions; do not include credentials."},
+                "notification": {"type": "object", "additionalProperties": false, "description": "Optional completion or recovery-required notice to an explicit endpoint. No automatic retries after an ambiguous send.", "properties": {
+                    "channel": {"type": "string", "enum": ["telegram"]},
+                    "chat_id": {"type": "integer", "description": "Must match the configured fleet Telegram group."},
+                    "topic_id": {"type": "integer", "minimum": 1, "description": "Existing topic; omitted means the configured group without a thread."}
+                }, "required": ["channel", "chat_id"]},
+                "worker_topic": {"type": "object", "additionalProperties": false, "description": "Opt-in: the existing Telegram topic where the worker delivers business output via schedule action=deliver. No topic is created and no registry row is owned. topic_id is required.", "properties": {
+                    "channel": {"type": "string", "enum": ["telegram"]},
+                    "chat_id": {"type": "integer", "description": "Must match the configured fleet Telegram group; never derived from the creator or worker."},
+                    "topic_id": {"type": "integer", "minimum": 1, "description": "Required: an existing topic id."}
+                }, "required": ["channel", "chat_id", "topic_id"]},
+                "auto_cleanup": {"type": "boolean", "description": "Opt-in: when true, the worker task instructs the worker to exit after finishing, and a Succeeded Run whose worker this daemon spawned and can prove fully contained (child reaped, process group gone, no external residue) is cleaned up automatically. Default false keeps today's manual recovery."},
+                "cleanup_retry_secs": {"type": "integer", "minimum": 0, "maximum": 600, "default": 60, "description": "Bounded retry window for auto_cleanup: each daemon tick re-attempts containment proof for up to this long before falling back to recovery_required. Ignored unless auto_cleanup is true. Default 60; 0 = immediate fallback."}
+            }, "required": ["backends", "artifact_directory"]},
             "cron": {"type": "string", "description": "5- or 6-field cron expression (recurring). 5-field layout: `min hour day-of-month month day-of-week`; 6-field prepends seconds. Day-of-week uses Quartz convention: 1=Sun, 2=Mon, 3=Tue, 4=Wed, 5=Thu, 6=Fri, 7=Sat (NOT Unix 0-6). Example: every Wed+Sat at 15:00 → `0 15 * * 4,7`."},
             "run_at": {"type": "string", "description": "ISO 8601 one-shot instant."},
-            "message": {"type": "string"}, "instance": {"type": "string", "description": "Name of the existing instance to deliver the scheduled message to."},
+            "message": {"type": "string", "description": "Message body for create, or the business delivery content for deliver. For deliver, provide this or message_from_file."},
+            "message_from_file": {"type": "string", "description": "deliver only: absolute path to a UTF-8 text file whose contents are delivered (overrides message). Use for large content that should not be an inline argument."},
+            "instance": {"type": "string", "description": "Name of the existing instance to deliver the scheduled message to."},
             "label": {"type": "string"},
             "timezone": {"type": "string", "description": "IANA zone name."},
             "enabled": {"type": "boolean"},
@@ -350,8 +393,8 @@ pub(crate) fn def_ci() -> Value {
     json!({"name": "ci", "description": "Manage CI watching and handoff pickup. Actions: watch, unwatch, status, defer, ack_handoff.",
         "inputSchema": {"type": "object", "properties": {
             "action": {"type": "string", "enum": ["watch", "unwatch", "status", "defer", "ack_handoff"]},
-            "repository": {"type": "string", "description": "GitHub `owner/repo` slug. Required for watch/unwatch/ack_handoff; optional filter for status."},
-            "branch": {"type": "string", "description": "Branch to watch (default: main); required for ack_handoff; optional filter for status."},
+            "repository": {"type": "string", "description": "GitHub `owner/repo` slug. For watch, provide this explicitly or use a valid caller binding with `source_repo`; unwatch/defer/ack_handoff require it explicitly. Optional filter for status."},
+            "branch": {"type": "string", "description": "Branch to watch (default: main); required for defer and ack_handoff; optional filter for status."},
             "interval_secs": {"type": "number", "description": "Poll interval in seconds (default: 60)"},
             "next_after_ci": {"oneOf": [{"type": "string"}, {"type": "array", "items": {"type": "string"}}], "description": "Instance or instances to auto-notify when CI passes. Daemon sends [ci-ready-for-action] to each target."},
             "review_class": {"type": "string", "enum": ["single", "dual"], "description": "#972: review threshold for the daemon's PR-state aggregator. `single` (default) — §3.6 one VERIFIED unlocks the merge gate. `dual` — §3.5 two distinct VERIFIED required before `[pr-ready-for-merge]` fires."},
@@ -359,6 +402,7 @@ pub(crate) fn def_ci() -> Value {
             "ci_provider_url": {"type": "string", "description": "watch: base URL for a self-hosted CI provider, persisted on the watch sidecar alongside `ci_provider`."},
             "task_id": {"type": "string", "description": "watch: optional task id to bind this watch to. Persisted on the watch sidecar as a back-link so the `[ci-ready-for-action]` the daemon emits on CI pass carries a structured reference to the originating task. Normally injected by the dispatch auto-watch (dispatch_auto_bind_lease); a manual `ci action=watch` caller may also pass it to bind the watch to a specific task (#1031)."},
             "head_sha": {"type": "string", "description": "watch: full immutable commit SHA (40- or 64-hex) for an EXACT-HEAD post-merge watch on a protected ref (`main`/`master`). Generic protected-branch watches stay E4.5-rejected; a protected watch is accepted ONLY with `head_sha` PLUS `task_id` and explicit `next_after_ci` (orchestrator/operator), OR with `notification_only=true` (task assignee with merge receipt). The poller resolves runs for THIS SHA only (GitHub `?head_sha=` fetch), ignoring newer main runs, so a later push can't falsely complete the post-merge check. Ignored on non-protected branches. GitHub-only this wave. unwatch (#3159): addresses ONE exact-head watch by that immutable identity — authority is no weaker than the arm (operator, the merge-receipt task assignee for notification_only, or the orchestrator of every next_after_ci target); a malformed/unknown/mismatched SHA fails closed and NEVER falls back to the generic branch watch."},
+            "subject_head_sha": {"type": "string", "description": "watch: full immutable commit SHA for the dispatch subject generation; persisted on feature-branch watches so Decision45 corrections can fence the exact PR head."},
             "notification_only": {"type": "boolean", "description": "#2812: when true on a protected watch, arms a notification-only exact-head watch for the task assignee — requires head_sha + task_id + matching merge receipt; forbids next_after_ci. No privileged continuation."},
             "episode": {"type": "string", "description": "defer/ack_handoff: exact episode identity for CAS. For ack_handoff, use the episode surfaced by `ci action=status`; the action settles only the caller's matching pickup without removing the watch."},
             "wake_task_id": {"type": "string", "description": "defer: task_id whose terminal state (Done|Cancelled) will reactivate the track."},
@@ -409,8 +453,8 @@ pub(crate) fn def_repo() -> Value {
             "from_ref": {"type": "string", "description": "checkout bind:true: base ref to auto-create `branch` from when it doesn't exist locally (default `origin/main`)."},
             "expected_head": {"type": "string", "description": "#6: optional exact full-SHA precondition. When provided, the branch HEAD must equal this value; mismatch returns structured error with zero mutation. Omitted preserves current behavior."},
             "checkout_purpose": {"type": "string", "enum": ["disposable_review"], "description": "Architecture-14 item 10: typed daemon-provisioned disposable review checkout. Requires bind=true, task_id, expected_head, and a newly-created branch."},
-            "task_id": {"type": "string", "description": "#2533: checkout bind:true — optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). Absent → unattributed bind, existing warning behavior unchanged."},
-            "force": {"type": "boolean", "description": "#2539: merge — emergency bypass for the CI fail-closed gate and the base-staleness (BEHIND/DIRTY) refusal. Requires non-empty `force_reason`; the bypass is audit-logged to fleet_events.jsonl. release — required when `discard_nested_dirt=true` (confirms destructive intent)."},
+            "task_id": {"type": "string", "description": "#2533: checkout bind:true — optional task board id this self-claim is attributable to. Recorded in binding.json; a task_id-carrying self-claim is treated as in-dispatch (no `binding_out_of_dispatch` operator warning). merge — optional explicit task-board id ('t-...') passed straight through to the post-merge receipt/watch so the actionable assignee is resolved from the task itself (zero binding scan); absent → legacy live-binding resolve. Absent → unattributed bind, existing warning behavior unchanged."},
+            "force": {"type": "boolean", "description": "#2539/#3454: merge — emergency bypass for THREE policy gates: the CI fail-closed gate, the base-staleness (BEHIND/DIRTY) refusal, AND the exact-head review threshold (#3454 made review a hard merge precondition; force is its sole audited bypass — forcing for any one reason drops all three). Exact head/base acquisition and the pre-merge identity recheck remain non-bypassable. Requires non-empty `force_reason`; the bypass is audit-logged to fleet_events.jsonl including the review evidence (review_class, verified counts, reviewer identities). release — required when `discard_nested_dirt=true` (confirms destructive intent)."},
             "force_reason": {"type": "string", "description": "#2539: merge — required non-empty justification when `force=true`, recorded in the fleet_events.jsonl audit entry."},
             "discard_nested_dirt": {"type": "boolean", "description": "release: authorize discarding unpreservable nested-submodule working-tree dirt. Requires `force=true` and a matching `expected_nested_dirt_digest` (confirmation round-trip). The digest is returned in the refusal response when nested dirt blocks a release."},
             "expected_nested_dirt_digest": {"type": "string", "description": "release: exact hex digest of the nested-dirt enumeration, as returned by a prior refusal's `nested_dirt_digest` field. Guards against TOCTOU: the daemon re-enumerates under locks and refuses if the digest changed."}
@@ -428,7 +472,7 @@ pub(crate) fn def_bind_self() -> Value {
 }
 
 pub(crate) fn def_release_worktree() -> Value {
-    json!({"name": "release_worktree", "description": "Release the daemon-managed worktree and clear the binding for the given agent. Idempotent. Only removes worktrees carrying the `.agend-managed` marker — operator-created worktrees are left alone. #2548/#S2: `force:true` absorbs the former standalone `force_release_worktree` tool and joins the guarded release transaction. A Known binding must match the requested branch and owning repository; an Opaque or mismatched binding is preserved. An Absent binding may remove only an exact marker+owning-repo managed target; marker-less or ambiguous orphans are refused with a GC archive/operator recovery route. Requires `branch` and restricts callers to the worktree's own agent or its team orchestrator (AUDIT2-002).",
+    json!({"name": "release_worktree", "description": "Release the daemon-managed worktree and clear the binding for the given agent. Idempotent. A verified ignored target/ cache is removed before the Git worktree, and the binding is cleared only after removal succeeds; failures return release_incomplete with stage/path/bytes_remaining. Slow release continues daemon-side and returns release_in_flight before the proxy timeout. Only removes worktrees carrying the `.agend-managed` marker — operator-created worktrees are left alone. #2548/#S2: `force:true` absorbs the former standalone `force_release_worktree` tool and joins the guarded release transaction. A Known binding must match the requested branch and owning repository; an Opaque or mismatched binding is preserved. An Absent binding may remove only an exact marker+owning-repo managed target; marker-less or ambiguous orphans are refused with a GC archive/operator recovery route. Requires `branch` and restricts callers to the worktree's own agent or its team orchestrator (AUDIT2-002).",
         "inputSchema": {"type": "object", "properties": {
             "instance": {"type": "string", "description": "Name of the existing instance whose worktree + binding to release"},
             "dry_run": {"type": "boolean", "description": "#1933: for the normal binding-driven path, preview what would be released WITHOUT releasing (no binding/worktree mutation). `force:true` does not support dry_run and returns `dry_run_unsupported`; use `binding_state` to inspect the authoritative binding. Default false. Consumed at mcp/handlers/worktree.rs."},
@@ -453,6 +497,21 @@ pub(crate) fn def_revoke_review_assignment() -> Value {
         "inputSchema": {"type": "object", "properties": {
             "assignment_id": {"type": "string", "description": "UUID of the assignment to revoke (exact CAS identity)"}
         }, "required": ["assignment_id"]}})
+}
+
+pub(crate) fn def_correct_review_class() -> Value {
+    json!({"name": "correct_review_class", "description": "Decision45 operator-only audited correction for one exact PR generation. Preview or apply requires canonical repository, PR number, subject branch, full current head, expected old class, new class, stable operation_id, and nonempty reason. Apply persists intent before invalidating exact assignments/receipts and preserves all CI/exact-head/base/non-force merge gates. Agents and orchestrators are denied; no wildcard reset or raw state edit.",
+        "inputSchema": {"type": "object", "properties": {
+            "action": {"type": "string", "enum": ["preview", "apply"]},
+            "repository": {"type": "string"},
+            "pr_number": {"type": "integer", "minimum": 1},
+            "branch": {"type": "string"},
+            "head_sha": {"type": "string", "description": "Exact full 40/64-hex current PR head."},
+            "expected_old_class": {"type": "string", "enum": ["single", "dual"]},
+            "new_class": {"type": "string", "enum": ["single", "dual"]},
+            "operation_id": {"type": "string"},
+            "reason": {"type": "string"}
+        }, "required": ["action", "repository", "pr_number", "branch", "head_sha", "expected_old_class", "new_class", "operation_id", "reason"]}})
 }
 
 pub(crate) fn def_usage_limit_takeover() -> Value {
@@ -490,6 +549,19 @@ mod tests {
                 .is_some_and(|s| s.contains("ack_handoff")),
             "#2817: top-level CI description must name the settlement action"
         );
+    }
+
+    #[test]
+    fn ci_schema_describes_repository_and_branch_requirements_3708() {
+        let d = def_ci();
+        let props = &d["inputSchema"]["properties"];
+        let repository = props["repository"]["description"]
+            .as_str()
+            .unwrap_or_default();
+        assert!(repository.contains("valid caller binding"));
+        assert!(repository.contains("unwatch/defer/ack_handoff require it explicitly"));
+        let branch = props["branch"]["description"].as_str().unwrap_or_default();
+        assert!(branch.contains("required for defer and ack_handoff"));
     }
 
     /// #2453 R2 P1: the restart_daemon schema must describe app-mode IN-PLACE re-exec
@@ -536,6 +608,18 @@ mod tests {
                 .expect("desc")
                 .contains("claude"),
             "backend description should list available CLI names"
+        );
+    }
+
+    #[test]
+    fn task_schema_does_not_advertise_public_force_override() {
+        let definition = def_task();
+        let props = definition["inputSchema"]["properties"]
+            .as_object()
+            .expect("task properties");
+        assert!(
+            !props.contains_key("force") && !props.contains_key("force_reason"),
+            "public task done/update must not advertise the removed force override: {props:?}"
         );
     }
 
@@ -642,6 +726,16 @@ mod tests {
             !required_strs.contains(&"target_pane"),
             "target_pane must stay optional"
         );
+    }
+
+    #[test]
+    fn create_instance_schema_hides_restart_identity_3670() {
+        let definition = def_create_instance();
+        let props = definition["inputSchema"]["properties"]
+            .as_object()
+            .expect("create_instance properties");
+        assert!(!props.contains_key("restart_id"));
+        assert!(!props.contains_key("old_instance_ref"));
     }
 
     #[test]
@@ -833,7 +927,7 @@ mod tests {
         let tools = defs["tools"].as_array().expect("tools array");
         assert_eq!(
             tools.len(),
-            32,
+            34,
             "#1400: 34 + tokens (#1077 Phase 1) = 35; + mode (#1339 Operator Mode) = 36; \
              + ephemeral (#1967 Phase-1) = 37; - replace_instance (#2547, folded into \
              restart_instance mode=fresh) = 36; - set_display_name/set_description \
@@ -844,7 +938,8 @@ mod tests {
              into release_worktree(force:true)) = 27; + bind_topic (#991 Phase 2) = 28; \
              + instance (#2550 P1, folded read-only alias for list_instances/pane_snapshot) = 29; \
              + set_model (#2744 PR-A, typed fleet model intent) = 30; \
-             + revoke_review_assignment (#2782 slice 1) = 31; + usage_limit_takeover (Architecture-14 item 5 Slice 2A) = 32. \
+             + revoke_review_assignment (#2782 slice 1) = 31; + usage_limit_takeover (Architecture-14 item 5 Slice 2A) = 32; \
+             + operator_page (#3480 orchestrator-only operator page) = 33; + correct_review_class (Decision45) = 34. \
              Current tools: {:?}",
             tools
                 .iter()
@@ -979,6 +1074,22 @@ mod tests {
             (
                 "force_meta",
                 "internal: delegate_task force metadata, set by dispatch path",
+            ),
+            (
+                "force",
+                "internal: public task done/update boundary rejects caller-supplied force; intentionally not advertised",
+            ),
+            (
+                "restart_id",
+                "internal: app TUI restart correlation; not agent-facing",
+            ),
+            (
+                "old_instance_ref",
+                "internal: app TUI predecessor identity; not agent-facing",
+            ),
+            (
+                "skip_unsent_draft_gate",
+                "internal: explicit restart ingress marker; not agent-facing",
             ),
             (
                 "provenance",
@@ -1130,6 +1241,7 @@ mod tests {
             ("send", "second_reviewer", "comms.rs → review_class=dual on auto-armed watch"),
             ("send", "second_reviewer_reason", "comms.rs dual-review reason validation"),
             ("send", "reviewed_head", "messaging.rs sha-gate / auto-release verdict"),
+            ("send", "expected_head", "comms_delegate.rs untyped branch dispatch exact-head precondition"),
             ("send", "artifacts", "comms.rs report body + evidence gate"),
             ("send", "branch", "comms.rs dispatch_auto_bind_lease → worktree + ci_watch"),
             ("send", "worktree_binding_required", "messaging.rs check_worktree_enforcement gate"),
@@ -1140,9 +1252,11 @@ mod tests {
             ("send", "ack_inbox", "comms.rs ack_inbox=true on kind=report → inbox::ack_by_correlation settles the sender's DELIVERING rows whose task_id==correlation_id"),
             ("send", "plan_ack_required", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
             ("send", "plan_ack_reason", "comms_gates/dispatch.rs pre-check validation + comms.rs auto-create forwards into task create_args (#2249)"),
-            ("send", "review_class", "comms_delegate.rs maybe_auto_bind_lease → resolve_dispatch_review_class authority/fallback (atomic reject on unresolved) + maybe_auto_create_task create_args seed (#2745)"),
+            ("send", "review_class", "comms_delegate.rs preflight_branch_authority → tasks/governance::resolve_dispatch_authority + maybe_auto_create_task create_args seed (#3419/#2745)"),
+            ("send", "governing_decision_id", "comms_delegate.rs maybe_auto_create_task → tasks/handler.rs governed Created authority (#3419)"),
             ("send", "bind", "comms_delegate/mod.rs dispatch_should_skip_auto_bind → skip auto-bind when false (#6 d-4)"),
             ("send", "review_assignment", "comms_gates/dispatch.rs run_dispatch_pre_checks parse → comms_delegate.rs handle_delegate_task validate_review_assignment_marker fail-closed gate (t-…-17)"),
+            ("send", "repository", "dispatch_hook/mod.rs resolve_review_assignment_repo — explicit owner/repo slug consumed FIRST, canonicalized fail-closed; absent → target source_repo fallback (#3479)"),
             ("send", "pr_number", "comms_delegate.rs validate_review_assignment_marker — mandatory nonzero generation identity, atomic reject if missing/zero (t-…-17 B18/B19)"),
             ("send", "review_author", "comms_gates/dispatch.rs parse_review_author strict typed parse → comms_delegate.rs validate_review_assignment_marker self-review deny (t-…-17)"),
             ("send", "triaged", "comms_gates/triaged_gate.rs pre-check validation + comms.rs handle_send_to_instance/handle_report_result → daemon/discharge_ledger.rs record_discharge (#2537/#2524 P6 PR-1)"),
@@ -1172,8 +1286,6 @@ mod tests {
             ("task", "limit", "tasks/handler.rs list cap"),
             ("task", "due_at", "tasks/handler.rs create deadline"),
             ("task", "branch", "tasks/handler.rs create event"),
-            ("task", "force", "tasks/handler.rs done/update ACL bypass"),
-            ("task", "force_reason", "tasks/handler.rs force audit"),
             ("task", "apply", "tasks/sweep.rs dry-run vs apply"),
             ("task", "confirm_ids", "tasks/sweep.rs apply subset"),
             ("task", "audit_reason", "tasks/sweep.rs apply audit"),
@@ -1187,11 +1299,17 @@ mod tests {
             ("task", "plan_ack_required", "tasks/handler.rs handle_create validation + metadata seed; handle_update in_progress gate chokepoint (#2249)"),
             ("task", "plan_ack_reason", "tasks/handler.rs handle_create validation + metadata seed (#2249)"),
             ("task", "review_class", "tasks/handler.rs handle_create → Task.metadata review_class seed; dispatch/poll fail-closed authority (#2745)"),
+            ("task", "governing_decision_id", "tasks/handler.rs handle_create → TaskEvent::Created governing authority (#3419)"),
+            ("task", "decision_id", "tasks/orphan_reconcile.rs preview/apply exact governing decision allowlist (#3584 slice 6)"),
+            ("task", "board", "tasks/orphan_reconcile.rs preview/apply exact project-board route gate (#3584 slice 6)"),
+            ("task", "mappings", "tasks/orphan_reconcile.rs preview parses the frozen seven-row mapping set (#3584 slice 6)"),
+            ("task", "confirmation", "tasks/orphan_reconcile.rs apply consumes the actor-bound preview token (#3584 slice 6)"),
             // ── decision ──
             ("decision", "action", "decisions.rs routing"),
             ("decision", "title", "decisions.rs post"),
             ("decision", "content", "decisions.rs post/update"),
             ("decision", "scope", "decisions.rs post"),
+            ("decision", "review_class", "decisions.rs post → immutable typed Decision.review_class (#3419)"),
             ("decision", "tags", "decisions.rs post/list-filter/update"),
             ("decision", "ttl_days", "decisions.rs post/update"),
             ("decision", "supersedes", "decisions.rs post archives prior"),
@@ -1207,6 +1325,8 @@ mod tests {
             ("decision", "limit", "decisions.rs bounded list result cap"),
             ("decision", "scan_budget", "decisions.rs bounded scan cap"),
             ("decision", "cursor", "decisions.rs opaque pagination cursor"),
+            ("decision", "verbose", "decisions.rs list full-content opt-in (#3506)"),
+            ("decision", "fields", "decisions.rs list minimal projection (#3506)"),
             ("decision", "apply", "decisions.rs archive_batch preview/apply"),
             ("decision", "confirm_token", "decisions.rs actor-bound batch confirmation"),
             ("decision", "confirm_ids", "decisions.rs exact batch preview binding"),
@@ -1231,9 +1351,15 @@ mod tests {
             // ── schedule ──
             ("schedule", "action", "schedules.rs routing"),
             ("schedule", "id", "schedules.rs update/delete target"),
+            ("schedule", "job", "schedules.rs job_from_args create/update"),
+            ("schedule", "cleanup_confirmed", "schedule_jobs resolve_recovery explicit acknowledgement"),
+            ("schedule", "run_id", "schedule_jobs runs/complete routing"),
+            ("schedule", "attempt_id", "schedule_jobs complete attempt fence"),
+            ("schedule", "result", "schedule_jobs complete receipt"),
             ("schedule", "cron", "schedules.rs trigger_from_args"),
             ("schedule", "run_at", "schedules.rs trigger_from_args one-shot"),
-            ("schedule", "message", "schedules.rs create/update"),
+            ("schedule", "message", "schedules.rs create/update; schedule_jobs deliver content (#3658)"),
+            ("schedule", "message_from_file", "mcp/handlers/schedule.rs handle_job_deliver resolves file content before schedule_jobs::deliver (#3658)"),
             ("schedule", "instance", "schedules.rs create target / list filter"),
             ("schedule", "label", "schedules.rs create/update"),
             ("schedule", "timezone", "schedules.rs cron eval zone"),
@@ -1259,6 +1385,7 @@ mod tests {
             ("ci", "ci_provider_url", "ci/mod.rs self-hosted base URL"),
             ("ci", "task_id", "ci/watch.rs:163 handle_watch_ci watch back-link (#1031)"),
             ("ci", "head_sha", "ci/watch.rs handle_watch_ci exact-head protected-branch pin (S1)"),
+            ("ci", "subject_head_sha", "ci/watch.rs handle_watch_ci immutable dispatch-generation pin (Decision45)"),
             ("ci", "episode", "ci/watch.rs:595 handle_defer_ci exact-episode CAS identity"),
             ("ci", "wake_task_id", "ci/watch.rs:599 handle_defer_ci task-wake predicate"),
             ("ci", "reason", "ci/watch.rs:605 handle_defer_ci deferral reason"),
@@ -1340,6 +1467,16 @@ mod tests {
             // ── usage_limit_takeover (Architecture-14 item 5 Slice 2A) ──
             ("usage_limit_takeover", "instance", "mcp/handlers/usage_limit_takeover.rs source-scoped lock and persisted binding validation"),
             ("usage_limit_takeover", "episode_id", "mcp/handlers/usage_limit_takeover.rs persisted CandidateReady episode identity validation"),
+            // ── correct_review_class (Decision45) ──
+            ("correct_review_class", "action", "review_class_correction.rs handle_correct_review_class operation routing"),
+            ("correct_review_class", "repository", "review_class_correction.rs exact repository validation"),
+            ("correct_review_class", "pr_number", "review_class_correction.rs exact PR-generation validation"),
+            ("correct_review_class", "branch", "review_class_correction.rs exact subject-branch validation"),
+            ("correct_review_class", "head_sha", "review_class_correction.rs immutable current-head fence"),
+            ("correct_review_class", "expected_old_class", "review_class_correction.rs stale-class fence"),
+            ("correct_review_class", "new_class", "review_class_correction.rs requested class validation"),
+            ("correct_review_class", "operation_id", "review_class_correction.rs durable idempotency journal key"),
+            ("correct_review_class", "reason", "review_class_correction.rs operator audit reason persistence"),
         ];
 
         // Intentionally-deferred passthrough: advertised by design, Phase-2
@@ -1377,6 +1514,7 @@ mod tests {
             "config",
             "revoke_review_assignment",
             "usage_limit_takeover",
+            "correct_review_class",
         ];
 
         // Simple query/display/control tools — not directive-bearing, so their
@@ -1385,6 +1523,10 @@ mod tests {
         const NON_COORDINATION: &[&str] = &[
             "set_model",
             "reply",
+            // #3480: addresses the OPERATOR, not the fleet. Its single field is
+            // opaque human-readable text, not a directive the daemon consumes —
+            // the same class as `reply`.
+            "operator_page",
             "download_attachment",
             "inbox",
             "list_instances",
@@ -1496,5 +1638,95 @@ mod tests {
                 .is_some_and(|s| s.contains("discard")),
             "audit_reason description must reference discard use"
         );
+    }
+
+    /// #3466: since #3454 made the exact-head review threshold a hard merge
+    /// precondition with `force=true` as its sole audited bypass, the
+    /// caller-facing `force` description must enumerate all THREE bypassed
+    /// policy gates and name the two identity gates that stay non-bypassable —
+    /// the live tool description is the first authority layer an agent reads.
+    #[test]
+    fn repo_force_description_enumerates_review_threshold_bypass_3466() {
+        let d = def_repo();
+        let desc = d["inputSchema"]["properties"]["force"]["description"]
+            .as_str()
+            .expect("repo force description");
+        // The three bypassed policy gates.
+        assert!(
+            desc.contains("CI fail-closed"),
+            "force description must name the CI fail-closed gate bypass"
+        );
+        assert!(
+            desc.contains("base-staleness (BEHIND/DIRTY)"),
+            "force description must name the base-staleness (BEHIND/DIRTY) bypass"
+        );
+        assert!(
+            desc.contains("exact-head review threshold"),
+            "force description must name the exact-head review-threshold bypass (#3454)"
+        );
+        // The two non-bypassable identity gates.
+        assert!(
+            desc.contains("head/base acquisition"),
+            "force description must say exact head/base acquisition is non-bypassable"
+        );
+        assert!(
+            desc.contains("pre-merge identity recheck"),
+            "force description must say the pre-merge identity recheck is non-bypassable"
+        );
+    }
+
+    /// #3479 PR-A: the review_assignment dispatch handler already consumes an
+    /// explicit `repository` slug FIRST (dispatch_hook/mod.rs
+    /// `resolve_review_assignment_repo` — its fail-closed error even instructs
+    /// callers to set it), but `def_send` never declared the property, so a
+    /// cross-board caller cannot discover it and falls back to a plain query —
+    /// losing the typed assignment's post-merge settle linkage (#3470 feeder).
+    /// The live tool schema is the first authority layer a caller reads; it
+    /// must declare what the handler accepts.
+    #[test]
+    fn send_schema_declares_repository_for_review_assignment_3479() {
+        let d = def_send();
+        let prop = &d["inputSchema"]["properties"]["repository"];
+        assert!(
+            prop.is_object(),
+            "def_send must declare `repository` for review_assignment dispatches"
+        );
+        assert_eq!(
+            prop["type"].as_str(),
+            Some("string"),
+            "repository must be a string owner/repo slug"
+        );
+        let desc = prop["description"].as_str().unwrap_or_default();
+        assert!(
+            desc.contains("review_assignment"),
+            "repository description must scope the field to review_assignment dispatches"
+        );
+        assert!(
+            desc.contains("owner/repo"),
+            "repository description must name the owner/repo slug shape"
+        );
+        assert!(
+            desc.contains("source_repo"),
+            "repository description must state the absent-field fallback (target's source_repo)"
+        );
+    }
+
+    #[test]
+    fn instance_tool_describes_weak_observation_uncertainty_3349() {
+        for tool in [def_list_instances(), def_instance()] {
+            let description = tool["description"].as_str().expect("tool description");
+            assert!(
+                description.contains("weak"),
+                "missing weak-confidence caveat"
+            );
+            assert!(
+                description.contains("may differ from `agent_state`"),
+                "missing independent-observation caveat"
+            );
+            assert!(
+                description.contains("`since_ms` is when that observed state began"),
+                "missing stable since_ms meaning"
+            );
+        }
     }
 }

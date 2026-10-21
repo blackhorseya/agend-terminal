@@ -3,7 +3,6 @@
 //! Uses agent::spawn_agent() for all panes (agents and shells), sharing the
 //! same PTY lifecycle as the daemon: auto-dismiss, state tracking, broadcast.
 
-mod api_server;
 // #t-5: `pub(crate)` so `render::overlay` can read the completion specs
 // (`CommandSpec` / `COMMAND_SPECS` / `matching_specs`). `execute` stays
 // `pub(super)` = app-only, so command EXECUTION is not widened.
@@ -15,6 +14,7 @@ mod mouse;
 mod overlay;
 mod pane_factory;
 mod restart_resume;
+mod rpc;
 #[cfg(all(unix, test))]
 use restart_resume::restart_argv;
 pub(crate) use restart_resume::run_restart_probe;
@@ -30,15 +30,12 @@ mod app_state;
 use app_state::{AppDeps, AppState, LoopFlow};
 mod session;
 mod telegram_hooks;
-mod tui_events;
 mod tui_spawn;
 
 use menu::{build_menu_items, pane_from_menu_item};
 pub use overlay::{BoardView, DecisionMode, MenuItem, MenuItemKind, TaskBoardMode};
-pub(crate) use tui_events::{TuiEvent, TuiEventSender, TuiNotifier};
 
 use crate::agent::{self, AgentRegistry};
-use crate::channel::TelegramStatus;
 use crate::keybinds::KeyHandler;
 use crate::layout::{Layout, Pane};
 use crate::notification_queue;
@@ -188,77 +185,6 @@ pub fn run(
     }
 }
 
-/// #1726: per-tick handlers that app-standalone INTENTIONALLY does not run,
-/// excluded from the otherwise-shared `build_default_handlers` set. Each is a
-/// deliberate, justified omission; the completeness invariant
-/// (`app_tick_handlers_cover_every_non_allowlisted_daemon_handler`) fails CI if a
-/// NEW handler is added to `build_default_handlers` but is neither run in app nor
-/// listed here — so additions are a conscious decision, not silent drift.
-///
-/// - `snapshot_rotation`: app owns session persistence via `session::save_session_if_changed`.
-/// - `thread_dump`: env-gated diagnostic, not needed in the interactive TUI.
-///
-/// #1694(a): `recovery_dispatcher` was REMOVED from this allowlist — the live
-/// daemon runs in app mode (`app::run_app`, never `run_core`), so allowlisting it
-/// out meant the #685 recovery ladder was silently dead in the live daemon (the
-/// #1720 class). It now runs in app mode: Stage1 (ESC-nudge to the PTY) needs no
-/// `crash_rx` at all (#2549: Stage2/3 were converged away — see
-/// `daemon/per_tick/recovery_dispatcher.rs`'s module doc). Stage1 stays
-/// shadow-gated-off by default — zero behavior change unless an operator opts in.
-///
-/// #2413 Phase B (live-fix): `shadow_observe` was REMOVED from this allowlist (same
-/// #1720/#685 class as `recovery_dispatcher` above). The original #2433 allowlisted it
-/// out, reasoning the plane was "run_core-only" — but the LIVE fleet daemon runs
-/// `agend-terminal app` (`run_app`), NEVER `run_core`, so that gated the whole Shadow
-/// Observer DEAD in production: `observed_status` stayed null on every agent even with
-/// the flag on. The fix is symmetric to #1694(a): the reducer driver now runs in app mode
-/// (un-allowlisted), and `run_app` starts the hook-event socket server (`shadow::start`)
-/// alongside the api-activity probe. Flag-OFF by default ⇒ zero behaviour change.
-/// Per-tick handlers ALWAYS allowlisted out of app-standalone (unconditional skips).
-/// `thread_dump` is an env-gated diagnostic not needed in the interactive TUI.
-///
-/// #2413 PR-B (#1720-class fix): `snapshot_rotation` was REMOVED from this list — see
-/// [`app_snapshot_rotation_enabled`]. The live daemon runs `run_app`, never `run_core`, so
-/// allowlisting `snapshot_rotation` out meant the live daemon NEVER wrote `<home>/snapshot.json`
-/// (it was weeks-stale), and `dispatch_idle` / inbox / handoff / reply — which read it — all
-/// operated on stale state. Same #1720 class already fixed for `recovery_dispatcher` (#1694a)
-/// and `shadow_observe` (#2413 Phase B). It now runs in app mode by default, reversible via the
-/// `AGEND_APP_SNAPSHOT=0` kill-switch.
-const APP_TICK_ALLOWLIST: &[&str] = &["thread_dump"];
-
-/// #2413 PR-B: whether app-standalone runs `snapshot_rotation` (writes `snapshot.json` every
-/// tick). **Default ON** — the #1720-class fix so the live daemon's snapshot-reading deciders
-/// (dispatch_idle / inbox / handoff / reply) see CURRENT state. The `AGEND_APP_SNAPSHOT=0`
-/// kill-switch restores the pre-PR-B behaviour (allowlisted out — no app-mode snapshot write),
-/// a reversible escape hatch since flipping the whole snapshot plane stale→live is a behaviour
-/// change with a broad blast radius.
-fn app_snapshot_rotation_enabled() -> bool {
-    std::env::var("AGEND_APP_SNAPSHOT").as_deref() != Ok("0")
-}
-
-/// Build the per-tick handler set app-standalone runs: the shared
-/// `build_default_handlers` minus `APP_TICK_ALLOWLIST` (and minus `snapshot_rotation` only when
-/// the `AGEND_APP_SNAPSHOT=0` kill-switch is set). Extracted so the completeness invariant can
-/// compare it against the full daemon set.
-fn app_tick_handlers(
-    daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
-) -> Vec<Box<dyn crate::daemon::per_tick::PerTickHandler>> {
-    let mut handlers = crate::daemon::build_default_handlers(daemon_binary_stale);
-    let skip_snapshot = !app_snapshot_rotation_enabled();
-    handlers.retain(|h| {
-        let name = h.name();
-        if APP_TICK_ALLOWLIST.contains(&name) {
-            return false;
-        }
-        // #2413 PR-B: snapshot_rotation runs by default; the kill-switch skips it.
-        if skip_snapshot && name == "snapshot_rotation" {
-            return false;
-        }
-        true
-    });
-    handlers
-}
-
 /// Main event loop for the TUI app.
 ///
 /// M5 note: this function is 550+ lines with 15+ locals. Extraction to
@@ -377,10 +303,25 @@ fn render_active_overlay(
         }
         Overlay::ConfirmClose { target } => {
             let msg = match target {
-                CloseTarget::Pane => "Close pane? (y/n)",
-                CloseTarget::Tab => "Close tab and kill all agents? (y/n)",
+                CloseTarget::Pane => "Close pane view? (does not delete fleet agent) (y/n)",
+                CloseTarget::Tab => "Close tab view? (does not delete fleet agents) (y/n)",
             };
             render::render_confirm(frame, msg);
+        }
+        Overlay::ConfirmRestart { command } => {
+            render::render_confirm(frame, &format!("Restart '{command}'? (y/n)"));
+        }
+        Overlay::ConfirmDeleteInstance {
+            name,
+            input,
+            notice,
+        } => {
+            let mut msg = format!("Type '{name}' to delete: {input}");
+            if let Some(notice) = notice {
+                msg.push_str(" — ");
+                msg.push_str(notice);
+            }
+            render::render_confirm(frame, &msg);
         }
         Overlay::TabList { selected } => {
             render::render_tab_list(frame, layout, *selected);
@@ -395,6 +336,9 @@ fn render_active_overlay(
         }
         Overlay::Help => {
             render::render_help(frame);
+        }
+        Overlay::ReconnectNotice { message } => {
+            render::render_notice(frame, message);
         }
         Overlay::Scroll => {
             let so = layout
@@ -428,11 +372,31 @@ fn render_active_overlay(
             row,
             ref mode,
             ref view,
+            ref notice,
+            ..
         } => {
-            render::render_tasks(frame, items, *col, *row, mode, *view, home);
+            render::render_tasks(
+                frame,
+                items,
+                *col,
+                *row,
+                mode,
+                *view,
+                home,
+                notice.as_deref(),
+            );
         }
         Overlay::ScratchShell { pane } => {
             render::render_scratch_shell(frame, pane, registry);
+        }
+        Overlay::Organizer {
+            scope,
+            plan,
+            applied,
+            notice,
+            ..
+        } => {
+            render::render_organizer(frame, plan, &scope.label(), *applied, notice.as_deref());
         }
         Overlay::None => {}
     }
@@ -446,31 +410,35 @@ pub(crate) enum RunOutcome {
     RestartRequested(Option<crate::types::InstanceId>),
 }
 
+fn disable_closed_daemon_event_receiver(
+    daemon_event_rx: &mut crossbeam_channel::Receiver<rpc::EventStreamOutcome>,
+    disabled_event_rx: &crossbeam_channel::Receiver<rpc::EventStreamOutcome>,
+) {
+    *daemon_event_rx = disabled_event_rx.clone();
+}
+
 fn run_app(
     terminal: &mut DefaultTerminal,
     fleet_override: Option<&Path>,
-    restart_requester_id: Option<crate::types::InstanceId>,
+    _restart_requester_id: Option<crate::types::InstanceId>,
 ) -> Result<RunOutcome> {
     let home = crate::home_dir();
     app_boot_preflight(&home);
+    crate::bootstrap::signals::install_term_only();
     let fleet_path =
         fleet_override.map_or_else(|| crate::fleet::fleet_yaml_path(&home), Path::to_path_buf);
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     // #1027: shared TUI status-bar flag — supervisor flips it, render reads it.
     let daemon_binary_stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
         Default::default();
-    let (tui_event_tx, tui_event_rx) = crossbeam_channel::bounded::<TuiEvent>(256);
-    let (app_restart_gate, app_restart_inject, app_restart_rx) = build_app_restart_wiring();
-    let (_api_guard, telegram_state, telegram_status, attached_run_dir) = setup_app_bootstrap(
-        &home,
-        &fleet_path,
-        &registry,
-        tui_event_tx,
-        Some(app_restart_inject),
-    )?;
-    let attached_mode = attached_run_dir.is_some();
-    let app_restart_rx = never_when_attached(app_restart_rx, attached_mode);
-    let owner_services = start_owned_services(&home, &registry, &telegram_state, attached_mode);
+    let (app_restart_gate, _app_restart_inject, _app_restart_rx) = build_app_restart_wiring();
+    let attached_run_dir = setup_app_bootstrap(&home, &fleet_path)?;
+    if !wait_for_agent_spawn_completion(&attached_run_dir, std::time::Duration::from_secs(30)) {
+        anyhow::bail!("daemon control plane is ready but agent startup did not complete");
+    }
+    let attached_run_dir = Some(attached_run_dir);
+    let attached_mode = true;
+    let app_restart_rx = crossbeam_channel::never();
     let mut state = AppState::new();
     let (wakeup_tx, wakeup_rx) = crossbeam_channel::unbounded::<usize>();
     // #2057: size-probe env gate, read once; shared by milestones + per-frame probe.
@@ -478,6 +446,14 @@ fn run_app(
     trace_tty_size(size_debug, "startup-baseline");
     // restart-freeze RCA anchor: boot critical path start (pure tracing).
     let restore_start = std::time::Instant::now();
+    let (task_rpc_tx, task_rpc_rx, task_rpc_worker) = rpc::spawn_task_worker(&home);
+    let (remote_state_rpc_tx, remote_state_rpc_rx, remote_state_rpc_worker) =
+        rpc::spawn_agent_state_worker(&home);
+    let (remote_restart_request_tx, remote_restart_request_rx) =
+        crossbeam_channel::bounded::<commands::RemoteRestartRequest>(16);
+    let (remote_restart_worker_tx, remote_restart_outcome_rx, remote_restart_worker) =
+        rpc::spawn_remote_restart_worker(&home);
+    let (event_stop_tx, daemon_event_rx, event_worker) = rpc::spawn_event_worker(&home);
     let deps = AppDeps {
         home: &home,
         fleet_path: &fleet_path,
@@ -485,187 +461,132 @@ fn run_app(
         wakeup_tx: &wakeup_tx,
         app_restart_gate: &app_restart_gate,
         daemon_binary_stale: &daemon_binary_stale,
-        telegram_status,
+        telegram_status: crate::channel::TelegramStatus::NotConfigured,
         attached_run_dir: &attached_run_dir,
         attached_mode,
         size_debug,
+        task_rpc_tx: &task_rpc_tx,
+        remote_state_rpc_tx: &remote_state_rpc_tx,
+        remote_restart_request_tx: &remote_restart_request_tx,
+        remote_restart_worker_tx: &remote_restart_worker_tx,
     };
     // `_attach_tx` keepalive for the loop scope: see `restore_and_attach`.
     let (_attach_tx, attach_rx, attach_workers) = state.restore_and_attach(&deps, restore_start)?;
-    let mut restart_target =
-        restart_resume::resolve_target(&fleet_path, attached_mode, restart_requester_id);
-    restart_resume::arm_target_once(&mut restart_target, |instance_id, name, timeout| {
-        crate::agent::spawn_self_kick_bootstrap(
-            Arc::clone(&registry),
-            instance_id,
-            name,
-            home.clone(),
-            timeout,
-            crate::agent::BootstrapRegistrationState::MayRegisterLater,
-            None,
-        );
-    });
+    let mut reap_workers: Vec<std::thread::JoinHandle<()>> = Vec::new();
     let event_rx = spawn_crossterm_event_reader();
-    register_app_event_bus(attached_mode, &registry);
-    let (tick_rx, never_rx) = spawn_app_tick(attached_mode);
-    let (app_externals, app_configs, app_cycle) =
-        build_app_maintenance(&home, attached_mode, owner_services, &daemon_binary_stale);
+    let mut daemon_event_rx = daemon_event_rx;
+    let disabled_event_rx = crossbeam_channel::never::<rpc::EventStreamOutcome>();
     log_pre_render_milestone(size_debug, restore_start, attached_mode);
-    loop {
+    let loop_result: Result<()> = loop {
         if term_requested_logged() || state.poll_restart(&deps) == LoopFlow::Break {
-            break;
+            break Ok(());
         }
-        state.pre_select(terminal, &deps);
-        state.render_frame(terminal, &deps)?;
+        state.pre_select(terminal, &deps, &mut reap_workers);
+        if let Err(error) = state.render_frame(terminal, &deps) {
+            break Err(error);
+        }
         crossbeam_channel::select! {
             recv(app_restart_rx) -> req => state.handle_restart_request(req, &deps),
             recv(event_rx) -> ev => {
-                if state.handle_crossterm_event(ev, terminal, &deps) == LoopFlow::Break {
-                    break;
+                if state.handle_crossterm_event(ev, terminal, &deps, &mut reap_workers)
+                    == LoopFlow::Break
+                {
+                    break Ok(());
                 }
             }
             recv(wakeup_rx) -> _ => state.handle_wakeup(&wakeup_rx),
-            recv(attach_rx) -> outcome => state.handle_attach_outcome(outcome, &deps),
-            recv(tui_event_rx) -> ev => state.handle_tui_event(ev, &deps),
-            recv(tick_rx.as_ref().unwrap_or(&never_rx)) -> _ => {
-                state.handle_maintenance_tick(&app_cycle, &deps, &app_externals, &app_configs)
-            }
+            recv(attach_rx) -> outcome => state.handle_attach_outcome(outcome, &deps, &mut reap_workers),
+            recv(task_rpc_rx) -> outcome => state.handle_task_rpc_outcome(outcome),
+            recv(remote_state_rpc_rx) -> outcome => state.handle_agent_state_rpc_outcome(outcome),
+            recv(remote_restart_request_rx) -> request => {
+                if let Ok(request) = request {
+                    state.handle_remote_restart_request(request, &deps);
+                }
+            },
+            recv(remote_restart_outcome_rx) -> outcome => {
+                state.handle_remote_restart_outcome(outcome, &deps);
+            },
+            recv(daemon_event_rx) -> outcome => {
+                let receiver_closed = outcome.is_err();
+                state.handle_event_stream_outcome(outcome, &deps);
+                if receiver_closed {
+                    disable_closed_daemon_event_receiver(&mut daemon_event_rx, &disabled_event_rx);
+                }
+            },
             default(state.select_timeout()) => state.handle_idle_tick(&deps),
         }
-    }
+    };
+    drop(remote_state_rpc_tx);
+    drop(remote_state_rpc_rx);
+    let _ = remote_state_rpc_worker.join();
+    drop(remote_restart_worker_tx);
+    drop(remote_restart_request_tx);
+    // Stop consuming outcomes before joining: a full bounded outcome queue
+    // must wake the worker's blocking send so teardown cannot deadlock.
+    drop(remote_restart_outcome_rx);
+    let _ = remote_restart_worker.join();
+    drop(task_rpc_tx);
+    let _ = task_rpc_worker.join();
+    let _ = event_stop_tx.try_send(());
+    drop(event_stop_tx);
+    let _ = event_worker.join();
     // Teardown gating rationale is documented on `app_teardown`.
-    app_teardown(
-        &home,
-        &state.ui.layout,
-        &registry,
-        attached_mode,
-        attach_workers,
-    );
+    app_teardown(&home, &state.ui.layout, reap_workers, attach_workers);
+    loop_result?;
     Ok(state.restart.restart_outcome)
 }
 
-/// App startup bootstrap: prepare the fleet (issuing `api.cookie` BEFORE any API
-/// server thread starts — otherwise Telegram's router `api::call(INJECT)` would
-/// silently fail), then either start the in-process API server + the SIGTERM
-/// handler (Owned) or note the run dir to connect to (Attached). Extracted
-/// verbatim from the head of `run_app` (#14 god-fn split) — byte-identical.
-///
-/// Returns `(api_guard, telegram_channel, telegram_status, attached_run_dir)`.
-/// The RAII `ApiGuard` must outlive the TUI loop, so the caller binds it;
-/// `attached_run_dir.is_some()` ⇒ Attached mode.
-/// Does this `bootstrap::prepare` failure mean "another daemon already owns this
-/// `$AGEND_HOME`"?
-///
-/// App mode MUST NOT degrade to Owned when this is true: Owned spawns the whole
-/// fleet a second time behind the live daemon's back. Split out from the match
-/// arm in [`setup_app_bootstrap`] so the classification is directly testable —
-/// the TUI path itself needs a real TTY and cannot be driven headlessly.
-fn is_singleton_conflict(e: &anyhow::Error) -> bool {
-    e.downcast_ref::<crate::bootstrap::DaemonAlreadyRunning>()
-        .is_some()
+/// App is permanently a thin client: attach to a ready daemon, or start one
+/// detached and wait for its control plane. A failed spawn may simply mean a
+/// concurrent starter won the singleton race, so re-probe before surfacing it.
+fn setup_app_bootstrap(home: &Path, fleet_path: &Path) -> Result<PathBuf> {
+    if let Some(run_dir) = wait_for_ready_daemon(home, std::time::Duration::from_millis(300)) {
+        return Ok(run_dir);
+    }
+
+    let spawn_error = crate::bootstrap::daemon_spawn::spawn_detached(home, Some(fleet_path)).err();
+    if let Some(run_dir) = wait_for_ready_daemon(home, std::time::Duration::from_secs(5)) {
+        return Ok(run_dir);
+    }
+
+    match spawn_error {
+        Some(error) => Err(error.context("start daemon for app thin client")),
+        None => anyhow::bail!("daemon started but its control plane did not become ready"),
+    }
 }
 
-/// What [`setup_app_bootstrap`] hands back to `run_app`: the RAII API guard, the
-/// optional Telegram channel, its status, and — when non-`None` — the run dir of
-/// the daemon we attached to (`Some` ⇒ Attached mode).
-type AppBootstrap = (
-    api_server::ApiGuard,
-    Option<Arc<dyn crate::channel::Channel>>,
-    TelegramStatus,
-    Option<PathBuf>,
-);
-
-fn setup_app_bootstrap(
-    home: &Path,
-    fleet_path: &Path,
-    registry: &AgentRegistry,
-    tui_event_tx: TuiEventSender,
-    app_restart: Option<crate::api::app_restart::AppRestart>,
-) -> Result<AppBootstrap> {
-    let opts = crate::bootstrap::PrepareOptions {
-        resolve_agents: false, // app spawns via pane_factory from tabs
-        ..Default::default()
-    };
-    let mut attached_run_dir: Option<PathBuf> = None;
-    let (api_guard, telegram_state, telegram_status) =
-        match crate::bootstrap::prepare(home, fleet_path, opts) {
-            Ok(crate::bootstrap::BootstrapOutcome::Owned(prepared)) => {
-                let telegram = prepared.telegram.clone();
-                let status = if telegram.is_some() {
-                    TelegramStatus::Connected
-                } else {
-                    telegram_hooks::telegram_status_from_config(&prepared.config)
-                };
-                let guard =
-                    api_server::start_api_server(prepared, registry, tui_event_tx, app_restart);
-                // SIGTERM-only handler: `agend-terminal stop` can cleanly exit
-                // the owned app. SIGINT stays with crossterm so Ctrl+C still
-                // reaches the focused pane's PTY as 0x03.
-                crate::bootstrap::signals::install_term_only();
-                (guard, telegram, status)
+fn wait_for_ready_daemon(home: &Path, timeout: std::time::Duration) -> Option<PathBuf> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(run_dir) = crate::daemon::find_active_run_dir(home) {
+            if crate::ipc::probe_api(&run_dir) {
+                return Some(run_dir);
             }
-            Ok(crate::bootstrap::BootstrapOutcome::Attached(attached)) => {
-                tracing::info!(
-                    pid = attached.daemon_pid,
-                    path = %attached.run_dir.display(),
-                    "attached to existing daemon, connecting as remote client"
-                );
-                attached_run_dir = Some(attached.run_dir.clone());
-                (
-                    api_server::noop_guard(),
-                    None,
-                    TelegramStatus::NotConfigured,
-                )
-            }
-            // Losing the daemon singleton flock is NOT a degradable failure.
-            // Falling through here leaves `attached_run_dir == None`, which makes
-            // `run_app` take the Owned branch and spawn a SECOND copy of every
-            // fleet instance behind the live daemon's back — the split-brain this
-            // guard exists to prevent (duplicate agent identities, cross-written
-            // memory dirs, dispatch replies answered by the wrong lead).
-            //
-            // Note the asymmetry this fixes: `start --foreground` already bailed
-            // on this error (`cli::start_with_fleet`), only the app path degraded.
-            Err(e) if is_singleton_conflict(&e) => {
-                tracing::error!(error = %e, "refusing to boot: daemon singleton lock is held");
-                return Err(e.context(
-                    "refusing to start a second fleet — stop the running instance first, \
-                     or use `agend-terminal attach <agent>` to reach the live one",
-                ));
-            }
-            // Every other bootstrap failure keeps the pre-existing degraded-TUI
-            // behaviour: without the flock as evidence we cannot claim a peer is
-            // alive, and locking the operator out of the TUI on (say) an
-            // unparseable fleet.yaml would remove their only repair surface.
-            Err(e) => {
-                tracing::warn!(error = %e, "bootstrap failed, running TUI without in-process API");
-                (
-                    api_server::noop_guard(),
-                    None,
-                    TelegramStatus::NotConfigured,
-                )
-            }
-        };
-    Ok((api_guard, telegram_state, telegram_status, attached_run_dir))
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
-/// App exit teardown: persist the on-screen layout, then (Owned mode only) sync
-/// fleet.yaml + kill every agent PTY. Extracted verbatim from the tail of
-/// `run_app` (#14) — byte-identical.
-///
-/// `save_session` is UNGATED (#895): tab grouping / splits / ratios are
-/// presentation-layer state the app owns even when Attached, so the next attach
-/// can restore the custom layout. `sync_fleet_yaml` + agent-kill STAY gated to
-/// Owned mode — in Attached mode the daemon owns fleet.yaml and the agent PTYs.
-/// Process-global app-mode shutdown flag, cloned into every Owned-mode agent's
-/// `SpawnConfig.shutdown` (see `pane_factory::attach_agent_to_pane`). app mode
-/// is a singleton process, so one flag covers the whole fleet — this avoids
-/// threading an `Arc<AtomicBool>` through the entire restore/pane-factory call
-/// chain. `app_teardown` flips it true before killing agents so each agent's
-/// PTY-close handler (`agent::handle_pty_close`) takes the fast `is_shutdown`
-/// early-return (no per-thread 2 s exit-poll, no crash / shell-fallback events
-/// during teardown). It is the app-mode equivalent of run_core's
-/// "drain registry first" race guard. Sticky-true — process exits after.
+/// Session reconciliation needs the complete daemon registry. This is separate
+/// from the API liveness gate above: `.ready` means the agent spawn loop ended.
+fn wait_for_agent_spawn_completion(run_dir: &Path, timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if run_dir.join(".ready").is_file() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+/// Process-global flag used by app-owned pane attachment workers while the TUI
+/// exits. Sticky-true because the process exits immediately afterwards.
 static APP_SHUTDOWN: std::sync::OnceLock<Arc<std::sync::atomic::AtomicBool>> =
     std::sync::OnceLock::new();
 
@@ -693,17 +614,6 @@ fn build_app_restart_wiring() -> (
 /// #2453 R2: attached mode never listens for app restart requests — the
 /// daemon owns restart and the injected Sender was dropped in
 /// `setup_app_bootstrap`, so the arm must be never-ready.
-fn never_when_attached(
-    rx: crossbeam_channel::Receiver<crate::api::app_restart::AppRestartRequest>,
-    attached_mode: bool,
-) -> crossbeam_channel::Receiver<crate::api::app_restart::AppRestartRequest> {
-    if attached_mode {
-        crossbeam_channel::never()
-    } else {
-        rx
-    }
-}
-
 /// restart-freeze RCA (t-…55279): entering the render loop — the first draw
 /// is imminent; elapsed from `restore_start` is the full boot critical path
 /// the operator perceives as the restart freeze. Pure tracing.
@@ -717,7 +627,6 @@ fn log_pre_render_milestone(size_debug: bool, restore_start: std::time::Instant,
     );
 }
 
-/// Loop-skeleton guard: SIGTERM exit with its operator-visible log line.
 fn term_requested_logged() -> bool {
     if crate::bootstrap::signals::term_requested() {
         tracing::info!("app: SIGTERM received, exiting main loop");
@@ -749,100 +658,6 @@ fn app_boot_preflight(home: &Path) {
     crate::worktree_cleanup::warn_if_prune_live_retired();
 }
 
-/// #2453 Slice 2: owned-mode service wiring (supervisor, owner monitoring,
-/// shadow socket, stream observers, telegram registry attach), extracted
-/// verbatim from `run_app`. Attached mode returns None (daemon owns these).
-fn start_owned_services(
-    home: &Path,
-    registry: &AgentRegistry,
-    telegram_state: &Option<Arc<dyn crate::channel::Channel>>,
-    attached_mode: bool,
-) -> Option<crate::daemon::owner_services::OwnerServicesStarted> {
-    // SIGINT / SIGHUP are left to their defaults: Ctrl+C must reach the
-    // focused pane's PTY as 0x03 (crossterm reads it as a KeyEvent in raw
-    // mode), and SIGHUP's default "kill the process group" keeps shell-exit
-    // semantics intact. SIGTERM is the only signal the app intercepts, and
-    // only in the Owned branch — see `install_term_only` above.
-
-    // Per-agent AwaitingOperator supervisor: watches for stdout silence during
-    // Starting (or recently-entered Idle — some backends like codex match
-    // ready_pattern against the startup banner that precedes the update menu)
-    // and pushes a vterm tail to the agent's Telegram topic. In Attached mode
-    // the daemon already runs its own supervisor against the real registry, so
-    // the app must not also poll a disjoint (empty) registry.
-    // #2737: the owner-service composition is now a typed two-phase seam. This
-    // owned-only block yields the `OwnerServicesStarted` witness (None when
-    // attached); the owned-only maintenance tick REQUIRES it, so a run_app that
-    // skips the seam fails to compile (structural I2, replacing the old
-    // `owner_services_called_by_both_hosts` string-scan).
-    let owner_services: Option<crate::daemon::owner_services::OwnerServicesStarted> =
-        if !attached_mode {
-            crate::daemon::supervisor::spawn(home.to_path_buf(), Arc::clone(registry));
-            // #2453 Stage 1a / #2737: owner monitoring (instance_monitor +
-            // api_activity_probe) via the typed phase-1 seam — identical position/args
-            // in run_core's build_tick_infrastructure, so a service can't be wired in
-            // one host and silently dead in the other (#982/#1002/#1720/#2434). The
-            // returned OwnerMonitoringStarted token is required by phase 2 below, so
-            // monitoring is compile-forced to precede the stream observers (exact
-            // order preserved: monitoring → shadow::start → stream).
-            let monitoring = crate::daemon::owner_services::start_owner_monitoring(
-                crate::daemon::owner_services::OwnerRole::Owned,
-                home,
-                registry,
-                &crate::daemon::owner_services::OwnerMonitoringStarters::real(),
-            );
-            // #2413 Phase B (live-fix): start the hook-event socket server in app mode too.
-            // The LIVE fleet daemon runs THIS `run_app`, never `run_core` (shadow::start's
-            // only other caller), so without this the whole Shadow Observer plane was dead in
-            // production (observed_status null on every agent under the flag — #1720/#685
-            // silent-dead-in-app class, mirrors recovery_dispatcher #1694(a)). No-op under
-            // `AGEND_SHADOW_OBSERVER=0` (default-ON; the =0 kill-switch ⇒ zero change). Owner-only
-            // (`!attached_mode`) like the probe: an attached TUI must not also bind the socket;
-            // the daemon that owns the fleet started it. Lifecycle mirrors run_core — a
-            // detached accept loop that exits with the process; the stale socket is cleared on
-            // next bind (start_unix removes it before binding).
-            crate::daemon::shadow::start(home);
-            // #2453 Stage 1a / #2737: the three Shadow Observer stream planes (rollout
-            // + opencode + kiro) via the typed phase-2 seam. Requires the phase-1
-            // OwnerMonitoringStarted token (compile-enforced order). #2434: the live
-            // fleet daemon is app mode, so these must be app-wired (not run_core-only)
-            // or each backend's observer source is dead in production. Identical
-            // position/args in run_core's build_tick_infrastructure. shadow::start
-            // (the socket-ingest plane above) stays host-local — separate fork.
-            let owner_services = crate::daemon::owner_services::start_owner_stream_observers(
-                crate::daemon::owner_services::OwnerRole::Owned,
-                &monitoring,
-                home,
-                registry,
-                &crate::daemon::owner_services::OwnerStreamStarters::real(),
-            );
-            // Attached mode stays unwired: that process never owns the registry,
-            // and the Telegram bot (if any) runs under the other daemon which
-            // already did its own attach.
-            //
-            // #945 Phase 1: telegram_init is now backgrounded; `telegram_state`
-            // is always None at this point post-backgrounding. Publish registry
-            // to the pending slot so the background thread can attach when its
-            // ~6s HTTP init completes. The if-let path below covers the eager
-            // (fast/mocked init) case.
-            crate::agent::set_pending_registry(Arc::clone(registry));
-            if let Some(tg) = telegram_state.as_ref() {
-                tg.attach_registry(Arc::clone(registry));
-            } else if let Some(tg) = crate::channel::lookup_channel_by_name("telegram") {
-                // Multi-channel-safe (t-20260703164240502572-50899-11): this
-                // fallback is telegram-specific (the `tg`/`telegram_state`
-                // naming already assumed it); `active_channel()` would silently
-                // no-op here once discord is also registered.
-                tg.attach_registry(Arc::clone(registry));
-            }
-            // #2737: hand the final witness to the owned-only maintenance tick below.
-            Some(owner_services)
-        } else {
-            None
-        };
-    owner_services
-}
-
 /// #2453 Slice 2: the crossterm event-reader thread, extracted verbatim.
 fn spawn_crossterm_event_reader() -> crossbeam_channel::Receiver<Event> {
     // fire-and-forget: blocks in crossterm::event::read(); terminated by process exit.
@@ -860,128 +675,36 @@ fn spawn_crossterm_event_reader() -> crossbeam_channel::Receiver<Event> {
     event_rx
 }
 
-/// #2453 Slice 2: owned-mode event-bus subscriber registration, extracted
-/// verbatim (comment included — the silent-drop history is load-bearing).
-fn register_app_event_bus(attached_mode: bool, registry: &AgentRegistry) {
-    let _ = attached_mode;
-    // #event-bus: owned `app` mode never calls `daemon::run_core`, so it must
-    // register the bus subscribers itself — otherwise the maintenance tick below
-    // emits `CronFire` / `CiReady` / idle nudges into a bus with ZERO subscribers
-    // and every delivery silently drops (the live #1720 cron silent-drop; same
-    // regression class as #1002 / #982). Mirrors run_core; gated to owned mode
-    // because the attached daemon process owns delivery when attached.
-    if !attached_mode {
-        crate::daemon::register_event_subscribers(registry);
-    }
+/// How long teardown may spend joining the unmanaged-child reapers.
+///
+/// One grace window plus a small margin: `terminate_agents_parallel` gives each
+/// child `daemon::SHUTDOWN_GRACE` (2s) and reaps in parallel, so a healthy reap
+/// finishes inside that and this only bites on a child that ignores SIGTERM.
+const REAP_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(2_600);
+
+/// How long teardown may then spend joining the attach workers.
+const ATTACH_JOIN_BUDGET: std::time::Duration = std::time::Duration::from_millis(1_500);
+
+/// Deadlines for teardown's two join groups, from one start instant.
+///
+/// SEPARATE budgets, deliberately, rather than the single shared deadline this
+/// replaced. The reap join runs first, and with one deadline a reap that used the
+/// whole window handed the attach join an already-expired one — and
+/// `bounded_join_attach_workers` detaches on an expired deadline, so every attach
+/// worker would be abandoned. That is exactly the failure this file's reaper
+/// ownership exists to prevent, just relocated to the other group.
+///
+/// The documented total is REAP_JOIN_BUDGET + ATTACH_JOIN_BUDGET = 4.1s of
+/// worst-case join time at quit. Nothing bounds app quit below that: the only
+/// wall-clock consumers nearby are `bounded_join_attach_workers`'s own test
+/// (which injects its own deadline) and overlay's close-path assertion (which
+/// bounds CLOSE, not quit, and stays asynchronous).
+fn teardown_join_deadlines(start: std::time::Instant) -> (std::time::Instant, std::time::Instant) {
+    let reap_deadline = start + REAP_JOIN_BUDGET;
+    (reap_deadline, reap_deadline + ATTACH_JOIN_BUDGET)
 }
 
-/// #2453 Slice 2: the 10s owned-mode maintenance tick producer, extracted
-/// verbatim. Attached mode returns None (the daemon process owns cadence).
-fn spawn_app_tick(
-    attached_mode: bool,
-) -> (
-    Option<crossbeam_channel::Receiver<()>>,
-    crossbeam_channel::Receiver<()>,
-) {
-    // Periodic maintenance tick (10s) — mirrors daemon tick cadence.
-    // Only active in owned (non-attached) mode; when attached, the daemon
-    // process handles schedules, CI watches, and health decay.
-    let tick_rx = if !attached_mode {
-        let (tx, rx) = crossbeam_channel::bounded(1);
-        std::thread::Builder::new()
-            .name("app_tick".into())
-            .spawn(move || loop {
-                std::thread::sleep(std::time::Duration::from_secs(10));
-                if tx.send(()).is_err() {
-                    break;
-                }
-            })
-            .ok();
-        Some(rx)
-    } else {
-        None
-    };
-    // Never-ready placeholder for attached mode (select! needs a Receiver).
-    (tick_rx, crossbeam_channel::never::<()>())
-}
-
-/// #2453 Slice 2: the owned-maintenance pipeline wiring (registries, handler
-/// set, typed cycle), extracted verbatim from `run_app`.
-fn build_app_maintenance(
-    home: &Path,
-    attached_mode: bool,
-    owner_services: Option<crate::daemon::owner_services::OwnerServicesStarted>,
-    daemon_binary_stale: &crate::daemon::mcp_registry_watcher::DaemonBinaryStale,
-) -> (
-    crate::agent::ExternalRegistry,
-    crate::api::ConfigRegistry,
-    Option<crate::daemon::owned_maintenance::OwnedMaintenanceCycle>,
-) {
-    // #1726: app-standalone runs the FULL daemon per-tick pipeline (same
-    // `build_default_handlers` as run_core) minus APP_TICK_ALLOWLIST, replacing
-    // the old hand-picked subset that kept silently dropping handlers (#1002 /
-    // #982 / #1719 class). Built once, reused each tick like run_core. App has no
-    // external-agent / AgentConfig registry, so these are empty; the handlers that
-    // read them (external_liveness, inbox_maintenance worktree cleanup) graceful-
-    // no-op on empty. In attached mode the tick arm never fires, so these are
-    // harmlessly unused.
-    let app_externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
-    let app_configs: crate::api::ConfigRegistry = Arc::new(Mutex::new(HashMap::new()));
-    // W1.1 (#2050): the `mcp_registry` tracker (now a handler) flips this same
-    // `daemon_binary_stale` flag the render loop reads (line ~186); hand it the
-    // shared `Arc` so the status-bar warning still surfaces after the tracker
-    // moved off the supervisor thread.
-    let app_handlers = app_tick_handlers(Arc::clone(daemon_binary_stale));
-
-    // The attached app constructs no owned maintenance cycle. Owned mode keeps
-    // its profile handlers, owner-service witness, and optional stall monitor in
-    // one typed value; the tick producer and select arm remain host-local.
-    let app_cycle = crate::daemon::owned_maintenance::OwnedMaintenanceCycle::new_for_role(
-        if attached_mode {
-            crate::daemon::owner_services::OwnerRole::Attached
-        } else {
-            crate::daemon::owner_services::OwnerRole::Owned
-        },
-        app_handlers,
-        owner_services,
-        "app-owned-tick",
-        home,
-    );
-    (app_externals, app_configs, app_cycle)
-}
-
-/// #2453 Slice 2: one owned-maintenance tick, extracted verbatim from the
-/// tick select! arm (the handler-mapping comment is load-bearing).
-fn run_owned_maintenance_tick(
-    app_cycle: &Option<crate::daemon::owned_maintenance::OwnedMaintenanceCycle>,
-    home: &Path,
-    registry: &AgentRegistry,
-    app_externals: &crate::agent::ExternalRegistry,
-    app_configs: &crate::api::ConfigRegistry,
-) {
-    // #1726: owned-mode periodic maintenance now runs the FULL daemon
-    // per-tick pipeline (build_default_handlers minus APP_TICK_ALLOWLIST)
-    // instead of a hand-picked subset. Gated to owned mode via tick_rx
-    // (None in attached mode). The replaced manual calls map to:
-    //   cron_tick::check_schedules      → CheckSchedulesHandler
-    //   ci_watch::check_ci_watches      → CiWatchPollHandler
-    //   health.maybe_decay + check_hang → HangDetectionHandler
-    //   core.state.tick()               → supervisor::spawn (runs in
-    //     owned mode too — supervisor.rs:tick; the old manual call here
-    //     was a benign idempotent double, now removed).
-    app_cycle
-        .as_ref()
-        .expect("owned maintenance tick requires the owned cycle")
-        .run_once(home, registry, app_externals, app_configs);
-    // PR4: back to Waiting between maintenance ticks so the monitor
-    // never attributes render/idle time to the maintenance host.
-    app_cycle
-        .as_ref()
-        .expect("owned maintenance tick requires the owned cycle")
-        .enter_waiting();
-}
-
-/// #render-first phase-(b) F2: join attach workers, but DETACH any that haven't
+/// #render-first phase-(b) F2: join app workers, but DETACH any that haven't
 /// finished by the shared `deadline` — a worker wedged mid-spawn (fork/exec /
 /// skills / subscribe) must not hang quit (that would move the restore freeze to
 /// quit). A detached worker's child, if it registered one, is reaped by the
@@ -1005,91 +728,32 @@ fn bounded_join_attach_workers(
     detached
 }
 
+/// Flush presentation state and bound worker shutdown. The daemon and agent
+/// processes remain independently owned.
 fn app_teardown(
     home: &Path,
     layout: &Layout,
-    registry: &AgentRegistry,
-    attached_mode: bool,
+    reap_workers: Vec<std::thread::JoinHandle<()>>,
     attach_workers: Vec<std::thread::JoinHandle<()>>,
 ) {
+    // The event loop has stopped, so this final batch may wait for a metadata
+    // lock. Periodic UI flushing uses only the nonblocking path above; placing
+    // this before every other teardown side effect also covers render errors.
+    notification_queue::flush_pending_activity_at_teardown(home);
     session::save_session(home, layout);
-    if !attached_mode {
-        // Sync fleet.yaml to match current state (Owned-only — daemon owns
-        // fleet.yaml in Attached).
-        session::sync_fleet_yaml(home, layout);
-
-        // Cleanup: kill all agents (Owned-only — daemon owns PTYs in Attached).
-        //
-        // restart-freeze 真嫌#1 (t-…55279): this was a SEQUENTIAL per-agent
-        // `kill_agent` loop, each blocking on `wait_for_child_exit` (≤5 s),
-        // ~0.5 s × N ≈ ~6 s of the operator-visible restart freeze. Now:
-        //  1. flip the shutdown flag so PTY-close handlers fast-return (no
-        //     crash/shell-fallback events, no redundant per-thread exit poll) —
-        //     the app-mode equivalent of run_core's drain-first race guard;
-        //  2. drain the registry and kill ALL agents in parallel via the shared
-        //     run_core core (`terminate_agents_parallel`: parallel SIGTERM →
-        //     single grace → SIGKILL/reap holdouts), wall time ≈ one grace
-        //     window regardless of N;
-        //  3. run the per-agent cleanup tail (drop active-channel binding +
-        //     remove IPC port + event log) — mirrors `delete_transaction`'s
-        //     steps 5/7/8 (the registry remove is already done by the drain;
-        //     app mode tracks no AgentConfig map, matching its `configs: None`).
-        app_shutdown_flag().store(true, std::sync::atomic::Ordering::SeqCst);
-        // #render-first phase-(b): join the background attach workers BEFORE
-        // draining the registry. The shutdown flag (just set) makes each worker
-        // early-abort un-started attaches (run_attach checks it on entry), so a
-        // holdout is at most ONE in-flight spawn per worker. Joining first means
-        // every child a worker DID register is in the registry → the parallel
-        // terminate below reaps it.
-        //
-        // F2 (r4/r6): the join is BOUNDED — a worker wedged mid-spawn (fork/exec /
-        // skills / subscribe) must not move the restore freeze to quit. Poll up to
-        // a shared grace deadline (slightly longer than #2311's 2s SHUTDOWN_GRACE);
-        // past it, DETACH the holdout (drop its handle). `is_finished` (Rust 1.61+,
-        // MSRV 1.88) avoids a blocking `join()` on a wedged thread.
-        //
-        // Detaching is SAFE w.r.t. the one-shot drain below because we set the
-        // shutdown flag FIRST (above): a detached worker that finishes its spawn
-        // AFTER the drain sees the flag set and reaps its own child in
-        // `pane_factory::finish_attach` — so a late registration never outlives
-        // teardown (the r6 child-leak race). Children registered before the drain
-        // are reaped by the drain itself.
-        let attach_join_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-        let detached = bounded_join_attach_workers(attach_workers, attach_join_deadline);
-        if detached > 0 {
-            tracing::warn!(
-                detached,
-                "render-first: detached attach worker(s) still wedged past the join grace at quit"
-            );
-        }
-        // #t-41673 gap-instrument: clock the parallel teardown so the next
-        // operator restart EMPIRICALLY confirms the ~6s sequential freeze is
-        // gone (expect `teardown_elapsed_ms` ≈ one grace window). Mirrors
-        // shutdown_sequence's `shutdown_elapsed_ms` for the app-mode path, plus
-        // per-agent `reap_ms` inside `terminate_agents_parallel`.
-        let teardown_started = std::time::Instant::now();
-        let agents: Vec<(String, crate::daemon::ChildHandle)> = {
-            let mut reg = crate::agent::lock_registry(registry);
-            reg.drain()
-                .map(|(_id, handle)| (handle.name.to_string(), handle.child))
-                .collect()
-        };
-        let agents_total = agents.len();
-        let names: Vec<String> = agents.iter().map(|(n, _)| n.clone()).collect();
-        crate::daemon::terminate_agents_parallel(agents);
-        let run_dir = crate::daemon::run_dir(home);
-        for name in &names {
-            // Multi-channel-safe (t-20260703164240502572-50899-11): drops on
-            // every registered channel instead of only the `active_channel()`
-            // singleton, which silently no-ops in a telegram+discord fleet.
-            crate::channel::drop_binding_on_all_channels(name);
-            crate::ipc::remove_port(&run_dir, name);
-            crate::event_log::log(home, "delete", name, "delete: app teardown (parallel)");
-        }
-        tracing::info!(
-            agents_total,
-            teardown_elapsed_ms = teardown_started.elapsed().as_millis() as u64,
-            "app-mode parallel teardown complete"
+    let (reap_deadline, attach_deadline) = teardown_join_deadlines(std::time::Instant::now());
+    let detached_reapers = bounded_join_attach_workers(reap_workers, reap_deadline);
+    if detached_reapers > 0 {
+        tracing::warn!(
+            detached = detached_reapers,
+            "detached unmanaged child reaper(s) still running at app quit"
+        );
+    }
+    let detached = bounded_join_attach_workers(attach_workers, attach_deadline);
+    if detached > 0 {
+        tracing::warn!(
+            detached,
+            "detached attach worker(s) still running at app quit"
         );
     }
 }
@@ -1251,14 +915,23 @@ fn flush_idle_notifications(home: &Path, layout: &mut Layout) {
                 continue;
             };
             let agent_name = pane.agent_name.clone();
-            flush_notifications_for_pane(home, pane, |text| {
+            flush_notifications_for_pane(home, pane, |text, channel_origin| {
                 // #982 RC: queue contents come from compose_aware_*
                 // which would have submit-injected on the immediate-
                 // idle path. The flush must preserve that contract or
                 // queued hints (e.g. `[AGEND-MSG-PENDING]`) land in
                 // the prompt buffer without the backend submit_key —
                 // codex one-shots silently drop the wake.
-                crate::inbox::inject_notification_with_submit(home, &agent_name, text)
+                //
+                // #3324: and it forwards the row's typed channel provenance,
+                // so a deferred external message is not re-classified as
+                // internal on the way out of the queue.
+                crate::inbox::inject_notification_with_submit(
+                    home,
+                    &agent_name,
+                    text,
+                    channel_origin,
+                )
             });
         }
     }
@@ -1276,10 +949,63 @@ const DRAFT_INPUT_TAIL_ROWS: usize = 8;
 /// raw `Drafting` against the ACTUAL rendered input box (`pane.vterm` is
 /// TUI-owned; the headless flush has no pane and conservatively honors the
 /// raw draft state), plus the badge refresh.
+///
+/// #1944: the input-box probe shared by the flush gate below and the #3663
+/// publish path. `Some(true)` = box verifiably empty, `Some(false)` = real
+/// draft, `None` = undeterminable (fail toward protection). Only runs when
+/// `raw_state` is `Drafting` — otherwise there is no stale draft to refine.
+fn probe_input_box_empty(
+    pane: &mut Pane,
+    raw_state: notification_queue::DraftState,
+) -> Option<bool> {
+    if raw_state != notification_queue::DraftState::Drafting {
+        return None;
+    }
+    pane.backend.as_ref().and_then(|b| {
+        // #1948(b): codex's empty box shows DIM ghost text after `›`, which a
+        // plain marker probe mis-reads as typed content — route it through the
+        // DIM-aware check (needs the per-char dim mask). Everyone else uses the
+        // text-only probe: marker (claude/agy) → placeholder (kiro) → fallback.
+        // #t-97931 (F-A): route through the path-aware `Pane::tail_lines*` — off-
+        // thread the main-thread `pane.vterm` is idle/blank, so reading it directly
+        // mis-reads a real unsent draft as an empty box and the gate clobbers it.
+        if let Some(marker) = b.input_dim_ghost_marker() {
+            let (text, dim) = pane.tail_lines_with_dim(DRAFT_INPUT_TAIL_ROWS);
+            notification_queue::input_box_dim_aware_empty(&text, &dim, marker)
+        } else {
+            notification_queue::input_box_empty_probe(
+                &pane.tail_lines(DRAFT_INPUT_TAIL_ROWS),
+                b.input_prompt_marker(),
+                b.input_empty_placeholder(),
+            )
+        }
+    })
+}
+
+/// #3663: publish the TUI-observed empty box so DAEMON-side gates (restart
+/// defer, `should_defer_inject`, ambient gate — all metadata-only readers in
+/// another process) see the same refinement the TUI flush applies. Runs even
+/// when the queue is empty (the restart gate reads metadata, not the queue);
+/// gated on `raw_state == Drafting` so idle panes never write metadata every
+/// tick. Buffered + non-blocking; the ~1s badge cadence flushes it.
+fn publish_cleared_observation(home: &Path, pane: &mut Pane) {
+    let raw_state = notification_queue::draft_state(home, &pane.agent_name);
+    if raw_state != notification_queue::DraftState::Drafting {
+        return;
+    }
+    if probe_input_box_empty(pane, raw_state) == Some(true) {
+        notification_queue::record_cleared_activity(home, &pane.agent_name);
+    }
+}
+
 fn flush_notifications_for_pane<F>(home: &Path, pane: &mut Pane, injector: F)
 where
-    F: FnMut(&str) -> anyhow::Result<()>,
+    F: FnMut(&str, Option<crate::channel::ChannelKind>) -> anyhow::Result<()>,
 {
+    // #3663: publish the empty-box observation even when nothing is queued —
+    // the restart gate reads metadata, not the queue, so a type-then-clear
+    // with zero pending notifications must still lift the daemon-side defer.
+    publish_cleared_observation(home, pane);
     if pane.pending_notification_count == 0 {
         return;
     }
@@ -1297,29 +1023,7 @@ where
     // undeterminable read (no marker / agent mid-output) both keep deferring
     // (fail toward draft-protection — never risk clobbering a real draft).
     let raw_state = notification_queue::draft_state(home, &pane.agent_name);
-    let buffer_empty = if raw_state == notification_queue::DraftState::Drafting {
-        pane.backend.as_ref().and_then(|b| {
-            // #1948(b): codex's empty box shows DIM ghost text after `›`, which a
-            // plain marker probe mis-reads as typed content — route it through the
-            // DIM-aware check (needs the per-char dim mask). Everyone else uses the
-            // text-only probe: marker (claude/agy) → placeholder (kiro) → fallback.
-            // #t-97931 (F-A): route through the path-aware `Pane::tail_lines*` — off-
-            // thread the main-thread `pane.vterm` is idle/blank, so reading it directly
-            // mis-reads a real unsent draft as an empty box and the gate clobbers it.
-            if let Some(marker) = b.input_dim_ghost_marker() {
-                let (text, dim) = pane.tail_lines_with_dim(DRAFT_INPUT_TAIL_ROWS);
-                notification_queue::input_box_dim_aware_empty(&text, &dim, marker)
-            } else {
-                notification_queue::input_box_empty_probe(
-                    &pane.tail_lines(DRAFT_INPUT_TAIL_ROWS),
-                    b.input_prompt_marker(),
-                    b.input_empty_placeholder(),
-                )
-            }
-        })
-    } else {
-        None
-    };
+    let buffer_empty = probe_input_box_empty(pane, raw_state);
     let effective_state = if buffer_empty == Some(true) {
         notification_queue::DraftState::None
     } else {
@@ -1390,6 +1094,43 @@ fn kill_agent(home: &Path, registry: &AgentRegistry, name: &str) {
     crate::daemon::lifecycle::delete_transaction(home, name, registry, None, false);
 }
 
+/// Reap a TUI-local shell by its authoritative registry key.
+///
+/// Unmanaged shells are intentionally absent from fleet.yaml, so the managed
+/// name-based delete transaction cannot resolve them. Remove the exact UUID
+/// entry first, then terminate and reap the owned child.
+fn kill_unmanaged_agents(
+    registry: &AgentRegistry,
+    instance_ids: impl IntoIterator<Item = crate::types::InstanceId>,
+    reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
+) {
+    let drained: Vec<(String, crate::daemon::ChildHandle)> = instance_ids
+        .into_iter()
+        .filter_map(|instance_id| agent::remove_and_unregister(registry, &instance_id))
+        .map(|handle| (handle.name.to_string(), handle.child))
+        .collect();
+    if drained.is_empty() {
+        return;
+    }
+    // The JoinHandle is retained by the app owner and joined before attach
+    // workers at teardown, so close-then-quit cannot abandon this reap.
+    let reap_worker = std::thread::Builder::new()
+        .name("unmanaged_child_reaper".to_string())
+        .spawn(move || {
+            crate::daemon::terminate_agents_parallel(drained);
+        })
+        .expect("spawn unmanaged child reaper");
+    reap_workers.push(reap_worker);
+}
+
+fn kill_unmanaged_agent(
+    registry: &AgentRegistry,
+    instance_id: crate::types::InstanceId,
+    reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
+) {
+    kill_unmanaged_agents(registry, [instance_id], reap_workers);
+}
+
 /// Whether the agent's child process is still running.
 ///
 /// Used by the scratch shell overlay to self-close when the user exits the
@@ -1401,11 +1142,9 @@ fn kill_agent(home: &Path, registry: &AgentRegistry, name: &str) {
 /// would wedge the whole UI if another thread panicked while holding the child
 /// lock (parking_lot leaves it locked). Transient contention just keeps the
 /// overlay open for that tick — Esc still works.
-fn agent_is_alive(registry: &AgentRegistry, name: &str) -> bool {
+fn agent_is_alive(registry: &AgentRegistry, instance_id: crate::types::InstanceId) -> bool {
     let reg = agent::lock_registry(registry);
-    // #1441: registry is UUID-keyed; the overlay only knows the display name,
-    // so locate the handle by name (no fleet.yaml on the scratch-shell path).
-    let Some(handle) = reg.values().find(|h| h.name.as_str() == name) else {
+    let Some(handle) = reg.get(&instance_id) else {
         return false;
     };
     // Bind to a local so the child-lock's temporary MutexGuard drops
@@ -1420,1157 +1159,12 @@ fn agent_is_alive(registry: &AgentRegistry, name: &str) -> bool {
     alive
 }
 
+/// `app` unit tests live in the sibling `tests.rs` (exempt from the src
+/// file-size invariant `tests/src_file_size_invariant.rs` by filename);
+/// `mod tests;` resolves to `tests.rs`, and its `use super::*` reaches this
+/// module's private items exactly as the former inline `mod tests {}` did.
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::backend::Backend;
-    use crate::layout::PaneSource;
-    use crate::vterm::VTerm;
-
-    /// Split-brain regression (2026-07-21 incident).
-    ///
-    /// `setup_app_bootstrap` used to funnel EVERY `bootstrap::prepare` failure
-    /// into one degraded arm: `attached_run_dir` stayed `None`, `run_app` read
-    /// that as Owned mode, and the app spawned a second copy of the whole fleet
-    /// while the real daemon was still running. Losing the singleton flock must
-    /// be classified as fatal; everything else must stay degradable so an
-    /// unparseable fleet.yaml does not lock the operator out of the only UI that
-    /// can repair it.
-    ///
-    /// The TUI path needs a real TTY (`app::run` bails without one), so the
-    /// classification is tested directly rather than by driving the app.
-    #[test]
-    fn singleton_conflict_is_fatal_but_other_bootstrap_failures_are_not() {
-        let conflict = anyhow::Error::new(crate::bootstrap::DaemonAlreadyRunning {
-            pid: Some(4242),
-            boot_unix: Some(1_784_604_392),
-        });
-        assert!(
-            is_singleton_conflict(&conflict),
-            "losing the daemon flock must be fatal — degrading here is the split-brain bug"
-        );
-
-        // Same shape, wrapped in operator-facing context the way callers add it.
-        let wrapped = conflict.context("refusing to start a second fleet");
-        assert!(
-            is_singleton_conflict(&wrapped),
-            "classification must survive `.context()` — callers always add guidance"
-        );
-
-        let unrelated = anyhow::anyhow!("fleet.yaml: mapping values are not allowed here");
-        assert!(
-            !is_singleton_conflict(&unrelated),
-            "unrelated bootstrap failures must keep the degraded-TUI escape hatch"
-        );
-    }
-
-    /// #t-84833-10 redraw-storm frame cap — the `should_draw` rate-limit decision.
-    #[test]
-    fn should_draw_caps_at_frame_rate() {
-        use std::time::{Duration, Instant};
-        let fi = Duration::from_millis(33);
-        let t0 = Instant::now();
-        assert!(should_draw(None, t0, fi), "first frame always draws");
-        assert!(
-            !should_draw(Some(t0), t0, fi),
-            "no draw immediately after a draw"
-        );
-        assert!(
-            !should_draw(Some(t0), t0 + Duration::from_millis(10), fi),
-            "10ms < interval → throttled"
-        );
-        assert!(
-            should_draw(Some(t0), t0 + Duration::from_millis(33), fi),
-            "interval elapsed → draw"
-        );
-        assert!(
-            should_draw(Some(t0), t0 + Duration::from_millis(500), fi),
-            "well past interval → draw"
-        );
-    }
-
-    /// #t-84833-10: the redraw count under a wakeup flood is bounded by the FRAME
-    /// RATE, not by the number of wakeups (the storm fix). 1000 wakeups packed into
-    /// ~100ms must yield only ~3-4 draws (100ms / 33ms), not 1000.
-    #[test]
-    fn frame_cap_bounds_draws_under_wakeup_flood() {
-        use std::time::{Duration, Instant};
-        let fi = Duration::from_millis(33);
-        let t0 = Instant::now();
-        let mut last_draw: Option<Instant> = None;
-        let mut draws = 0u32;
-        for i in 0..1000u64 {
-            let now = t0 + Duration::from_micros(i * 100); // 1000 wakeups over ~100ms
-            if should_draw(last_draw, now, fi) {
-                draws += 1;
-                last_draw = Some(now);
-            }
-        }
-        assert!(
-            draws <= 5,
-            "draws must be bounded by frame-rate, got {draws} for 1000 wakeups in 100ms"
-        );
-        assert!(
-            draws >= 3,
-            "but should still draw a few times across 100ms, got {draws}"
-        );
-    }
-
-    /// #84833-15 R2 perf: the notification-queue disk-scan count under a wakeup flood
-    /// is bounded by `NOTIF_SYNC_INTERVAL` (≥1s), not by the number of wakeups. A burst
-    /// of M wakeups inside one <1s window must yield exactly ONE scan (pre-fix = M);
-    /// crossing the ≥1s boundary admits exactly one more. Deterministic via constructed
-    /// `Instant`s (no wall-clock timing), threading `last_sync` like the render loop.
-    #[test]
-    fn notif_sync_throttle_bounds_disk_scans_per_window() {
-        use std::time::{Duration, Instant};
-        let interval = Duration::from_secs(1);
-        let t0 = Instant::now();
-
-        // First-frame semantics: never-scanned ⇒ scan now (badge correct at startup).
-        assert!(
-            should_sync_notifications(None, t0, interval),
-            "first frame always scans so the startup badge is correct"
-        );
-
-        // 200 wakeups packed into ~900ms (one <1s window) → exactly ONE scan.
-        let mut last_sync: Option<Instant> = None;
-        let mut scans = 0u32;
-        for i in 0..200u64 {
-            let now = t0 + Duration::from_micros(i * 4500); // ~900ms total, all < 1s
-            if should_sync_notifications(last_sync, now, interval) {
-                scans += 1;
-                last_sync = Some(now);
-            }
-        }
-        assert_eq!(
-            scans, 1,
-            "a wakeup burst within one <1s window must scan exactly once, got {scans}"
-        );
-
-        // Crossing the ≥1s boundary admits exactly one more scan...
-        let after = t0 + Duration::from_millis(1000);
-        assert!(
-            should_sync_notifications(last_sync, after, interval),
-            "≥1s since last scan → scan again"
-        );
-        last_sync = Some(after);
-        // ...and the next sub-1s wakeup is throttled again.
-        assert!(
-            !should_sync_notifications(last_sync, after + Duration::from_millis(500), interval),
-            "0.5s after the last scan → throttled"
-        );
-    }
-
-    /// #render-first phase-(b) F2 (r4): `bounded_join_attach_workers` must DETACH a
-    /// worker wedged past the deadline (so quit can't hang) while still joining the
-    /// finished ones. Deterministic via a parked thread held by a channel.
-    #[test]
-    fn bounded_join_detaches_wedged_worker_without_hanging() {
-        let (keep_tx, keep_rx) = std::sync::mpsc::channel::<()>();
-        // Wedged: blocks until keep_tx drops (held past the join below).
-        let wedged = std::thread::spawn(move || {
-            let _ = keep_rx.recv();
-        });
-        let quick = std::thread::spawn(|| {}); // finishes immediately
-        let start = std::time::Instant::now();
-        let detached = bounded_join_attach_workers(
-            vec![quick, wedged],
-            start + std::time::Duration::from_millis(150),
-        );
-        assert!(
-            start.elapsed() < std::time::Duration::from_secs(2),
-            "bounded join must not hang on a wedged worker (took {:?})",
-            start.elapsed()
-        );
-        assert_eq!(
-            detached, 1,
-            "the wedged worker is detached; the quick one is joined"
-        );
-        drop(keep_tx); // release the parked thread (cleanup)
-    }
-
-    /// restart-freeze 真嫌#1 (t-…55279) source-scan invariant: `app_teardown`'s
-    /// Owned-mode cleanup must (1) flip the shutdown flag so PTY-close handlers
-    /// fast-return, then (2) tear agents down through the shared parallel core
-    /// `terminate_agents_parallel` — NOT the old SEQUENTIAL per-tab `kill_agent`
-    /// loop (each blocking ≤5 s on `wait_for_child_exit`, ~6 s of the restart
-    /// freeze). Regression-proof: revert app_teardown to a `kill_agent` loop and
-    /// this fails.
-    #[test]
-    fn app_teardown_uses_parallel_core_not_sequential_kill_loop() {
-        let src = include_str!("mod.rs");
-        let start = src.find("fn app_teardown(").expect("app_teardown present");
-        let after = &src[start..];
-        let end = after
-            .find("fn is_text_composing_input(")
-            .unwrap_or(after.len());
-        let body = &after[..end];
-
-        assert!(
-            body.contains("app_shutdown_flag().store(true"),
-            "app_teardown must flip the shutdown flag before killing agents \
-             (fast PTY-close early-return, no crash events during teardown)"
-        );
-        assert!(
-            body.contains("terminate_agents_parallel("),
-            "app_teardown must route the kill through the shared parallel core"
-        );
-        assert!(
-            !body.contains("kill_agent("),
-            "#真嫌1: app_teardown must NOT use the sequential per-agent kill_agent \
-             loop (that is the ~6s restart-freeze regression)"
-        );
-    }
-
-    /// #1457 regression guard: submit detection must fire for ALL backends, not
-    /// just claude. If this regresses to claude-only, non-claude panes never
-    /// record a submit timestamp → `draft_state` sees `submit=0` → every
-    /// keystroke looks like a permanent unsent draft → notifications NEVER
-    /// deliver to them (strictly worse than the bug #1457 fixes).
-    #[test]
-    fn submit_detection_fires_for_all_backends() {
-        use crate::backend::Backend;
-        for b in [
-            Backend::ClaudeCode,
-            Backend::Codex,
-            Backend::KiroCli,
-            Backend::OpenCode,
-            Backend::Agy,
-        ] {
-            assert!(
-                pane_input_contains_submit(Some(&b), b"hello\r"),
-                "submit key must be detected for {b:?}"
-            );
-            assert!(
-                !pane_input_contains_submit(Some(&b), b"hello"),
-                "no submit key in plain text for {b:?}"
-            );
-        }
-        // No backend → never a submit (anonymous/unknown pane).
-        assert!(!pane_input_contains_submit(None, b"hello\r"));
-    }
-
-    fn tmp_home(suffix: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "agend-app-phase2-{}-{}",
-            suffix,
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).ok();
-        dir
-    }
-
-    /// #1726 completeness invariant — the guard that closes the recurring
-    /// #1002 / #982 / #1719 "app silently drops a handler" class. Compares two
-    /// independently-built `name()` sets (the full daemon pipeline vs app's actual
-    /// run set), so it has teeth and is not a tautology: a NEW handler added to
-    /// `build_default_handlers` lands in `all`, and unless app runs it OR it is
-    /// allowlisted, `missing` is non-empty → CI red.
-    #[test]
-    fn app_tick_handlers_cover_every_non_allowlisted_daemon_handler() {
-        use std::collections::HashSet;
-        let stale: crate::daemon::mcp_registry_watcher::DaemonBinaryStale =
-            Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let all: HashSet<&str> = crate::daemon::build_default_handlers(stale)
-            .iter()
-            .map(|h| h.name())
-            .collect();
-        let app: HashSet<&str> =
-            app_tick_handlers(Arc::new(std::sync::atomic::AtomicBool::new(false)))
-                .iter()
-                .map(|h| h.name())
-                .collect();
-
-        // Positive: every non-allowlisted daemon handler must run in app.
-        // #2413 PR-B: `snapshot_rotation` is CONDITIONALLY run (default-ON, kill-switched by
-        // `AGEND_APP_SNAPSHOT=0`), so it is exempt from the "must always run" check regardless
-        // of the ambient env — its default-on + reversibility is pinned separately by
-        // `snapshot_rotation_runs_in_app_mode_by_default_1720`.
-        let missing: Vec<&str> = all
-            .difference(&app)
-            .filter(|n| !APP_TICK_ALLOWLIST.contains(n))
-            .filter(|n| **n != "snapshot_rotation")
-            .copied()
-            .collect();
-        assert!(
-            missing.is_empty(),
-            "app-standalone must run these per_tick handlers (or add to APP_TICK_ALLOWLIST \
-             with a justification): {missing:?}"
-        );
-        // Negative probe: no stale allowlist entry — every allowlisted name must
-        // still exist in the daemon set (catches a renamed/removed handler).
-        for a in APP_TICK_ALLOWLIST {
-            assert!(
-                all.contains(a),
-                "stale APP_TICK_ALLOWLIST entry '{a}' — handler renamed or removed?"
-            );
-            assert!(
-                !app.contains(a),
-                "allowlisted handler '{a}' must NOT run in app-standalone"
-            );
-        }
-    }
-
-    /// #1694(a): the #685 recovery ladder must RUN in app mode — the live daemon
-    /// is app-standalone (`run_app`), never `run_core`, so allowlisting
-    /// `recovery_dispatcher` out left the whole ladder silently dead in production
-    /// (the #1720 / #1002 class). This pins it back IN the app run set.
-    #[test]
-    fn recovery_dispatcher_runs_in_app_mode_1694a() {
-        let names: Vec<&str> =
-            app_tick_handlers(Arc::new(std::sync::atomic::AtomicBool::new(false)))
-                .iter()
-                .map(|h| h.name())
-                .collect();
-        assert!(
-            names.contains(&"recovery_dispatcher"),
-            "recovery_dispatcher must RUN in app mode (#1694a) — got {names:?}"
-        );
-        assert!(
-            !APP_TICK_ALLOWLIST.contains(&"recovery_dispatcher"),
-            "recovery_dispatcher must NOT be allowlisted out of app mode (#1694a)"
-        );
-    }
-
-    /// #2413 Phase B live-fix: the Shadow Observer reducer driver must RUN in app mode —
-    /// the live fleet daemon is app-standalone (`run_app`), never `run_core`, so
-    /// allowlisting `shadow_observe` out (as #2433 did) left `observed_status` null on
-    /// every agent in production even with the flag on (the #1720/#685 class, same as
-    /// `recovery_dispatcher` #1694a). This pins it IN the app run set so a future edit
-    /// can't silently re-gate it to run_core-only. Goes through the REAL app-mode entry
-    /// (`app_tick_handlers` = the set `run_app` actually executes), not a direct
-    /// `handler.run()` — the unit-call seam is exactly what let DUAL/CI miss the gap.
-    #[test]
-    fn shadow_observe_runs_in_app_mode_2413() {
-        let names: Vec<&str> =
-            app_tick_handlers(Arc::new(std::sync::atomic::AtomicBool::new(false)))
-                .iter()
-                .map(|h| h.name())
-                .collect();
-        assert!(
-            names.contains(&"shadow_observe"),
-            "shadow_observe (the reducer driver) must RUN in app mode (#2413 live-fix) — \
-             got {names:?}"
-        );
-        assert!(
-            !APP_TICK_ALLOWLIST.contains(&"shadow_observe"),
-            "shadow_observe must NOT be allowlisted out of app mode (#2413 live-fix)"
-        );
-    }
-
-    /// #2413 PR-B (#1720-class fix): `snapshot_rotation` must RUN in app mode BY DEFAULT so
-    /// the live daemon writes `snapshot.json` every tick (it was allowlisted out → weeks-stale
-    /// → dispatch_idle/inbox/handoff/reply read stale state). Reversible: `AGEND_APP_SNAPSHOT=0`
-    /// restores the allowlisted-out behaviour. Pins both the default-on and the kill-switch.
-    #[test]
-    #[serial_test::serial(app_snapshot_killswitch)]
-    fn snapshot_rotation_runs_in_app_mode_by_default_1720() {
-        struct EnvGuard(Option<String>);
-        impl Drop for EnvGuard {
-            fn drop(&mut self) {
-                match &self.0 {
-                    Some(v) => std::env::set_var("AGEND_APP_SNAPSHOT", v),
-                    None => std::env::remove_var("AGEND_APP_SNAPSHOT"),
-                }
-            }
-        }
-        let _g = EnvGuard(std::env::var("AGEND_APP_SNAPSHOT").ok());
-        let names = |stale| {
-            app_tick_handlers(stale)
-                .iter()
-                .map(|h| h.name())
-                .collect::<Vec<_>>()
-        };
-
-        // Default (unset) → snapshot_rotation RUNS in app mode.
-        std::env::remove_var("AGEND_APP_SNAPSHOT");
-        assert!(
-            names(Arc::new(std::sync::atomic::AtomicBool::new(false)))
-                .contains(&"snapshot_rotation"),
-            "snapshot_rotation must RUN in app mode by default (#1720 live-fix)"
-        );
-        assert!(
-            !APP_TICK_ALLOWLIST.contains(&"snapshot_rotation"),
-            "snapshot_rotation must NOT be unconditionally allowlisted out (#1720 live-fix)"
-        );
-
-        // Kill-switch `=0` → reverts to the old allowlisted-out behaviour.
-        std::env::set_var("AGEND_APP_SNAPSHOT", "0");
-        assert!(
-            !names(Arc::new(std::sync::atomic::AtomicBool::new(false)))
-                .contains(&"snapshot_rotation"),
-            "AGEND_APP_SNAPSHOT=0 must restore the allowlisted-out behaviour (no app snapshot write)"
-        );
-    }
-
-    /// #2413 PR-B (#1720 live-fix) — END-TO-END verification on a /tmp home, driving the REAL
-    /// app-mode handler set + real `snapshot.json` + real `dispatch_idle` gate. The
-    /// operator-evidence proof of (a)(b)(c) with the `AGEND_APP_SNAPSHOT` on/off contrast:
-    ///   (a) app mode WRITES `snapshot.json` with the PROMOTED operated state (it was
-    ///       allowlisted out → weeks-stale → all snapshot readers saw stale state);
-    ///   (b) at a REAL false-idle (raw screen Idle + a high-confidence Active
-    ///       `observed_status`), `dispatch_idle` does NOT mis-fire — whereas a stale/raw
-    ///       `idle` snapshot WOULD — and the shared busy-gate `agent_is_busy`
-    ///       (inbox/handoff/reply) reads the agent as BUSY;
-    ///   (c) `AGEND_APP_SNAPSHOT=0` reverts (app does not write) — the reversible escape hatch.
-    #[cfg(unix)]
-    #[test]
-    #[serial_test::serial(shadow_observer)]
-    #[allow(clippy::unwrap_used, clippy::expect_used)]
-    fn pr_b_end_to_end_operated_state_app_mode_1720() {
-        use crate::daemon::dispatch_idle;
-        use crate::daemon::shadow::evidence::{Authority, Confidence};
-        use crate::daemon::shadow::reducer::{ObservedState, ObservedStatus};
-        use crate::snapshot::{agent_is_busy, agent_state_of, AgentSnapshot};
-
-        struct G(&'static str, Option<String>);
-        impl Drop for G {
-            fn drop(&mut self) {
-                match &self.1 {
-                    Some(v) => std::env::set_var(self.0, v),
-                    None => std::env::remove_var(self.0),
-                }
-            }
-        }
-        let _g = (
-            G(
-                "AGEND_SHADOW_OBSERVER",
-                std::env::var("AGEND_SHADOW_OBSERVER").ok(),
-            ),
-            G(
-                "AGEND_OBSERVED_DISPATCH",
-                std::env::var("AGEND_OBSERVED_DISPATCH").ok(),
-            ),
-            G(
-                "AGEND_APP_SNAPSHOT",
-                std::env::var("AGEND_APP_SNAPSHOT").ok(),
-            ),
-        );
-        std::env::set_var("AGEND_SHADOW_OBSERVER", "1");
-        std::env::remove_var("AGEND_OBSERVED_DISPATCH"); // default-ON
-        std::env::remove_var("AGEND_APP_SNAPSHOT"); // default-ON
-
-        let home = std::env::temp_dir().join(format!("agend-pr-b-e2e-{}", std::process::id()));
-        std::fs::create_dir_all(&home).ok();
-
-        // A false-idle agent: raw screen Idle (mk_test_handle default) + a high-confidence
-        // Active observed_status (the mid-API false-idle the reducer produces live).
-        let id = crate::types::InstanceId::default();
-        let handle = crate::agent::mk_test_handle("victim", id);
-        handle.core.lock().observed_status = Some(ObservedStatus {
-            state: ObservedState::Active,
-            authority: Authority::Hook,
-            confidence: Confidence::Strong,
-            evidence: vec![],
-            since_ms: 0,
-        });
-        let registry: crate::agent::AgentRegistry =
-            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::from([
-                (id, handle),
-            ])));
-        let externals: crate::agent::ExternalRegistry =
-            Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-        let configs = Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
-        let stale = || Arc::new(std::sync::atomic::AtomicBool::new(false));
-
-        // Run ONLY the app-set's snapshot_rotation handler (proves it IS in the real app set
-        // AND that running it writes snapshot.json). Returns whether the app set contained it.
-        let run_app_snapshot = || {
-            let ctx = crate::daemon::per_tick::TickContext {
-                home: &home,
-                registry: &registry,
-                externals: &externals,
-                configs: &configs,
-            };
-            let mut ran = false;
-            for h in app_tick_handlers(stale()) {
-                if h.name() == "snapshot_rotation" {
-                    h.run(&ctx);
-                    ran = true;
-                }
-            }
-            ran
-        };
-
-        // ══ (a)+(b): ON (default) — app writes snapshot.json with the PROMOTED operated state ══
-        assert!(
-            run_app_snapshot(),
-            "(a) app mode runs snapshot_rotation by default (un-allowlisted)"
-        );
-        assert_eq!(
-            agent_state_of(&home, "victim").as_deref(),
-            Some("active"),
-            "(a)+(b) app mode wrote snapshot.json with the PROMOTED operated state (false-idle → active)"
-        );
-        assert!(
-            agent_is_busy(&home, "victim"),
-            "(b) the shared busy-gate (inbox/handoff/reply) reads the false-idle agent as BUSY"
-        );
-
-        // (b) dispatch_idle: drive the real scan_and_emit on a past-threshold pending dispatch.
-        // Isolate the agent_state gate from the silence gate by holding silence > threshold, so
-        // ONLY agent_state decides suppress-vs-fire.
-        let save_snap = |state: &str| {
-            crate::snapshot::save(
-                &home,
-                &[AgentSnapshot {
-                    name: "victim".to_string(),
-                    backend_command: "claude".to_string(),
-                    args: vec![],
-                    working_dir: None,
-                    submit_key: "\r".to_string(),
-                    health_state: "healthy".to_string(),
-                    agent_state: state.to_string(),
-                    silent_secs: 9_999,
-                    output_silent_secs: 9_999,
-                }],
-            );
-        };
-        let make_overdue = |corr: &str| -> String {
-            let did =
-                dispatch_idle::record_dispatch(&home, "lead", "victim", Some(corr), "task", 60)
-                    .expect("recorded pending dispatch");
-            let p = dispatch_idle::pending_path(&home, &did);
-            let mut v: serde_json::Value =
-                serde_json::from_str(&std::fs::read_to_string(&p).unwrap()).unwrap();
-            v["issued_at"] =
-                serde_json::json!((chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339());
-            v["status"] = serde_json::json!("pending");
-            v["not_working_streak"] = serde_json::json!(0);
-            crate::store::atomic_write(&p, serde_json::to_string(&v).unwrap().as_bytes()).unwrap();
-            did
-        };
-        let status_of = |did: &str| -> String {
-            dispatch_idle::list_pending(&home)
-                .into_iter()
-                .find(|d| d.dispatch_id == *did)
-                .map(|d| format!("{:?}", d.status))
-                .unwrap_or_else(|| "DELETED".into())
-        };
-
-        // Promoted "active" → SUPPRESSED across DEBOUNCE+margin scans (never mis-fires).
-        save_snap("active");
-        let did_ok = make_overdue("corr-suppress");
-        for _ in 0..5 {
-            dispatch_idle::scan_and_emit(&home);
-        }
-        assert_eq!(
-            status_of(&did_ok),
-            "Pending",
-            "(b) dispatch_idle SUPPRESSED on the promoted false-idle — did NOT mis-fire"
-        );
-
-        // Contrast: a stale/raw "idle" snapshot (the pre-#1720-fix behaviour) → FIRES (Exceeded).
-        save_snap("idle");
-        let did_fire = make_overdue("corr-fire");
-        for _ in 0..5 {
-            dispatch_idle::scan_and_emit(&home);
-        }
-        assert_eq!(
-            status_of(&did_fire),
-            "Exceeded",
-            "(b-baseline) a stale 'idle' snapshot MIS-FIRES (the bug PR-B fixes for the live daemon)"
-        );
-
-        // ══ (c): AGEND_APP_SNAPSHOT=0 reverts — app does NOT write the snapshot ══
-        std::env::set_var("AGEND_APP_SNAPSHOT", "0");
-        assert!(
-            !run_app_snapshot(),
-            "(c) AGEND_APP_SNAPSHOT=0 reverts: app mode does NOT run snapshot_rotation"
-        );
-
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #2413 Phase B live-fix companion: the reducer driver is useless without the
-    /// hook-event SOCKET SERVER feeding its buffer, and `shadow::start` is the only thing
-    /// that binds it. `run_core` already calls it; this source-pins that `run_app` does
-    /// too, so the plane can't be half-wired in app mode again (driver runs, but folds an
-    /// always-empty buffer). The behavioural end-to-end (flag-on → observed_status
-    /// populated) is the operator's live dogfood; this is the cheap cross-platform guard.
-    ///
-    /// Scans ONLY the production region (before the `#[cfg(test)]` cutoff). This
-    /// assertion's own needle literal lives in the test module below, so a WHOLE-FILE
-    /// substring check would self-match and stay green even if the real `run_app` call
-    /// were deleted — the #2433 vacuous-pin class this very PR fixes (DUAL round-1 caught
-    /// it here). Mirrors `run_app_registers_event_bus_subscribers`. REVERSE-MUTATION
-    /// verified: deleting the real `shadow::start(&home)` call from run_app turns this RED.
-    #[test]
-    fn run_app_wires_shadow_socket_server_2413() {
-        let source = std::fs::read_to_string("src/app/mod.rs")
-            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
-            .expect("source file must be readable from test cwd");
-        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
-        assert!(
-            prod.contains("crate::daemon::shadow::start("),
-            "run_app must start the Shadow Observer hook-socket server in the PRODUCTION \
-             region (#2413 live-fix) — gating it to run_core left the whole plane dead in \
-             the app-mode live daemon. No 'crate::daemon::shadow::start(&home)' before the \
-             #[cfg(test)] cutoff"
-        );
-    }
-
-    /// #1726 must-verify: app-standalone runs these handlers with EMPTY
-    /// externals/configs (it has no external-agent / AgentConfig registry) and a
-    /// possibly-empty registry. None may panic — `run_handlers` has catch_unwind,
-    /// but we want a clean no-op degrade, so we call each `run()` directly (no
-    /// catch) and a panic fails the test.
-    #[test]
-    fn app_tick_handlers_no_panic_on_empty_context() {
-        let home = tmp_home("tick-empty-ctx");
-        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let externals: crate::agent::ExternalRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let configs: crate::api::ConfigRegistry = Arc::new(Mutex::new(HashMap::new()));
-        let ctx = crate::daemon::per_tick::TickContext {
-            home: &home,
-            registry: &registry,
-            externals: &externals,
-            configs: &configs,
-        };
-        for h in app_tick_handlers(Arc::new(std::sync::atomic::AtomicBool::new(false))) {
-            h.run(&ctx); // panic here = test failure
-        }
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    fn pane(name: &str) -> Pane {
-        Pane {
-            agent_name: name.into(),
-            instance_id: crate::types::InstanceId::default(),
-            vterm: VTerm::new(10, 10),
-            rx: crossbeam_channel::bounded(1).1,
-            id: 1,
-            backend: None,
-            working_dir: None,
-            display_name: None,
-            scroll_offset: 0,
-            has_notification: false,
-            fleet_instance_name: None,
-            last_input_at: None,
-            pending_notification_count: 0,
-            pending_decision_count: 0,
-            selection: None,
-            source: PaneSource::Local,
-            offthread: None,
-            _fwd_cancel: None,
-        }
-    }
-
-    /// #2967 RED: `sync_notification_state` must perform exactly ONE
-    /// queue-directory `read_dir` per pass, across ALL panes/tabs — not one
-    /// per pane (the shape the #84833-15 comment above `NOTIF_SYNC_INTERVAL`
-    /// already documents). Pre-fix (`pending_count` called per pane, each
-    /// doing its own `list_draining_files` `read_dir`) this fails with N
-    /// (here 5, spread across 3 tabs); post-fix
-    /// (`QueueDirSnapshot::scan` once, `pending_count` reading from the
-    /// snapshot) it is exactly 1. Every agent is idle (nothing queued) so no
-    /// content read is exercised here — this test is purely about the
-    /// `read_dir` count.
-    #[test]
-    fn sync_notification_state_performs_exactly_one_dir_scan_2967() {
-        let home = tmp_home("sync-notif-dirscan");
-        let mut layout = Layout::new();
-        // 5 panes across 3 tabs, each a distinct agent — mirrors a real
-        // multi-tab fleet session.
-        layout
-            .tabs
-            .push(crate::layout::Tab::new("tab0".into(), pane("agent0")));
-        layout.tabs[0].split_focused(crate::layout::SplitDir::Horizontal, pane("agent1"));
-        layout
-            .tabs
-            .push(crate::layout::Tab::new("tab1".into(), pane("agent2")));
-        layout.tabs[1].split_focused(crate::layout::SplitDir::Horizontal, pane("agent3"));
-        layout
-            .tabs
-            .push(crate::layout::Tab::new("tab2".into(), pane("agent4")));
-
-        notification_queue::reset_scan_counters();
-        sync_notification_state(&home, &mut layout);
-
-        assert_eq!(
-            notification_queue::dir_scan_count(),
-            1,
-            "a sync_notification_state pass over 5 panes must perform exactly ONE \
-             queue-directory read_dir, not one per pane"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #982 RC wiring-pin: assert `flush_idle_notifications` invokes
-    /// the submit-aware injector (`inject_notification_with_submit`)
-    /// so queued hints get the backend `submit_key` applied on flush.
-    ///
-    /// Implemented as a file-level source pin — the raw
-    /// `inject_notification` was deleted in this PR, so the negative
-    /// half of the invariant is compile-time enforced. The positive
-    /// half (this assertion) is platform-agnostic and survives
-    /// rustfmt re-wrapping. Companion test:
-    /// `inbox::tests::t15_composing_flush_uses_submit_aware_inject`
-    /// pins the JSON payload contract end-to-end.
-    #[test]
-    fn flush_idle_notifications_wired_to_submit_aware_inject() {
-        let source = std::fs::read_to_string("src/app/mod.rs")
-            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
-            .expect("source file must be readable from test cwd");
-        // Search only the production region. This assertion's own literal
-        // lives in the #[cfg(test)] module below, so a whole-file substring
-        // check self-matches and would stay green even if the real call were
-        // deleted. Require the call form (with `(`) before the test cutoff.
-        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
-        assert!(
-            prod.contains("inject_notification_with_submit("),
-            "flush_idle_notifications must wire the submit-aware injector \
-             (#982 reviewer #999 verdict) — no call to \
-             'inject_notification_with_submit(' found in the production region \
-             of src/app/mod.rs"
-        );
-    }
-
-    // ── #1944: buffer-aware draft gate (the operator-facing fix) ──
-
-    /// Build a pane whose live `vterm` renders `screen` with `backend`. The term
-    /// is `VTerm::new(cols, rows)` — wide enough that input lines don't wrap, and
-    /// few enough rows that the content stays within `DRAFT_INPUT_TAIL_ROWS`.
-    fn pane_with_screen(name: &str, backend: Option<Backend>, screen: &str) -> Pane {
-        let mut p = pane(name);
-        p.backend = backend;
-        p.vterm = crate::vterm::VTerm::new(80, 6);
-        p.vterm.process(screen.as_bytes());
-        p
-    }
-
-    /// Set up a recent unsent draft (typed_ms > submit_ms → `Drafting`) and one
-    /// queued notification for `agent` under `home`.
-    fn seed_drafting_with_queued(home: &Path, agent: &str) {
-        let now = chrono::Utc::now().timestamp_millis();
-        crate::agent_ops::save_metadata(
-            home,
-            agent,
-            "last_input_epoch_ms",
-            serde_json::json!(now - 30_000),
-        );
-        crate::agent_ops::save_metadata(
-            home,
-            agent,
-            "last_submit_epoch_ms",
-            serde_json::json!(now - 60_000),
-        );
-        notification_queue::enqueue(home, agent, "[AGEND-MSG-PENDING] peer report")
-            .expect("enqueue test notification");
-    }
-
-    /// #1944 §3.9: a stale type-then-clear draft (typed_ms > submit_ms but the
-    /// input box is EMPTY) must DELIVER — the old timestamp-only gate held it.
-    #[test]
-    fn draft_gate_delivers_when_input_box_empty() {
-        let home = tmp_home("draftgate-empty");
-        seed_drafting_with_queued(&home, "lead");
-        // claude pane, input box empty (`❯ ` with nothing typed).
-        let mut p = pane_with_screen("lead", Some(Backend::ClaudeCode), "❯ ");
-        p.pending_notification_count = notification_queue::pending_count(&home, "lead");
-
-        let mut injected: Vec<String> = Vec::new();
-        flush_notifications_for_pane(&home, &mut p, |t| {
-            injected.push(t.to_string());
-            Ok(())
-        });
-        assert_eq!(
-            injected.len(),
-            1,
-            "empty input box → the stale-draft message must be delivered, not held"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #1944 §3.9: a REAL live draft (text in the input box) must still DEFER —
-    /// the draft-protection invariant is unchanged.
-    #[test]
-    fn draft_gate_defers_when_input_box_has_text() {
-        let home = tmp_home("draftgate-typed");
-        seed_drafting_with_queued(&home, "lead");
-        let mut p = pane_with_screen("lead", Some(Backend::ClaudeCode), "❯ half-typed reply");
-        p.pending_notification_count = notification_queue::pending_count(&home, "lead");
-
-        let mut injected: Vec<String> = Vec::new();
-        flush_notifications_for_pane(&home, &mut p, |t| {
-            injected.push(t.to_string());
-            Ok(())
-        });
-        assert!(
-            injected.is_empty(),
-            "a real draft (text in the box) must keep deferring (protection unchanged)"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #1944 §3.9: a backend with no prompt marker (Shell) → buffer-emptiness is
-    /// undeterminable → fall back to the timestamp behavior (defer), fail toward
-    /// draft-protection. Same outcome for a claude pane mid-output (no prompt in
-    /// the tail) — covered by `input_box_none_when_marker_absent`.
-    #[test]
-    fn draft_gate_falls_back_to_timestamp_for_markerless_backend() {
-        let home = tmp_home("draftgate-shell");
-        seed_drafting_with_queued(&home, "lead");
-        // Shell has no input_prompt_marker → None → keep the raw Drafting defer.
-        let mut p = pane_with_screen("lead", Some(Backend::Shell), "$ ");
-        p.pending_notification_count = notification_queue::pending_count(&home, "lead");
-
-        let mut injected: Vec<String> = Vec::new();
-        flush_notifications_for_pane(&home, &mut p, |t| {
-            injected.push(t.to_string());
-            Ok(())
-        });
-        assert!(
-            injected.is_empty(),
-            "markerless backend → fail toward protection (timestamp-only defer)"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #1948 v2 §3.9: kiro has no prompt marker but its empty box shows a
-    /// placeholder — a cleared kiro pane (placeholder visible) must DELIVER.
-    #[test]
-    fn draft_gate_delivers_for_kiro_when_placeholder_visible() {
-        let home = tmp_home("draftgate-kiro-empty");
-        seed_drafting_with_queued(&home, "lead");
-        // cleared kiro box: the real placeholder is visible (no typed content).
-        let mut p = pane_with_screen(
-            "lead",
-            Some(Backend::KiroCli),
-            "Kiro auto\n\n ask a question or describe a task ↵\n /copy",
-        );
-        p.pending_notification_count = notification_queue::pending_count(&home, "lead");
-
-        let mut injected: Vec<String> = Vec::new();
-        flush_notifications_for_pane(&home, &mut p, |t| {
-            injected.push(t.to_string());
-            Ok(())
-        });
-        assert_eq!(
-            injected.len(),
-            1,
-            "kiro cleared (placeholder visible) → stale draft delivered, not held"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #1948 v2 §3.9: a kiro pane with a real draft (placeholder replaced by typed
-    /// text) must still DEFER — protection unchanged.
-    #[test]
-    fn draft_gate_defers_for_kiro_when_typed() {
-        let home = tmp_home("draftgate-kiro-typed");
-        seed_drafting_with_queued(&home, "lead");
-        let mut p = pane_with_screen("lead", Some(Backend::KiroCli), "Kiro auto\n\n half typed\n");
-        p.pending_notification_count = notification_queue::pending_count(&home, "lead");
-
-        let mut injected: Vec<String> = Vec::new();
-        flush_notifications_for_pane(&home, &mut p, |t| {
-            injected.push(t.to_string());
-            Ok(())
-        });
-        assert!(
-            injected.is_empty(),
-            "kiro with text (placeholder gone) → keep deferring (protection unchanged)"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #1948(b) §3.9: codex's empty box shows DIM ghost text after `›` (SGR 2) —
-    /// the dim-aware path must DELIVER (the v1 plain-marker path mis-read the ghost
-    /// as typed content and held). The vterm processes the real SGR so the dim
-    /// flag is set exactly as codex emits it.
-    #[test]
-    fn draft_gate_delivers_for_codex_when_ghost_is_dim() {
-        let home = tmp_home("draftgate-codex-ghost");
-        seed_drafting_with_queued(&home, "lead");
-        // `ESC[1m›` (bold prompt) + `ESC[2m…` (dim ghost) — codex's real encoding.
-        let screen = "\u{1b}[1m›\u{1b}[22m\u{1b}[2m Use /skills to list available skills\u{1b}[0m";
-        let mut p = pane_with_screen("lead", Some(Backend::Codex), screen);
-        p.pending_notification_count = notification_queue::pending_count(&home, "lead");
-
-        let mut injected: Vec<String> = Vec::new();
-        flush_notifications_for_pane(&home, &mut p, |t| {
-            injected.push(t.to_string());
-            Ok(())
-        });
-        assert_eq!(
-            injected.len(),
-            1,
-            "codex empty box (dim ghost after ›) → stale draft delivered, not held"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    /// #1948(b) §3.9: a real codex draft (normal-intensity text after `›`) must
-    /// still DEFER — the dim signal must not false-deliver on a real draft.
-    #[test]
-    fn draft_gate_defers_for_codex_when_input_normal_intensity() {
-        let home = tmp_home("draftgate-codex-typed");
-        seed_drafting_with_queued(&home, "lead");
-        // `ESC[1m›` then NORMAL intensity input (no SGR 2).
-        let screen = "\u{1b}[1m›\u{1b}[22m my actual draft reply\u{1b}[0m";
-        let mut p = pane_with_screen("lead", Some(Backend::Codex), screen);
-        p.pending_notification_count = notification_queue::pending_count(&home, "lead");
-
-        let mut injected: Vec<String> = Vec::new();
-        flush_notifications_for_pane(&home, &mut p, |t| {
-            injected.push(t.to_string());
-            Ok(())
-        });
-        assert!(
-            injected.is_empty(),
-            "codex with normal-intensity input → keep deferring (protection unchanged)"
-        );
-        std::fs::remove_dir_all(&home).ok();
-    }
-
-    #[test]
-    fn input_prompt_marker_only_for_verified_backends() {
-        assert_eq!(Backend::ClaudeCode.input_prompt_marker(), Some("❯"));
-        assert_eq!(Backend::Agy.input_prompt_marker(), Some(">"));
-        // #1948 codex follow-up: codex is NOT marker-covered — its empty box shows
-        // a rotating ghost phrase after `›`, which the PLAIN marker probe mis-reads
-        // as typed content. #1948(b): codex is instead covered via the DIM-aware
-        // path (`input_dim_ghost_marker`) — the ghost is dim, real input is normal.
-        assert_eq!(Backend::Codex.input_prompt_marker(), None);
-        assert_eq!(Backend::Codex.input_empty_placeholder(), None);
-        assert_eq!(Backend::Codex.input_dim_ghost_marker(), Some("›"));
-        assert_eq!(Backend::Shell.input_prompt_marker(), None);
-        assert_eq!(Backend::OpenCode.input_prompt_marker(), None);
-        // #1948 v2: kiro covered via placeholder, NOT a marker; opencode stays
-        // fully fallback (no marker, no placeholder).
-        assert_eq!(Backend::KiroCli.input_prompt_marker(), None);
-        assert_eq!(
-            Backend::KiroCli.input_empty_placeholder(),
-            Some("ask a question or describe a task")
-        );
-        assert_eq!(Backend::OpenCode.input_empty_placeholder(), None);
-        assert_eq!(Backend::ClaudeCode.input_empty_placeholder(), None);
-        // dim-ghost is codex-only: the marker-backends and kiro are NOT dim-aware.
-        assert_eq!(Backend::ClaudeCode.input_dim_ghost_marker(), None);
-        assert_eq!(Backend::Agy.input_dim_ghost_marker(), None);
-        assert_eq!(Backend::KiroCli.input_dim_ghost_marker(), None);
-    }
-
-    /// app-mode subscriber-wiring source pin. Owned `agend-terminal app` mode
-    /// never calls `daemon::run_core`, so `run_app` MUST itself register the
-    /// event-bus subscribers — otherwise the maintenance tick emits `CronFire` /
-    /// `CiReady` / idle nudges into an empty bus and every delivery silently
-    /// drops (the live #1720 cron silent-drop; regression class #1002 / #982).
-    ///
-    /// File-level positive pin (cross-platform-safe; survives rustfmt re-wrap),
-    /// same pattern as `flush_idle_notifications_wired_to_submit_aware_inject`.
-    /// The functional counterpart —
-    /// `cron_tick::tests::global_bus_cron_subscriber_delivers` — proves the
-    /// registered set actually delivers a CronFire on the process-global bus.
-    #[test]
-    fn run_app_registers_event_bus_subscribers() {
-        let source = std::fs::read_to_string("src/app/mod.rs")
-            .or_else(|_| std::fs::read_to_string("agend-terminal/src/app/mod.rs"))
-            .expect("source file must be readable from test cwd");
-        // Search only the production region. This assertion's own literal
-        // lives in the #[cfg(test)] module below, so a whole-file substring
-        // check self-matches and would stay green even if the real call were
-        // deleted. Require the call form (with `(`) before the test cutoff.
-        let prod = &source[..source.find("#[cfg(test)]").unwrap_or(source.len())];
-        assert!(
-            prod.contains("register_event_subscribers("),
-            "run_app must call daemon::register_event_subscribers in owned mode \
-             (app mode never reaches run_core's registration — #1720 app-mode \
-             silent-drop root fix). No call to 'register_event_subscribers(' \
-             found in the production region of src/app/mod.rs"
-        );
-    }
-
-    #[test]
-    fn flush_drains_queue_on_idle() {
-        let home = tmp_home("flush");
-        let mut pane = pane("agent1");
-        notification_queue::enqueue(&home, "agent1", "queued").expect("queue notification");
-        pane.pending_notification_count = notification_queue::pending_count(&home, "agent1");
-        let mut flushed = Vec::new();
-        flush_notifications_for_pane(&home, &mut pane, |text| {
-            flushed.push(text.to_string());
-            Ok(())
-        });
-        assert_eq!(flushed, vec!["queued".to_string()]);
-        assert_eq!(pane.pending_notification_count, 0);
-        std::fs::remove_dir_all(home).ok();
-    }
-
-    #[test]
-    fn flush_respects_disk_compose_state_for_fresh_pane() {
-        let home = tmp_home("flush-compose-disk");
-        let mut pane = pane("agent1");
-        notification_queue::record_input_activity(&home, "agent1");
-        notification_queue::flush_pending_input_activity(&home);
-        notification_queue::enqueue(&home, "agent1", "queued").expect("queue notification");
-        pane.pending_notification_count = notification_queue::pending_count(&home, "agent1");
-
-        let mut flushed = Vec::new();
-        flush_notifications_for_pane(&home, &mut pane, |text| {
-            flushed.push(text.to_string());
-            Ok(())
-        });
-
-        assert!(
-            flushed.is_empty(),
-            "fresh pane must respect disk compose state"
-        );
-        assert_eq!(pane.pending_notification_count, 1);
-        std::fs::remove_dir_all(home).ok();
-    }
-
-    // -----------------------------------------------------------------------
-    // #1762: draft detection — only text-composing input marks a draft
-    // -----------------------------------------------------------------------
-
-    /// #1762: navigation / control keys + lone whitespace are NOT text-composing
-    /// (they must not defer actionable injects), while real character input,
-    /// UTF-8, and bracketed paste ARE (so #1675 still protects a live draft).
-    /// Byte forms mirror `tui::key_to_bytes`.
-    #[test]
-    fn is_text_composing_input_excludes_nav_control_whitespace_1762() {
-        // Navigation / control (ESC-prefixed) → NOT composing.
-        for seq in [
-            &b"\x1b[A"[..], // Up
-            b"\x1b[B",      // Down
-            b"\x1b[C",      // Right
-            b"\x1b[D",      // Left
-            b"\x1b[H",      // Home
-            b"\x1b[F",      // End
-            b"\x1b[5~",     // PageUp
-            b"\x1b[6~",     // PageDown
-            b"\x1b[3~",     // Delete
-            b"\x1b[Z",      // Shift+Tab (BackTab)
-            b"\x1bOP",      // F1
-            b"\x1b",        // Esc
-            b"\x1ba",       // Alt+a
-        ] {
-            assert!(
-                !is_text_composing_input(seq),
-                "ESC-seq {seq:?} must NOT be text-composing"
-            );
-        }
-        // Bare control bytes → NOT composing.
-        assert!(!is_text_composing_input(&[0x01])); // Ctrl+A
-        assert!(!is_text_composing_input(b"\t")); // Tab
-        assert!(!is_text_composing_input(&[0x7f])); // Backspace (DEL)
-        assert!(!is_text_composing_input(b"\r")); // Enter (submit — counted separately)
-        assert!(!is_text_composing_input(b"\n")); // Shift+Enter
-                                                  // Lone whitespace → NOT composing (#1762 fat-fingered space).
-        assert!(!is_text_composing_input(b" "));
-        assert!(!is_text_composing_input(b"   "));
-        assert!(!is_text_composing_input(&[])); // empty
-
-        // Real character input → IS composing.
-        assert!(is_text_composing_input(b"a"));
-        assert!(is_text_composing_input(b"hello"));
-        assert!(is_text_composing_input(b"hi there")); // space among text still composing
-        assert!(is_text_composing_input("café".as_bytes())); // UTF-8
-        assert!(is_text_composing_input("日本語".as_bytes())); // multibyte
-                                                               // Bracketed paste wraps PASTED TEXT → composing.
-        assert!(is_text_composing_input(b"\x1b[200~pasted\x1b[201~"));
-    }
-
-    /// #1762 behavioral contract: exercising the exact gate `write_to_focused`
-    /// applies (`if is_text_composing_input(bytes) { record_input_activity }`),
-    /// a navigation key leaves the pane Clean (actionable injects NOT deferred),
-    /// while real typing marks it Drafting (#1675 still protects a live draft).
-    /// (`write_to_focused` itself needs a PTY-backed Layout; the wiring is the
-    /// 3-line gate, exercised here against the real predicate + draft_state.)
-    #[test]
-    fn nav_key_does_not_defer_but_typing_does_1762() {
-        let home = tmp_home("1762-behavior");
-        let agent = "agent1";
-
-        // (a) operator browses history with Up while idle → gate skips → no draft.
-        let up = b"\x1b[A";
-        if is_text_composing_input(up) {
-            notification_queue::record_input_activity(&home, agent);
-            notification_queue::flush_pending_input_activity(&home);
-        }
-        assert_eq!(
-            notification_queue::draft_state(&home, agent),
-            notification_queue::DraftState::None,
-            "#1762: a nav key must NOT mark a draft → actionable notif not deferred"
-        );
-
-        // (b) operator types real text → gate records → draft present (deferred).
-        if is_text_composing_input(b"hello") {
-            notification_queue::record_input_activity(&home, agent);
-            notification_queue::flush_pending_input_activity(&home);
-        }
-        assert_eq!(
-            notification_queue::draft_state(&home, agent),
-            notification_queue::DraftState::Drafting,
-            "#1762: real typing still marks a draft (#1675 preserved)"
-        );
-        std::fs::remove_dir_all(home).ok();
-    }
-
-    // -----------------------------------------------------------------------
-    // Regression pins: app mode tick consumers (t-20260423022134)
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn app_mode_fires_one_shot_schedule() {
-        // Write a one-shot schedule with past run_at directly to disk,
-        // call check_schedules, verify it fires (auto-disabled).
-        let home = tmp_home("sched-fire");
-        let past = (chrono::Utc::now() - chrono::Duration::seconds(2)).to_rfc3339();
-        let store_json = serde_json::json!({
-            "schema_version": 2,
-            "schedules": [{
-                "id": "s-test-oneshot",
-                "message": "ping",
-                "target": "nonexistent-agent",
-                "trigger": {"kind": "once", "at": past},
-                "enabled": true,
-                "timezone": "UTC",
-                "label": "test-oneshot",
-                "created_at": chrono::Utc::now().to_rfc3339(),
-                "updated_at": chrono::Utc::now().to_rfc3339(),
-                "run_history": []
-            }]
-        });
-        std::fs::create_dir_all(&home).expect("create home");
-        std::fs::write(
-            home.join("schedules.json"),
-            serde_json::to_string_pretty(&store_json).expect("serialize"),
-        )
-        .expect("write schedule file");
-
-        // Fire the tick — schedule is past due, should trigger.
-        crate::daemon::cron_tick::check_schedules(&home);
-
-        // Verify: schedule should now be disabled (one-shot auto-disable).
-        let store = crate::schedules::load(&home);
-        let sched = store.schedules.iter().find(|s| s.id == "s-test-oneshot");
-        assert!(
-            sched.is_some_and(|s| !s.enabled),
-            "one-shot schedule must be auto-disabled after firing"
-        );
-        std::fs::remove_dir_all(home).ok();
-    }
-
-    #[test]
-    fn app_mode_health_decay_runs() {
-        // Verify health.maybe_decay() is callable on an agent handle —
-        // binding test that the tick consumer code path compiles and
-        // exercises the health decay method.
-        use crate::health::HealthTracker;
-        let mut health = HealthTracker::new();
-        // maybe_decay on a fresh tracker should not panic or change state.
-        health.maybe_decay(true);
-        assert_eq!(
-            health.state.display_name(),
-            "healthy",
-            "fresh tracker should remain healthy after decay tick"
-        );
-    }
-}
+mod tests;
 
 /// #2453 R2 slice 2 — preflight failure proves ZERO teardown. `Prepared` is the
 /// ONLY `ProbePoll` variant that can lead the TUI loop into the irreversible
@@ -2606,6 +1200,24 @@ mod probe_poll_tests {
             },
             rx,
         )
+    }
+
+    #[test]
+    fn remote_restart_teardown_drops_outcome_receiver_before_join_3649() {
+        let source = include_str!("mod.rs")
+            .split("#[cfg(test)]")
+            .next()
+            .unwrap_or_default();
+        let drop_at = source
+            .find("drop(remote_restart_outcome_rx)")
+            .expect("teardown must close the outcome receiver");
+        let join_at = source
+            .find("remote_restart_worker.join()")
+            .expect("teardown must join the restart worker");
+        assert!(
+            drop_at < join_at,
+            "closing the outcome receiver must precede joining the worker"
+        );
     }
 
     #[test]
@@ -2664,3 +1276,6 @@ mod restart_resume_tests;
 // anti-monolith ratchet and may not grow.
 #[cfg(test)]
 mod appstate_2453_tests;
+
+#[cfg(test)]
+mod reap_workers_3420_tests;

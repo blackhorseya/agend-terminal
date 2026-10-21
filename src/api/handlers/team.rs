@@ -13,7 +13,11 @@ pub(crate) fn handle_update_team(params: &Value, ctx: &HandlerCtx) -> Value {
         Some(n) => n.to_string(),
         None => return json!({"ok": false, "error": "missing name"}),
     };
-    let outcome = crate::teams::update_with_diff(ctx.home, params);
+    let outcome = crate::teams::update_with_diff_authorized(
+        ctx.home,
+        params,
+        crate::teams::TeamUpdateCaller::Operator,
+    );
     if outcome.result.get("error").is_none() {
         if let Some(n) = ctx.notifier {
             let diff_nonempty = !outcome.added.is_empty() || !outcome.removed.is_empty();
@@ -23,6 +27,11 @@ pub(crate) fn handle_update_team(params: &Value, ctx: &HandlerCtx) -> Value {
                     name: team_name.clone(),
                     added: outcome.added.clone(),
                     removed: outcome.removed.clone(),
+                });
+            }
+            if outcome.config_changed && !diff_nonempty {
+                n.notify(ApiEvent::ConfigChanged {
+                    name: team_name.clone(),
                 });
             }
         }
@@ -81,6 +90,7 @@ pub(crate) fn handle_create_team(params: &Value, ctx: &HandlerCtx) -> Value {
             accept_from,
         },
         ctx.registry,
+        ctx.configs,
         ctx.notifier.map(|n| n.as_ref()),
     )
 }

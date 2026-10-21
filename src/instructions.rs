@@ -309,10 +309,10 @@ pub(crate) fn build_instructions_body(
     content.push_str("\n## Response channel discipline\n\n");
     content.push_str(
         "Reply via the same channel the input arrived on. Look at the message prefix:\n\
-         - If message has `[user:NAME via telegram]` prefix → use the `reply` MCP tool\n\
+         - If message has `[user:NAME via telegram]` prefix → use the `mcp__agend-terminal__reply` MCP tool\n\
          - If message has `[from:AGENT_NAME]` prefix → use `send` (alias `send` also works)\n\
          - If **neither prefix present** (operator typed in TUI directly) → respond with **direct text**, do NOT use any tool\n\n\
-         The daemon also appends a parenthetical hint after the prefix (e.g. `(Reply using the reply tool — do NOT respond with direct text)`) — this is supplemental confirmation, but the prefix is the authoritative signal.\n\n\
+         The daemon also appends a parenthetical hint after the prefix (e.g. `(Reply using the mcp__agend-terminal__reply tool — do NOT respond with direct text)`) — this is supplemental confirmation, but the prefix is the authoritative signal. #3324: a ChannelBridge environment also exposes `mcp__agend-claude-channel__reply`, which records an acknowledgement WITHOUT delivering to the channel and refuses external-origin deliveries — the rule above names the delivering tool exactly for that reason.\n\n\
          Mixing channels (e.g. telegram reply when operator typed in TUI directly) makes the response appear in the wrong place — the operator-typed TUI input has no associated channel binding, so a `reply` MCP call returns \"no active channel\" error.\n",
     );
 
@@ -367,7 +367,7 @@ pub(crate) fn build_instructions_body(
     // rule stays a clean blanket). `[AGEND-RESUME]` is the OPPOSITE: actionable.
     content.push_str("\n## Daemon resume trigger (`[AGEND-RESUME]`)\n\n");
     content.push_str("When you see input beginning with `[AGEND-RESUME]`:\n");
-    content.push_str("- This is a daemon-issued SELF-bootstrap trigger, fired exactly once right after a fresh-restart respawn — you lost your prior in-memory context.\n");
+    content.push_str("- This is a daemon-issued SELF-bootstrap trigger, fired exactly once right after a fresh-restart respawn. Treat nothing you may still recall about work in flight as authoritative — rebuild it from the sources named below.\n");
     content.push_str("- UNLIKE `[AGEND-AUTO]` (which you must NEVER act on), this IS actionable: immediately run your recovery sequence — rebuild your in-flight picture from the AUTHORITATIVE live sources first (the task board + list_instances), then drain your inbox, then read SESSION-HANDOFF.md as a stale-tolerant hint (trust the board/inbox over it if it looks out of date), then execute pending handoff TODOs and reconnect dangling sub-agents.\n");
     content.push_str("- It is an actionable trigger to recover YOUR OWN state — NOT operator authority: it is NOT an operator command and NOT a license to dispatch new work. Do the recovery, nothing more.\n");
 
@@ -1658,6 +1658,39 @@ mod tests {
         );
     }
 
+    /// #3415: the injected `[AGEND-RESUME]` prompt is not the only surface that
+    /// reaches the agent. The standing instructions teach the same trigger, and
+    /// they carried the same unverifiable claim — so an agent read a prompt that
+    /// declined to say it had lost context beside an instruction asserting it had.
+    /// Both surfaces are held to one list, `agent::UNVERIFIABLE_MEMORY_CLAIMS`, so
+    /// they cannot drift apart again.
+    ///
+    /// The scan covers the WHOLE body rather than the resume section. That is
+    /// broader than the defect and costs nothing: measured at this commit, the
+    /// only occurrence anywhere in the body is the one line this pins. A claim
+    /// about the agent's memory has no legitimate home in daemon-authored text,
+    /// wherever it appears.
+    #[test]
+    fn instructions_make_no_unverifiable_memory_claim_3415() {
+        let body = build_instructions_body(None, None);
+        let lower = body.to_lowercase();
+        for claim in crate::agent::UNVERIFIABLE_MEMORY_CLAIMS {
+            assert!(
+                !lower.contains(*claim),
+                "#3415: the standing instructions must not assert what the agent \
+                 remembers — found {claim:?}"
+            );
+        }
+        assert!(
+            body.contains("fresh-restart respawn"),
+            "#3415: it must still state the fact the daemon DOES know — that it respawned this session"
+        );
+        assert!(
+            body.contains("rebuild your in-flight picture"),
+            "#3415: dropping the memory claim must not drop the duty it carried"
+        );
+    }
+
     #[test]
     fn test_all_backends_include_agend_msg_rule() {
         // Generate instructions for each backend and verify [AGEND-MSG] is present.
@@ -1754,11 +1787,32 @@ mod tests {
                 "{backend_cmd} instructions must teach the no-prefix → direct text branch, path={}",
                 instr_path.display()
             );
-            // The reply MCP tool name must appear (operator-hit error
-            // root-cause: agent called `reply` from TUI-direct context).
+            // #3324: the AUTHORITATIVE routing rule must name the EXACT tool.
+            //
+            // This assertion used to accept the bare "`reply` MCP tool", which
+            // is precisely the ambiguity that cost eleven minutes: a
+            // ChannelBridge environment exposes a second tool also called
+            // `reply` that records an acknowledgement and never delivers. The
+            // supplemental hint further down already named the exact tool, but
+            // the document itself says the PREFIX RULE is authoritative — so
+            // the rule line is the one an agent follows, and it is the line
+            // that has to be unambiguous. Scoped to that line on purpose: a
+            // whole-content check passes on the hint alone and would have let
+            // this ship.
+            let routing_rule = content
+                .lines()
+                .find(|line| line.contains("[user:NAME via telegram]") && line.contains("prefix"))
+                .unwrap_or_else(|| {
+                    panic!(
+                        "{backend_cmd} instructions must carry a telegram prefix routing rule, path={}",
+                        instr_path.display()
+                    )
+                });
             assert!(
-                content.contains("`reply` MCP tool"),
-                "{backend_cmd} instructions must name the `reply` MCP tool explicitly, path={}",
+                routing_rule.contains("mcp__agend-terminal__reply"),
+                "{backend_cmd} instructions must name `mcp__agend-terminal__reply` on the \
+                 AUTHORITATIVE routing rule itself, not only in the hint below it — \
+                 got {routing_rule:?}, path={}",
                 instr_path.display()
             );
         }

@@ -8,6 +8,7 @@ use super::overlay::{self, Overlay, OverlayCtx};
 use crate::agent::AgentRegistry;
 use crate::keybinds::KeyHandler;
 use crate::layout::Layout;
+use crate::team_view::TeamView;
 use crossterm::event::{KeyEvent, MouseEvent};
 use std::collections::HashMap;
 use std::path::Path;
@@ -28,6 +29,12 @@ pub(super) struct UiDeps<'a> {
     pub(super) home: &'a Path,
     pub(super) fleet_path: &'a Path,
     pub(super) wakeup_tx: &'a crossbeam_channel::Sender<usize>,
+    pub(super) task_rpc_tx: &'a crossbeam_channel::Sender<super::rpc::TaskRequest>,
+    pub(super) restart_request_tx:
+        Option<&'a crossbeam_channel::Sender<super::commands::RemoteRestartRequest>>,
+    pub(super) task_snapshot: &'a [crate::tasks::Task],
+    pub(super) reap_workers: &'a mut Vec<std::thread::JoinHandle<()>>,
+    pub(super) team_view: Option<&'a TeamView>,
 }
 
 /// Signals `handle_key_event` returns to the event loop (applied independently).
@@ -43,7 +50,7 @@ impl UiState {
     /// handlers borrow layout/name_counter/last_tab disjointly from `overlay`
     /// (no `&mut self` re-borrow, no RefCell/mem::take). Mirrors the former
     /// inline `Event::Key` branch (overlay path returns early == `continue`).
-    pub(super) fn handle_key_event(&mut self, key: KeyEvent, deps: &UiDeps<'_>) -> KeyOutcome {
+    pub(super) fn handle_key_event(&mut self, key: KeyEvent, deps: &mut UiDeps<'_>) -> KeyOutcome {
         let mut out = KeyOutcome::default();
         if !matches!(self.overlay, Overlay::None) {
             let mut octx = OverlayCtx {
@@ -53,6 +60,9 @@ impl UiState {
                 fleet_path: deps.fleet_path,
                 wakeup_tx: deps.wakeup_tx,
                 name_counter: &mut self.name_counter,
+                task_rpc_tx: deps.task_rpc_tx,
+                restart_request_tx: deps.restart_request_tx,
+                reap_workers: &mut *deps.reap_workers,
             };
             let outcome = overlay::handle_key(&mut self.overlay, key, &mut octx);
             out.needs_resize = outcome.needs_resize;
@@ -68,6 +78,8 @@ impl UiState {
             last_tab: &mut self.last_tab,
             wakeup_tx: deps.wakeup_tx,
             name_counter: &mut self.name_counter,
+            task_rpc_tx: deps.task_rpc_tx,
+            task_snapshot: deps.task_snapshot,
         };
         let res = dispatch::dispatch(action, &mut dctx);
         out.needs_resize = res.needs_resize;
@@ -94,6 +106,7 @@ impl UiState {
             &mut self.mouse_state,
             deps.fleet_path,
             deps.registry,
+            deps.team_view,
         );
         let needs_resize = out.needs_resize;
         if let Some(prev) = out.new_last_tab {
@@ -123,11 +136,18 @@ mod tests {
         std::fs::create_dir_all(&home).ok();
         let fleet_path = home.join("fleet.yaml");
         let (wakeup_tx, _rx) = crossbeam_channel::unbounded::<usize>();
-        let deps = UiDeps {
+        let (task_rpc_tx, _task_rpc_rx) = crossbeam_channel::unbounded();
+        let mut reap_workers = Vec::new();
+        let mut deps = UiDeps {
             registry: &registry,
             home: &home,
             fleet_path: &fleet_path,
             wakeup_tx: &wakeup_tx,
+            task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
+            task_snapshot: &[],
+            reap_workers: &mut reap_workers,
+            team_view: None,
         };
         let mut ui = UiState {
             layout: Layout::new(),
@@ -140,13 +160,13 @@ mod tests {
 
         // Key, dispatch path: Ctrl+B then 'c' → Action::NewTab → new_overlay applied.
         let ctrl_b = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
-        ui.handle_key_event(ctrl_b, &deps);
+        ui.handle_key_event(ctrl_b, &mut deps);
         assert!(
             matches!(ui.overlay, Overlay::None),
             "prefix must not open overlay"
         );
         let c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::empty());
-        let out = ui.handle_key_event(c, &deps);
+        let out = ui.handle_key_event(c, &mut deps);
         assert!(!out.should_break, "NewTab must not break the loop");
         assert!(
             matches!(ui.overlay, Overlay::NewTabMenu { .. }),
@@ -155,7 +175,7 @@ mod tests {
 
         // Key, active-overlay path: Esc routes to overlay::handle_key → closes it.
         let esc = KeyEvent::new(KeyCode::Esc, KeyModifiers::empty());
-        ui.handle_key_event(esc, &deps);
+        ui.handle_key_event(esc, &mut deps);
         assert!(
             matches!(ui.overlay, Overlay::None),
             "Esc must close the overlay (routed to overlay::handle_key, not dispatch)"
@@ -192,6 +212,84 @@ mod tests {
             matches!(ui.overlay, Overlay::Help),
             "modal swallow must not change the overlay"
         );
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn ui_state_routes_shift_x_to_delete_and_plain_x_to_view_close() {
+        let registry: AgentRegistry = std::sync::Arc::new(parking_lot::Mutex::new(HashMap::new()));
+        let home =
+            std::env::temp_dir().join(format!("agend-delete-uistate-{}", std::process::id()));
+        std::fs::create_dir_all(&home).ok();
+        let fleet_path = home.join("fleet.yaml");
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded::<usize>();
+        let (task_rpc_tx, _task_rpc_rx) = crossbeam_channel::unbounded();
+        let mut reap_workers = Vec::new();
+        let mut deps = UiDeps {
+            registry: &registry,
+            home: &home,
+            fleet_path: &fleet_path,
+            wakeup_tx: &wakeup_tx,
+            task_rpc_tx: &task_rpc_tx,
+            restart_request_tx: None,
+            task_snapshot: &[],
+            reap_workers: &mut reap_workers,
+            team_view: None,
+        };
+        let pane = crate::layout::Pane {
+            agent_name: "label".into(),
+            instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
+            vterm: crate::vterm::VTerm::new(10, 10),
+            rx: crossbeam_channel::bounded(1).1,
+            id: 1,
+            backend: None,
+            working_dir: None,
+            display_name: None,
+            restart_error: None,
+            scroll_offset: 0,
+            has_notification: false,
+            fleet_instance_name: Some("managed".into()),
+            last_input_at: None,
+            pending_notification_count: 0,
+            pending_decision_count: 0,
+            selection: None,
+            source: crate::layout::PaneSource::Local,
+            offthread: None,
+            _fwd_cancel: None,
+        };
+        let mut ui = UiState {
+            layout: Layout::new(),
+            last_tab: 0,
+            name_counter: HashMap::new(),
+            overlay: Overlay::None,
+            key_handler: KeyHandler::new(),
+            mouse_state: mouse::MouseState::default(),
+        };
+        ui.layout
+            .add_tab(crate::layout::Tab::new("managed".into(), pane));
+
+        let ctrl_b = KeyEvent::new(KeyCode::Char('b'), crossterm::event::KeyModifiers::CONTROL);
+        ui.handle_key_event(ctrl_b, &mut deps);
+        ui.handle_key_event(
+            KeyEvent::new(KeyCode::Char('X'), crossterm::event::KeyModifiers::NONE),
+            &mut deps,
+        );
+        assert!(matches!(
+            ui.overlay,
+            Overlay::ConfirmDeleteInstance { name, input, notice: None }
+                if name == "managed" && input.is_empty()
+        ));
+
+        ui.overlay = Overlay::None;
+        ui.key_handler = KeyHandler::new();
+        ui.handle_key_event(ctrl_b, &mut deps);
+        ui.handle_key_event(
+            KeyEvent::new(KeyCode::Char('x'), crossterm::event::KeyModifiers::NONE),
+            &mut deps,
+        );
+        assert!(matches!(ui.overlay, Overlay::ConfirmClose { .. }));
 
         std::fs::remove_dir_all(&home).ok();
     }

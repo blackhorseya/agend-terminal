@@ -31,12 +31,15 @@ pub enum Action {
     ResizeRight,
     ClosePane,
     CloseTab,
+    DeleteInstance,
     ToggleZoom,
     /// #917: Flip the split direction (H↔V) for the focused pane pair.
     FlipSplit,
     NextLayout,
     RenameTab,
     RenamePane,
+    /// Rebuild the focused remote pane's daemon bridge without restarting its agent.
+    ReconnectPane,
     /// Open the move-pane target menu (cross-tab relocation of the focused pane).
     MovePaneMenu,
     ListTabs,
@@ -179,10 +182,13 @@ fn dispatch_prefix(key: KeyEvent) -> Action {
         KeyCode::Char('"') => Action::SplitHorizontal,
         KeyCode::Char('%') => Action::SplitVertical,
         KeyCode::Char('o') => Action::CycleFocus,
+        KeyCode::Char('X') => Action::DeleteInstance,
+        KeyCode::Char('x') if key.modifiers.contains(KeyModifiers::SHIFT) => Action::DeleteInstance,
         KeyCode::Char('x') => Action::ClosePane,
         KeyCode::Char('z') => Action::ToggleZoom,
         KeyCode::Char(' ') => Action::NextLayout,
         KeyCode::Char('.') => Action::RenamePane,
+        KeyCode::Char('r') => Action::ReconnectPane,
         // tmux uses `!` for break-pane (split pane to new window). We reuse
         // the same key, but open a menu that lets the user pick an EXISTING
         // tab OR spawn a new one — covering both move-pane and break-pane.
@@ -331,6 +337,14 @@ mod tests {
         );
     }
 
+    #[test]
+    fn keybind_ctrl_b_r_reconnects_focused_pane() {
+        assert_eq!(
+            prefix_action(KeyCode::Char('r'), KeyModifiers::empty()),
+            Action::ReconnectPane
+        );
+    }
+
     // --- i: PasteImage (#2435) ---
 
     #[test]
@@ -443,5 +457,41 @@ mod tests {
         let mut handler = KeyHandler::new();
         let action = handler.handle(key(KeyCode::Char('c'), KeyModifiers::CONTROL));
         assert!(matches!(action, Action::Forward(_)));
+    }
+
+    #[test]
+    fn ctrl_b_shift_x_deletes_but_plain_x_closes_view() {
+        // RED: Ctrl+B X is currently unmapped, while lowercase x is the
+        // established view-only close action.
+        assert_eq!(
+            prefix_action(KeyCode::Char('X'), KeyModifiers::NONE),
+            Action::DeleteInstance
+        );
+        assert_eq!(
+            prefix_action(KeyCode::Char('x'), KeyModifiers::SHIFT),
+            Action::DeleteInstance
+        );
+        assert_eq!(
+            prefix_action(KeyCode::Char('x'), KeyModifiers::NONE),
+            Action::ClosePane
+        );
+    }
+
+    #[test]
+    fn ctrl_b_shift_x_is_one_shot() {
+        let mut handler = KeyHandler::new();
+        assert_eq!(
+            handler.handle(key(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            Action::None
+        );
+        assert_eq!(
+            handler.handle(key(KeyCode::Char('X'), KeyModifiers::NONE)),
+            Action::DeleteInstance
+        );
+        assert!(!handler.in_repeat(), "destructive action must not repeat");
+        assert!(matches!(
+            handler.handle(key(KeyCode::Char('x'), KeyModifiers::NONE)),
+            Action::Forward(_)
+        ));
     }
 }

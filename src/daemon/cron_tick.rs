@@ -43,6 +43,12 @@ pub fn check_schedules(home: &Path) {
         if !sched.enabled {
             continue;
         }
+        if sched.job.is_some() {
+            if let Err(error) = crate::schedule_jobs::admit_due(home, sched, now_utc) {
+                tracing::warn!(schedule = %sched.id, %error, "job admission failed; durable watermark retained");
+            }
+            continue;
+        }
 
         // Resolve target timezone once — used by Cron dispatch and by
         // log/error messages. `Once` stores an absolute RFC 3339 instant
@@ -223,7 +229,7 @@ fn cron_transport_status(
         Err(crate::daemon::delivery_worker::TransportEnqueueError::QueueFull { .. }) => {
             "drop_queue_full"
         }
-        Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced) => "drop_fenced",
+        Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced { .. }) => "drop_fenced",
     }
 }
 
@@ -296,7 +302,7 @@ fn deliver_cron_fire(
                 }) => {
                     tracing::warn!(target = %name, "schedule delivery dropped: transport queue full");
                 }
-                Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced) => {
+                Err(crate::daemon::delivery_worker::TransportEnqueueError::Fenced { .. }) => {
                     tracing::warn!(target = %name, "schedule delivery fenced by lifecycle transition");
                 }
                 Ok(()) => {}
@@ -852,7 +858,7 @@ mod tests {
             "drop_queue_full"
         );
         assert_eq!(
-            super::cron_transport_status(&Err(TransportEnqueueError::Fenced)),
+            super::cron_transport_status(&Err(TransportEnqueueError::Fenced { epoch: 0 })),
             "drop_fenced"
         );
     }
@@ -1173,6 +1179,8 @@ mod tests {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
         )
         .expect("seed Created");

@@ -4,12 +4,19 @@ mod acl;
 mod activity;
 pub mod auto_close;
 mod board_router;
+mod board_sweep;
+mod board_unretire;
+pub(crate) mod governance;
 mod handler;
 pub mod lifecycle;
+pub(crate) mod operator_settlement;
 mod orphan;
+mod orphan_reconcile;
 mod supersession;
 mod sweep;
 
+#[cfg(test)]
+mod settlement_diagnostic_3584;
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 #[path = "tests.rs"]
@@ -46,6 +53,26 @@ pub(crate) fn task_terminal_cleanup(home: &Path, task_id: &str) {
     crate::dispatch_tracking::remove_all_for_task(home, task_id);
 }
 
+pub(crate) fn task_terminal_cleanup_event(
+    home: &Path,
+    board: &str,
+    task_id: &str,
+    instance: &str,
+    seq: u64,
+    now: &str,
+) -> anyhow::Result<()> {
+    task_terminal_cleanup(home, task_id);
+    // Assignment authority already owns its branch lock while cancelling the
+    // review task and will retire that same authority before returning.
+    if instance == "system:review-assignment" {
+        return Ok(());
+    }
+    crate::daemon::assignment_authority::retire_for_terminal_event(
+        home, board, task_id, instance, seq, now,
+    )?;
+    Ok(())
+}
+
 pub(crate) fn settle_completion_receipt(
     home: &Path,
     task_id: &str,
@@ -58,29 +85,171 @@ pub(crate) fn settle_completion_receipt(
     }
 }
 
+/// F6: the lease's `review_assignment_id` must still name a LIVE assignment that
+/// authorizes this caller for this task. Parsing it as a UUID says only that the
+/// id is well-formed, and a revoked assignment keeps its shape after its row is
+/// gone — `assignment_authority::revoke_under_lock` ends in
+/// `remove_if_assignment_matches_strict`, so the id outlives the authority.
+///
+/// This mirrors the sibling revalidation in `daemon::pr_state::record_validated_receipt`
+/// in intent rather than in mechanism. That path calls
+/// `review_receipt::assignment_still_authorizes`, which needs a `ReviewReceiptSummary`
+/// — reviewer instance id, PR number, reviewed head, class and slot — that a
+/// completion caller does not have and cannot honestly synthesize. What the binding
+/// does carry is the assignment id, the caller and the task, so those are what get
+/// checked here, against the same store and the same receipt-capability predicate.
+///
+/// No assignment lock is taken, deliberately. The sibling holds the assignment
+/// branch lock across its check→PR-state mutation; the documented order is
+/// assignment-OUTER / pr_state-INNER, and this runs underneath the task-board
+/// path, so taking it here would invert that order rather than extend it. The
+/// residual window — a revoke landing between this lookup and the Done event — is
+/// closed next door instead: `revoke` cancels the review task before removing the
+/// row, and a cancelled task cannot transition to Done.
+/// `revoke_cancels_the_review_task_before_removing_the_row` pins that reason so it
+/// is not just an assertion in a comment.
+fn lease_assignment_still_authorizes(
+    home: &Path,
+    binding: &serde_json::Value,
+    caller: &str,
+    task_id: &str,
+) -> bool {
+    binding["review_assignment_id"]
+        .as_str()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok())
+        .and_then(|id| {
+            crate::daemon::assignment_authority::lookup_by_assignment_id_strict(home, id).ok()
+        })
+        .is_some_and(|assignment| {
+            assignment.is_receipt_capable()
+                && assignment.target == caller
+                && assignment.task_id == task_id
+        })
+}
+
 /// Gate completion by the assignee's bound branch state. Non-assignees (the
 /// orchestrator/system paths) and branchless tasks retain their existing ACL.
+/// What [`assignee_completion_guard`] actually decided.
+///
+/// It used to return `Result<Option<MergeReceipt>, String>`, where `Ok(None)`
+/// said two unrelated things: "this guard has no opinion about this call" and
+/// "the assignee's binding checked out and there is no receipt to carry". Both
+/// call sites read it as permit, which is how the predicate came to look like a
+/// containment boundary it is not. Splitting the two apart does not move a
+/// single permission — it forces each caller to say WHY it proceeds.
+pub(crate) enum CompletionGate {
+    /// The guard has no opinion; upstream authority is the only authority that
+    /// ran. It is NOT a statement that the caller is allowed.
+    NotApplicable(GateInapplicable),
+    /// The assignee's binding, or an unconsumed merge receipt, checked out.
+    Permit(Option<crate::merge_receipt::MergeReceipt>),
+    /// The assignee failed the binding check.
+    Deny(String),
+}
+
+/// Why the guard had no opinion. The two reasons reach different callers and
+/// mean different things, so they are not collapsed into one variant.
+pub(crate) enum GateInapplicable {
+    /// The task carries no branch, so there is no binding to check.
+    Branchless,
+    /// The caller is not the task's assignee. `can_mutate_record` upstream is
+    /// then the only gate that ran, and it admits system identities,
+    /// `is_orchestrator_of`, and the owner's team orchestrator (see
+    /// [`crate::tasks::acl`]) — so this variant must never be read as
+    /// owner-only containment.
+    NotTheAssignee,
+}
+
 pub(crate) fn assignee_completion_guard(
     home: &Path,
     task_id: &str,
     caller: &str,
     record: &crate::task_events::TaskRecord,
-) -> Result<Option<crate::merge_receipt::MergeReceipt>, String> {
+) -> CompletionGate {
     let Some(branch) = record.branch.as_deref() else {
-        return Ok(None);
+        return CompletionGate::NotApplicable(GateInapplicable::Branchless);
     };
     if record.owner.as_ref().map(|owner| owner.0.as_str()) != Some(caller) {
-        return Ok(None);
+        return CompletionGate::NotApplicable(GateInapplicable::NotTheAssignee);
     }
 
-    let Some(binding) = crate::binding::read(home, caller) else {
+    match assignee_binding_check(home, task_id, caller, branch) {
+        Ok(receipt) => CompletionGate::Permit(receipt),
+        Err(reason) => CompletionGate::Deny(reason),
+    }
+}
+
+/// The half of the guard that actually CHECKS something: the caller is the
+/// assignee of a branch-carrying task, and this decides whether their binding
+/// (or an unconsumed merge receipt) backs the completion. Kept as a `Result` so
+/// the failure paths stay a plain `?`; the caller-facing three-state answer is
+/// assembled by [`assignee_completion_guard`], which is also where the two
+/// "no opinion" cases are decided — before any of this runs.
+fn assignee_binding_check(
+    home: &Path,
+    task_id: &str,
+    caller: &str,
+    branch: &str,
+) -> Result<Option<crate::merge_receipt::MergeReceipt>, String> {
+    // Authenticate the same disk snapshot while both binding writer locks are
+    // held. Drop them before task/assignment locks or completion side effects.
+    let (snapshot, signature_status) = {
+        let _agent = crate::binding::acquire_agent_mutation_lock(home, caller)?;
+        let _binding = crate::binding::acquire_binding_file_lock(home, caller)?;
+        let snapshot = crate::binding::guarded_binding_disk_fresh(home, caller);
+        let signature_status = crate::binding::signature_status(home, caller);
+        (snapshot, signature_status)
+    };
+    let signature_valid = signature_status == crate::binding::SignatureStatus::Valid;
+    let binding = match snapshot {
+        crate::binding::GuardedBinding::Absent => None,
+        crate::binding::GuardedBinding::Opaque(reason) => {
+            return Err(format!(
+                "assignee completion binding is unreadable: {reason}"
+            ));
+        }
+        crate::binding::GuardedBinding::Known { value, .. } => Some(value),
+    };
+    let prior_task_binding = binding.as_ref().is_some_and(|value| {
+        signature_valid
+            && value["agent"].as_str() == Some(caller)
+            && value["task_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty() && id != task_id)
+            && value["branch"].as_str().is_some_and(|s| !s.is_empty())
+            && value["source_repo"].as_str().is_some_and(|s| !s.is_empty())
+            && value["worktree"].as_str().is_some_and(|s| !s.is_empty())
+    });
+    // A sidecar-less schema-1 binding carrying the original issued_at field can
+    // predate the HMAC rollout and therefore cannot be used as completion
+    // authority. When it explicitly names a different task, however, it is
+    // unrelated to this receipt-backed completion and must not become a false
+    // denial. The receipt remains the sole authority; this arm never cleans or
+    // releases the legacy workspace. A present-but-invalid sidecar is classified
+    // separately and stays fail-closed below.
+    let unrelated_legacy_binding = binding.as_ref().is_some_and(|value| {
+        signature_status == crate::binding::SignatureStatus::Missing
+            && value["version"].as_u64() == Some(1)
+            && value["agent"].as_str() == Some(caller)
+            && value["task_id"]
+                .as_str()
+                .is_some_and(|id| !id.is_empty() && id != task_id)
+            && value["issued_at"].as_str().is_some_and(|s| !s.is_empty())
+            && value["branch"].as_str().is_some_and(|s| !s.is_empty())
+            && value["worktree"].as_str().is_some_and(|s| !s.is_empty())
+    });
+    if binding.is_none() || prior_task_binding || unrelated_legacy_binding {
         return crate::merge_receipt::find_for_task_completion(home, task_id, caller)
             .map(Some)
             .ok_or_else(|| {
                 "assignee completion requires an exact live binding or unconsumed merge receipt"
                     .to_string()
             });
-    };
+    }
+    if !signature_valid {
+        return Err("assignee completion binding signature is invalid or missing".to_string());
+    }
+    let binding = binding.ok_or_else(|| "assignee binding unavailable".to_string())?;
     let binding_agent = binding["agent"].as_str();
     let binding_task = binding["task_id"].as_str();
     let binding_branch = binding["branch"].as_str();
@@ -94,9 +263,14 @@ pub(crate) fn assignee_completion_guard(
         (Some("disposable_review"), Some("DaemonProvisionedReview"), Some(head)) => Some(head),
         _ => None,
     };
+    let typed_disposable_review = provisioned_head.is_some()
+        && binding["lease_kind"].as_str() == Some("review")
+        && binding["expected_head"].as_str() == provisioned_head
+        && lease_assignment_still_authorizes(home, &binding, caller, task_id)
+        && signature_valid;
     if binding_agent != Some(caller)
         || binding_task != Some(task_id)
-        || binding_branch != Some(branch)
+        || (binding_branch != Some(branch) && !typed_disposable_review)
         || source_repo.is_empty()
         || worktree.is_empty()
     {
@@ -114,8 +288,8 @@ pub(crate) fn assignee_completion_guard(
 
     let actual_branch = crate::git_helpers::git_cmd(worktree, &["symbolic-ref", "--short", "HEAD"])
         .map_err(|error| format!("assignee worktree branch check failed: {error}"))?;
-    if actual_branch != branch {
-        return Err("assignee worktree branch does not match the task".to_string());
+    if Some(actual_branch.as_str()) != binding_branch {
+        return Err("assignee worktree branch does not match the binding".to_string());
     }
     let disposable_review_at_provisioned_head = if let Some(expected_head) = provisioned_head {
         let actual_head = crate::git_helpers::git_cmd(worktree, &["rev-parse", "HEAD"])
@@ -192,6 +366,9 @@ pub(crate) fn cancel_review_assignment_task(
             ))
         }
     };
+    if routed.task.status.is_terminal() {
+        return Ok(false);
+    }
     let task_id_owned = task_id.to_string();
     let target_owned = target.to_string();
     let reason_owned = reason.to_string();
@@ -252,8 +429,11 @@ pub(crate) fn cancel_review_assignment_task(
     }
 }
 
+pub(crate) use handler::create_schedule_task;
 pub use handler::handle;
+#[cfg(test)]
 pub(crate) use handler::handle_with_live_instances;
+pub(crate) use handler::handle_with_live_instances_and_refresh;
 pub use handler::register_subscriber as register_cascade_subscriber;
 // #2117 P2: resolution helpers for the out-of-`tasks` callers — comms dispatch
 // auto-create (target board) and the per-board task sweep (project id from a
@@ -262,7 +442,9 @@ pub use handler::register_subscriber as register_cascade_subscriber;
 // seams) are no longer re-exported — every per-id authority path routes through
 // the strict `load_routed` / `caller_can_mutate_task` above instead.
 pub(crate) use board_router::{
-    list_all_boards, list_all_strict, project_id_from_source_repo, resolve_target_project,
+    explicit_project_ids, list_all_boards, list_all_boards_checked, list_all_strict,
+    project_id_from_source_repo, resolve_repository_project, resolve_target_project,
+    stable_project_id_from_source_repo,
 };
 // #2760: the per-board mutation ACL is no longer re-exported for external callers
 // (reclaim now routes through the strict `caller_can_mutate_task` above). It stays
@@ -272,7 +454,7 @@ pub use orphan::{
     release_inprogress_orphans_with_live,
 };
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: String,
     pub title: String,
@@ -467,6 +649,29 @@ pub(super) fn fire_before_mutation_commit_hook_for_test() {
     }
 }
 
+// #3584: test-only seam for the manual sweep repository-authority TOCTOU.
+// Fires after candidate/confirm validation and before the apply path acquires
+// the fleet authority lock, so a regression test can mutate a team claim and
+// prove the fresh locked scope rejects the stale candidate.
+#[cfg(test)]
+thread_local! {
+    static BEFORE_MANUAL_SWEEP_REPOSITORY_SCOPE_HOOK:
+        std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
+}
+
+#[cfg(test)]
+pub(crate) fn set_before_manual_sweep_repository_scope_hook_for_test(f: impl FnOnce() + 'static) {
+    BEFORE_MANUAL_SWEEP_REPOSITORY_SCOPE_HOOK.with(|h| *h.borrow_mut() = Some(Box::new(f)));
+}
+
+#[cfg(test)]
+pub(super) fn fire_before_manual_sweep_repository_scope_hook_for_test() {
+    let hook = BEFORE_MANUAL_SWEEP_REPOSITORY_SCOPE_HOOK.with(|h| h.borrow_mut().take());
+    if let Some(f) = hook {
+        f();
+    }
+}
+
 impl<'a> DepResolver<'a> {
     fn new(home: &'a Path, local_board: &'a Path, snapshot: &[Task]) -> Self {
         let local = snapshot.iter().map(|t| (t.id.clone(), t.status)).collect();
@@ -504,7 +709,7 @@ impl<'a> DepResolver<'a> {
             return None;
         }
         let map = self.board_cache.entry(board.clone()).or_insert_with(|| {
-            crate::task_events::replay_at(&board)
+            crate::task_events::projected_state_at(&board)
                 .map(|st| {
                     st.tasks
                         .iter()
@@ -782,7 +987,8 @@ impl RoutedTask {
     }
 
     /// #2760 R2: like [`RoutedTask::with_revalidated_board`] but the append EVENTS
-    /// are COMPUTED from the FRESH under-lock replay ([`crate::task_events::append_batch_computed_at`]).
+    /// are COMPUTED from the fresh under-lock catalog snapshot
+    /// ([`crate::task_events::append_batch_computed_at`]).
     /// A route-only revalidation (board/incarnation) is NOT enough for a mutation
     /// whose authority or payload depends on current task CONTENT — ownership,
     /// status, metadata, the ack set. This runs the caller's `compute` under the
@@ -1154,8 +1360,8 @@ pub(crate) fn load_routed(home: &Path, task_id: &str) -> Result<RoutedTask, Task
     })
 }
 
-/// Return all tasks as typed structs. **PR3 cutover** — sources state
-/// from `task_events::replay()` instead of the legacy `tasks.json`.
+/// Return all tasks as typed structs. Sources authoritative state from the
+/// task catalog instead of replaying history or reading legacy `tasks.json`.
 /// Dep-derived blocking is computed in-memory at this call (option (a)
 /// per m-42); explicit operator-emitted Blocked/Unblocked events are
 /// honoured by replay's `apply()` as before.
@@ -1172,10 +1378,14 @@ pub fn list_all(home: &Path) -> Vec<Task> {
 /// board, cached per pass). For single-project deployments every dep is on this
 /// same board → no cross-board read → byte-identical.
 pub(crate) fn list_all_at(home: &Path, board: &Path) -> Vec<Task> {
-    let state = crate::task_events::replay_at(board).unwrap_or_default();
+    list_all_at_checked(home, board).unwrap_or_default()
+}
+
+pub(crate) fn list_all_at_checked(home: &Path, board: &Path) -> anyhow::Result<Vec<Task>> {
+    let state = crate::task_events::projected_state_at(board)?;
     let mut tasks: Vec<Task> = state.tasks.values().map(record_to_task).collect();
     apply_dependency_eval_in_memory(&mut tasks, home, board);
-    tasks
+    Ok(tasks)
 }
 
 /// #1942: link a git `branch` to an existing task by emitting a `BranchLinked`
@@ -1274,7 +1484,7 @@ pub fn link_branch_to_task(home: &Path, task_id: &str, branch: &str) -> anyhow::
 /// until the next maintenance pass retries.
 pub fn sweep_overdue_claimed(home: &Path) -> Vec<String> {
     let now = chrono::Utc::now();
-    let state = crate::task_events::replay(home).unwrap_or_default();
+    let state = crate::task_events::projected_state(home).unwrap_or_default();
     let emitter = crate::task_events::InstanceName::from("system:overdue_sweep");
     let mut released = Vec::new();
 
@@ -1305,6 +1515,177 @@ pub fn sweep_overdue_claimed(home: &Path) -> Vec<String> {
         }
     }
     released
+}
+
+// ── #3536: the settled-report / unsettled-task gap ────────────────────────
+//
+// `dispatch_tracking::mark_completed` DELETES the dispatch entry when a report
+// arrives — deliberately, and pinned by
+// `dispatch_tracking::tests::test_report_result_marks_dispatch_completed`
+// ("removed outright, not flipped to completed and kept"). From that moment
+// `sweep_stuck` cannot see the work again. `sweep_overdue_claimed` above only
+// looks at tasks carrying a `due_at`. A task whose assignee reported and then
+// went idle therefore falls between the two sweeps and is nagged by nobody: the
+// case that opened #3536 sat `claimed` for 40+ hours in silence.
+//
+// The trace has to live on the TASK, because the dispatch entry is gone. The
+// stamp is written at settlement time by [`note_dispatch_settled`] and consumed
+// by [`sweep_unsettled_after_report`].
+
+/// Metadata key: RFC3339 instant at which a dispatch for this task was settled
+/// by a report. Re-stamped by every later report.
+pub const DISPATCH_COMPLETED_AT: &str = "dispatch_completed_at";
+/// Metadata key: the `dispatch_completed_at` value a reminder was already sent
+/// for. The fire-once latch — a NEW report writes a new stamp, which re-arms.
+pub const DISPATCH_UNSETTLED_NOTIFIED_FOR: &str = "dispatch_unsettled_notified_for";
+/// Emitter identity for the settlement trace and its latch.
+const SETTLEMENT_EMITTER: &str = "system:dispatch_settlement";
+
+/// How long a task may sit unsettled after its assignee reported before both
+/// parties are reminded.
+///
+/// Deliberately far above `DISPATCH_WARN_MINUTES`/`DISPATCH_ASK_MINUTES` (15/30):
+/// `mark_completed` also fires for PROGRESS reports (`terminal:false`), so
+/// "a report arrived" is not "the work is done". Because every report re-stamps
+/// `DISPATCH_COMPLETED_AT`, this timer restarts on each one — an agent that keeps
+/// reporting is never reminded, while one that reported and went idle is. Two
+/// hours is well inside the 40+ hour failure that opened #3536 and matches the
+/// `eta_minutes: 120` this fleet commonly dispatches with.
+pub const UNSETTLED_AFTER_REPORT_MINUTES: i64 = 120;
+
+/// A task whose dispatch was settled by a report while the task itself was left
+/// open. Returned by [`sweep_unsettled_after_report`] for the daemon to notify.
+#[derive(Debug, Clone)]
+pub struct UnsettledAfterReport {
+    pub task_id: String,
+    /// Current owner — the assignee who can send a terminal report.
+    pub assignee: Option<String>,
+    /// Task creator — the orchestrator who can `task action=done`.
+    pub created_by: String,
+    /// Board status at detection time (`claimed` or `in_progress`).
+    pub status: String,
+    /// Minutes since the settling report.
+    pub age_minutes: i64,
+}
+
+/// Stamp the settlement trace on a task whose dispatch a report just cleared.
+///
+/// Called from `dispatch_tracking::mark_completed` and ONLY when an entry was
+/// actually removed, so an unsolicited report (no dispatch outstanding) writes
+/// nothing. Terminal tasks are skipped: they are already settled, and a stamp
+/// there would be dead weight that later replays must carry.
+///
+/// Routing matters — this fleet keeps its real work on project boards, so the
+/// stamp must land on the board that actually holds the task, never the default
+/// one. A task that cannot be routed uniquely gets no stamp (fail-closed: a
+/// missing reminder is recoverable, a stamp written to the wrong board is not).
+pub fn note_dispatch_settled(home: &Path, task_id: &str) {
+    if task_id.is_empty() {
+        return;
+    }
+    let routed = match load_routed(home, task_id) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::debug!(task_id, %e, "#3536: no unique route for the reported task; no settlement stamp");
+            return;
+        }
+    };
+    if routed.record.status.is_terminal() {
+        return;
+    }
+    let emitter = crate::task_events::InstanceName::from(SETTLEMENT_EMITTER);
+    let event = crate::task_events::TaskEvent::MetadataSet {
+        task_id: crate::task_events::TaskId(task_id.to_string()),
+        by: emitter.clone(),
+        key: DISPATCH_COMPLETED_AT.to_string(),
+        value: serde_json::Value::String(chrono::Utc::now().to_rfc3339()),
+    };
+    if let Err(e) = crate::task_events::append_at(routed.board.path(), &emitter, event) {
+        tracing::warn!(task_id, error = %e, "#3536: settlement stamp failed; the task stays invisible to the unsettled sweep until the next report");
+    }
+}
+
+/// Find tasks whose dispatch a report settled but which nobody closed.
+///
+/// Scoped to `Claimed`/`InProgress` rather than "any non-terminal" on purpose:
+/// `InReview` and `Blocked` are LEGITIMATELY waiting on somebody else (a
+/// reviewer, an unblocking event) and have their own machinery — reminding them
+/// every tick would be noise, not signal.
+///
+/// Unlike [`sweep_overdue_claimed`], which reads only the default board, this
+/// walks every project board: the tasks #3536 is about live on project boards,
+/// so a default-only sweep would never see them. Marks each hit as notified
+/// (fire-once per report) before returning it.
+pub fn sweep_unsettled_after_report(home: &Path) -> Vec<UnsettledAfterReport> {
+    let now = chrono::Utc::now();
+    let emitter = crate::task_events::InstanceName::from(SETTLEMENT_EMITTER);
+    let projects = board_router::enumerate_projects(home)
+        .unwrap_or_else(|_| vec![crate::task_events::DEFAULT_PROJECT.to_string()]);
+    let mut found = Vec::new();
+
+    for project in projects {
+        let board = crate::task_events::board_root(home, &project);
+        let state = match crate::task_events::projected_state_at(&board) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(project, error = %e, "#3536: board unreadable; skipped this pass");
+                continue;
+            }
+        };
+        for (tid, record) in &state.tasks {
+            let status = match record.status {
+                crate::task_events::TaskStatus::Claimed => "claimed",
+                crate::task_events::TaskStatus::InProgress => "in_progress",
+                _ => continue,
+            };
+            let settled_at = match record
+                .metadata
+                .get(DISPATCH_COMPLETED_AT)
+                .and_then(|v| v.as_str())
+            {
+                Some(s) => s,
+                None => continue,
+            };
+            // Already reminded for THIS report; a newer report rewrites the
+            // stamp and re-arms the reminder.
+            if record
+                .metadata
+                .get(DISPATCH_UNSETTLED_NOTIFIED_FOR)
+                .and_then(|v| v.as_str())
+                == Some(settled_at)
+            {
+                continue;
+            }
+            let settled = match chrono::DateTime::parse_from_rfc3339(settled_at) {
+                Ok(dt) => dt.with_timezone(&chrono::Utc),
+                Err(_) => continue,
+            };
+            let age_minutes = now.signed_duration_since(settled).num_minutes();
+            if age_minutes < UNSETTLED_AFTER_REPORT_MINUTES {
+                continue;
+            }
+            let latch = crate::task_events::TaskEvent::MetadataSet {
+                task_id: tid.clone(),
+                by: emitter.clone(),
+                key: DISPATCH_UNSETTLED_NOTIFIED_FOR.to_string(),
+                value: serde_json::Value::String(settled_at.to_string()),
+            };
+            if let Err(e) = crate::task_events::append_at(&board, &emitter, latch) {
+                // Without the latch this would re-fire every tick, so skip the
+                // notification rather than risk nagging forever.
+                tracing::warn!(task = %tid, error = %e, "#3536: latch write failed; reminder deferred to the next pass");
+                continue;
+            }
+            found.push(UnsettledAfterReport {
+                task_id: tid.0.clone(),
+                assignee: record.owner.as_ref().map(|o| o.0.clone()),
+                created_by: record.created_by.0.clone(),
+                status: status.to_string(),
+                age_minutes,
+            });
+        }
+    }
+    found
 }
 
 /// Result of [`reconcile_stale_cross_board_claims`].
@@ -1364,7 +1745,7 @@ pub fn reconcile_stale_cross_board_claims(home: &Path) -> CrossBoardReconcileRep
         // derived view (`list_all_at`/`list_all_boards`) would relabel an
         // InProgress task with an unsatisfied dep to `Blocked` before we ever
         // see it, hiding it from both the Claimed and InProgress arms below.
-        let state = match crate::task_events::replay_at(&board) {
+        let state = match crate::task_events::projected_state_at(&board) {
             Ok(s) => s,
             Err(_) => continue,
         };
@@ -1525,7 +1906,7 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
             skipped: 0,
         });
     }
-    let state = crate::task_events::replay(home).unwrap_or_default();
+    let state = crate::task_events::projected_state(home).unwrap_or_default();
     let migrator = crate::task_events::InstanceName::from("system:legacy_migration");
     let mut events: Vec<crate::task_events::TaskEvent> = Vec::new();
     let mut migrated = 0usize;
@@ -1568,6 +1949,8 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
             bind: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         });
         // Emit the minimum status-transition events to bring the task to
         // its current legacy status. The replay-derived view post-PR3
@@ -1632,8 +2015,8 @@ pub fn migrate_legacy_tasks_json_to_event_log(home: &Path) -> anyhow::Result<Mig
     }
     // PR4 — retire tasks.json: rename the live file to a `.legacy_pre_v2`
     // sidecar so the operator can archeologically inspect the
-    // pre-migration state, but the daemon's read path (now via
-    // `task_events::replay()`) no longer touches it. Idempotent: if the
+    // pre-migration state, but the daemon's catalog read path no longer
+    // touches it. Idempotent: if the
     // file is already absent the rename silently no-ops. Only triggers
     // when the migration found legacy data — otherwise leaving the empty
     // file in place avoids surprising the operator with sudden file

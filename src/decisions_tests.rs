@@ -40,6 +40,181 @@ fn test_post_and_list() {
 }
 
 #[test]
+fn decision_get_returns_full_record_with_supersession_links_3506() {
+    let home = tmp_home("get-full-3506");
+    let long_content = "詳".repeat(260);
+    let old = post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "old policy", "content": long_content, "tags": ["policy"]
+        }),
+    );
+    let old_id = old["id"].as_str().expect("old id").to_string();
+    let new = post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "new policy", "content": "replacement", "supersedes": old_id
+        }),
+    );
+    let new_id = new["id"].as_str().expect("new id").to_string();
+    std::fs::write(decisions_dir(&home).join("unrelated.json"), "{broken").unwrap();
+
+    let got_old = get(&home, &serde_json::json!({"id": old_id}));
+    assert_eq!(got_old["decision"]["id"], old_id);
+    assert_eq!(got_old["decision"]["content"], long_content);
+    assert_eq!(got_old["decision"]["archived"], true);
+    assert_eq!(got_old["decision"]["supersedes"], Value::Null);
+    assert_eq!(got_old["decision"]["superseded_by"], new_id);
+
+    let got_new = get(&home, &serde_json::json!({"id": new_id}));
+    assert_eq!(got_new["decision"]["supersedes"], old_id);
+    assert_eq!(got_new["decision"]["superseded_by"], Value::Null);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn decision_get_missing_and_not_found_are_structured_3506() {
+    let home = tmp_home("get-errors-3506");
+    let missing = get(&home, &serde_json::json!({}));
+    assert_eq!(missing["code"], "missing_id");
+
+    let absent = get(&home, &serde_json::json!({"id": "d-does-not-exist"}));
+    assert_eq!(absent["code"], "decision_not_found");
+    assert!(absent["error"]
+        .as_str()
+        .expect("error")
+        .contains("not found"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn decision_get_corrupt_json_is_unreadable_without_echoing_contents_3506() {
+    let home = tmp_home("get-corrupt-3506");
+    let path = decisions_dir(&home).join("d-corrupt.json");
+    let secret = "{broken SECRET_FIXTURE_CONTENT";
+    std::fs::write(&path, secret).unwrap();
+
+    let result = get(&home, &serde_json::json!({"id": "d-corrupt"}));
+    assert_eq!(result["code"], "decision_unreadable", "{result}");
+    assert_eq!(result["path"], path.display().to_string(), "{result}");
+    assert!(result["reason"]
+        .as_str()
+        .is_some_and(|reason| !reason.is_empty()));
+    assert!(
+        !result.to_string().contains(secret),
+        "must not echo file contents"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn decision_get_newer_schema_is_unreadable_without_echoing_contents_3506() {
+    let home = tmp_home("get-newer-schema-3506");
+    let path = decisions_dir(&home).join("d-future.json");
+    let mut decision = make_test_decision("lead");
+    decision.id = "d-future".into();
+    decision.content = "SECRET_FUTURE_CONTENT".into();
+    decision.schema_version = SCHEMA_VERSION + 1;
+    crate::store::save_atomic(&path, &decision).unwrap();
+
+    let result = get(&home, &serde_json::json!({"id": "d-future"}));
+    assert_eq!(result["code"], "decision_unreadable", "{result}");
+    assert_eq!(result["path"], path.display().to_string(), "{result}");
+    assert!(result["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("newer schema")));
+    assert!(!result.to_string().contains("SECRET_FUTURE_CONTENT"));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn decision_list_is_utf8_safe_terse_by_default_and_verbose_opt_in_3506() {
+    let home = tmp_home("list-projection-3506");
+    let long_content = "決".repeat(260);
+    post(
+        &home,
+        "lead",
+        &serde_json::json!({"title": "policy", "content": long_content}),
+    );
+
+    let terse = list(&home, &serde_json::json!({}));
+    assert_eq!(terse["terse"], true);
+    assert_eq!(terse["fields"], "full");
+    let capped = terse["decisions"][0]["content"].as_str().expect("content");
+    assert!(
+        capped.starts_with(&"決".repeat(200)),
+        "UTF-8 prefix must stay intact"
+    );
+    assert!(capped.contains("+60 chars; verbose=true for full"));
+
+    let verbose = list(&home, &serde_json::json!({"verbose": true}));
+    assert_eq!(verbose["terse"], false);
+    assert_eq!(verbose["decisions"][0]["content"], long_content);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn decision_list_fields_minimal_has_exact_projection_3506() {
+    let home = tmp_home("list-minimal-3506");
+    post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "policy", "content": "secret detail", "tags": ["release"]
+        }),
+    );
+
+    let listed = list(&home, &serde_json::json!({"fields": "minimal"}));
+    assert_eq!(listed["fields"], "minimal");
+    let row = listed["decisions"][0].as_object().expect("decision object");
+    let mut keys: Vec<_> = row.keys().map(String::as_str).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "archived",
+            "author",
+            "created_at",
+            "id",
+            "status",
+            "tags",
+            "title"
+        ]
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn review_class_is_persisted_and_create_only_3419() {
+    let home = tmp_home("review_class_3419");
+    let posted = post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governance",
+            "content": "dual review",
+            "review_class": "dual",
+        }),
+    );
+    let id = posted["id"].as_str().expect("decision id").to_string();
+    let listed = list(&home, &serde_json::json!({"include_archived": true}));
+    assert_eq!(listed["decisions"][0]["review_class"], "dual");
+
+    let update = update(
+        &home,
+        "lead",
+        &serde_json::json!({"id": id, "review_class": "single"}),
+    );
+    assert_eq!(
+        update["code"], "decision_review_class_immutable",
+        "review_class must not be mutable after decision creation: {update}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn test_update_and_archive() {
     let home = tmp_home("update_archive");
     let result = post(
@@ -110,6 +285,156 @@ fn test_supersede_archives_old() {
         .map(|d| d["id"].as_str().unwrap_or(""))
         .collect();
     assert!(!active_ids.contains(&old_id.as_str()));
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn retroactive_supersession_rejects_invalid_pairs_3507() {
+    let home = tmp_home("retroactive-invalid-3507");
+    let predecessor = post(
+        &home,
+        "author",
+        &serde_json::json!({"title": "old", "content": "v1"}),
+    );
+    let predecessor_id = predecessor["id"]
+        .as_str()
+        .expect("predecessor id")
+        .to_string();
+    let successor = post(
+        &home,
+        "author",
+        &serde_json::json!({"title": "new", "content": "v2"}),
+    );
+    let successor_id = successor["id"].as_str().expect("successor id").to_string();
+
+    let missing = update(
+        &home,
+        "author",
+        &serde_json::json!({"id": successor_id, "supersedes": "d-missing"}),
+    );
+    assert_eq!(missing["code"], "decision_supersession_target_not_found");
+
+    let self_reference = update(
+        &home,
+        "author",
+        &serde_json::json!({"id": successor_id, "supersedes": successor_id}),
+    );
+    assert_eq!(self_reference["code"], "invalid_decision_supersession");
+
+    let other = post(
+        &home,
+        "other-author",
+        &serde_json::json!({"title": "other", "content": "protected"}),
+    );
+    let other_id = other["id"].as_str().expect("other id").to_string();
+    let unauthorized = update(
+        &home,
+        "author",
+        &serde_json::json!({"id": successor_id, "supersedes": other_id}),
+    );
+    assert_eq!(unauthorized["code"], "invalid_decision_supersession");
+
+    let old_after = get(&home, &serde_json::json!({"id": predecessor_id}));
+    assert_eq!(old_after["decision"]["archived"], false);
+    let other_after = get(&home, &serde_json::json!({"id": other_id}));
+    assert_eq!(other_after["decision"]["archived"], false);
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn retroactive_supersession_rejects_existing_cycle_3507() {
+    let home = tmp_home("retroactive-cycle-3507");
+    let predecessor = post(
+        &home,
+        "author",
+        &serde_json::json!({"title": "old", "content": "v1"}),
+    );
+    let predecessor_id = predecessor["id"]
+        .as_str()
+        .expect("predecessor id")
+        .to_string();
+    let successor = post(
+        &home,
+        "author",
+        &serde_json::json!({"title": "new", "content": "v2"}),
+    );
+    let successor_id = successor["id"].as_str().expect("successor id").to_string();
+
+    let mut cyclic_predecessor = make_test_decision("author");
+    cyclic_predecessor.id = predecessor_id.clone();
+    cyclic_predecessor.supersedes = Some(successor_id.clone());
+    write_named_decision(
+        &home,
+        &format!("{predecessor_id}.json"),
+        &cyclic_predecessor,
+    );
+
+    let result = update(
+        &home,
+        "author",
+        &serde_json::json!({"id": successor_id, "supersedes": predecessor_id}),
+    );
+    assert_eq!(result["code"], "invalid_decision_supersession", "{result}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn retroactive_supersession_rejects_malformed_chain_3507() {
+    let home = tmp_home("retroactive-malformed-chain-3507");
+    let predecessor = post(
+        &home,
+        "author",
+        &serde_json::json!({"title": "old", "content": "v1"}),
+    );
+    let predecessor_id = predecessor["id"]
+        .as_str()
+        .expect("predecessor id")
+        .to_string();
+    let successor = post(
+        &home,
+        "author",
+        &serde_json::json!({"title": "new", "content": "v2"}),
+    );
+    let successor_id = successor["id"].as_str().expect("successor id").to_string();
+
+    let mut malformed_predecessor = make_test_decision("author");
+    malformed_predecessor.id = predecessor_id.clone();
+    malformed_predecessor.supersedes = Some("../outside".into());
+    write_named_decision(
+        &home,
+        &format!("{predecessor_id}.json"),
+        &malformed_predecessor,
+    );
+
+    let result = update(
+        &home,
+        "author",
+        &serde_json::json!({"id": successor_id, "supersedes": predecessor_id}),
+    );
+    assert_eq!(result["code"], "invalid_decision_supersession", "{result}");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn supersede_new_save_failure_leaves_old_unmarked_3506() {
+    let home = tmp_home("supersede-new-save-failure-3506");
+    let posted = post(
+        &home,
+        "lead",
+        &serde_json::json!({"title": "old", "content": "v1"}),
+    );
+    let old_id = posted["id"].as_str().expect("old id").to_string();
+    let mut successor = make_test_decision("lead");
+    successor.id = "d-successor-save-fails".into();
+    successor.supersedes = Some(old_id.clone());
+    crate::store::fail_next_atomic_write_for_test(&decision_path(&home, &successor.id));
+
+    let error = persist_post(&home, &successor).expect_err("successor save must fail");
+    assert!(error.to_string().contains("forced atomic_write failure"));
+    let old = get(&home, &serde_json::json!({"id": old_id}));
+    assert_eq!(old["decision"]["archived"], false, "{old}");
+    assert_eq!(old["decision"]["superseded_by"], Value::Null, "{old}");
+    assert!(!decision_path(&home, &successor.id).exists());
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -195,7 +520,9 @@ fn make_test_decision(author: &str) -> Decision {
         updated_at: "2026-04-27T00:00:00Z".into(),
         archived: false,
         supersedes: None,
+        superseded_by: None,
         working_directory: None,
+        review_class: None,
         schema_version: SCHEMA_VERSION,
         needs_answer: false,
         status: None,
@@ -1529,6 +1856,108 @@ fn auto_answer_timeout_none_for_operator_answered_decision_2313() {
     assert_eq!(
         d["answer"], "operator-choice",
         "operator's answer must survive"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+// ── #3419 poison-directory pins for `resolve_governing_decision` ─────────────
+// Each fixture is written as raw files (bypassing `post`) so the directory can
+// hold shapes the API would never produce. Every test first proves the clean
+// base resolves, so a refusal below is attributable to the poison, not to a
+// malformed fixture.
+
+fn governed_base(home: &Path, id: &str) -> Decision {
+    let mut base = make_test_decision("lead");
+    base.id = id.into();
+    base.review_class = Some(crate::daemon::pr_state::ReviewClass::Dual);
+    write_named_decision(home, &format!("{id}.json"), &base);
+    base
+}
+
+fn superseder(home: &Path, id: &str, supersedes: &str) {
+    let mut sup = make_test_decision("lead");
+    sup.id = id.into();
+    sup.supersedes = Some(supersedes.into());
+    write_named_decision(home, &format!("{id}.json"), &sup);
+}
+
+fn resolve_err(home: &Path, id: &str) -> String {
+    match resolve_governing_decision(home, id) {
+        Ok(resolved) => panic!("'{id}' must be refused, but resolved to {resolved:?}"),
+        Err(e) => e.to_string(),
+    }
+}
+
+#[test]
+fn governing_decision_refuses_ambiguous_superseding_leaves_3419() {
+    let home = tmp_home("ambiguous-leaves-3419");
+    governed_base(&home, "d-base");
+    assert_eq!(
+        resolve_governing_decision(&home, "d-base")
+            .expect("clean base resolves")
+            .review_class,
+        Some(crate::daemon::pr_state::ReviewClass::Dual)
+    );
+
+    // One active superseder: superseded, not ambiguous.
+    superseder(&home, "d-sup-a", "d-base");
+    let one = resolve_err(&home, "d-base");
+    assert!(one.contains("is superseded"), "one leaf: {one}");
+    assert!(
+        !one.contains("ambiguous"),
+        "one leaf must not read as ambiguous: {one}"
+    );
+
+    // Two active superseders for the same decision: the leaf is ambiguous and
+    // must be named as such — a resolver that only knows "superseded" cannot
+    // tell an operator that the directory itself is inconsistent.
+    superseder(&home, "d-sup-b", "d-base");
+    let two = resolve_err(&home, "d-base");
+    assert!(
+        two.contains("ambiguous superseding leaf"),
+        "two active leaves must be refused as ambiguous: {two}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn governing_decision_refuses_file_name_identity_mismatch_3419() {
+    let home = tmp_home("identity-mismatch-3419");
+    governed_base(&home, "d-clean");
+    assert!(resolve_governing_decision(&home, "d-clean").is_ok());
+
+    // `d-named.json` whose record claims to be `d-other`: the file a caller
+    // reaches by id must be the record that carries that id.
+    let mut imposter = make_test_decision("lead");
+    imposter.id = "d-other".into();
+    imposter.review_class = Some(crate::daemon::pr_state::ReviewClass::Single);
+    write_named_decision(&home, "d-named.json", &imposter);
+    let err = resolve_err(&home, "d-named");
+    assert!(
+        err.contains("mismatched record identity"),
+        "file/name identity mismatch must be refused: {err}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn governing_decision_refuses_stray_record_claiming_its_id_3419() {
+    let home = tmp_home("stray-identity-3419");
+    governed_base(&home, "d-real");
+    assert!(resolve_governing_decision(&home, "d-real").is_ok());
+
+    // A second file, under an unrelated name, that claims the same id. The
+    // exact file is still intact, but the directory now carries two records
+    // for one identity — the same tamper shape the reverse-link scan exists to
+    // expose, so it must be refused rather than silently ignored.
+    let mut stray = make_test_decision("lead");
+    stray.id = "d-real".into();
+    stray.review_class = Some(crate::daemon::pr_state::ReviewClass::Single);
+    write_named_decision(&home, "stray.json", &stray);
+    let err = resolve_err(&home, "d-real");
+    assert!(
+        err.contains("mismatched record identity"),
+        "a stray record claiming the id must be refused: {err}"
     );
     std::fs::remove_dir_all(&home).ok();
 }

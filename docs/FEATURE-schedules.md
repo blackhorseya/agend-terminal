@@ -43,6 +43,81 @@ For repeatable team setups, a deployment can create the whole arrangement at onc
 }
 ```
 
+### Daemon-owned Job schedules
+
+Set `job` instead of `instance` to create a worker when the schedule becomes due. The daemon owns admission, completion tracking, and recovery tracking; no permanent coordinator instance is required. This first version retries only failures before spawn intent is recorded. Once an attempt may have launched, it never automatically starts a replacement backend.
+
+```json
+{
+  "action": "create",
+  "cron": "0 15 * * 4,7",
+  "timezone": "Asia/Taipei",
+  "message": "Find new podcast episodes, reuse saved transcripts, summarize, and deliver using the output context. Persist progress by episode GUID and destination.",
+  "job": {
+    "backends": ["codex", "claude"],
+    "artifact_directory": "/absolute/path/podcast-artifacts",
+    "timeout_secs": 3600,
+    "max_attempts": 3,
+    "retry_delay_secs": 60,
+    "output_context": "Deliver using the configured Telegram and LINE destinations; keep a separate delivery receipt for each."
+  }
+}
+```
+
+`backends` is a nonempty, unique ordered list of canonical managed backend names: `claude`, `codex`, `kiro-cli`, `opencode`, `antigravity-cli`, or `grok`. Raw commands and shell backends are rejected. `artifact_directory` must be absolute. Defaults and bounds are: `timeout_secs` 3600 (60–86400), `max_attempts` 3 (1–10), and `retry_delay_secs` 60 (1–3600). Unknown Job fields are rejected. `backends`, `max_attempts`, and `retry_delay_secs` govern only failures before spawn intent, not usage limits or failures after launch.
+
+`output_context` holds fixed business delivery instructions, not credentials or an automatically provisioned channel endpoint. Workers must use the authorized destination configuration available to their tools. Each attempt has its own workspace; persistent transcripts, summaries, and delivery records belong in `artifact_directory`.
+
+`job.auto_cleanup` (default `false`) opts a Job into automatic cleanup of a successful Run whose worker the daemon both spawned and can prove fully contained — the child was observed to exit and the whole isolated process group has been reaped, with no external registry residue. Under this opt-in the task message also instructs the worker to terminate its own session once the work (and any configured delivery) is done, so the worker exits on its own. Since a worker can take a moment to exit, cleanup is retried on every daemon tick for a bounded window (`job.cleanup_retry_secs`, default 60, range 0–600; `0` restores the immediate fallback): a worker that exits within the window is cleaned up automatically, and only a Run still unprovable after the window falls back to `recovery_required`. The proof only exists in the daemon lifecycle that spawned the worker: after a daemon restart, or when only an `Intent` journal row, a still-running worker, or an external registry entry remains, the Run cannot be auto-cleaned and requires manual recovery. When `auto_cleanup` is not enabled, the worker message and the recovery behaviour are unchanged.
+
+Optional `job.notification` sends one completion or recovery-required status notice independently of business delivery:
+
+```json
+"notification": {"channel": "telegram", "chat_id": -1001234567890, "topic_id": 42}
+```
+
+Replace the example chat ID with the configured fleet Telegram group and the topic ID with an existing topic. Omitting `topic_id` sends without a thread. The daemon validates the explicit group at configuration and send time; it does not derive the destination from the creator/worker or create topics. Credentials stay in the existing channel environment configuration. The returned Telegram message ID is saved in the Run. A send interrupted by a crash or an ambiguous transport error becomes `unknown` and is not blindly retried. Notification state is separate from execution success and cleanup; inspect `runs` to reconcile an unknown outcome. This first notification endpoint supports Telegram only; Telegram/LINE podcast delivery still follows the task's business instructions.
+
+Optional `job.worker_topic` gives the worker a business-delivery channel to an existing Telegram topic, bypassing the status-notice length budget:
+
+```json
+"worker_topic": {"channel": "telegram", "chat_id": -1001234567890, "topic_id": 12153}
+```
+
+`topic_id` is required. The daemon validates the explicit group against the fleet configuration and never derives the destination from the creator or worker; it does not create a topic and owns no registry row, so worker teardown can never delete the shared topic. Unlike `job.notification`, delivery has no status-notice length cap: the content is split into transport-sized chunks and the full text is sent. A worker delivers with:
+
+```json
+{"action":"deliver","run_id":"<run-id>","attempt_id":1,"message_from_file":"/absolute/path/summary.md"}
+```
+
+The worker passes the output as `message` or `message_from_file`. Completion is refused while a delivery is in flight or has failed, so the worker finishes only after its output is fully accepted or deliberately skipped (a Run with nothing to deliver simply completes without delivering). The Run records the delivery outcome separately from execution: `sent` with one receipt per chunk, `failed` with the reason, or `not_requested`. A Run is never recorded as delivered unless the transport accepted every chunk. When unset, the worker spawns with topic binding `skip` exactly as before.
+
+Job admission has a durable per-schedule watermark. Missed cron occurrences coalesce to the latest due occurrence rather than creating a backlog. If a Run is still active, a later occurrence is recorded as an overlap skip. Jobs bypass legacy one-shot message replay and target-orphan handling. A launched attempt is never replaced automatically, even when its backend process exits: tools or other descendants may still be running. Usage limits, timeout, crash, and post-launch failures require manual recovery. While `recovery_required` or cleanup remains pending, later occurrences stay blocked as overlap skips — unless `job.auto_cleanup` enabled a contained success to clear that hold.
+
+Inspect executions with `{"action":"runs","id":"<schedule-id>"}`. Successful completion requires the current worker to call:
+
+```json
+{"action":"complete","run_id":"<run-id>","attempt_id":1,"result":"Completed; artifacts: /absolute/path/podcast-artifacts/..."}
+```
+
+The daemon checks the current attempt and caller identity and persists a completion receipt. Idle state, process exit, message admission, and task status alone do not prove success. Task settlement follows the receipt; failures in follow-up steps do not rerun successful work. A successful Run remains successful even if `cleanup_pending` and `recovery_required` require manual cleanup. Without `job.auto_cleanup`, normal success also requires that manual recovery step before later Runs can start.
+
+To resolve recovery:
+
+1. Inspect `runs`, preserve needed workspace files, and externally stop the worker and all its tools/descendants. Reconcile any ambiguous delivery outcomes and checkpoints.
+2. Use the existing `delete_instance` operation to remove the worker's fleet entry after that cleanup. Deleting the leader alone does not prove every descendant stopped.
+3. After confirming external cleanup, the operator runs this from an operator shell:
+
+```sh
+agend-terminal admin resolve-job-recovery '<run-id>' --attempt 1 --cleanup-confirmed --result "All worker/tool processes stopped; delivery checkpoints reconciled."
+```
+
+Recovery resolution requires the authenticated Operator API principal. Agent-principal requests are denied, and this CLI refuses ordinary agent environments; the schedule creator and worker cannot approve their own cleanup through agent tools. The action requires the worker fleet entry to be absent, records the audit note, and performs no process killing. It preserves an existing success receipt or marks unfinished work failed, releases the recovery hold, and never retries that Run. Later schedule occurrences can become eligible; skipped occurrences are not replayed.
+
+Create a new schedule to change between Job and instance modes. Updating `job` replaces its configuration for future Runs; existing Runs retain their snapshot. Job mode rejects `instance`, `linked_task_id`, `replacement_key`, and `fire_strategy: "until_success"`.
+
+Admission deduplication does not guarantee exactly-once external delivery. Tasks must preserve episode-level and destination-level progress, and reconcile unknown delivery outcomes before retrying endpoints that lack idempotency support.
+
 ### Operations
 
 #### create — create a schedule

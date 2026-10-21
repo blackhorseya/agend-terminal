@@ -43,11 +43,13 @@ use std::sync::Arc;
 
 pub(crate) mod assignment_reconcile;
 pub(crate) mod backend_exit_detection;
+pub(crate) mod busy_park_redrive;
 pub(crate) mod canonical_heartbeat;
 pub(crate) mod check_schedules;
 pub(crate) mod checkout_txn_recover;
 pub(crate) mod ci_watch_poll;
 pub(crate) mod claude_self_kick;
+pub(crate) mod codex_mcp_refusal;
 pub(crate) mod context_alert;
 pub(crate) mod context_handoff;
 pub(crate) mod context_thresholds;
@@ -70,6 +72,7 @@ pub(crate) mod reclaim;
 pub(crate) mod reconcile_backups_gc;
 pub(crate) mod recovery_dispatcher;
 pub(crate) mod respawn_watchdog;
+pub(crate) mod schedule_jobs;
 pub(crate) mod shadow_observe;
 pub(crate) mod snapshot;
 pub(crate) mod supervisor_trackers;
@@ -82,9 +85,11 @@ pub(crate) mod worktree_registry_sweep;
 
 pub(crate) use assignment_reconcile::AssignmentReconcileHandler;
 pub(crate) use backend_exit_detection::BackendExitDetectionHandler;
+pub(crate) use busy_park_redrive::BusyParkRedriveHandler;
 pub(crate) use check_schedules::CheckSchedulesHandler;
 pub(crate) use ci_watch_poll::CiWatchPollHandler;
 pub(crate) use claude_self_kick::ClaudeSelfKickHandler;
+pub(crate) use codex_mcp_refusal::CodexMcpRefusalHandler;
 pub(crate) use context_thresholds::ContextThresholdsHandler;
 pub(crate) use ephemeral_reap::EphemeralReapHandler;
 pub(crate) use external_liveness::ExternalLivenessHandler;
@@ -349,13 +354,8 @@ pub(crate) fn dispatch_exit_event_guarded(
     }
 }
 
-/// Build the canonical per-tick handler pipeline. Shared by `run_core` (daemon)
-/// and `app::run_app` (owned `agend-terminal app`) so both run the IDENTICAL set
-/// — the single source of truth that closes the recurring "app hand-picks a
-/// subset → silently drops a handler" class (#1002 / #982 / #1719). App filters
-/// only an explicit allowlist (see `app::APP_TICK_ALLOWLIST`), and a completeness
-/// invariant fails CI if a new handler lands here but neither runs in app nor is
-/// allowlisted.
+/// Build the canonical per-tick handler pipeline executed by daemon `run_core`.
+/// APP mode is a permanent thin client and does not run daemon handlers (#3344).
 ///
 /// #2538: relocated verbatim from `daemon::mod` (that grandfathered file was at
 /// its LOC ceiling with zero slack) — every `per_tick::X` reference below became
@@ -423,6 +423,7 @@ pub(crate) fn build_default_handlers(
         Box::new(ShadowObserveHandler::new()),
         Box::new(SnapshotRotationHandler::new()),
         Box::new(CheckSchedulesHandler::new()),
+        Box::new(schedule_jobs::ScheduleJobsHandler::new()),
         Box::new(CiWatchPollHandler::new()),
         Box::new(PrStateScanHandler::new()),
         // t-…-17 C12: reconcile the durable reviewer-assignment authority every tick
@@ -433,7 +434,7 @@ pub(crate) fn build_default_handlers(
         // regardless). Bounded work: one pass over the (few) active assignment
         // branches; a store with no reviewer assignments does a single empty
         // read_dir. Runs in app mode too (the live daemon is app-mode).
-        Box::new(AssignmentReconcileHandler::new(1)),
+        Box::new(AssignmentReconcileHandler::new(60)),
         Box::new(InboxMaintenanceHandler::new(60)),
         // #2604: offline-target unread-obligation escalation. Same 60-tick
         // cadence as the inbox sweep it races — an offline/nonexistent target's
@@ -510,6 +511,12 @@ pub(crate) fn build_default_handlers(
         // machines, not shared) and is panic-isolated from the other inside
         // `ContextThresholdsHandler::run`. Runs in app mode (live daemon).
         Box::new(ContextThresholdsHandler::new(6, 6)),
+        // t-20260902154222470714-82348-82: codex MCP-refusal detector. Same
+        // ~1min cadence as the context handlers next to it; reads each codex
+        // pane's screen text under a short `core.lock()` and raises ONE
+        // edge-triggered orchestrator notice per appearance-episode. Detection
+        // + notification only — no restart, no keystroke, no dispatch gating.
+        Box::new(CodexMcpRefusalHandler::new(6)),
         // #2044 inject-delivery watchdog: every tick (~10s) verify that an
         // armed actionable wake produced a UserPromptSubmit; re-deliver once
         // + WARN if a dialog swallowed it. Cheap (iterates a usually-empty
@@ -548,6 +555,11 @@ pub(crate) fn build_default_handlers(
         Box::new(AutoReleaseHandler::new()),
         Box::new(DispatchIdleHandler::new()),
         Box::new(RetentionHandler::new()),
+        // #3666: redrive busy-parked task dispatches on the target's idle
+        // transition (~60s cadence, the dispatch-idle L1 scan rate). Placed
+        // next to DispatchIdleHandler (same watch-don't-strand concern); an
+        // empty park store costs one read_dir per scan.
+        Box::new(BusyParkRedriveHandler::new(6)),
         // #2127 Phase 1: reclaim board tasks from agents stuck in a non-recoverable
         // usage_limit window (operator decision d-…085112: Phase 1, grace=10min).
         // Every 30 ticks (~5min). Fires ONLY for UsageLimit/QuotaExceeded with a
@@ -639,6 +651,22 @@ pub(crate) fn mock_live_agent_no_context(
     (handle, reader)
 }
 
+/// t-…-82348-36: the ONE place that turns a scraped context reading into the
+/// words the daemon says about it. Claude's statusline figure
+/// (`context_meaning == Some("window_fill")`) is the fill of an auto-compacted
+/// CONTEXT WINDOW — it cycles during normal work and is NOT remaining session
+/// budget (2026-09-02: a live pane read 95.0%, auto-compaction fired, it then
+/// read 7.0%) — so it is named as such wherever it is quoted; two orchestrators
+/// read the old "context usage" wording as budget and nearly restarted healthy
+/// agents. Every other backend keeps the base phrase byte-identical.
+pub(crate) fn context_reading_phrase(meaning: Option<&str>, pct: f32) -> String {
+    if meaning == Some("window_fill") {
+        format!("context-WINDOW fill at {pct:.1}%")
+    } else {
+        format!("context usage at {pct:.1}%")
+    }
+}
+
 /// Test-only: build a LIVE `AgentHandle` (real openpty, child `cat`) whose
 /// `StateTracker` has a REAL, fresh Claude context-percent reading (fed via
 /// a synthetic statusline frame, same shape as `state::tests::CLAUDE_STATUSLINE_FRAME`)
@@ -648,11 +676,32 @@ pub(crate) fn mock_live_agent_no_context(
 /// existing call sites across `per_tick`'s test suites — #2549 W5). Used by
 /// the `ContextAlertHandler`/`ContextHandoffHandler` merge's cross-
 /// independence pin, which needs a live agent whose threshold-crossing
-/// decision actually fires.
+/// decision actually fires. Delegates to [`mock_live_agent_with_frame`] with
+/// the Claude statusline frame it has always fed (t-…-82348-36).
 #[cfg(test)]
 pub(crate) fn mock_live_agent_with_context(
     name: &str,
     pct: f32,
+) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
+    mock_live_agent_with_frame(
+        name,
+        &crate::backend::Backend::ClaudeCode,
+        &format!(
+            "  Model: Fable 5 | Ctx Used: {pct:.1}% | ⎇ b | (+0,-0)\n  ⏵⏵ bypass permissions on (shift+tab to cycle)"
+        ),
+    )
+}
+
+/// Test-only generalization (t-…-82348-36): a LIVE handle whose tracker was
+/// fed an arbitrary rendered `frame` under an explicit `backend` — lets a
+/// test pin per-backend context semantics (e.g. the REAL captured Claude
+/// statusline, whose figure is context-WINDOW fill rather than remaining
+/// session budget, and whose alert/handoff wording must say so).
+#[cfg(test)]
+pub(crate) fn mock_live_agent_with_frame(
+    name: &str,
+    backend: &crate::backend::Backend,
+    frame: &str,
 ) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
     use std::sync::Arc;
     let pty_system = portable_pty::native_pty_system();
@@ -677,10 +726,8 @@ pub(crate) fn mock_live_agent_with_context(
     let reader = pair.master.try_clone_reader().expect("clone reader");
     let writer = pair.master.take_writer().expect("take writer");
     let pty_writer: crate::agent::PtyWriter = Arc::new(parking_lot::Mutex::new(writer));
-    let mut state = crate::state::StateTracker::new(Some(&crate::backend::Backend::ClaudeCode));
-    state.feed(&format!(
-        "  Model: Fable 5 | Ctx Used: {pct:.1}% | ⎇ b | (+0,-0)\n  ⏵⏵ bypass permissions on (shift+tab to cycle)"
-    ));
+    let mut state = crate::state::StateTracker::new(Some(backend));
+    state.feed(frame);
     let core = Arc::new(crate::sync_audit::CoreMutex::new(crate::agent::AgentCore {
         vterm: crate::vterm::VTerm::with_pty_writer(80, 10, Arc::clone(&pty_writer)),
         subscribers: Vec::new(),
@@ -719,6 +766,21 @@ mod tests {
     use super::*;
     use parking_lot::Mutex as PLMutex;
     use std::sync::Arc;
+
+    /// t-…-82348-36: the shared phrase names Claude's window fill for what it
+    /// is, and leaves every other backend's wording byte-identical to base.
+    #[test]
+    fn context_reading_phrase_names_window_fill_only_for_claude() {
+        assert_eq!(
+            context_reading_phrase(Some("window_fill"), 95.0),
+            "context-WINDOW fill at 95.0%"
+        );
+        assert_eq!(
+            context_reading_phrase(Some("context_gauge"), 82.0),
+            "context usage at 82.0%"
+        );
+        assert_eq!(context_reading_phrase(None, 61.0), "context usage at 61.0%");
+    }
 
     /// #t-watchdog-boot-suppress: the boot-grace predicate is active for a
     /// just-built handler and expires past the window; the window itself is a

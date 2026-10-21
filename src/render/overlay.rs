@@ -256,10 +256,12 @@ pub fn render_help(frame: &mut Frame) {
         "    Drag title     Swap pane position",
         "    Drag → tab bar Move pane across tabs (drop on tab or [+])",
         "    Ctrl+B x       Close pane",
+        "    Ctrl+B X       Delete fleet instance (type exact name)",
         "    Ctrl+B z       Toggle zoom",
         "    Ctrl+B Space   Next layout preset",
         "    Ctrl+B .       Rename pane",
         "    Ctrl+B !       Move pane to another tab (menu)",
+        "    Ctrl+B r       Reconnect focused pane bridge",
         "",
         "  Scroll",
         "    Mouse wheel    Scroll focused pane",
@@ -308,6 +310,86 @@ pub fn render_help(frame: &mut Frame) {
         .map(|l| Line::from(Span::styled(*l, Style::default().fg(Color::White))))
         .collect();
     frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// #3631: Team Organizer preview. Shows each destination tab and its ordered
+/// members, the move count, and the key hints. Read-only: the plan is a snapshot
+/// and rendering it never touches the layout.
+pub fn render_organizer(
+    frame: &mut Frame,
+    plan: &crate::layout::organizer::OrganizerPlan,
+    scope_label: &str,
+    applied: bool,
+    notice: Option<&str>,
+) {
+    let area = frame.area();
+    let row_count = plan.groups.len() as u16;
+    let content_h = row_count.saturating_add(5);
+    let la = centered_overlay_rect(area, content_h, 64, 2, 4);
+    let title = format!(
+        " Team Organizer [{}]{} (Tab: scope  Enter: apply  u: undo  Esc: cancel) ",
+        scope_label,
+        if applied { " — applied" } else { "" }
+    );
+    let inner = render_titled_popup(frame, la, Color::Green, title);
+
+    let mut lines: Vec<Line> = Vec::with_capacity(content_h as usize);
+    if plan.groups.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (nothing to arrange)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+    for group in &plan.groups {
+        let reuse = if group.reuse_tab_id.is_some() {
+            "existing tab"
+        } else {
+            "new tab"
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!(" {:<12}", group.name),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(format!("[{reuse}] "), Style::default().fg(Color::DarkGray)),
+            Span::styled(group.members.join(", "), Style::default().fg(Color::White)),
+        ]));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled(
+        format!(" {} pane(s) will move • local shells stay put", plan.moves),
+        Style::default().fg(Color::Yellow),
+    )));
+    if let Some(notice) = notice {
+        lines.push(Line::from(Span::styled(
+            format!(" {notice}"),
+            Style::default().fg(Color::Red),
+        )));
+    }
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+pub fn render_notice(frame: &mut Frame, message: &str) {
+    let area = frame.area();
+    let content_w = u16::try_from(message.width()).unwrap_or(u16::MAX);
+    let notice_area = centered_overlay_rect(area, 3, content_w.saturating_add(4), 2, 4);
+    let inner = render_titled_popup(
+        frame,
+        notice_area,
+        Color::Cyan,
+        " Notice (press any key to close) ",
+    );
+    frame.render_widget(
+        Paragraph::new(Span::styled(
+            message,
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        inner,
+    );
 }
 
 pub fn render_scroll_indicator(frame: &mut Frame, offset: usize) {

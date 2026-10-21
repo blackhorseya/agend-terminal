@@ -23,7 +23,9 @@ scripts/preflight.sh          # full matrix; --quick skips the Windows check
 This is the one-shot mirror of CI's `check` job and the best way to avoid a
 local-green → CI-red round trip. It runs `cargo fmt --check`,
 `cargo clippy --all-targets --features tray -- -D warnings`,
-`cargo test --tests --features tray` (unit + integration + invariants), and a
+`cargo nextest run --features tray` (unit + integration + invariants — CI's
+runner; `cargo test --tests --features tray` only when cargo-nextest is
+missing), and a
 **Windows cross-check** (`x86_64-pc-windows-msvc`) — the keystone, since
 Windows-only code (`libc::getppid`, `/bin/sh` spawns, `UnixStream`) compiles
 fine on a unix dev box but breaks CI's `windows-latest` runner.
@@ -39,34 +41,67 @@ Without `cargo-xwin` the Windows step SKIPs with a hint (never false-fails);
 CI's `windows-latest` runner stays the backstop. The preflight is intentionally
 *not* a git hook — the full matrix takes a few minutes; run it manually.
 
-A pre-commit hook at `.git/hooks/pre-commit` auto-formats staged `.rs` files
-and re-stages them. It does NOT run clippy — clippy is too slow for a
-pre-commit path. Run clippy yourself before `git push`.
+**Filtered test runs must still build `tests/`.** Iterate with
+`cargo nextest run --features tray <filter>`, never
+`cargo test --bin agend-terminal <filter>`: `--bin` compiles only the binary's
+own `#[cfg(test)]` modules and skips every `tests/*.rs` invariant (temp-fixture
+prefix isolation, env-mutation serialisation, spawn rationale, file-size
+ceilings, docs bilingual), so a green `--bin` run is not evidence for CI. Say
+"tests green" only after that gate (or `scripts/preflight.sh --quick`). In a
+daemon-managed agent shell `export AGENTIC_GIT_HOME="$AGEND_HOME"` first
+(preflight does it itself): tests that scope `AGEND_HOME` and spawn `git`
+otherwise trip the agentic-git shim's recursion guard (#1504) — about 40
+deterministic failures CI never sees, because CI has no shim on PATH. Which
+of the remaining results you may trust from an agent shell, and which need a
+solo re-run first, is defined in CONTRIBUTING.md under "Which local results
+an agent worktree can trust".
+
+**Which hooks actually fire depends on `core.hooksPath`, and there are two
+regimes.** In a daemon-managed worktree — and in any clone whose
+`core.hooksPath` points at `$AGEND_HOME/hooks` — the active hooks are the
+daemon-owned ones written there: `prepare-commit-msg` (plus
+`prepare-commit-msg.ps1`) and `reference-transaction`. The tracked
+`scripts/hooks` assets described below (`pre-commit`, `pre-push`, `post-merge`)
+are NOT active in that regime, and `.git/hooks/*` is shadowed by
+`core.hooksPath` entirely. The descriptions that follow apply to the other
+regime: a clone whose `core.hooksPath` points at `scripts/hooks`, which is what
+`scripts/install-hooks.sh` switches a clone to. Check which regime a clone is in
+with `git config --get core.hooksPath`.
+
+In the `scripts/hooks` regime, a pre-commit hook (`scripts/hooks/pre-commit`)
+auto-formats staged `.rs` files and re-stages them. It does NOT run clippy —
+clippy is too slow for a pre-commit path. Run clippy yourself before
+`git push`.
 
 The pre-push hook (`scripts/hooks/pre-push`) runs **two gates**:
 
 1. **CI-parity** (#t-ci-parity-prepush-guard) — on a push whose range touches
    `src/` / `tests/` / `Cargo.*` / `build.rs`, it runs `scripts/preflight.sh
    --quick` (the exact CI `check` commands: `cargo fmt --check`, `cargo clippy
-   --all-targets --features tray -- -D warnings`, `cargo test --tests --features
+   --all-targets --features tray -- -D warnings`, `cargo nextest run --features
    tray`) and **blocks the push if they fail**. This closes the recurring miss
    where an agent ran only `cargo test --bin` — which SKIPS the `tests/`
    integration targets — declared CI-ready, and CI then rejected it
    (#1734 stale-string integration test, #1735 block_on invariant). Docs-only
    pushes skip the build. `--quick` omits the Windows cross-check (CI's
    `windows-latest` is the backstop for that).
-2. **claim-verify** — verifies `Claim:` trailers against the actual diff.
+2. **claim-verify** — a best-effort local nudge: it checks the latest commit's
+   `Claim:` trailer against the actual diff for each pushed ref. It is not the
+   authoritative trust boundary; CI, daemon-side review, and the canonical
+   merge gate remain authoritative.
 
 Override either with `git push --no-verify` in emergencies (the daemon-side gate
 and CI still apply, so `--no-verify` is not a free pass).
 
-A post-merge hook triggers a background `cargo build --release` when `src/`
-files change. Desktop notification on completion. Does not auto-restart the
-daemon — operator decides restart timing. Disable with
+In the `scripts/hooks` regime, a post-merge hook triggers a background
+`cargo build --release` when `src/` files change, with a desktop notification on
+completion. It does not auto-restart the daemon — operator decides restart
+timing. Under the `$AGEND_HOME/hooks` regime this hook is not installed, so no
+automatic rebuild happens there. Disable with
 `git config core.hooksPath /dev/null` only in an operator-owned standalone
 clone, with the understanding that this disables every tracked hook. Never
-change `core.hooksPath` in a daemon-managed agent worktree; it also carries the
-provenance and pre-push safety hooks.
+change `core.hooksPath` in a daemon-managed agent worktree; it carries the
+provenance hooks the daemon owns.
 
 ### If the hook isn't installed
 
@@ -76,15 +111,23 @@ Hooks are per-clone. After a fresh `git clone`, install with:
 scripts/install-hooks.sh   # idempotent — safe to re-run
 ```
 
-**Fleet-agent coexistence**: the daemon sets each managed worktree's
-`core.hooksPath` to `$AGEND_HOME/hooks` (`src/binding.rs::install_hooks`) and
-writes only `prepare-commit-msg` there — it does *not* clear the directory. So
-`install-hooks.sh` *copies* the tracked `pre-push` into `$AGEND_HOME/hooks/pre-push`,
-where it coexists and fires for agent pushes (one copy covers every current and
-future worktree, since they share that dir). Agent pushes DO run the hook: the
-The active agent git guard ultimately invokes real `git`, which honours
-`core.hooksPath`. This coexistence relies on the daemon not deleting
-`$AGEND_HOME/hooks/pre-push`; if that changes, re-run `install-hooks.sh`.
+**Fleet-agent coexistence and the accepted trust boundary (#3593)**: the daemon
+sets each managed worktree's `core.hooksPath` to `$AGEND_HOME/hooks`
+(`src/binding.rs::install_hooks`) and writes only the daemon-owned provenance
+hooks there — it does *not* clear, install, or reconcile the tracked `pre-push`.
+That shared directory is **not a daemon trust boundary** for pre-push. The
+`install-hooks.sh` copy of `pre-push`, when present there, is an
+**operator-installed convenience**, not an integrity guarantee. A missing or
+renamed copy (for example `pre-push.disabled-*`) is an accepted limitation and
+does not automatically repair; use `ls "$AGEND_HOME/hooks"` before relying on
+it. The fleet policy question (t-20260712073154879622-40783-31) is therefore
+resolved conservatively: agent pushes are not required to pass this local hook,
+and no mutation-capable hook is silently enabled in the shared directory.
+
+The claim check is likewise only a local nudge: it examines the latest commit's
+`Claim:` trailer, and `git push --no-verify` bypasses it. Neither the latest-
+commit scope nor that local bypass changes the authoritative CI, daemon-side
+review, or canonical merge gates.
 
 ## Test fidelity: feed consumers the producer's real output (#1493)
 

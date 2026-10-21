@@ -347,12 +347,18 @@ pub(crate) fn tool_allowed_for_role_action(
     tool_allowed_for_role(role_kind, tool)
 }
 
-static ALL_TOOLS: [ToolEntry; 32] = [
+static ALL_TOOLS: [ToolEntry; 34] = [
     // ── Channel ──
     ToolEntry {
         name: "reply",
         definition: super::tools::def_reply,
         handler: super::handlers::dispatch::dispatch_reply,
+        class: ToolClass::SIDE_EFFECT,
+    },
+    ToolEntry {
+        name: "operator_page",
+        definition: super::tools::def_operator_page,
+        handler: super::handlers::dispatch::dispatch_operator_page,
         class: ToolClass::SIDE_EFFECT,
     },
     ToolEntry {
@@ -372,7 +378,7 @@ static ALL_TOOLS: [ToolEntry; 32] = [
         name: "inbox",
         definition: super::tools::def_inbox,
         handler: super::handlers::dispatch::dispatch_inbox,
-        class: ToolClass::FAST_RETRY_SAFE,
+        class: ToolClass::SIDE_EFFECT,
     },
     // ── Instance ──
     ToolEntry {
@@ -540,7 +546,14 @@ static ALL_TOOLS: [ToolEntry; 32] = [
         name: "release_worktree",
         definition: super::tools::def_release_worktree,
         handler: super::handlers::dispatch::dispatch_release_worktree,
-        class: ToolClass::RETRY_SAFE,
+        // #3694: NOT Fast. The real work is `git worktree remove --force`,
+        // bounded by `git_helpers::LOCAL_GIT_TIMEOUT` (60s), plus the bounded
+        // pre-removal ignored-cache sweep. The old Fast (5s) band false-timed
+        // out every oversized release; the proxy then returned
+        // `accepted_in_progress` while the worker was still mid-remove, so an
+        // instance restart/delete at that point stranded a marker-less,
+        // gitdir_dangling orphan (#3692). SLOW matches the real upper bound.
+        class: ToolClass::SLOW_SIDE_EFFECT,
     },
     ToolEntry {
         name: "binding_state",
@@ -553,6 +566,12 @@ static ALL_TOOLS: [ToolEntry; 32] = [
         name: "revoke_review_assignment",
         definition: super::tools::def_revoke_review_assignment,
         handler: super::handlers::dispatch::dispatch_revoke_review_assignment,
+        class: ToolClass::SIDE_EFFECT,
+    },
+    ToolEntry {
+        name: "correct_review_class",
+        definition: super::tools::def_correct_review_class,
+        handler: super::handlers::dispatch::dispatch_correct_review_class,
         class: ToolClass::SIDE_EFFECT,
     },
     ToolEntry {
@@ -682,8 +701,8 @@ mod tests {
         let all_names: Vec<&str> = all().iter().map(|e| e.name).collect();
         assert_eq!(
             all_names.len(),
-            32,
-            "registry baseline is 32 tools (+ usage_limit_takeover Architecture-14 item 5 Slice 2A)"
+            34,
+            "registry baseline is 34 tools (+ Decision45 correct_review_class)"
         );
         for role in [
             None,

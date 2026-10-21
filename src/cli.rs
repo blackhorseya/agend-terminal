@@ -177,6 +177,11 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
     check("Home directory", home, " ✗ (not found)");
     check(".env file", &home.join(".env"), " - (optional)");
 
+    println!(
+        "\n  File descriptors (this process): {}",
+        crate::resource_limits::doctor_fd_usage()
+    );
+
     println!("\n  Protocol:");
     print_protocol_human(home);
 
@@ -247,6 +252,33 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
         println!("    (none)");
     }
 
+    // #3505 P0(c) r2 B1: surface Live-registry vs *.port drift. The drift
+    // source MUST be the Live registry (`list_live_agents`), not the
+    // fallback-merged `agents` above — when the daemon is down the merged
+    // list IS the port glob, and diffing it against itself would hide
+    // every drift. A file-direct edit (or a refused/partial teardown)
+    // leaves one source stale while the other still names the agents —
+    // without this the TUI just loops `attach failed` warns with no
+    // actionable pointer.
+    match crate::runtime::list_live_agents(home) {
+        Some(live) => {
+            let ports: Vec<String> = run
+                .as_ref()
+                .map(|r| crate::ipc::list_agent_ports(r))
+                .unwrap_or_default();
+            let drift = crate::runtime::detect_registry_port_drift(&live, &ports);
+            if !drift.is_empty() {
+                println!("\n  Registry/port drift ({}):", drift.len());
+                for line in &drift {
+                    println!("    ⚠ {line}");
+                }
+            }
+        }
+        None => {
+            println!("\n  Registry/port drift: daemon unreachable — cannot compare Live registry against *.port files");
+        }
+    }
+
     println!("\n  Thread census:");
     let census = crate::thread_census::snapshot();
     if census.is_empty() {
@@ -300,6 +332,8 @@ pub fn run_doctor(home: &Path) -> anyhow::Result<()> {
     for candidate in &mut report.candidates {
         candidate.cwd = cwds.get(&candidate.pid).cloned();
     }
+    // #3539: cwd is known only now, so the display-only hint is recomputed.
+    crate::admin::orphan_provenance::annotate_residual_hints(home, &mut report);
     for line in crate::admin::orphan_provenance::render_human(&report).lines() {
         println!("  {line}");
     }
@@ -505,6 +539,40 @@ pub fn run_doctor_orphans_apply(
         }
         Err(message) => Err(anyhow::anyhow!(message)),
     }
+}
+
+/// Recover one exact markerless bound worktree. The explicit `--yes` guard is
+/// kept at the CLI boundary so scripts cannot accidentally invoke archival
+/// cleanup by omitting the destructive confirmation.
+#[allow(clippy::too_many_arguments)]
+pub fn run_admin_recover_worktree(
+    home: &Path,
+    instance: &str,
+    branch: &str,
+    worktree: &Path,
+    source_repo: &Path,
+    actor: &str,
+    audit_reason: &str,
+    yes: bool,
+) -> anyhow::Result<()> {
+    if !yes {
+        anyhow::bail!("refusing markerless worktree recovery without --yes");
+    }
+    let report = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        home,
+        actor,
+        audit_reason,
+        instance,
+        branch,
+        worktree,
+        source_repo,
+    )
+    .map_err(|message| anyhow::anyhow!(message))?;
+    println!(
+        "recovered markerless worktree to {}",
+        report.archive.display()
+    );
+    Ok(())
 }
 
 // ─────────────────────────────────────────────────────────────────

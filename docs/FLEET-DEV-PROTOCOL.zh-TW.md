@@ -88,6 +88,13 @@ gh pr checks <PR#>
 - 若任何檢查為 `pending`，請等待並重新檢查
 - 若任何檢查為 `fail`，阻止合併並回報實作者
 
+**GitHub 審查欄位不是 fleet 權威。** 每個 fleet agent 都以共用的
+`suzuke` 帳號向 GitHub 驗證，而該帳號同時也是 PR 作者。因此 GitHub 無法記錄
+不同身分的核准者：`reviewDecision` 會一直是 `REVIEW_REQUIRED`，且
+`mergeStateStatus: BLOCKED` 是預期狀態。不得等待這些欄位改變。Fleet 的 typed
+review receipt 與 exact-head review threshold 才是審查狀態的權威；GitHub 上的
+判定同步只供人類查看。
+
 **不穩定測試宣告需要 CI 紀錄證據。** 將 CI 失敗稱為「不穩定測試」（以便重新執行而非修正）MUST 引用發生失敗之執行紀錄中的真實失敗測試名稱：
 
 ```
@@ -102,6 +109,10 @@ gh run view <run-id> --log-failed
 
 ### 3.4 再次審查（r1+）派發
 每次再次審查的派發都必須列舉上一輪的所有發現事項及其狀態：已修正／已延後／已撤回。對照關係缺漏或不完整 → 審查者重做完整的原始範圍（`full_review`），而非僅審查聲稱已修正的部分。
+
+若 reviewer 拒絕某項測試，而該測試隨後被重寫，重寫後的測試必須先形成自己的
+immutable RED commit，並證明它在尚未修正的實作上會失敗；之後才能提交實作修正。
+先前遭拒測試的 RED commit 不能證明重寫後的測試。
 
 ### 3.5 多位審查者
 - 預設：單一主要審查者
@@ -152,14 +163,15 @@ gh run view <run-id> --log-failed
 ### 3.12 判定外部化（原 §3.5.13）
 Fleet 內部判定 MUST 透過作用中的 SCM 提供者同步至 PR（GitHub 上使用 `gh pr comment`）。套用 §3.5 的合併權限矩陣：作者／實作者自行合併需要雙重 VERIFIED；協調器合併則使用該任務的審查類別；§3.6 僅文件的操作員例外仍須明確列出。CI 綠燈 + 必要的判定同步永遠是必要條件。
 
-**標準合併步驟：`repo({action:"merge", pr:<N>, repository:"<owner/repo>"})`**（MCP `repo` 工具 → `handle_merge_repo`，`src/mcp/handlers/ci/mod.rs`）。它發出的合併與原始 `gh` 呼叫在位元組層級**完全相同**（`gh pr merge <N> --repo R --admin --squash --delete-branch`，由 `scm::tests::pr_merge_args_match_existing_gh_call` 鎖定），但包覆了原始命令欠缺的三層安全網：
+**標準合併步驟：`repo({action:"merge", pr:<N>, repository:"<owner/repo>"})`**（MCP `repo` 工具 → `handle_merge_repo`，`src/mcp/handlers/ci/mod.rs`）。它發出的合併與原始 `gh` 呼叫在位元組層級**完全相同**（`gh pr merge <N> --repo R --admin --squash --delete-branch`，由 `scm::tests::pr_merge_args_match_existing_gh_call` 鎖定），但包覆了原始命令欠缺的四層安全網：
 1. **安全的儲存庫解析（#1619）** — 透過 `resolve_repo_or_error` 解析目標 `owner/repo`；偵測失敗時會報錯，而不是默默對硬編碼／維護者的儲存庫執行合併。
 2. **CI 失敗即關閉閘門** — 先執行 `pr checks`（透過 `ScmProvider`）；任何非 `SUCCESS`/`SKIPPED` 的檢查，或任何無法判定的結果，都會拒絕合併。僅能用 `force=true` + 非空的 `force_reason` 繞過（稽核記錄於 `fleet_events.jsonl`）。
 3. **`verify_merge_landed`（#1467）** — `gh pr merge` 以 0 結束是必要條件，但並不充分（合併佇列／最終一致性可能在尚未實際合併時就以 0 結束）；它會再次 `view` PR，並回報 `merged:false, pending:true`，而非誤報成功，讓呼叫端重新查詢，而不是盲目再次合併。
+4. **精確 head 審查門檻閘門（#3419）** — 非 force 的 CI、base-drift 與 freshness 閘門接受精確取得的 head 後，載入相同 repo／PR／branch／head 的持久化 `PrState` 主體；若審查鏈結、類別／指派權威或當前 head 的 VERIFIED receipt 不符合門檻，便以 typed `MergeDeficit` 結果拒絕。`force=true` 且 `force_reason` 非空，是此審查閘門唯一經稽核的繞過方式；精確 head/base 取得與合併前 identity recheck 仍不可繞過。
 
 它也會透過 `ScmProvider` 路由（平台無關 — 並未硬接至 `gh`）。
 
-⚠ **閘門的範圍：** `repo action=merge` 會對 **CI 失敗即關閉**設閘，而不是對審查判定設閘。上述雙重 VERIFIED 要求仍是由協調器強制執行的 **fleet 慣例**（派發審查者 → 等候 `VERIFIED` → 接著執行 `repo action=merge`）— 此變更並不會讓審查成為合併原語的硬性前置條件。
+⚠ **閘門的範圍：** 標準的非 force `repo action=merge` 會受到 CI 失敗即關閉、base-drift/freshness 與精確 head 審查門檻的約束；審查是硬性前置條件，不只是 fleet 慣例。`force=true` + 非空 `force_reason` 路徑是上文所述、經稽核的審查門檻繞過方式。原始 `gh` 備援仍在此常駐程式審查閘門之外，因此不受此原語的審查閘門約束；僅依下文記載的緊急／分支保護規則使用。
 
 **備援（緊急情況／MCP 無法使用）：** 原始 `gh pr merge <N>` — `--auto --squash --delete-branch` 形式（§3.12.1，伺服器端佇列；需要嚴格的分支保護）或同步的 `--admin --squash --delete-branch` 形式（佇列競爭復原／管理員繞過，依 #985/#988 的偏離先例）。優先使用 MCP 原語；僅在 MCP 路徑無法執行時才降級使用原始 `gh`。
 
@@ -768,7 +780,7 @@ Impl/reviewer 必須在 worktree 中工作，絕不能使用 canonical working t
 
 `↳ 緣由 A-§12.7`
 
-## §13. `AGEND_GIT_BYPASS=1` 使用方式
+## §13. `AGENTIC_GIT_BYPASS=1` 使用方式
 
 **TL;DR：** agent 在 daemon-managed worktree 內使用一般 git，且絕不 bypass shim denial。Bypass 只保留給 daemon internal，以及經 operator 明確授權的 repair/bootstrapping exception。
 
@@ -782,7 +794,7 @@ git add / commit / fetch
 git push origin <your-branch>     # any branch except main
 ```
 
-不得預先加上 `AGEND_GIT_BYPASS=1`。若 shim deny 某個 action，請停止，依照 daemon-managed remediation 處理，或詢問 lead/operator；deny 不是從 guard 下方重試的許可。
+不得預先加上 `AGENTIC_GIT_BYPASS=1`。若 shim deny 某個 action，請停止，依照 daemon-managed remediation 處理，或詢問 lead/operator；deny 不是從 guard 下方重試的許可。Shim 也接受 legacy 的 `AGEND_GIT_BYPASS=1` 拼法。
 
 ### 13.2 已授權的 bypass scope
 
@@ -794,6 +806,12 @@ git push origin <your-branch>     # any branch except main
 - Repository-owned test wrapper 可以在內部設定 bypass，供自身 nested git probe 可能遞迴的 tool 使用（例如 configured `nextest` wrapper）。Agent 不得臨時自行加上 prefix。
 
 Raw worktree lifecycle、切換 protected branch 與 push 至 main 都不屬於 agent bypass scope。使用 `repo`、`bind_self`、`release_worktree` 與 PR/merge workflow。
+
+Agent 的長期授權（standing authorization）同樣不授權修改受保護的
+canonical local refs。特別是，即使不切換 branch 也不 push，從 canonical
+checkout 執行 `git merge --ff-only @{u}` 仍屬 protected-branch mutation。
+Canonical sync 必須經由 daemon-managed repo/release/merge workflow，或另一個
+個別授權的 daemon-managed action。
 
 ### 13.3 Bypass 為何代價高昂
 
@@ -813,7 +831,7 @@ Raw worktree lifecycle、切換 protected branch 與 push 至 main 都不屬於 
 3. 若有建議，依照 daemon-managed remediation（`repo`、`bind_self`、`release_worktree`）處理。
 4. 如果唯一建議的 remediation 是 bypass，agent 應暫停並要求 lead/operator 指示。只有 operator 或明確授權的 procedure 能核准 exact one-command scope。
 
-`AGEND_GIT_BYPASS_UNTIL=<epoch>` 用於 audited、time-bounded operator intervention；它不是 agent convenience flag。
+`AGENTIC_GIT_BYPASS_UNTIL=<epoch>` 用於 audited、time-bounded operator intervention；它不是 agent convenience flag。Shim 也接受 legacy 的 `AGEND_GIT_BYPASS_UNTIL=<epoch>` 拼法。
 
 ### 13.5 Bug-Blocks-Its-Own-Fix Exception（Sprint 62）
 

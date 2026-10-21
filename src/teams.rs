@@ -502,7 +502,17 @@ pub(crate) fn list_with_live_instances(home: &Path, live_agents: &HashSet<String
     serde_json::json!({"teams": teams})
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TeamUpdateCaller<'a> {
+    Operator,
+    Managed(&'a str),
+}
+
 pub fn update(home: &Path, args: &Value) -> Value {
+    update_authorized(home, args, TeamUpdateCaller::Operator)
+}
+
+pub fn update_authorized(home: &Path, args: &Value, caller: TeamUpdateCaller<'_>) -> Value {
     let name = match args["name"].as_str() {
         Some(n) => n.to_string(),
         None => return serde_json::json!({"error": "missing 'name'"}),
@@ -551,6 +561,21 @@ pub fn update(home: &Path, args: &Value) -> Value {
     let Some(current) = fleet.teams.get(&name).cloned() else {
         return serde_json::json!({"error": format!("team '{name}' not found")});
     };
+    let orchestrator_changed = new_orchestrator
+        .as_deref()
+        .is_some_and(|new| current.orchestrator.as_deref() != Some(new));
+    if orchestrator_changed {
+        if let TeamUpdateCaller::Managed(requester) = caller {
+            if current.orchestrator.as_deref() != Some(requester) {
+                return serde_json::json!({
+                    "error": format!(
+                        "only the current orchestrator or operator may change team '{name}' orchestrator"
+                    ),
+                    "denied_by": "team_orchestrator_authority",
+                });
+            }
+        }
+    }
 
     // Block removing the orchestrator
     if let Some(ref orch) = current.orchestrator {
@@ -597,7 +622,21 @@ pub fn update(home: &Path, args: &Value) -> Value {
     let new_project_id = args["project_id"]
         .as_str()
         .map(String::from)
-        .or_else(|| current.project_id.clone());
+        .or_else(|| current.project_id.clone())
+        // Legacy teams had no pinned project_id. Preserve their current board
+        // before accepting a source_repo change so the update cannot silently
+        // split one repository across two boards.
+        .or_else(|| {
+            current
+                .source_repo
+                .as_deref()
+                .map(crate::tasks::project_id_from_source_repo)
+        })
+        .or_else(|| {
+            new_source_repo
+                .as_deref()
+                .map(crate::tasks::stable_project_id_from_source_repo)
+        });
 
     let new_accept_from: Vec<String> = args["accept_from"]
         .as_array()
@@ -616,9 +655,27 @@ pub fn update(home: &Path, args: &Value) -> Value {
         project_id: new_project_id,
         accept_from: new_accept_from,
     };
+    if orchestrator_changed {
+        let old = current.orchestrator.as_deref().unwrap_or("<none>");
+        let new = cfg.orchestrator.as_deref().unwrap_or("<none>");
+        let (caller_name, channel) = match caller {
+            TeamUpdateCaller::Operator => ("operator", "operator"),
+            TeamUpdateCaller::Managed(requester) => (requester, "mcp"),
+        };
+        if let Err(error) = crate::event_log::try_log(
+            home,
+            "team_orchestrator_change_authorized",
+            caller_name,
+            &format!("team={name} old={old} new={new} caller={caller_name} channel={channel}"),
+        ) {
+            return serde_json::json!({
+                "error": format!("could not durably audit orchestrator change: {error}")
+            });
+        }
+    }
     match crate::fleet::update_team_in_yaml(home, &name, &cfg) {
         Ok(crate::fleet::TeamWriteOutcome::Written) => {
-            if cfg.orchestrator.is_some() {
+            if orchestrator_changed && matches!(caller, TeamUpdateCaller::Operator) {
                 cleanup_orchestrator_tasks_for_team(home, &name);
             }
             serde_json::json!({"status": "updated", "name": name})
@@ -774,15 +831,28 @@ pub struct TeamUpdateOutcome {
     pub result: Value,
     pub added: Vec<String>,
     pub removed: Vec<String>,
+    pub config_changed: bool,
 }
 
 /// Apply a team update and return the original wire result plus the effective
 /// added/removed member diff. Callers own transport-specific response mapping
 /// and notification; this service owns the single roster mutation path.
 pub fn update_with_diff(home: &Path, args: &Value) -> TeamUpdateOutcome {
+    update_with_diff_authorized(home, args, TeamUpdateCaller::Operator)
+}
+
+pub fn update_with_diff_authorized(
+    home: &Path,
+    args: &Value,
+    caller: TeamUpdateCaller<'_>,
+) -> TeamUpdateOutcome {
     let team_name = args["name"].as_str().unwrap_or("");
+    let before_config = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .and_then(|fleet| fleet.teams.get(team_name).cloned())
+        .and_then(|config| serde_json::to_value(config).ok());
     let before = get_members(home, team_name);
-    let result = update(home, args);
+    let result = update_authorized(home, args, caller);
     let after = get_members(home, team_name);
     let before_set: std::collections::HashSet<&String> = before.iter().collect();
     let after_set: std::collections::HashSet<&String> = after.iter().collect();
@@ -796,10 +866,15 @@ pub fn update_with_diff(home: &Path, args: &Value) -> TeamUpdateOutcome {
         .filter(|member| !after_set.contains(member))
         .cloned()
         .collect();
+    let after_config = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .and_then(|fleet| fleet.teams.get(team_name).cloned())
+        .and_then(|config| serde_json::to_value(config).ok());
     TeamUpdateOutcome {
         result,
         added,
         removed,
+        config_changed: before_config != after_config,
     }
 }
 
@@ -1754,6 +1829,31 @@ mod tests {
         assert_eq!(
             team.source_repo.as_deref(),
             Some(std::path::Path::new("/tmp/new-repo"))
+        );
+        assert_eq!(team.project_id.as_deref(), Some("tmp_old-repo"));
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn legacy_team_update_pins_previous_board_identity() {
+        let home = tmp_home("update_legacy_src_repo");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "teams:\n  dev:\n    members: [alice]\n    source_repo: /tmp/old-repo\n",
+        )
+        .unwrap();
+        let result = update(
+            &home,
+            &serde_json::json!({
+                "name": "dev",
+                "repository_path": "/tmp/new-repo"
+            }),
+        );
+        assert_eq!(result["status"], "updated");
+        let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(&home)).unwrap();
+        assert_eq!(
+            fleet.teams["dev"].project_id.as_deref(),
+            Some("tmp_old-repo")
         );
         std::fs::remove_dir_all(&home).ok();
     }

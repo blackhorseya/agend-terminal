@@ -231,6 +231,48 @@ fn explicit_legacy_pty_is_the_only_claude_fallback() {
 }
 
 #[test]
+fn unrelated_missing_env_source_preserves_legacy_pty_opt_in_3540_r1() {
+    let home = home("legacy-missing-unrelated-env");
+    fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  claude-agent:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE: legacy_pty\n      DESTINATION_TOKEN:\n        from_env: AGEND_TEST_MISSING_ENV_3540_R1\n",
+    )
+    .expect("fleet");
+
+    assert!(
+        legacy_pty_opt_in(&home, "claude-agent"),
+        "an unrelated missing source must not erase the declared legacy PTY opt-in"
+    );
+    assert_eq!(
+        mode_for_instance(&home, "claude-agent"),
+        TransportMode::LegacyPty
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+#[tracing_test::traced_test]
+#[test]
+fn missing_transport_mode_source_is_reported_and_keeps_channel_bridge_3540_r2() {
+    let home = home("transport-mode-missing-source");
+    fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  claude-agent:\n    backend: claude\n    env:\n      AGEND_TRANSPORT_MODE:\n        from_env: AGEND_TEST_MISSING_TRANSPORT_MODE_3540_R2\n",
+    )
+    .expect("fleet");
+
+    assert!(!legacy_pty_opt_in(&home, "claude-agent"));
+    assert!(logs_contain(
+        "Claude transport mode environment resolution failed; retaining ChannelBridge"
+    ));
+    assert!(logs_contain("AGEND_TEST_MISSING_TRANSPORT_MODE_3540_R2"));
+    assert_eq!(
+        mode_for_instance(&home, "claude-agent"),
+        TransportMode::ChannelBridge
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+#[test]
 fn channel_locator_persists_across_daemon_restart() {
     let home = home("locator");
     let (first, first_listener) =
@@ -495,6 +537,15 @@ fn persisted_claude_locator_keeps_channel_mode() {
 enum FakeChannelExit {
     StopRequested,
     AcceptFailed(String),
+    /// #3322: the accepted socket's blocking mode could not be normalised. After
+    /// that the mode is unknown, which is exactly the state that can park a read
+    /// forever, so the stand-in stops instead of serving blind.
+    AcceptedModeFailed(String),
+    /// #3322: a non-transient error while reading the request. It used to be
+    /// swallowed by `unwrap_or(0)`, which also degraded the request to empty and
+    /// answered 404 — a wrong-but-plausible result the caller could not tell
+    /// apart from a real one.
+    RequestReadFailed(String),
 }
 
 /// `WouldBlock` is the nonblocking-accept idle case; `Interrupted` and
@@ -507,11 +558,102 @@ fn accept_error_is_fatal(kind: io::ErrorKind) -> bool {
     )
 }
 
+/// #3322: read the WHOLE request before answering it.
+///
+/// The stand-in used to make ONE `read` attempt and answer whatever it got. A
+/// request split across segments then left its body in the receive queue, and
+/// closing a socket with unread data sends an RST instead of a FIN — so the
+/// client loses the response it was already sent (`ECONNRESET`: os error 104 on
+/// Linux, 54 on macOS). That is the SAME MECHANISM as the observed CI failure —
+/// the error class matches and the fixture is racy by construction, but that
+/// this mechanism produced that particular run was never reproduced.
+///
+/// Bounded by `stop`, never by a clock: a wall-clock bound is what makes a
+/// stand-in die under load. `Ok(None)` means the caller asked us to stop.
+fn drain_request(
+    stream: &mut std::net::TcpStream,
+    stop: &AtomicBool,
+    inject_read_error: &AtomicBool,
+) -> io::Result<Option<String>> {
+    let mut buf: Vec<u8> = Vec::with_capacity(4096);
+    loop {
+        if stop.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if let Some(end) = header_end(&buf) {
+            if buf.len() >= end + content_length(&buf[..end]) {
+                return Ok(Some(String::from_utf8_lossy(&buf).into_owned()));
+            }
+        }
+        let mut chunk = [0_u8; 4096];
+        let attempt = if inject_read_error.load(Ordering::Acquire) {
+            Err(io::Error::other("#3322 injected read failure"))
+        } else {
+            stream.read(&mut chunk)
+        };
+        match attempt {
+            // Peer half-closed: this is all the request there will ever be.
+            Ok(0) => return Ok(Some(String::from_utf8_lossy(&buf).into_owned())),
+            Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) =>
+            {
+                thread::sleep(Duration::from_millis(2));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Index just past the `\r\n\r\n` that ends the request headers.
+fn header_end(buf: &[u8]) -> Option<usize> {
+    buf.windows(4).position(|w| w == b"\r\n\r\n").map(|i| i + 4)
+}
+
+/// `Content-Length` from the header block, or 0 when absent (e.g. `GET /health`).
+fn content_length(headers: &[u8]) -> usize {
+    String::from_utf8_lossy(headers)
+        .lines()
+        .find_map(|line| {
+            let (name, value) = line.split_once(':')?;
+            name.trim()
+                .eq_ignore_ascii_case("content-length")
+                .then(|| value.trim().parse::<usize>().ok())?
+        })
+        .unwrap_or(0)
+}
+
 struct FakeChannel {
     port: u16,
     stop: Arc<AtomicBool>,
     health_probes: Arc<AtomicUsize>,
     not_ready_answers: Arc<AtomicUsize>,
+    /// #3322 test-support: bumped immediately after `accept`, BEFORE any read.
+    /// Lets a test synchronise on "the connection was accepted" instead of
+    /// sleeping and hoping, which is what the request-split RED needs.
+    accepted_connections: Arc<AtomicUsize>,
+    /// #3322 test-support: widen the window between finishing the request read
+    /// and sending the response. That window is REAL and normally microseconds
+    /// wide — read, format, `write_all`, drop — and a request segment landing
+    /// inside it is left unread at close. This makes the existing race
+    /// observable; it does not invent one.
+    pause_before_response: Arc<Mutex<Duration>>,
+    /// #3322 test-support: make the mode normalisation itself fail. Otherwise
+    /// only a real `fcntl` failure reaches that arm, which no test can schedule,
+    /// so the fail-closed branch would ship undefended.
+    inject_mode_error: Arc<AtomicBool>,
+    /// #3322 test-support: make the request read fail with a NON-transient
+    /// error. `WouldBlock`/`Interrupted` are retried by design, so only an
+    /// injected error can reach the arm that records and ends the exchange.
+    inject_read_error: Arc<AtomicBool>,
+    /// #3322 test-support: force the LINUX shape — a BLOCKING accepted socket —
+    /// on whatever platform the test runs on. macOS inherits the listener's
+    /// non-blocking flag and Linux does not, so without this the normalisation
+    /// guard is unreachable from a developer machine and only CI could see it.
+    simulate_blocking_accept: Arc<AtomicBool>,
     exit: Arc<Mutex<Option<FakeChannelExit>>>,
     handle: Option<thread::JoinHandle<()>>,
 }
@@ -532,10 +674,20 @@ impl FakeChannel {
         let stop = Arc::new(AtomicBool::new(false));
         let health_probes = Arc::new(AtomicUsize::new(0));
         let not_ready_answers = Arc::new(AtomicUsize::new(0));
+        let accepted_connections = Arc::new(AtomicUsize::new(0));
+        let pause_before_response = Arc::new(Mutex::new(Duration::from_millis(0)));
+        let simulate_blocking_accept = Arc::new(AtomicBool::new(false));
+        let inject_mode_error = Arc::new(AtomicBool::new(false));
+        let inject_read_error = Arc::new(AtomicBool::new(false));
         let exit = Arc::new(Mutex::new(None));
         let thread_stop = Arc::clone(&stop);
         let thread_probes = Arc::clone(&health_probes);
         let thread_not_ready = Arc::clone(&not_ready_answers);
+        let thread_accepted = Arc::clone(&accepted_connections);
+        let thread_pause = Arc::clone(&pause_before_response);
+        let thread_simulate_blocking = Arc::clone(&simulate_blocking_accept);
+        let thread_inject_mode_error = Arc::clone(&inject_mode_error);
+        let thread_inject_read_error = Arc::clone(&inject_read_error);
         let thread_exit = Arc::clone(&exit);
         let handle = thread::spawn(move || {
             let reason = loop {
@@ -544,9 +696,37 @@ impl FakeChannel {
                 }
                 match listener.accept() {
                     Ok((mut stream, _)) => {
-                        let mut request = [0_u8; 4096];
-                        let read = stream.read(&mut request).unwrap_or(0);
-                        let request = String::from_utf8_lossy(&request[..read]);
+                        thread_accepted.fetch_add(1, Ordering::AcqRel);
+                        if thread_simulate_blocking.load(Ordering::Acquire) {
+                            // The Linux shape, reproduced anywhere.
+                            let _ = stream.set_nonblocking(false);
+                        }
+                        // #3322: NORMALISE the accepted socket, never inherit it.
+                        // macOS inherits the listener's non-blocking flag and
+                        // Linux does not (std's `accept4` never asks for
+                        // `SOCK_NONBLOCK`), and std normalises neither — so the
+                        // drain below would be `stop`-bounded on one platform
+                        // and unbounded on the other. Fail closed: after a failed
+                        // normalisation the mode is unknown.
+                        let normalised = if thread_inject_mode_error.load(Ordering::Acquire) {
+                            Err(io::Error::other("#3322 injected mode failure"))
+                        } else {
+                            stream.set_nonblocking(true)
+                        };
+                        if let Err(error) = normalised {
+                            break FakeChannelExit::AcceptedModeFailed(error.to_string());
+                        }
+                        let request = match drain_request(
+                            &mut stream,
+                            &thread_stop,
+                            &thread_inject_read_error,
+                        ) {
+                            Ok(Some(request)) => request,
+                            Ok(None) => break FakeChannelExit::StopRequested,
+                            Err(error) => {
+                                break FakeChannelExit::RequestReadFailed(error.to_string())
+                            }
+                        };
                         let path = request.split_whitespace().nth(1).unwrap_or("/");
                         let (status, body) = if path == "/health" {
                             let served = thread_probes.fetch_add(1, Ordering::AcqRel) + 1;
@@ -576,6 +756,11 @@ impl FakeChannel {
                                 "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
                                 body.len()
                             );
+                        // #3322 test-support: the real read->close window, widened.
+                        let pause = *thread_pause.lock();
+                        if !pause.is_zero() {
+                            thread::sleep(pause);
+                        }
                         let _ = stream.write_all(response.as_bytes());
                     }
                     Err(error) if !accept_error_is_fatal(error.kind()) => {
@@ -593,6 +778,11 @@ impl FakeChannel {
             stop,
             health_probes,
             not_ready_answers,
+            accepted_connections,
+            pause_before_response,
+            simulate_blocking_accept,
+            inject_mode_error,
+            inject_read_error,
             exit,
             handle: Some(handle),
         }
@@ -607,6 +797,222 @@ impl FakeChannel {
             .lock()
             .clone()
             .expect("fake channel must record why its accept loop ended")
+    }
+}
+
+/// #3322 RED: the stand-in answers a request it has not finished reading, then
+/// closes — and closing a socket whose receive queue still holds the request
+/// body sends an RST instead of a FIN, so the client's read of the response
+/// dies with `ECONNRESET` even though `write_all` succeeded.
+///
+/// This reproduces the same mechanism as a CI failure that was observed but not
+/// itself reproduced: `channel_bridge_queue_without_turn_start_is
+/// _truthfully_overdue` panicked at `self_kick_tests.rs:35:6` with
+/// "ChannelBridge webhook queue admission: Connection reset by peer (os error
+/// 104)", on `main` at 485b8920 and again on PR #3320's head. It is a race, so
+/// it passes most of the time — this test removes the race by SPLITTING the
+/// request on purpose.
+///
+/// NOT a sleep-and-hope: the test synchronises on `accepted_connections` for the
+/// accept, and only the gap between accept and the stand-in's single read is
+/// timed. The unfixed stand-in reads immediately on accept, so that gap is not
+/// a guess; after the fix the stand-in waits for the body and the gap stops
+/// mattering at all.
+#[test]
+fn split_request_is_drained_before_the_response_closes_3322() {
+    use std::io::Write as _;
+
+    let mut channel = FakeChannel::spawn(1);
+    let port = channel.port;
+    // Widen the real read->close window so the race is observable rather than
+    // occasional. The window exists without this; it is normally microseconds.
+    *channel.pause_before_response.lock() = Duration::from_millis(400);
+    let before = channel.accepted_connections.load(Ordering::Acquire);
+
+    let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let body = json!({"kind": "queue", "id": "3322"}).to_string();
+    client
+        .write_all(
+            format!(
+                "POST /webhook HTTP/1.1\r\nHost: 127.0.0.1\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            )
+            .as_bytes(),
+        )
+        .expect("headers");
+
+    // Synchronise on the accept, then leave the unfixed stand-in's single read
+    // room to consume the headers alone.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while channel.accepted_connections.load(Ordering::Acquire) == before
+        && std::time::Instant::now() < deadline
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_ne!(
+        channel.accepted_connections.load(Ordering::Acquire),
+        before,
+        "#3322 fixture check: the stand-in must have accepted the connection"
+    );
+    thread::sleep(Duration::from_millis(80));
+
+    // The body arrives while the stand-in sits in that window: an unfixed
+    // stand-in has already finished its single read, so the body is still queued
+    // in its receive buffer when it closes.
+    client.write_all(body.as_bytes()).expect("body");
+
+    let mut response = Vec::new();
+    let read = io::Read::read_to_end(&mut client, &mut response);
+
+    assert!(
+        read.is_ok(),
+        "#3322: the stand-in closed with the request body unread, so the close \
+         sent an RST and the client lost the response it had already been sent. \
+         A stand-in must DRAIN the request before answering it: {:?}",
+        read.err()
+    );
+    let text = String::from_utf8_lossy(&response);
+    assert!(
+        text.contains("202 Accepted"),
+        "#3322: a fully drained /webhook POST must be answered 202, not degraded \
+         to a 404 by a request the stand-in never finished reading; got: {text:?}"
+    );
+
+    assert_eq!(channel.stop_and_join(), FakeChannelExit::StopRequested);
+}
+
+/// #3322: a client that connects and says nothing must not wedge teardown.
+///
+/// The drain is bounded by `stop` and never by a clock, but `stop` is only
+/// reachable if `read` RETURNS — which makes the accepted socket's blocking mode
+/// load-bearing. macOS inherits the listener's non-blocking flag; **Linux does
+/// not**, so a blocking read on a silent client parks forever and the join in
+/// `stop_and_join` waits on a thread that will never finish. This test FORCES
+/// the Linux shape everywhere, and deliberately does not join to observe the
+/// outcome: joining a parked thread hangs the binary instead of reporting the
+/// failure.
+#[test]
+fn a_silent_client_does_not_wedge_teardown_3322() {
+    let mut channel = FakeChannel::spawn(1);
+    channel
+        .simulate_blocking_accept
+        .store(true, Ordering::Release);
+    let port = channel.port;
+
+    let _silent = std::net::TcpStream::connect(("127.0.0.1", port)).expect("#3322: connect");
+    let accept_deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while channel.accepted_connections.load(Ordering::Acquire) == 0
+        && std::time::Instant::now() < accept_deadline
+    {
+        thread::sleep(Duration::from_millis(2));
+    }
+    assert_ne!(
+        channel.accepted_connections.load(Ordering::Acquire),
+        0,
+        "#3322 fixture check: the stand-in must have accepted the silent client"
+    );
+    thread::sleep(Duration::from_millis(50));
+
+    // What `stop_and_join` does, minus the join we cannot safely perform yet.
+    channel.stop.store(true, Ordering::Release);
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    while channel.exit.lock().is_none() && std::time::Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    if channel.exit.lock().is_none() {
+        // Leak rather than join: `stop_and_join` joins, and joining a thread
+        // parked in a blocking read hangs the whole binary in place of this
+        // message.
+        std::mem::forget(channel);
+        panic!(
+            "#3322: the request drain never observed `stop` — the accepted \
+             socket's blocking mode was inherited rather than normalised, so \
+             `read` never returned and the join would have wedged the binary"
+        );
+    }
+
+    assert_eq!(channel.stop_and_join(), FakeChannelExit::StopRequested);
+}
+
+/// #3322: wait for the serving loop to record WHY it ended, without joining.
+/// `stop_and_join` sets `stop` first, so joining straight after connecting races
+/// the accept and reports `StopRequested` instead of the arm under test.
+fn wait_for_exit_reason(channel: &FakeChannel, budget: Duration) -> Option<FakeChannelExit> {
+    let deadline = std::time::Instant::now() + budget;
+    while std::time::Instant::now() < deadline {
+        if let Some(reason) = channel.exit.lock().clone() {
+            return Some(reason);
+        }
+        thread::sleep(Duration::from_millis(5));
+    }
+    None
+}
+
+/// #3322: a failed mode normalisation must END the exchange with its reason.
+///
+/// Fail-closed for a reason: after `set_nonblocking` fails the socket's mode is
+/// UNKNOWN, and an unknown mode is exactly the state that can park the drain
+/// forever. Serving on regardless trades a reported failure for a hang.
+/// Reviewer `archfix-codex-dev` rejected the first version of this PR because
+/// this arm had no seam — deleting the guard left the suite green — so the seam
+/// makes the branch reachable and this test makes it defended.
+#[test]
+fn accepted_mode_failure_is_reported_and_ends_the_exchange_3322() {
+    let mut channel = FakeChannel::spawn(1);
+    channel.inject_mode_error.store(true, Ordering::Release);
+    let port = channel.port;
+
+    let _ = std::net::TcpStream::connect(("127.0.0.1", port));
+
+    let exit = wait_for_exit_reason(&channel, Duration::from_secs(5))
+        .expect("#3322: the loop must record why it ended");
+    assert_eq!(channel.stop_and_join(), exit);
+    match exit {
+        FakeChannelExit::AcceptedModeFailed(ref reason) => assert!(
+            reason.contains("injected mode failure"),
+            "#3322: the recorded reason must name the failure; got {reason:?}"
+        ),
+        other => panic!(
+            "#3322: a failed mode normalisation must end the loop as \
+             AcceptedModeFailed, not {other:?} — an unknown socket mode is the \
+             state that can park the drain forever"
+        ),
+    }
+}
+
+/// #3322: a NON-transient request-read error must END the exchange with its
+/// reason, never be swallowed.
+///
+/// `WouldBlock`/`Interrupted` are retried by design, so only an injected error
+/// reaches this arm — which is why it needs a seam. The behaviour it replaces
+/// was `unwrap_or(0)`: that swallowed the error AND degraded the request to
+/// empty, so the stand-in answered a plausible 404 and the caller could not tell
+/// "never arrived" from "wrong path".
+#[test]
+fn request_read_failure_is_reported_and_ends_the_exchange_3322() {
+    use std::io::Write as _;
+
+    let mut channel = FakeChannel::spawn(1);
+    channel.inject_read_error.store(true, Ordering::Release);
+    let port = channel.port;
+
+    let mut client = std::net::TcpStream::connect(("127.0.0.1", port)).expect("#3322: connect");
+    let _ = client.write_all(b"GET /health HTTP/1.1\r\nHost: x\r\n\r\n");
+
+    let exit = wait_for_exit_reason(&channel, Duration::from_secs(5))
+        .expect("#3322: the loop must record why it ended");
+    assert_eq!(channel.stop_and_join(), exit);
+    match exit {
+        FakeChannelExit::RequestReadFailed(ref reason) => assert!(
+            reason.contains("injected read failure"),
+            "#3322: the recorded reason must name the failure; got {reason:?}"
+        ),
+        other => panic!(
+            "#3322: a non-transient read error must end the loop as \
+             RequestReadFailed, not {other:?} — swallowing it is what let the \
+             stand-in answer a request it never read"
+        ),
     }
 }
 
@@ -669,6 +1075,7 @@ fn registry_delivery_waits_for_delayed_channel_bridge_without_pty_fallback() {
             &home,
             "claude-agent",
             "registry delivery",
+            None,
             move |_, _, _| {
                 legacy_called_by_closure.store(true, Ordering::Release);
                 Ok(())
@@ -754,6 +1161,7 @@ fn permanently_terminated_channel_helper_surfaces_transport_error() {
             &home,
             "claude-agent",
             "registry delivery",
+            None,
             move |_, _, _| {
                 legacy_called_by_closure.store(true, Ordering::Release);
                 Ok(())
@@ -1363,6 +1771,370 @@ fn legacy_inbound_ambiguous_accepts_exact_start_ack() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// #3324: the bridge's own MCP instructions are one of the two signals that
+/// sent the agent to the wrong tool, and BOTH halves were wrong.
+///
+/// It described the envelope as `source="agend-terminal"` when the real wrapper
+/// is `source="agend-claude-channel" ... sender_id="agend-terminal"` — the two
+/// fields transposed — and then said "reply with the reply tool", which names
+/// two different tools in this environment. An agent reading it reasons
+/// correctly to the wrong conclusion.
+#[test]
+fn bridge_instructions_describe_the_real_envelope_and_the_exact_tool_3324() {
+    let home = home("instructions-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let response = mcp_message(
+        json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"initialize",
+            "params":{
+                "protocolVersion":"2025-06-18",
+                "clientInfo":{"name":"claude-code","version":"2.1.80"}
+            }
+        }),
+        &runtime,
+    )
+    .expect("initialize response");
+    let text = response["result"]["instructions"]
+        .as_str()
+        .expect("instructions")
+        .to_string();
+    let _ = fs::remove_dir_all(home);
+    assert!(
+        text.contains("source=\"agend-claude-channel\""),
+        "#3324: instructions must describe the envelope the agent actually \
+         receives; got {text:?}"
+    );
+    assert!(
+        !text.contains("source=\"agend-terminal\""),
+        "#3324: the transposed source/sender_id description must be gone; got {text:?}"
+    );
+    assert!(
+        text.contains("mcp__agend-terminal__reply"),
+        "#3324: instructions must name the tool that actually reaches an \
+         external channel, since this server's own `reply` does not; got {text:?}"
+    );
+}
+
+/// #3324: seed one delivery exactly as the daemon would, and hand the runtime
+/// the inbound mapping the bridge webhook records.
+fn seed_delivery(
+    home: &Path,
+    locator: &SessionLocator,
+    runtime: &ChannelRuntime,
+    body: &str,
+    origin: Option<crate::channel::ChannelKind>,
+) -> (Uuid, String) {
+    seed_delivery_with_logical_id(home, locator, runtime, body, origin, Some("m-3324"))
+}
+
+/// #3324 (N5): the logical id is what the refusal names as `message_id=`. It is
+/// absent whenever the notification carried no `[AGEND-MSG] id=…` header, so the
+/// refusal text has to be correct for both cases.
+fn seed_delivery_with_logical_id(
+    home: &Path,
+    locator: &SessionLocator,
+    runtime: &ChannelRuntime,
+    body: &str,
+    origin: Option<crate::channel::ChannelKind>,
+    logical_delivery_id: Option<&str>,
+) -> (Uuid, String) {
+    let mut envelope = DeliveryEnvelope::new(
+        "claude-agent",
+        locator.clone(),
+        crate::transport::envelope::DeliveryKind::Notification,
+        body,
+        None,
+    );
+    envelope.channel_origin = origin;
+    envelope.logical_delivery_id = logical_delivery_id.map(str::to_string);
+    let delivery_id = envelope.delivery_id;
+    let chat_id = chat_id_for_delivery("claude-agent", delivery_id);
+    let store = ReceiptStore::for_instance(home, "claude-agent").expect("store");
+    store.record_queued(&envelope).expect("queued receipt");
+    runtime
+        .remember_inbound(delivery_id, &chat_id, Some("agend-terminal"), body)
+        .expect("inbound mapping");
+    (delivery_id, chat_id)
+}
+
+fn call_bridge_reply(runtime: &ChannelRuntime, chat_id: &str, delivery_id: Uuid) -> Value {
+    mcp_message(
+        json!({
+            "jsonrpc":"2.0",
+            "id":1,
+            "method":"tools/call",
+            "params": {
+                "name":"reply",
+                "arguments": {
+                    "chat_id": chat_id,
+                    "delivery_id": delivery_id,
+                    "text":"the answer the user is waiting for"
+                }
+            }
+        }),
+        runtime,
+    )
+    .expect("tool response")
+}
+
+/// #3324 RED: a delivery that ORIGINATED on an external channel must not be
+/// replied to through the bridge.
+///
+/// The bridge is an inbound transport. Its `reply` records a transport
+/// acknowledgement and never reaches Telegram — and the environment exposes a
+/// SECOND tool also called `reply` that does. The observed incident: the agent
+/// called this one twice, got success twice, and the user received nothing for
+/// eleven minutes while the escalation ladder ran.
+///
+/// Fail CLOSED, and fail BEFORE the Reply record: a recorded reply is what makes
+/// the loss invisible afterwards.
+#[test]
+fn bridge_reply_is_refused_for_an_external_channel_origin_3324() {
+    let home = home("external-origin-refused-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let (delivery_id, chat_id) = seed_delivery(
+        &home,
+        &locator,
+        &runtime,
+        "[user:chiachenghuang via telegram] please research this",
+        Some(crate::channel::ChannelKind::Telegram),
+    );
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "#3324: an external-origin delivery must be REFUSED, not acknowledged; got {response}"
+    );
+    assert!(
+        message.contains("mcp__agend-terminal__reply"),
+        "#3324: the refusal must name the exact tool that can deliver, or the \
+         agent picks the wrong `reply` again; got {message:?}"
+    );
+    assert!(
+        message.contains("m-3324"),
+        "#3324: the refusal must name the target identity so the agent can \
+         address the right message; got {message:?}"
+    );
+    assert!(
+        runtime.reply_for(delivery_id).is_none(),
+        "#3324: nothing may be recorded as replied — the obligation stays armed"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// #3324: a delivery with NO receipt is served, deliberately.
+///
+/// Unknown origin is not external origin. `deliver_resident` records the
+/// envelope before posting the webhook, so a live delivery has one; the absent
+/// case is a pruned or pre-settle row (#3310), and refusing those would break
+/// internal replies with no way for the agent to tell why. Pinned so the choice
+/// is a decision rather than an accident — a later "fail closed on anything
+/// unknown" would break legacy rows and this test says so.
+#[test]
+fn bridge_reply_serves_a_delivery_with_no_receipt_3324() {
+    let home = home("no-receipt-served-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let delivery_id = Uuid::new_v4();
+    let chat_id = chat_id_for_delivery("claude-agent", delivery_id);
+    // Inbound mapping only — no receipt is ever written for this delivery.
+    runtime
+        .remember_inbound(
+            delivery_id,
+            &chat_id,
+            Some("agend-terminal"),
+            "orphaned row",
+        )
+        .expect("inbound mapping");
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+
+    assert!(
+        response.get("error").is_none(),
+        "#3324: an unknown-origin delivery must still be answerable; got {response}"
+    );
+    assert!(
+        runtime.reply_for(delivery_id).is_some(),
+        "#3324: and its reply must be recorded"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// #3324 RED: the bracket-in-name case, pinned at the GUARD.
+///
+/// The typed-source unit test says the classification is right; this says the
+/// DELIVERY is actually refused, which is the property the user's message
+/// depends on. The origin here comes from `NotifySource::external_channel`,
+/// exactly as production takes it — so the header this body renders (an
+/// operator whose configured allowlist name contains `]`) is along for the
+/// ride, not the evidence. Both channel kinds, because the guard must key on
+/// "external", not on Telegram.
+#[test]
+fn bridge_reply_is_refused_for_a_bracketed_display_name_3324() {
+    for kind in [
+        crate::channel::ChannelKind::Telegram,
+        crate::channel::ChannelKind::Discord,
+    ] {
+        let home = home(&format!("bracket-name-refused-3324-{kind:?}"));
+        let locator = test_published_locator(&home, "claude-agent");
+        let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+        let source = crate::inbox::NotifySource::Channel("alice]", kind);
+        let body = crate::inbox::notify::format_notification_for_inject(
+            false,
+            &source,
+            "please help",
+            &[],
+        );
+        let (delivery_id, chat_id) =
+            seed_delivery(&home, &locator, &runtime, &body, source.external_channel());
+
+        let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+
+        assert_eq!(
+            response["error"]["code"], -32602,
+            "#3324: a `]` in the display name must not let an external delivery \
+             through the bridge (kind={kind:?}); got {response}"
+        );
+        assert!(
+            runtime.reply_for(delivery_id).is_none(),
+            "#3324: and nothing may be recorded as replied (kind={kind:?})"
+        );
+        let _ = fs::remove_dir_all(home);
+    }
+}
+
+/// #3324 (N5): when the envelope carries no logical id, the refusal must not
+/// name one.
+///
+/// The first cut rendered prose into the value slot —
+/// `message_id=the original message id from the inbox` — which reads as a
+/// literal id an agent can pass straight through to the other tool, turning a
+/// helpful refusal into a second failed call.
+#[test]
+fn the_refusal_omits_message_id_when_the_envelope_has_none_3324() {
+    let home = home("no-logical-id-refusal-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let (delivery_id, chat_id) = seed_delivery_with_logical_id(
+        &home,
+        &locator,
+        &runtime,
+        "[user:alice via telegram] no AGEND-MSG header here",
+        Some(crate::channel::ChannelKind::Telegram),
+        None,
+    );
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "#3324: it is still an external delivery and still refused; got {response}"
+    );
+    assert!(
+        !message.contains("message_id="),
+        "#3324 (N5): no `message_id=` may be named when the envelope has no \
+         logical id — got {message:?}"
+    );
+    assert!(
+        message.contains("mcp__agend-terminal__reply"),
+        "#3324: the exact delivering tool must still be named; got {message:?}"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// #3324 (N2): the self-kick refusal runs BEFORE the origin guard, and that
+/// ordering is what makes `deliver_self_kick_notification`'s unconditional
+/// `None` safe.
+///
+/// Production composes the self-kick prompt itself, so it has no external
+/// origin by construction and passes `None`. Primary review's N2: the safety of
+/// that `None` therefore rests on `reject_self_kick_reply` refusing every
+/// self-kick reply first — a call order nothing pinned. This seeds the
+/// adversarial combination (a self-kick envelope that DOES carry an external
+/// origin) and asserts the self-kick refusal is the one that fires, so a future
+/// reorder is a test failure rather than a silent change of which guard owns
+/// the case.
+#[test]
+fn the_self_kick_refusal_runs_before_the_origin_guard_3324() {
+    let home = home("self-kick-before-origin-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let mut envelope = DeliveryEnvelope::self_kick(
+        "claude-agent",
+        locator.clone(),
+        "[AGEND-RESUME] recover your own state",
+    );
+    envelope.channel_origin = Some(crate::channel::ChannelKind::Telegram);
+    envelope.logical_delivery_id = Some("m-3324-self-kick".to_string());
+    let delivery_id = envelope.delivery_id;
+    let chat_id = chat_id_for_delivery("claude-agent", delivery_id);
+    let store = ReceiptStore::for_instance(&home, "claude-agent").expect("store");
+    store.record_queued(&envelope).expect("queued receipt");
+    runtime
+        .remember_inbound(
+            delivery_id,
+            &chat_id,
+            Some("agend-terminal"),
+            &envelope.body,
+        )
+        .expect("inbound mapping");
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+    let message = response["error"]["message"].as_str().unwrap_or_default();
+
+    assert_eq!(
+        response["error"]["code"], -32602,
+        "#3324: it must still be refused; got {response}"
+    );
+    assert!(
+        message.contains("ack_complete"),
+        "#3324 (N2): the SELF-KICK refusal must be the one that fires — it runs \
+         first, which is what lets the self-kick path pass `None` safely; \
+         got {message:?}"
+    );
+    assert!(
+        runtime.reply_for(delivery_id).is_none(),
+        "#3324: and nothing may be recorded as replied"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// #3324: the guard must not overreach. A delivery that originated INSIDE AgEnD
+/// is the bridge's own to answer, and refusing it would break every internal
+/// query.
+#[test]
+fn bridge_reply_still_serves_an_internal_delivery_3324() {
+    let home = home("internal-origin-served-3324");
+    let locator = test_published_locator(&home, "claude-agent");
+    let runtime = ChannelRuntime::new(&home, "claude-agent", &locator).expect("runtime");
+    let (delivery_id, chat_id) = seed_delivery(
+        &home,
+        &locator,
+        &runtime,
+        "[from:codex-125550] status?",
+        None,
+    );
+
+    let response = call_bridge_reply(&runtime, &chat_id, delivery_id);
+
+    assert!(
+        response.get("error").is_none(),
+        "#3324: an internal delivery must still be accepted; got {response}"
+    );
+    assert!(
+        runtime.reply_for(delivery_id).is_some(),
+        "#3324: the internal reply must still be recorded"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
 #[test]
 fn reply_requires_delivery_and_chat_correlation() {
     let home = home("correlation");
@@ -1431,6 +2203,95 @@ fn event_worker_switches_to_a_restarted_bridge_locator() {
         second
     );
     stop_instance_state(&home, "claude-agent");
+    let _ = fs::remove_dir_all(home);
+}
+
+/// #3515 follow-up (RED): shutdown must not pay the stop-observation latency
+/// once PER INSTANCE.
+///
+/// `stop_instance_state` sets an events worker's stop flag and then joins it,
+/// but the worker only observes that flag when its current SSE read returns —
+/// bounded by `SSE_READ_TIMEOUT` (20s). `cleanup_managed_transports` walks the
+/// instances one at a time, so before the fix each instance's wait started only
+/// after the previous one finished: N stuck workers cost N × 20s. #3515 is what
+/// put that loop on the `agend-terminal stop` path.
+///
+/// The stand-in worker's wind-down starts when it OBSERVES its flag, not when it
+/// is spawned. That is what makes the gate deterministic: pre-fix, flag i is set
+/// only once the join for i-1 returned, so the cost is exactly N × WIND_DOWN;
+/// post-fix every flag is already set, so the wind-downs overlap and the cost is
+/// about one. Review r1 rejected an earlier version whose workers ran a free
+/// clock from spawn — scheduler phase then decided how many windows were
+/// actually paid, and the measured RED ranged 1.616s–2.423s against a 1.600s
+/// threshold: a near-boundary gate, the exact thing this is supposed to prevent.
+///
+/// With the wind-down anchored to the flag there is no phase to get lucky with:
+/// the threshold sits at half the sequential cost, ~4× from either side.
+#[test]
+fn shutdown_signals_every_event_worker_before_joining_3515() {
+    use std::time::{Duration, Instant};
+
+    const WORKERS: usize = 8;
+    /// What one worker costs the caller once its flag is set — the stand-in for
+    /// everything between noticing the stop and the thread actually exiting.
+    const WIND_DOWN: Duration = Duration::from_millis(400);
+    /// The flag is observed promptly; only the wind-down is meant to be paid.
+    const FLAG_POLL: Duration = Duration::from_millis(1);
+
+    let home = home("shutdown-batch-stop");
+    let instances: Vec<String> = (0..WORKERS).map(|i| format!("claude-agent-{i}")).collect();
+
+    for instance in &instances {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        // Stands in for the real worker's exit cost: the wind-down begins when
+        // the flag is OBSERVED, so what the caller pays is decided by when the
+        // flag was set, never by where a free-running sleep happened to be.
+        let join = std::thread::Builder::new()
+            .name(format!("test-sse-{instance}"))
+            .spawn(move || {
+                while !thread_stop.load(Ordering::Acquire) {
+                    std::thread::sleep(FLAG_POLL);
+                }
+                std::thread::sleep(WIND_DOWN);
+            })
+            .expect("spawn stand-in worker");
+        event_workers().lock().insert(
+            worker_key(&home, instance),
+            EventWorker {
+                stop,
+                join: Some(join),
+                locator: SessionLocator::claude(
+                    "http://127.0.0.1:43123".to_string(),
+                    format!("session-{instance}"),
+                    "test-token".to_string(),
+                ),
+            },
+        );
+    }
+
+    let started = Instant::now();
+    crate::daemon::shutdown_cleanup::cleanup_managed_transports(&home, &instances);
+    let elapsed = started.elapsed();
+
+    assert!(
+        elapsed < WIND_DOWN * (WORKERS as u32) / 2,
+        "shutdown paid each worker's wind-down in series: {elapsed:?} for {WORKERS} \
+         workers at {WIND_DOWN:?} each — the stop flags must all be set before any \
+         worker is joined so the wind-downs overlap (#3515 follow-up)"
+    );
+
+    // Speed must not cost completeness: every worker is stopped and gone.
+    for instance in &instances {
+        assert!(
+            event_workers()
+                .lock()
+                .get(&worker_key(&home, instance))
+                .is_none(),
+            "cleanup must still remove every event worker ({instance})"
+        );
+    }
+
     let _ = fs::remove_dir_all(home);
 }
 

@@ -916,6 +916,8 @@ fn seed_task(home: &Path, id: &str, owner: &str, branch: &str, done: bool) {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -990,17 +992,15 @@ fn write_fleet(home: &Path, agent: &str) {
 
 /// REAL task-done entry: the MCP handler (`task action=done`) — exercises the
 /// handler→enqueue wiring (codex gap ③ / §3.9). These policy fixtures model
-/// root's operator-forced terminalization, because their synthetic worktrees
-/// are often deliberately dirty, unpushed, or cross-leased. Asserts no error.
+/// system cleanup terminalization, because their synthetic worktrees are often
+/// deliberately dirty, unpushed, or cross-leased. Asserts no error.
 fn task_done_via_handler(home: &Path, task_id: &str) {
     let r = crate::tasks::handle(
         home,
-        "operator",
+        "system:auto_close",
         &serde_json::json!({
             "action": "done",
-            "id": task_id,
-            "force": true,
-            "force_reason": "auto-release policy fixture"
+            "id": task_id
         }),
     );
     assert!(r.get("error").is_none(), "task action=done failed: {r}");
@@ -1047,7 +1047,7 @@ fn integration_merge_releases_via_real_scanner() {
 }
 
 #[test]
-fn merged_task_assignee_can_finish_after_auto_release_with_receipt() {
+fn merged_task_is_auto_closed_before_release_with_receipt() {
     let home = tmp_home("merge-receipt-task-done");
     let repo = itest_source_repo(&home, "owner/repo");
     let branch = "feat/receipt-done";
@@ -1068,6 +1068,7 @@ fn merged_task_assignee_can_finish_after_auto_release_with_receipt() {
         42,
         branch,
         "lead",
+        None,
     );
     assert_eq!(
         post_merge["receipt"], "persisted",
@@ -1098,22 +1099,18 @@ fn merged_task_assignee_can_finish_after_auto_release_with_receipt() {
     drain_queue(&home);
     assert!(!bound(&home, "dev"), "merge must auto-release the worktree");
 
-    let done = crate::tasks::handle(
-        &home,
-        "dev",
-        &serde_json::json!({"action": "done", "id": task_id}),
-    );
-    assert!(
-        done.get("error").is_none(),
-        "merge receipt should replace the intentionally released live binding: {done}"
-    );
+    let task = crate::tasks::list_all(&home)
+        .into_iter()
+        .find(|task| task.id.as_str() == task_id)
+        .expect("task present");
     assert_eq!(
-        done["status"], "done",
-        "task must reach terminal state: {done}"
+        task.status,
+        crate::task_events::TaskStatus::Done,
+        "merged PR-state must auto-close the structured task"
     );
     assert!(
-        crate::merge_receipt::find_for_task_completion(&home, task_id, "dev").is_none(),
-        "successful terminalization must settle the task-completion proof"
+        crate::merge_receipt::find_for_task_completion(&home, task_id, "dev").is_some(),
+        "system auto-close must not consume the assignee's merge receipt"
     );
     assert!(
         crate::merge_receipt::find(&home, "owner/repo", &merge_sha, task_id).is_some(),
@@ -1123,6 +1120,7 @@ fn merged_task_assignee_can_finish_after_auto_release_with_receipt() {
 }
 
 #[test]
+#[tracing_test::traced_test]
 fn integration_open_pr_retains_via_real_handler() {
     let home = tmp_home("itest-open");
     write_fleet(&home, "dev");
@@ -1145,6 +1143,10 @@ fn integration_open_pr_retains_via_real_handler() {
         "open PR → NOT released (binding stays)"
     );
     assert_eq!(queue_len(&home), 1, "open-PR intent retained for retry");
+    assert!(
+        logs_contain("reason=ObservedOpen") && logs_contain("retaining for retry"),
+        "open-PR retain must be visible at info with a bounded reason"
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -1392,6 +1394,7 @@ fn auto_close_on_report_enqueues_release_recompute() {
         Some(crate::binding::BindingProvenance::DaemonProvisionedReview {
             provisioned_head: &provisioned_head,
         }),
+        false, // #3546: this fixture makes no claim about the base's freshness
     )
     .expect("daemon-provisioned review binding");
     let seeded_tracking_ref = crate::git_helpers::git_bypass(
@@ -1586,6 +1589,8 @@ fn seed_task_on_board(home: &Path, project: &str, id: &str, owner: &str, branch:
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -1619,8 +1624,8 @@ fn cross_lease_done_no_release_when_binding_task_mismatch() {
     itest_lease(&home, &repo, "dev-1", "feat/new", "t-new", false);
     // An OLD task (t-old / feat/old) also exists, owned by dev-1
     seed_task(&home, "t-old", "dev-1", "feat/old", false);
-    // Root marks t-old done (the stale cleanup scenario) through the shared
-    // operator-forced handler fixture.
+    // System cleanup marks t-old done (the stale cleanup scenario) through the
+    // shared handler fixture.
     task_done_via_handler(&home, "t-old");
     assert_eq!(
             queue_len(&home),

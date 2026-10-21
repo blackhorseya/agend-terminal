@@ -105,6 +105,7 @@ teams:
 | `args` | [string] | CLI 參數列表 |
 | `model` | string | 具體模型名稱（如 opus、sonnet）。優先於 `model_tier` |
 | `model_tier` | string | `model_tiers` 中的符號 tier（如 cheap / strong），用於角色/任務成本策略（#2477） |
+| `effort` | string | 推理預算等級（`low` / `medium` / `high` / `xhigh` / `max`；各 backend 有效範圍於啟動時套用）。以 `--effort`（claude/agy）或 `-c model_reasoning_effort="…"`（codex）傳入；不支援的 backend 跳過並記錄 warning（#3541） |
 | `ready_pattern` | string | 正規表達式，用來判斷 agent 何時準備就緒 |
 | `env` | map | 環境變數（key-value 對） |
 | `cols` | int | 終端寬度（預設 200） |
@@ -134,6 +135,7 @@ teams:
 | `git_branch` | string | 自訂 worktree 分支名稱（別名：`worktree_source`） |
 | `model` | string | 具體模型覆蓋；優先於 `model_tier` |
 | `model_tier` | string | `model_tiers` 中的符號 tier。若未設定 `model`，會解析成具體模型後以 `--model` 傳給 backend |
+| `effort` | string | 推理預算覆蓋（instance 優先於 `defaults.effort`；空字串視為未設定）。值域與 backend 行為見上表 `defaults` 說明 |
 | `env` | map | 環境變數（與 defaults 合併，instance 優先） |
 | `cols` / `rows` | int | 終端尺寸覆蓋 |
 | `ready_pattern` | string | 就緒判斷正規表達式覆蓋 |
@@ -143,6 +145,8 @@ teams:
 | `skills` | [string] | 該 agent 可使用的 skills 白名單 |
 | `topic_id` | int | Telegram topic ID（daemon 自動管理，通常不需手動設定） |
 | `topic_binding_mode` | string | Topic 建立模式：`auto`（預設）/ `skip` / `deferred` |
+
+在 **codex** 上，instance 的 `model` / `args` 覆寫可能讓 MCP 完全失效：例如 Codex 0.150.x 搭配 `model: gpt-5.6-luna` 與 `-c model_reasoning_effort=xhigh`，Codex 會以 `MCP tool call requires approval, but approval policy is never` 拒絕每一個 MCP 呼叫 —— daemon 看到該行時會對團隊 orchestrator 發出 `codex_mcp_refusal` inbox 通知並記錄 `codex_mcp_refusal_detected` 事件；請移除這些覆寫並 fresh-restart。
 
 #### `channel` — 通訊頻道
 
@@ -304,8 +308,20 @@ defaults:
 # 然後只在需要改名時才在 fleet.yaml 中引用：
 defaults:
   env:
-    SERVICE_KEY_ALIAS: "${MY_SERVICE_API_KEY}"
+    SERVICE_KEY_ALIAS:
+      from_env: MY_SERVICE_API_KEY
 ```
+
+`from_env` 是完整值引用；instance 解析時會從 daemon process 的環境讀取。
+若來源變數未設定或不是有效 Unicode，AgEnD 會拒絕啟動該 instance，並回報
+來源變數名稱。字面字串不會進行插值，因此 `"${NAME}"` 仍會原樣保留。
+被引用的值不會寫回 `fleet.yaml`，也不會出現在此錯誤或相關 log 中。若 instance
+名稱根本不在 `fleet.yaml`，仍會走既有的 unmanaged/default 解析路徑；這與已設定
+instance 但無法解析 `from_env` 來源的情況不同。
+
+敏感變數政策仍以目的鍵（上例的 `SERVICE_KEY_ALIAS`）為準，包含既有的
+backend credential 例外；來源變數名稱和值都不能繞過該政策。
+`passthrough_env` 行為不變，仍只傳遞同名鍵。
 
 **Per-instance 覆蓋：**
 

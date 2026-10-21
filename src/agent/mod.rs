@@ -15,17 +15,22 @@ use std::io::{Read, Write};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub(crate) mod dev_modal;
 mod dismiss;
+mod executable;
 #[allow(unused_imports)]
 pub use dismiss::try_dismiss_dialog;
 pub(crate) mod crash_disposition;
 use dismiss::{
-    dismiss_scan_armed, is_dismissible_prompt_state, prepare_dismiss_patterns,
-    try_prepared_dismiss_dialog, PreparedDismissPattern,
+    dismiss_scan_armed, dismiss_scan_scope, is_dismissible_prompt_state, prepare_dismiss_patterns,
+    try_prepared_dismiss_dialog_with_cooldown, PreparedDismissPattern,
 };
 
 pub mod deleting;
+pub(crate) mod deletion_recovery;
 
+/// #3315 B3: platform shim so the write path never names `write_actor` directly.
+mod actor_write;
 #[cfg(unix)]
 mod write_actor;
 
@@ -36,10 +41,17 @@ use typed_inject::{observe_post_submit, readback_confirm_typed};
 
 pub type PtyWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
+/// #3682: PTY-output broadcast fan-out + subscriber liveness plumbing. Extracted
+/// to keep this grandfathered file from growing; re-exported so callers/tests see
+/// the same names as before.
+mod broadcast;
+pub use broadcast::Subscription;
+pub(crate) use broadcast::{broadcast_pty_output, retain_live_subscribers, SubscriberEntry};
+
 /// Core state for one agent — protected by a single Mutex for atomic operations.
 pub struct AgentCore {
     pub(crate) vterm: VTerm,
-    pub(crate) subscribers: Vec<crossbeam_channel::Sender<Vec<u8>>>,
+    pub(crate) subscribers: Vec<SubscriberEntry>,
     pub(crate) state: StateTracker,
     pub(crate) health: HealthTracker,
     /// #2413 Phase 1: out-of-path API-activity signal, fed by the
@@ -147,6 +159,29 @@ pub(crate) fn published_observed_of(
 // delivery (both via crate::fleet::resolve_uuid). Name→id resolution always
 // goes through that single resolver; the registry never holds its own name index.
 pub type AgentRegistry = Arc<Mutex<HashMap<crate::types::InstanceId, AgentHandle>>>;
+
+/// Snapshot the exact identity of a live handle. The registry key supplies the
+/// stable configured id; the owner-scoped generation fences replacements of
+/// the same id/name within this daemon lifetime.
+pub(crate) fn instance_ref_for_id(
+    registry: &AgentRegistry,
+    instance_id: crate::types::InstanceId,
+) -> Option<crate::types::InstanceRef> {
+    let reg = lock_registry(registry);
+    reg.get(&instance_id)
+        .map(|handle| crate::types::InstanceRef::new(handle.id, handle.generation.value()))
+}
+
+/// Resolve a live handle's exact identity through the authoritative fleet
+/// name→UUID mapping. Missing/invalid mappings return None rather than
+/// fabricating an identity for a managed lifecycle event.
+pub(crate) fn instance_ref_for_name(
+    registry: &AgentRegistry,
+    home: &std::path::Path,
+    name: &str,
+) -> Option<crate::types::InstanceRef> {
+    crate::fleet::resolve_uuid(home, name).and_then(|id| instance_ref_for_id(registry, id))
+}
 
 /// Handle for an externally connected agent (not PTY-managed by daemon).
 pub struct ExternalAgentHandle {
@@ -738,18 +773,32 @@ fn codex_remote_command_args(
     locator: &crate::transport::SessionLocator,
     args: &[String],
     spawn_mode: crate::backend::SpawnMode,
+    // #3317/#3402: per-invocation `-c` overrides for the fleet MCP bridge and
+    // canonical workspace trust.
+    // Placed with the existing `check_for_update_on_startup` override — after
+    // the endpoint flags, BEFORE the `resume` subcommand — because `-c` is a
+    // global option on codex 0.148 and only gained a per-subcommand form later.
+    config_args: &[String],
 ) -> anyhow::Result<Vec<String>> {
     let mut enriched = crate::transport::codex_attach_args(locator)?;
+    enriched.extend(config_args.iter().cloned());
     enriched.extend([
         "-c".to_string(),
         "check_for_update_on_startup=false".to_string(),
     ]);
-    if spawn_mode == crate::backend::SpawnMode::Resume {
-        let thread_id = crate::transport::codex_thread_for_spawn(locator, spawn_mode)
-            .unwrap_or_else(|| "--last".to_string());
+    let resumed_thread = if spawn_mode == crate::backend::SpawnMode::Resume {
+        crate::transport::codex_thread_for_spawn(locator, spawn_mode)
+    } else {
+        None
+    };
+    if let Some(thread_id) = resumed_thread {
         enriched.extend(["resume".to_string(), thread_id]);
+    } else {
+        // Codex rejects permission overrides when resuming a remote task.
+        // Keep the autonomous bypass for fresh/locator-less remote sessions,
+        // but never combine it with `resume <thread_id>`.
+        enriched.push("--dangerously-bypass-approvals-and-sandbox".to_string());
     }
-    enriched.push("--dangerously-bypass-approvals-and-sandbox".to_string());
     enriched.extend(args.iter().cloned());
     Ok(enriched)
 }
@@ -798,7 +847,9 @@ fn provision_opencode_data_dir(
 /// Extracted from `spawn_agent` so the command-construction logic (arg
 /// enrichment, env filtering, PATH prepend, cwd validation) is isolated
 /// from the PTY plumbing that follows.
-fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option<Backend>)> {
+fn build_command(
+    config: &SpawnConfig,
+) -> anyhow::Result<(CommandBuilder, Option<Backend>, dev_modal::SpawnProvenance)> {
     let SpawnConfig {
         name,
         backend: _,
@@ -832,12 +883,21 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
         _ => None,
     };
 
+    // #3317/#3402: child-only bridge + canonical workspace trust overrides.
+    // `home` is required; an ad-hoc Codex spawn without one is unchanged.
+    let codex_config_args: Vec<String> = match (detected_backend.as_ref(), *home) {
+        (Some(Backend::Codex), Some(h)) => {
+            crate::mcp_config::codex_managed_config_args(h, Some(name), *working_dir)?
+        }
+        _ => Vec::new(),
+    };
+
     // argv = preset (per spawn_mode) + caller args + backend spawn_flags.
     // Centralized here so callers don't double-apply preset args.
     let enriched_args: Vec<String> = if let Some(locator) = opencode_locator.as_ref() {
         opencode_attach_command_args(locator, args)?
     } else if let Some(locator) = codex_locator.as_ref() {
-        codex_remote_command_args(locator, args, *spawn_mode)?
+        codex_remote_command_args(locator, args, *spawn_mode, &codex_config_args)?
     } else {
         let preset = detected_backend
             .as_ref()
@@ -848,26 +908,23 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
             .zip(*working_dir)
             .map(|(b, wd)| b.spawn_flags(wd))
             .unwrap_or_default();
-        preset
-            .into_iter()
+        // #3317/#3402: overrides lead, so they precede any Codex subcommand.
+        // Empty for every non-Codex backend.
+        codex_config_args
+            .iter()
+            .cloned()
+            .chain(preset)
             .chain(args.iter().cloned())
             .chain(flags)
             .collect()
     };
 
-    // Resolve bare command names to absolute paths via `which` before handing
-    // them to `CommandBuilder`. On Windows, npm global installs drop both a
-    // Unix-style shell-script (no extension) and a `.cmd` wrapper in the same
-    // directory; `CreateProcessW`'s PATHEXT search walks the exact name first
-    // and picks the extensionless Unix script, which blows up with
-    // ERROR_BAD_EXE_FORMAT (193). Pre-resolving gives us the `.cmd` path
-    // unambiguously. On Unix this is a no-op — `execvp` already does the
-    // equivalent PATH walk — but keeping the same code path on both platforms
-    // avoids a `#[cfg(windows)]` split here.
-    let resolved_command =
-        which::which(backend_command).unwrap_or_else(|_| std::path::PathBuf::from(backend_command));
-    let mut cmd = CommandBuilder::new(&resolved_command);
+    let pinned_command = executable::resolve_and_pin(backend_command);
+    let mut cmd = CommandBuilder::new(&pinned_command);
     cmd.args(&enriched_args);
+    // #3314 B1: capture the arming fact from the command we JUST built. Reading
+    // the argv back later could disagree with what this generation is running.
+    let spawn_provenance = dev_modal::SpawnProvenance::capture(&cmd);
 
     // #1440: agent-backend env isolation. INVARIANT: env_clear() must run here,
     // before any env injection below, or the explicit keys we set would be wiped.
@@ -906,6 +963,20 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     // after the clear, exactly like AGEND_INSTANCE_NAME above.
     if let Some(h) = *home {
         cmd.env("AGEND_HOME", h);
+        // #1504 family (t-…-65): the agentic-git shim on the agent's PATH derives
+        // its own self-exclusion dir from AGENTIC_GIT_HOME, falling back to
+        // AGEND_HOME. Tests that scope AGEND_HOME to a temp dir (ScopedAgendHome)
+        // and then spawn `git` otherwise make the shim resolve to itself and trip
+        // its recursion guard. Pin the PRIMARY name to the daemon home so the shim
+        // keeps knowing where its own binary lives whatever the crate's home is
+        // scoped to. Same deny-list class as AGEND_HOME, and nothing can redirect
+        // it: `resolve_child_env` drops sensitive keys when it builds the isolation
+        // plan, so the `env_clear` + injected loop above never carries one in; this
+        // pin is written after that loop, so by ordering it wins over anything the
+        // plan injected; and the per-instance fleet.yaml `env:` loop further down
+        // skips sensitive keys unless they are the backend's own credential keys
+        // (#2106), which this is not.
+        cmd.env("AGENTIC_GIT_HOME", h);
     }
 
     // #2413 Shadow Observer — LOCAL plane (default-ON; `AGEND_SHADOW_OBSERVER=0` disables).
@@ -1224,7 +1295,7 @@ fn build_command(config: &SpawnConfig) -> anyhow::Result<(CommandBuilder, Option
     // git shim (which checks the var), not inherit a blanket bypass.
     cmd.env_remove("AGEND_GIT_BYPASS");
 
-    Ok((cmd, detected_backend))
+    Ok((cmd, detected_backend, spawn_provenance))
 }
 
 /// Resolve the authoritative registry `InstanceId` for a spawn (#1441).
@@ -1332,7 +1403,13 @@ pub(crate) fn spawn_agent_with_capture_home(
         .is_some_and(|backend| matches!(backend, Backend::OpenCode));
     if is_opencode {
         if let Some(home_path) = *home {
-            crate::transport::prepare_opencode_tui_session(home_path, name, *working_dir, args)?;
+            crate::transport::prepare_opencode_tui_session(
+                home_path,
+                name,
+                *working_dir,
+                args,
+                *spawn_mode,
+            )?;
         }
     }
     let is_codex = Backend::from_command(backend_command)
@@ -1349,7 +1426,7 @@ pub(crate) fn spawn_agent_with_capture_home(
         }
     }
 
-    let (cmd, detected_backend) = build_command(config)?;
+    let (cmd, detected_backend, spawn_provenance) = build_command(config)?;
 
     // #995 Bug 3: emit a warning when spawning a backend whose MCP
     // discovery is incompatible with fleet's `<workdir>/.<vendor>/mcp_config.json`
@@ -1519,6 +1596,19 @@ pub(crate) fn spawn_agent_with_capture_home(
         })
         .unwrap_or_default();
     let dismiss = prepare_dismiss_patterns(&dismiss);
+    // #3314 B1: arming is a PURE function of the provenance captured from the
+    // command that was actually built and spawned — never a post-spawn re-read.
+    let dev_modal_armed = dev_modal::armed_for_spawn(&spawn_provenance);
+    // #3547 P0-near Task1: log the arming fact at info (grep-able field names)
+    // so the next dismiss-miss can be answered from the log: was this
+    // generation even armed, and did its argv carry the dev-channel flag?
+    // Observability only — the value flows unchanged into `ctx` below.
+    tracing::info!(
+        agent = name,
+        dev_modal_armed,
+        argv_has_dev_channel_flag = spawn_provenance.argv_has_dev_channel_flag,
+        "dev-modal dismiss armed for spawn"
+    );
     let shutdown_for_reaper = shutdown.clone();
     let deleted_for_reaper = {
         let reg = lock_registry(registry);
@@ -1536,6 +1626,7 @@ pub(crate) fn spawn_agent_with_capture_home(
         home: home_for_reaper,
         crash_tx: crash_tx_for_reaper,
         dismiss_patterns: dismiss,
+        dev_modal_armed,
         shutdown: shutdown_for_reaper,
         deleted: deleted_for_reaper,
         generation,
@@ -1609,6 +1700,10 @@ pub(crate) fn spawn_agent_with_capture_home(
         let reg = lock_registry(registry);
         if let Some(handle) = reg.get(&instance_id) {
             let (tx, rx) = crossbeam_channel::bounded(1024);
+            // #3682: the router's buffer holds the sole strong token, so its tap
+            // stays live for the agent's lifetime and is pruned the moment the
+            // router thread drops the receiver (its buffer's Disconnected retain).
+            let live = Arc::new(());
             // Lock order: registry → core (registry held here, core acquired
             // under it = the canonical direction). `core` is a short,
             // non-self-IPC temporary (subscriber push only) dropped on this
@@ -1619,8 +1714,12 @@ pub(crate) fn spawn_agent_with_capture_home(
             // (the supervisor inversion #1593 killed; the hot tick loop pinned
             // by `tick_does_not_reacquire_registry_under_core_f2`, #1530/F2), so
             // this AB-BA pair cannot form. See docs/DAEMON-LOCK-ORDERING.md.
-            handle.core.lock().subscribers.push(tx);
-            crate::daemon::router::register_agent(name, rx);
+            handle
+                .core
+                .lock()
+                .subscribers
+                .push((tx, Arc::downgrade(&live)));
+            crate::daemon::router::register_agent(name, rx, live);
         }
     }
 
@@ -1683,186 +1782,16 @@ impl EphemeralPtyHandle {
     }
 }
 
-/// #CR-2026-06-14: lock the per-agent core (OFF the registry lock path) and
-/// report whether it has reached Idle. Kept as a helper so the readiness check
-/// snapshots `Arc::clone(&h.core)` under the registry lock, drops that guard, and
-/// only then acquires the core lock here — never registry→core nested.
-fn bootstrap_core_is_idle(core: &std::sync::Arc<CoreMutex<AgentCore>>) -> bool {
-    core.lock().state.get_state() == crate::state::AgentState::Idle
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum IdleInjectWaitTerminal {
-    Shutdown,
-    NeverRegisteredTimeout,
-    NotIdleTimeout,
-    DisappearedAfterSeen,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum BootstrapRegistrationState {
-    MayRegisterLater,
-    AlreadyRegistered,
-}
-
-/// First-turn readiness authority plus the registration contract. Legacy PTY
-/// waits for raw prompt classification because a starting TUI can swallow bytes;
-/// structured adapters own their handshake, session discovery, and turn admission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum BootstrapWaitPolicy {
-    RawPromptIdle(BootstrapRegistrationState),
-    StructuredTransport(BootstrapRegistrationState),
-}
-
-impl IdleInjectWaitTerminal {
-    fn label(self) -> &'static str {
-        match self {
-            Self::Shutdown => "shutdown",
-            Self::NeverRegisteredTimeout => "never-registered-timeout",
-            Self::NotIdleTimeout => "not-idle-timeout",
-            Self::DisappearedAfterSeen => "disappeared-after-seen",
-        }
-    }
-}
-
-struct IdleInjectWaitResult {
-    target: Option<InjectTarget>,
-    terminal: Option<IdleInjectWaitTerminal>,
-}
-
-impl IdleInjectWaitResult {
-    fn ready(target: InjectTarget) -> Self {
-        Self {
-            target: Some(target),
-            terminal: None,
-        }
-    }
-
-    fn terminal(reason: IdleInjectWaitTerminal) -> Self {
-        Self {
-            target: None,
-            terminal: Some(reason),
-        }
-    }
-}
-
-/// Wait for the caller-selected first-turn readiness authority, then settle and
-/// snapshot its [`InjectTarget`] with the registry lock released. `RawPromptIdle`
-/// is used by Kiro instructions and LegacyPty self-kick delivery, whose bytes
-/// would be swallowed while the TUI is still starting. `StructuredTransport`
-/// waits only for the exact handle to register, then delegates handshake/thread
-/// discovery/turn admission to the adapter. `None` => do not inject.
-///
-/// A restore can publish the exact UUID after this waiter starts. Absence is
-/// therefore tolerated until the deadline before first observation; once the
-/// handle has been observed, disappearance is an immediate terminal outcome.
-///
-/// #CR-2026-06-14 (concurrency): for raw-prompt readiness, snapshot the core Arc
-/// under the tier-1 registry lock, DROP the registry guard, THEN lock the core
-/// (in `bootstrap_core_is_idle`) — never registry→core nested. Structured
-/// readiness needs no core lock.
-fn wait_for_bootstrap_inject_target_with_clock<Now, Sleep>(
-    registry: &AgentRegistry,
-    instance_id: crate::types::InstanceId,
-    timeout: std::time::Duration,
-    policy: BootstrapWaitPolicy,
-    shutdown: Option<&Arc<std::sync::atomic::AtomicBool>>,
-    now: &mut Now,
-    sleep: &mut Sleep,
-) -> IdleInjectWaitResult
-where
-    Now: FnMut() -> std::time::Duration,
-    Sleep: FnMut(std::time::Duration),
-{
-    let poll_interval = std::time::Duration::from_millis(200);
-    let settle_delay = std::time::Duration::from_millis(500);
-    let registration = match policy {
-        BootstrapWaitPolicy::RawPromptIdle(state)
-        | BootstrapWaitPolicy::StructuredTransport(state) => state,
-    };
-    let mut seen_handle = matches!(registration, BootstrapRegistrationState::AlreadyRegistered);
-
-    loop {
-        if let Some(s) = shutdown {
-            if s.load(std::sync::atomic::Ordering::Relaxed) {
-                return IdleInjectWaitResult::terminal(IdleInjectWaitTerminal::Shutdown);
-            }
-        }
-        if now() >= timeout {
-            return IdleInjectWaitResult::terminal(if seen_handle {
-                IdleInjectWaitTerminal::NotIdleTimeout
-            } else {
-                IdleInjectWaitTerminal::NeverRegisteredTimeout
-            });
-        }
-        let core = {
-            let reg = lock_registry(registry);
-            match reg.get(&instance_id) {
-                Some(h) => {
-                    seen_handle = true;
-                    Some(std::sync::Arc::clone(&h.core))
-                }
-                None if seen_handle => {
-                    return IdleInjectWaitResult::terminal(
-                        IdleInjectWaitTerminal::DisappearedAfterSeen,
-                    );
-                }
-                None => None,
-            }
-        };
-        let ready = match policy {
-            BootstrapWaitPolicy::RawPromptIdle(_) => {
-                core.as_ref().is_some_and(bootstrap_core_is_idle)
-            }
-            BootstrapWaitPolicy::StructuredTransport(_) => core.is_some(),
-        };
-        if ready {
-            break;
-        }
-        sleep(poll_interval);
-    }
-    // Small settle delay for prompt paint or structured-session publication.
-    sleep(settle_delay);
-    // #1530/F1: snapshot the inject target under the registry lock, release it,
-    // THEN inject (caller side) — never hold the registry across the blocking write.
-    let reg = lock_registry(registry);
-    match reg.get(&instance_id) {
-        Some(handle) => IdleInjectWaitResult::ready(InjectTarget::from_handle(handle)),
-        None => IdleInjectWaitResult::terminal(IdleInjectWaitTerminal::DisappearedAfterSeen),
-    }
-}
-
-fn wait_for_bootstrap_inject_target(
-    registry: &AgentRegistry,
-    instance_id: crate::types::InstanceId,
-    name: &str,
-    timeout: std::time::Duration,
-    policy: BootstrapWaitPolicy,
-    shutdown: Option<&Arc<std::sync::atomic::AtomicBool>>,
-    what: &str,
-) -> Option<InjectTarget> {
-    let started = std::time::Instant::now();
-    let mut now = || started.elapsed();
-    let mut sleep = std::thread::sleep;
-    let result = wait_for_bootstrap_inject_target_with_clock(
-        registry,
-        instance_id,
-        timeout,
-        policy,
-        shutdown,
-        &mut now,
-        &mut sleep,
-    );
-    if let Some(reason) = result.terminal {
-        tracing::warn!(
-            agent = %name,
-            what,
-            reason = reason.label(),
-            "bootstrap wait ended"
-        );
-    }
-    result.target
-}
+mod bootstrap_wait;
+// Re-exported so the extraction changes no call site: `agent_ops::spawn` and
+// `daemon` name the registration state, `daemon::crash_respawn` the respawn wait.
+pub(crate) use bootstrap_wait::{wait_for_respawn_inject_target, BootstrapRegistrationState};
+// Used by this module's own bootstrap spawners.
+use bootstrap_wait::{wait_for_bootstrap_inject_target, BootstrapWaitPolicy};
+// Reached only from `tests.rs` (via its `use super::*`), which drives the waiter
+// through its injected-clock seam.
+#[cfg(test)]
+use bootstrap_wait::{wait_for_bootstrap_inject_target_with_clock, IdleInjectWaitTerminal};
 
 fn spawn_instructions_bootstrap(
     registry: AgentRegistry,
@@ -1925,9 +1854,11 @@ pub(crate) fn spawn_self_kick_bootstrap(
     timeout: std::time::Duration,
     registration_state: BootstrapRegistrationState,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
-) {
+) -> Option<std::thread::JoinHandle<()>> {
     let thread_name = format!("{name}_selfkick");
-    // fire-and-forget: mirrors spawn_instructions_bootstrap's lifetime/discipline.
+    // fire-and-forget: production callers discard the handle, so the thread runs detached;
+    // it is bounded by `timeout` and observes `shutdown`. Tests may join the returned
+    // handle for deterministic teardown.
     let spawn_result = std::thread::Builder::new().name(thread_name).spawn(move || {
         let _census = crate::thread_census::register("self_kick");
         let readiness_deadline = std::time::Instant::now() + timeout;
@@ -1970,12 +1901,28 @@ pub(crate) fn spawn_self_kick_bootstrap(
                 }
                 Err(error) => {
                     tracing::warn!(agent = %name, error = %error, "fresh-restart self-kick delivery failed");
+                    // The kick failed CLOSED — one attempt, no retry, no PTY
+                    // fallback — and a warn alone left an unattended restart
+                    // silently stranded. Record it where the operator looks.
+                    crate::event_log::log(
+                        &home,
+                        "self_kick_delivery_failed",
+                        &name,
+                        &format!(
+                            "fresh-restart self-kick delivery failed: {error}; no retry, no \
+                             fallback — inspect the agent and resume it manually"
+                        ),
+                    );
                 }
             }
         }
     });
-    if let Err(e) = spawn_result {
-        tracing::warn!(error = %e, "failed to spawn self-kick bootstrap thread");
+    match spawn_result {
+        Ok(handle) => Some(handle),
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to spawn self-kick bootstrap thread");
+            None
+        }
     }
 }
 
@@ -1992,55 +1939,15 @@ struct PtyReadContext {
     home: Option<std::path::PathBuf>,
     crash_tx: Option<CrashChannel>,
     dismiss_patterns: Vec<PreparedDismissPattern>,
+    /// #3314: this generation's argv actually carried
+    /// `--dangerously-load-development-channels`.
+    dev_modal_armed: bool,
     shutdown: Option<Arc<std::sync::atomic::AtomicBool>>,
     deleted: Arc<std::sync::atomic::AtomicBool>,
     generation: crash_disposition::SpawnGeneration,
 }
 
 /// PTY read loop: feeds VTerm, broadcasts output, auto-dismisses dialogs, handles exit.
-/// Broadcast one PTY output chunk to all subscribers WITHOUT blocking.
-///
-/// The caller holds the agent's `core.lock()` (the broadcast is kept atomic
-/// with `feed_with_fg` so a concurrent `subscribe_with_dump` can't interleave a
-/// dump between process and broadcast). That makes blocking here lethal: a
-/// blocking `send` on a full `bounded(1024)` subscriber channel would hold the
-/// core lock forever and wedge every core-lock waiter — the main TUI
-/// render/input thread, the supervisor, all of it. (Observed: two agents'
-/// pty_read threads parked in a full-channel send while holding their core
-/// locks; the TUI drains those very channels but was itself parked waiting for a
-/// core lock — a deadlock cycle that froze the whole daemon.)
-///
-/// `try_send` never blocks. On `Full` the consumer is too far behind, so the
-/// chunk is dropped (best-effort mirror; the consumer resyncs from the next
-/// screen dump) and `dropped_chunks` is bumped + throttled-logged. On
-/// `Disconnected` the subscriber is removed (the `retain` returns `false`).
-fn broadcast_pty_output(
-    subscribers: &mut Vec<crossbeam_channel::Sender<Vec<u8>>>,
-    data: &[u8],
-    dropped_chunks: &mut u64,
-    agent: &str,
-) {
-    subscribers.retain(|tx| match tx.try_send(data.to_vec()) {
-        Ok(()) => true,
-        Err(crossbeam_channel::TrySendError::Full(_)) => {
-            *dropped_chunks += 1;
-            // Throttle: first drop, then powers-of-two, so a chronically-full
-            // subscriber stays visible in the log without flooding it.
-            if dropped_chunks.is_power_of_two() {
-                tracing::warn!(
-                    agent,
-                    dropped_chunks = *dropped_chunks,
-                    "pty broadcast: subscriber channel full — dropping output chunk (consumer \
-                     stalled). Mirror is best-effort; the daemon is NOT blocked (was a freeze \
-                     before this guard)."
-                );
-            }
-            true
-        }
-        Err(crossbeam_channel::TrySendError::Disconnected(_)) => false,
-    });
-}
-
 fn pty_read_loop(
     pty_reader: &mut dyn Read,
     ctx: &PtyReadContext,
@@ -2055,6 +1962,7 @@ fn pty_read_loop(
         home,
         crash_tx,
         dismiss_patterns,
+        dev_modal_armed,
         shutdown,
         deleted,
         generation,
@@ -2062,6 +1970,36 @@ fn pty_read_loop(
     let mut buf = [0u8; 8192];
     let mut dismiss_cooldown_until: Option<std::time::Instant> = None;
     let mut dismiss_scan_enabled = !dismiss_patterns.is_empty();
+    // #3314: per-generation gate — a plain local, generation-scoped by
+    // construction. #3315 B2: the guard ends the generation (cancel, then
+    // disarm) from its Drop, so EVERY exit of this loop is covered, including
+    // an unwind — which the trailing statements it replaces silently skipped.
+    let (dev_modal_guard, mut dev_modal_gate) =
+        dev_modal::arm_generation(pty_writer, *dev_modal_armed, Arc::clone(deleted), name);
+    // Monotonic base for the stability window; the gate never reads a clock.
+    let dev_modal_clock = std::time::Instant::now();
+    // #3314: has the agent reached Idle at least once? That is the point after
+    // which a daemon-caused STARTUP modal can no longer legitimately appear, so
+    // the post-latch re-arm narrows to workspace-trust only. See
+    // `dismiss_scan_scope`.
+    let mut dismiss_agent_ever_idle = false;
+    // t-…-82348-29 r2 (review F1): the PER-SPAWN one-shot for BACKEND-caused
+    // startup modals (`REARM_PRE_IDLE_BACKEND_STARTUP_HINTS` — today the codex
+    // update menu). Set when such a dismiss is DISPATCHED, never reset here, so
+    // exactly one answering keystroke reaches this child. Scoped by
+    // construction: a `restart_instance` runs this loop afresh and therefore
+    // gets a fresh one-shot.
+    //
+    // This — not the cooldown below — is the bound. The cooldown is rate
+    // limiting: `feed_with_lazy_fg` reports `state_changed` on ANY screen-hash
+    // change, so a repaint that still shows the modal re-arms the scan the
+    // moment the window lapses. If the single write fails the auto-skip is
+    // forfeited for this spawn: the pane stays prompt-blocked and visible to
+    // the stuck watchdog rather than looping keystrokes into the child.
+    let mut backend_startup_hint_spent = false;
+    // t-20260913083736497384-27902-0: remember if the dev-modal WARNING hint was seen
+    // in this generation, so consult stays armed while the modal remains unresolved.
+    let mut dev_modal_hint_seen = false;
     // #t-23: debug-only seam — verbose per-read PTY logging (read counts / byte
     // totals). Off by default; enable with `AGEND_DEBUG_PTY_READ=1`. Tightened
     // from presence-based (`is_ok()`: any value, even `=0`, enabled it) to the
@@ -2104,6 +2042,11 @@ fn pty_read_loop(
                 }
                 let data = &buf[..n_bytes];
 
+                // A delayed startup-modal CR is valid only while the child has
+                // emitted no newer frame. Count every PTY output chunk before
+                // snapshotting the candidate barrier below.
+                dev_modal::note_pty_output(pty_writer);
+
                 capture.write(data);
 
                 // Feed VTerm + state detection + broadcast (under same lock = atomic),
@@ -2111,7 +2054,14 @@ fn pty_read_loop(
                 // post-render means we match what the user actually sees —
                 // Ink-style TUIs that draw char-by-char with cursor positioning
                 // won't defeat us (VTerm resolves the geometry). Cooldown: 10s.
-                let (screen, state_changed, dismiss_latch_off, prompt_blocked) = {
+                let (
+                    screen,
+                    state_changed,
+                    dismiss_latch_off,
+                    prompt_blocked,
+                    agent_is_idle,
+                    agent_state,
+                ) = {
                     let mut c = core.lock();
                     // Disjoint field borrows so the lazy-fg closure may read
                     // `vterm` while `state` is borrowed mutably (both fields of
@@ -2146,31 +2096,105 @@ fn pty_read_loop(
                     // past the startup latch — agy's banner trips the latch before
                     // its trust modal renders. See `dismiss_scan_armed`.
                     let prompt_blocked = is_dismissible_prompt_state(cur);
+                    // #3314: recorded AFTER this frame's scan (below), so the very
+                    // frame that first settles the agent is still scanned pre-Idle.
+                    let agent_is_idle = cur == crate::state::AgentState::Idle;
                     broadcast_pty_output(subscribers, data, &mut dropped_chunks, name);
-                    (screen, state_changed, dismiss_latch_off, prompt_blocked)
+                    (
+                        screen,
+                        state_changed,
+                        dismiss_latch_off,
+                        prompt_blocked,
+                        agent_is_idle,
+                        cur,
+                    )
                 };
 
                 let in_cooldown = dismiss_cooldown_until
                     .map(|t| std::time::Instant::now() < t)
                     .unwrap_or(false);
-                if dismiss_scan_armed(dismiss_scan_enabled, prompt_blocked, state_changed)
-                    && !in_cooldown
-                    && try_prepared_dismiss_dialog(
+                // #3314: a complete pre-Idle dev modal bypasses cooldown and state dedup.
+                // t-20260913064200432164-24626-4 / t-20260913083736497384-27902-0: dev-gated
+                // consult must not depend on `state_changed` or state classification, nor can it
+                // only test the current screen's ephemeral contains() — if the hint was seen in
+                // this spawn generation and remains unresolved, the consult condition stays armed.
+                if *dev_modal_armed && screen.contains("WARNING: Loading development channels") {
+                    dev_modal_hint_seen = true;
+                }
+                let dev_modal_unresolved = dev_modal_hint_seen && !dev_modal_gate.is_answered();
+                let dev_modal_visible = *dev_modal_armed
+                    && (screen.contains("WARNING: Loading development channels")
+                        || dev_modal_unresolved);
+                // #3547 D(ii): hand the gate this frame's prompt-state fact before
+                // it is consulted. It is what distinguishes "the modal is still
+                // painting" from "this pane is blocked on a prompt and the modal
+                // never completed", which is the only case the relaxed anchored
+                // retry is allowed to fire in.
+                // D(ii) is valid only while the daemon has a real prompt state
+                // and this generation has never reached Idle. AwaitingOperator
+                // is a daemon silence fallback, not proof that this modal owns
+                // the input; allowing it would turn quoted startup text into CR.
+                let dev_modal_prompt_blocked = prompt_blocked
+                    && !dismiss_agent_ever_idle
+                    && agent_state != crate::state::AgentState::AwaitingOperator;
+                dev_modal_gate.set_prompt_blocked(dev_modal_prompt_blocked);
+                // t-20260912171012286674-51827-9: hand the gate the settled-scope
+                // fact it needs to bound itself (complete-only, competitor veto).
+                dev_modal_gate.set_settled(dismiss_agent_ever_idle);
+                // t-20260913052851207170-74631-0 (vii): a repaint-no-op frame
+                // (dedup hit, screen byte-identical) that still carries the
+                // complete modal re-anchors the waiting writer instead of
+                // letting repaint noise cancel it with no retry. Deliberately
+                // outside `dismiss_scan_armed`: no consult, no verdict, no
+                // worker — just the epoch refresh, and only while the modal
+                // is still fully on screen.
+                if !state_changed && dev_modal::complete_modal_digest(&screen).is_some() {
+                    dev_modal_gate.refresh_candidate_epoch();
+                }
+                let dev_modal_cooldown_retry = dev_modal_visible
+                    && in_cooldown
+                    && dismiss_agent_ever_idle
+                    && !dev_modal_gate.is_answered();
+                let admits_dismiss = !in_cooldown
+                    || (dev_modal_visible && !dismiss_agent_ever_idle)
+                    || dev_modal_cooldown_retry;
+                if dismiss_scan_armed(
+                    dismiss_scan_enabled,
+                    prompt_blocked,
+                    state_changed,
+                    dev_modal_visible,
+                ) && admits_dismiss
+                    && try_prepared_dismiss_dialog_with_cooldown(
                         name,
                         &screen,
                         pty_writer,
                         dismiss_patterns,
-                        // #2473 (r6): a post-latch re-arm (scan_enabled==false,
-                        // armed only via prompt_blocked) scans ONLY workspace-
-                        // trust patterns — never runtime-approval `Yes, proceed`.
-                        !dismiss_scan_enabled,
+                        // #3314: the cooldown bypass admits only the daemon-caused
+                        // startup modal, never runtime approval patterns.
+                        if dev_modal_visible && !dismiss_agent_ever_idle {
+                            dismiss::DismissScanScope::RearmPreIdle
+                        } else {
+                            dismiss_scan_scope(dismiss_scan_enabled, dismiss_agent_ever_idle)
+                        },
+                        &mut dev_modal_gate,
+                        dev_modal::LogicalMs(dev_modal_clock.elapsed().as_millis() as u64),
+                        &mut backend_startup_hint_spent,
+                        if dev_modal_cooldown_retry {
+                            dismiss_cooldown_until
+                        } else {
+                            None
+                        },
                     )
+                    && !dev_modal_cooldown_retry
                 {
                     dismiss_cooldown_until =
-                        Some(std::time::Instant::now() + std::time::Duration::from_secs(10));
+                        Some(std::time::Instant::now() + dismiss::dismiss_cooldown());
                 }
                 if dismiss_latch_off {
                     dismiss_scan_enabled = false;
+                }
+                if agent_is_idle {
+                    dismiss_agent_ever_idle = true;
                 }
             }
             Err(e) => {
@@ -2184,6 +2208,11 @@ fn pty_read_loop(
             }
         }
     }
+
+    // #3315 B2: explicit so the ordering the trailing statements had is kept —
+    // the generation ends BEFORE `handle_pty_close`. On an unwind this line is
+    // skipped and Drop does it anyway, which is the whole point.
+    drop(dev_modal_guard);
 
     // #1144: handle_pty_close runs after BOTH exit paths (EOF and read error).
     // Previously only the Ok(0) branch called it; the Err branch broke without
@@ -2523,6 +2552,16 @@ fn handle_pty_close(
         return;
     }
 
+    // Job reconciliation owns recovery and cleanup. Retain the original child
+    // handle as exit evidence; interactive shell fallback or crash cleanup would
+    // replace/remove it before the controller can reconcile the attempt.
+    if home
+        .as_deref()
+        .is_some_and(|home| crate::schedule_jobs::owns_worker(home, name))
+    {
+        return;
+    }
+
     match classify_exit(exit_code) {
         ExitKind::UserExit => {
             if is_startup_failure(name, id, registry) {
@@ -2621,19 +2660,6 @@ fn write_in_progress_set() -> &'static parking_lot::Mutex<std::collections::Hash
     WRITE_IN_PROGRESS.get_or_init(|| parking_lot::Mutex::new(std::collections::HashSet::new()))
 }
 
-/// `Some(Ok/Err)` -> `writer` is registered with `write_actor`, use its
-/// result directly. `None` -> not registered (Windows; synthetic/test
-/// writer) -- fall through to the thread-per-write mechanism below.
-#[cfg(unix)]
-fn try_actor_write(writer: &PtyWriter, data: &[u8]) -> Option<std::io::Result<()>> {
-    write_actor::write(writer, data.to_vec(), PTY_WRITE_TIMEOUT)
-}
-
-#[cfg(not(unix))]
-fn try_actor_write(_writer: &PtyWriter, _data: &[u8]) -> Option<std::io::Result<()>> {
-    None
-}
-
 /// Test-only cross-module registration check (used by `daemon::lifecycle`'s
 /// Unix-only test — `write_actor` doesn't exist on other platforms).
 #[cfg(all(test, unix))]
@@ -2642,10 +2668,23 @@ pub(crate) fn write_actor_is_registered(writer: &PtyWriter) -> bool {
 }
 
 fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
-    if let Some(result) = try_actor_write(writer, data) {
-        return result;
-    }
+    write_with_timeout_guarded(writer, data, None)
+}
 
+/// As [`write_with_timeout`], but the write carries a #3314 barrier re-checked
+/// immediately before the syscall on the registered-writer (actor) path.
+fn write_with_timeout_guarded(
+    writer: &PtyWriter,
+    data: &[u8],
+    barrier: Option<crate::agent::dev_modal::WriteBarrier>,
+) -> std::io::Result<()> {
+    // #3314: chokepoint for every PTY write; see `agent::dev_modal`.
+    if let Some(result) = actor_write::try_actor_write_guarded(writer, data, barrier.clone()) {
+        return actor_write::record_successful_write(writer, result);
+    }
+    if barrier.as_ref().is_some_and(|b| !b.still_valid()) {
+        return Err(std::io::ErrorKind::Interrupted.into());
+    }
     let key = Arc::as_ptr(writer) as usize;
 
     // If a previous write is still stuck, fail fast.
@@ -2661,6 +2700,7 @@ fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
         guard.insert(key);
     }
 
+    let epoch_writer = Arc::clone(writer);
     let data = data.to_vec();
     let writer = Arc::clone(writer);
     let (tx, rx) = crossbeam_channel::bounded(1);
@@ -2720,7 +2760,7 @@ fn write_with_timeout(writer: &PtyWriter, data: &[u8]) -> std::io::Result<()> {
         }
     };
 
-    result
+    actor_write::record_successful_write(&epoch_writer, result)
 }
 
 pub fn write_to_agent(agent: &AgentHandle, data: &[u8]) -> crate::error::Result<()> {
@@ -2807,10 +2847,41 @@ pub(crate) const DAEMON_HANDOFF_INJECT_MARKER: &str = "[AGEND-HANDOFF]";
 /// AUTHORITATIVE live sources; `SESSION-HANDOFF.md` is only a stale-tolerant hint
 /// because a fresh restart's DELETE=kill may have happened before any fresh
 /// handoff was written.
+///
+/// #3415: the opening states the restart and nothing about the agent's memory.
+/// The daemon performed the restart, so that much is observed fact; what
+/// survived inside the agent is not visible from here, and asserting it made the
+/// first sentence of this prompt unverifiable. The operational duty the old
+/// claim carried is stated directly instead — rebuild the in-flight picture from
+/// the sources below rather than recall it — which is what the recovery sequence
+/// needed all along.
+/// #3415: claims about what the agent still remembers, which no daemon-authored
+/// text may make. The daemon observes that it restarted a process; it cannot
+/// observe what survived inside the agent, so any such sentence is unverifiable
+/// in exactly the messages that most need to be trusted.
+///
+/// Shared by both delivered surfaces — the injected `[AGEND-RESUME]` prompt and
+/// the standing instructions — so the two guards cannot drift apart. It is
+/// deliberately a family rather than the one phrase that shipped: a guard pinned
+/// to exact wording is stepped around by the next paraphrase.
+#[cfg(test)]
+pub(crate) const UNVERIFIABLE_MEMORY_CLAIMS: &[&str] = &[
+    "lost your",
+    "lost its",
+    "have lost",
+    "no longer remember",
+    "do not remember",
+    "in-memory context",
+    "your memory",
+    "memory was",
+    "context was lost",
+];
+
 pub(crate) fn fresh_restart_self_kick_prompt() -> String {
     format!(
-        "{DAEMON_RESUME_INJECT_MARKER} You were just fresh-restarted and lost your in-memory \
-         context. If this arrives through Claude ChannelBridge, first call its ack_start tool \
+        "{DAEMON_RESUME_INJECT_MARKER} This session was just fresh-restarted. Treat nothing you \
+         may still recall about work in flight as authoritative — rebuild it from the sources \
+         below before you act on it. If this arrives through Claude ChannelBridge, first call its ack_start tool \
          with the exact delivery_id from the channel metadata, before any recovery action; after \
          the bounded recovery sequence call ack_complete with that same delivery_id; these acks \
          do not send an outward reply. Recover your OWN state now, in this order: (1) rebuild your in-flight picture \
@@ -3062,79 +3133,29 @@ pub fn broadcast_registry(
 
 /// Get atomic subscribe + screen dump (under core lock — no output gap).
 /// Creates a new per-subscriber channel. Each subscriber gets ALL output (broadcast).
-pub fn subscribe_with_dump(agent: &AgentHandle) -> (crossbeam_channel::Receiver<Vec<u8>>, Vec<u8>) {
+///
+/// #3682: also sweeps dead taps under the same lock, so a reconnect reclaims a
+/// disconnected client's entry even when the agent is quiet. The returned
+/// [`Subscription`] owns the liveness token — the caller MUST keep it alive while
+/// the receiver is in use, or the tap is pruned as dead.
+pub fn subscribe_with_dump(agent: &AgentHandle) -> (Subscription, Vec<u8>) {
     let mut core = agent.core.lock();
+    retain_live_subscribers(&mut core.subscribers);
     let dump = core.vterm.dump_screen();
     let (tx, rx) = crossbeam_channel::bounded(1024);
-    core.subscribers.push(tx);
-    (rx, dump)
-}
-
-/// Minimal managed `AgentHandle` over a throwaway `true` PTY, for cross-module
-/// tests that need a registry entry whose CONTENTS are irrelevant — e.g. the
-/// t-65 register-external TOCTOU repro only needs `reg.contains_key(id)` to be
-/// true. Spawns a minimal test PTY child; the caller owns cleanup of the registry.
-/// Uses the platform's portable-pty command shape so cross-platform tests can
-/// construct the same minimal live handle.
-#[cfg(test)]
-pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentHandle {
-    let pair = native_pty_system()
-        .openpty(PtySize {
-            rows: 24,
-            cols: 80,
-            pixel_width: 0,
-            pixel_height: 0,
-        })
-        .expect("openpty");
-    #[cfg(not(target_os = "windows"))]
-    let mut cmd = CommandBuilder::new("true");
-    #[cfg(target_os = "windows")]
-    let mut cmd = {
-        let mut c = CommandBuilder::new("cmd");
-        c.args(["/c", "findstr", ".*"]);
-        c
-    };
-    cmd.cwd(std::env::temp_dir());
-    let child = pair.slave.spawn_command(cmd).expect("spawn test PTY child");
-    drop(pair.slave);
-    let pty_writer: PtyWriter = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
-    let pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
-    let core = Arc::new(CoreMutex::new(AgentCore {
-        vterm: VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
-        subscribers: Vec::new(),
-        state: StateTracker::new(None),
-        health: HealthTracker::new(),
-        api_activity: crate::agent::ApiActivity::default(),
-        observed_status: None,
-    }));
-    let published_state = core.lock().state.published_handle();
-    let published_observed = core.lock().state.published_observed_handle();
-    AgentHandle {
-        id,
-        name: name.to_string().into(),
-        declared_backend: None,
-        backend_command: "true".to_string(),
-        pty_writer,
-        pty_master,
-        core,
-        published_state,
-        published_observed,
-        child: Arc::new(Mutex::new(child)),
-        submit_key: "\r".to_string(),
-        inject_prefix: String::new(),
-        typed_inject: false,
-        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-        spawned_at: std::time::Instant::now(),
-        spawned_at_epoch_ms: 0,
-        spawn_mode: crate::backend::SpawnMode::Fresh,
-        generation: crash_disposition::SpawnGeneration::default(),
-        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-    }
+    let live = Arc::new(());
+    core.subscribers.push((tx, Arc::downgrade(&live)));
+    (Subscription { rx, live }, dump)
 }
 
 #[cfg(test)]
 #[path = "tests.rs"]
 mod tests;
+#[cfg(test)]
+pub(crate) use tests::mk_test_handle;
+
+#[cfg(all(test, unix))]
+pub(crate) use tests::mk_sigterm_immune_test_handle;
 
 #[cfg(test)]
 mod review_repro_agent_binding;

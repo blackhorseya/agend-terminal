@@ -445,6 +445,8 @@ fn auto_create_task_if_needed(
         eta_secs: None,
         tags: Vec::new(),
         parent_id: None,
+        governing_decision_id: None,
+        review_class: None,
     };
     match crate::task_events::append(
         home,
@@ -520,6 +522,7 @@ fn build_message(
         ci_handoff_episode: None,
         ci_handoff_class: None,
         ci_handoff_settlement: None,
+        idempotency_key: None,
         delivery_nonce: req.delivery_nonce.clone(),
         review_assignment: None,
     }
@@ -802,6 +805,15 @@ pub(crate) fn track_dispatch(
                     status: status.to_string(),
                 },
             );
+            // #3666: a delivery that actually went out retires any busy-parked
+            // intent for the same (target, task) — e.g. the dispatcher manually
+            // re-dispatched (or forced) while parked. Without this the later
+            // idle scan would deliver the same work a second time.
+            if let Some(tid) = msg.task_id.as_deref() {
+                crate::mcp::handlers::comms_gates::busy_park::invalidate_parked_for_delivery(
+                    home, target, tid,
+                );
+            }
         }
     } else if kind_str == "report" {
         if let Some(corr) = msg.correlation_id.as_deref().or(msg.task_id.as_deref()) {

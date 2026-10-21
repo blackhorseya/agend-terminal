@@ -1,7 +1,152 @@
 use super::*;
+
+/// Minimal managed `AgentHandle` over a throwaway `true` PTY, for cross-module
+/// tests that need a registry entry whose CONTENTS are irrelevant — e.g. the
+/// t-65 register-external TOCTOU repro only needs `reg.contains_key(id)` to be
+/// true. Spawns a minimal test PTY child; the caller owns cleanup of the registry.
+/// Uses the platform's portable-pty command shape so cross-platform tests can
+/// construct the same minimal live handle.
+#[cfg(test)]
+pub(crate) fn mk_test_handle(name: &str, id: crate::types::InstanceId) -> AgentHandle {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    #[cfg(not(target_os = "windows"))]
+    let mut cmd = CommandBuilder::new("true");
+    #[cfg(target_os = "windows")]
+    let mut cmd = {
+        let mut c = CommandBuilder::new("cmd");
+        c.args(["/c", "findstr", ".*"]);
+        c
+    };
+    cmd.cwd(std::env::temp_dir());
+    let child = pair.slave.spawn_command(cmd).expect("spawn test PTY child");
+    drop(pair.slave);
+    let pty_writer: PtyWriter = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
+    let pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
+    let core = Arc::new(CoreMutex::new(AgentCore {
+        vterm: VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
+        subscribers: Vec::new(),
+        state: StateTracker::new(None),
+        health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+    let published_state = core.lock().state.published_handle();
+    let published_observed = core.lock().state.published_observed_handle();
+    AgentHandle {
+        id,
+        name: name.to_string().into(),
+        declared_backend: None,
+        backend_command: "true".to_string(),
+        pty_writer,
+        pty_master,
+        core,
+        published_state,
+        published_observed,
+        child: Arc::new(Mutex::new(child)),
+        submit_key: "\r".to_string(),
+        inject_prefix: String::new(),
+        typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        spawned_at: std::time::Instant::now(),
+        spawned_at_epoch_ms: 0,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        generation: crash_disposition::SpawnGeneration::default(),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
 use crate::transport::{
     DeliveryEnvelope, DeliveryKind, DeliveryReceipt, DeliveryState, SessionLocator,
 };
+
+/// #3420: an `AgentHandle` whose child stays alive until something SIGKILLs it.
+///
+/// A test that asserts a child was reaped BEFORE some call returned cannot use
+/// [`super::mk_test_handle`]: its `true` child exits on its own within milliseconds, so
+/// the closing `try_wait` reports `Ok(Some(_))` even when nothing waited for the
+/// reaper. This child ignores SIGTERM instead, so it survives
+/// `terminate_agents_parallel`'s stage-1 signal AND its whole `SHUTDOWN_GRACE`
+/// window; only the post-grace SIGKILL ends it. Being dead afterwards is then
+/// evidence that the caller waited.
+///
+/// `trap "" TERM HUP` installs SIG_IGN, which no later signal can clear. HUP is
+/// as load-bearing as TERM here: the close path drops the `AgentHandle` — and
+/// with it the PTY master — before the reaper runs, and closing the controlling
+/// terminal SIGHUPs the session. Trapping only TERM leaves the child dying to
+/// that hangup instead, which is the same vacuity in a new costume. The inner
+/// `sleep` is a separate process without the trap, so it dies to the group
+/// signal and the loop simply restarts it, leaving the shell reachable only by
+/// SIGKILL.
+#[cfg(all(test, unix))]
+pub(crate) fn mk_sigterm_immune_test_handle(
+    name: &str,
+    id: crate::types::InstanceId,
+) -> super::AgentHandle {
+    let mut cmd = CommandBuilder::new("sh");
+    cmd.args(["-c", "trap \"\" TERM HUP; while :; do sleep 300; done"]);
+    mk_test_handle_over(name, id, cmd, "sh")
+}
+
+// Unix-only, matching its sole caller `mk_sigterm_immune_test_handle` above:
+// `mk_test_handle` builds its own handle per platform and does not use this.
+#[cfg(all(test, unix))]
+pub(crate) fn mk_test_handle_over(
+    name: &str,
+    id: crate::types::InstanceId,
+    mut cmd: CommandBuilder,
+    backend_command: &str,
+) -> super::AgentHandle {
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .expect("openpty");
+    cmd.cwd(std::env::temp_dir());
+    let child = pair.slave.spawn_command(cmd).expect("spawn test PTY child");
+    drop(pair.slave);
+    let pty_writer: PtyWriter = Arc::new(Mutex::new(pair.master.take_writer().expect("writer")));
+    let pty_master: Arc<Mutex<Box<dyn MasterPty + Send>>> = Arc::new(Mutex::new(pair.master));
+    let core = Arc::new(CoreMutex::new(AgentCore {
+        vterm: VTerm::with_pty_writer(80, 24, Arc::clone(&pty_writer)),
+        subscribers: Vec::new(),
+        state: StateTracker::new(None),
+        health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+    let published_state = core.lock().state.published_handle();
+    let published_observed = core.lock().state.published_observed_handle();
+    super::AgentHandle {
+        id,
+        name: name.to_string().into(),
+        declared_backend: None,
+        backend_command: backend_command.to_string(),
+        pty_writer,
+        pty_master,
+        core,
+        published_state,
+        published_observed,
+        child: Arc::new(Mutex::new(child)),
+        submit_key: "\r".to_string(),
+        inject_prefix: String::new(),
+        typed_inject: false,
+        typed_inject_contaminated: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        spawned_at: std::time::Instant::now(),
+        spawned_at_epoch_ms: 0,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        generation: crash_disposition::SpawnGeneration::default(),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    }
+}
 
 static R8_DISMISS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 struct SelfKickTestGuard {
@@ -206,6 +351,46 @@ fn fresh_restart_self_kick_prompt_shape() {
     assert!(p.contains("NOT authority to dispatch"));
 }
 
+/// #3415 RED: the prompt's opening asserts a fact the daemon cannot observe —
+/// that the agent "lost your in-memory context". The daemon performed the
+/// restart, so it can state THAT; what survived inside the agent is not visible
+/// from here. An agent that does still remember its work is told something false
+/// by the first sentence of the very message asking it to trust the rest, and
+/// the whole point of this prompt is to be trusted.
+///
+/// The replacement has to carry the same operational weight without the claim:
+/// state the restart, and require the in-flight picture to be REBUILT from the
+/// authoritative sources rather than recalled. That instruction is what the
+/// false sentence was standing in for, so the guard pins it too — deleting the
+/// claim must not quietly delete the duty.
+///
+/// The ban list is deliberately broader than the one phrase that shipped. A
+/// guard pinned to the exact wording is stepped around by the next paraphrase,
+/// and this prompt has no legitimate reason to assert anything about what the
+/// agent remembers. Ordering and the authority guard stay pinned by
+/// `fresh_restart_self_kick_prompt_shape`, so a rewrite that neutralises the
+/// opening but drops the recovery sequence still fails there.
+#[test]
+fn fresh_restart_prompt_makes_no_unverifiable_memory_claim_3415() {
+    let prompt = super::fresh_restart_self_kick_prompt();
+    let lower = prompt.to_lowercase();
+    for claim in super::UNVERIFIABLE_MEMORY_CLAIMS {
+        assert!(
+            !lower.contains(*claim),
+            "#3415: the prompt must not assert what the agent remembers — found {claim:?}"
+        );
+    }
+    assert!(
+        lower.contains("fresh-restarted"),
+        "#3415: it must still state the fact the daemon DOES know — that it restarted this session"
+    );
+    assert!(
+        lower.contains("rebuild"),
+        "#3415: dropping the memory claim must not drop the duty it carried — the in-flight \
+         picture has to be REBUILT from the authoritative sources, not recalled"
+    );
+}
+
 /// RED: a structured fresh-restart bootstrap must not inherit LegacyPty's raw
 /// screen-idle prerequisite. The structured adapter owns readiness and turn
 /// admission, so a stale `Active` screen classification must still reach exactly
@@ -307,7 +492,7 @@ fn fresh_restart_self_kick_structured_route_has_no_pty_fallback() {
     )));
     crate::daemon::hook_shadow::record_event(&name, "UserPromptSubmit", None);
 
-    spawn_self_kick_bootstrap(
+    let bootstrap = spawn_self_kick_bootstrap(
         Arc::clone(&registry),
         id,
         name.clone(),
@@ -315,15 +500,9 @@ fn fresh_restart_self_kick_structured_route_has_no_pty_fallback() {
         std::time::Duration::from_secs(2),
         BootstrapRegistrationState::AlreadyRegistered,
         None,
-    );
-
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while adapter_requests.load(Ordering::SeqCst) == 0
-        && written.lock().is_empty()
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    )
+    .expect("self-kick bootstrap thread");
+    bootstrap.join().expect("self-kick bootstrap");
     crate::transport::test_support::set_delivery_hook(None);
 
     assert_eq!(
@@ -587,6 +766,86 @@ fn self_kick_structured_error_or_ambiguity_never_falls_back_or_retries() {
     }
 }
 
+/// A self-kick that fails CLOSED on the transport used to leave only a
+/// `tracing::warn!` behind, so the recurring "restarted overnight and just sat
+/// there" failure was invisible to an absent operator. The terminal failure must
+/// leave exactly one durable record — without becoming a retry or a PTY write.
+#[test]
+fn self_kick_transport_failure_records_one_durable_event() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    let _test_guard = SelfKickTestGuard::acquire();
+    let fixture = self_kick_fixture("failure-event");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let calls_for_hook = Arc::clone(&calls);
+    let expected_home = fixture.home.clone();
+    let expected_name = fixture.name.clone();
+    crate::transport::test_support::set_delivery_hook(Some(Arc::new(move |home, name, body| {
+        if home != expected_home || name != expected_name {
+            return None;
+        }
+        calls_for_hook.fetch_add(1, Ordering::SeqCst);
+        Some(Ok(self_kick_test_receipt(
+            name,
+            body,
+            DeliveryState::Failed,
+        )))
+    })));
+    fixture
+        .registry
+        .lock()
+        .get(&fixture.id)
+        .expect("fixture handle")
+        .core
+        .lock()
+        .state
+        .current = crate::state::AgentState::Idle;
+    crate::daemon::hook_shadow::record_event(&fixture.name, "UserPromptSubmit", None);
+
+    spawn_self_kick_bootstrap(
+        Arc::clone(&fixture.registry),
+        fixture.id,
+        fixture.name.clone(),
+        fixture.home.clone(),
+        std::time::Duration::from_secs(2),
+        BootstrapRegistrationState::AlreadyRegistered,
+        None,
+    )
+    .expect("self-kick bootstrap thread")
+    .join()
+    .expect("self-kick bootstrap");
+
+    // Reaching the transport exactly once is what makes the record above
+    // non-vacuous: a bootstrap that never got past the readiness wait would
+    // leave this at 0 rather than silently passing.
+    assert_eq!(calls.load(Ordering::SeqCst), 1, "no transport retry");
+    assert!(fixture.written.lock().is_empty(), "no PTY fallback");
+    assert!(
+        !crate::daemon::inject_delivery::is_armed_for_test(&fixture.name),
+        "a failed self-kick must not arm delivery verification"
+    );
+    let log = std::fs::read_to_string(fixture.home.join("event-log.jsonl"))
+        .expect("failed self-kick must leave a durable event log");
+    // Match the exact `kind` field rather than counting a substring of the
+    // line: a superstring kind is a DIFFERENT event and must not satisfy this.
+    let recorded: Vec<serde_json::Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("event log line must be JSON"))
+        .filter(|event: &serde_json::Value| event["kind"] == "self_kick_delivery_failed")
+        .collect();
+    assert_eq!(
+        recorded.len(),
+        1,
+        "a failed self-kick must record exactly one operator-visible event"
+    );
+    assert_eq!(
+        recorded[0]["instance"],
+        fixture.name.as_str(),
+        "the record must name the stranded agent"
+    );
+    clear_self_kick_fixture(&fixture);
+}
+
 #[test]
 fn self_kick_structured_readiness_cannot_downgrade_to_legacy_pty() {
     let _test_guard = SelfKickTestGuard::acquire();
@@ -727,7 +986,7 @@ fn fresh_restart_self_kick_legacy_uses_captured_target_and_arms_hook() {
         .state
         .current = crate::state::AgentState::Idle;
     crate::daemon::hook_shadow::record_event(&fixture.name, "UserPromptSubmit", None);
-    spawn_self_kick_bootstrap(
+    let bootstrap = spawn_self_kick_bootstrap(
         Arc::clone(&fixture.registry),
         fixture.id,
         fixture.name.clone(),
@@ -735,14 +994,9 @@ fn fresh_restart_self_kick_legacy_uses_captured_target_and_arms_hook() {
         std::time::Duration::from_secs(2),
         BootstrapRegistrationState::AlreadyRegistered,
         None,
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while (!fixture.written.lock().ends_with(b"\r")
-        || !crate::daemon::inject_delivery::is_armed_for_test(&fixture.name))
-        && std::time::Instant::now() < deadline
-    {
-        std::thread::sleep(std::time::Duration::from_millis(10));
-    }
+    )
+    .expect("self-kick bootstrap thread");
+    bootstrap.join().expect("self-kick bootstrap");
     let written = fixture.written.lock().clone();
     assert!(
         !written.is_empty(),
@@ -767,12 +1021,13 @@ fn self_kick_legacy_arm_precedes_delete_lane_acquisition() {
     let _arm_guard = crate::daemon::inject_delivery::test_support::arm_hook_guard();
     let mut fixture = self_kick_fixture("arm-delete-order");
     crate::daemon::hook_shadow::record_event(&fixture.name, "UserPromptSubmit", None);
-    let writer_entered = Arc::new(AtomicBool::new(false));
-    let writer_release = Arc::new(AtomicBool::new(false));
+    let (writer_entered_tx, writer_entered_rx) = std::sync::mpsc::channel();
+    let (writer_release_tx, writer_release_rx) = std::sync::mpsc::channel();
     let blocking_writer: PtyWriter = Arc::new(Mutex::new(Box::new(BlockingWriter {
         bytes: Arc::clone(&fixture.written),
-        entered: Arc::clone(&writer_entered),
-        release: Arc::clone(&writer_release),
+        entered: Some(writer_entered_tx),
+        release: writer_release_rx,
+        post_release_stall: SELF_KICK_ARM_PATH_STALL,
     })));
     fixture.target.pty_writer = Arc::clone(&blocking_writer);
     fixture
@@ -806,7 +1061,11 @@ fn self_kick_legacy_arm_precedes_delete_lane_acquisition() {
     let bootstrap_id = fixture.id;
     let bootstrap_name = fixture.name.clone();
     let bootstrap_home = fixture.home.clone();
-    spawn_self_kick_bootstrap(
+    // Deliberately NOT joined before the assertions: they must hold while the
+    // bootstrap is still blocked inside the captured writer, holding the
+    // transport lane. The handle is only a liveness guard for the waits below
+    // and is joined after the last assertion for deterministic teardown.
+    let bootstrap = spawn_self_kick_bootstrap(
         bootstrap_registry,
         bootstrap_id,
         bootstrap_name,
@@ -814,14 +1073,13 @@ fn self_kick_legacy_arm_precedes_delete_lane_acquisition() {
         std::time::Duration::from_secs(2),
         BootstrapRegistrationState::AlreadyRegistered,
         None,
-    );
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-    while !writer_entered.load(Ordering::SeqCst) && std::time::Instant::now() < deadline {
-        std::thread::yield_now();
-    }
-    assert!(
-        writer_entered.load(Ordering::SeqCst),
-        "Legacy self-kick must reach its captured writer before delete starts"
+    )
+    .expect("self-kick bootstrap thread");
+    // The writer signals from inside the lane, at the moment it blocks.
+    recv_from_self_kick_bootstrap(
+        &writer_entered_rx,
+        &bootstrap,
+        "Legacy self-kick must reach its captured writer before delete starts",
     );
 
     let (delete_started_tx, delete_started_rx) = std::sync::mpsc::channel();
@@ -854,12 +1112,15 @@ fn self_kick_legacy_arm_precedes_delete_lane_acquisition() {
         "delete must wait for the self-kick lane while the writer is blocked"
     );
 
-    writer_release.store(true, Ordering::SeqCst);
-    let arm_after_delete = arm_rx
-        .recv_timeout(std::time::Duration::from_secs(1))
-        .expect("Legacy arm observer");
+    writer_release_tx
+        .send(())
+        .expect("BlockingWriter must still be blocked on release");
+    let arm_after_delete =
+        recv_from_self_kick_bootstrap(&arm_rx, &bootstrap, "Legacy arm observer");
+    // Bounded by the delete thread's own lifetime (its sender drops on exit),
+    // not by a wall-clock budget on the bootstrap releasing the lane.
     delete_done_rx
-        .recv_timeout(std::time::Duration::from_secs(1))
+        .recv()
         .expect("delete must complete after self-kick releases the lane");
     delete.join().expect("delete thread");
     assert!(
@@ -870,6 +1131,7 @@ fn self_kick_legacy_arm_precedes_delete_lane_acquisition() {
         !crate::daemon::inject_delivery::is_armed_for_test(&fixture.name),
         "delete's post-acquisition forget must clear the Legacy verification arm"
     );
+    bootstrap.join().expect("self-kick bootstrap");
     clear_self_kick_fixture(&fixture);
 }
 
@@ -1585,6 +1847,35 @@ fn unmanaged_local_shell_spawns_without_fleet_entry() {
     assert_eq!(handle.name.as_str(), "shell");
 }
 
+/// #3547 P0-near Task1 RED: spawn must log the dev-modal arming fact at info
+/// (grep-able `dev_modal_armed` + `argv_has_dev_channel_flag`) so the next
+/// dismiss-miss can be answered from the log instead of guessed.
+#[test]
+#[tracing_test::traced_test]
+fn spawn_logs_dev_modal_arming_at_info_3547() {
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let cfg = SpawnConfig {
+        name: "shell",
+        backend: None,
+        backend_command: "true", // exits immediately; we only assert the spawn log
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: None,
+        submit_key: "\r",
+        home: None, // unmanaged identity — the local-shell path
+        crash_tx: None,
+        shutdown: None,
+    };
+    let _ = spawn_agent(&cfg, &registry).expect("spawn must succeed");
+    assert!(
+        logs_contain("dev_modal_armed"),
+        "spawn must log the dev-modal arming fact at info level"
+    );
+}
+
 /// Deleted agent: reaper should not spawn shell fallback when deleted flag is set.
 /// Behavioral test: spawn a short-lived process, set deleted=true, verify
 /// no shell replacement appears in registry after exit.
@@ -1792,7 +2083,7 @@ fn build_command_strips_agend_git_bypass() {
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, _) = build_command(&config).expect("build_command");
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
     // #t-3 audit: actually assert the strip. portable_pty's CommandBuilder
     // captures the FULL parent env into its `envs` map at `::new()`, and
     // `env_remove` deletes the key from that map — so `get_env` DOES reflect
@@ -1839,7 +2130,7 @@ fn build_command_sets_git_editor_defaults() {
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, _) = build_command(&config).expect("build_command");
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
     for key in &["GIT_EDITOR", "GIT_SEQUENCE_EDITOR", "EDITOR", "VISUAL"] {
         let value = cmd
             .get_env(key)
@@ -1850,6 +2141,153 @@ fn build_command_sets_git_editor_defaults() {
             "{key} must default to `true` (no-op editor binary), got {value:?}"
         );
     }
+}
+
+/// #3315 (pins the #3314 B1 fix): `SpawnProvenance` must report the argv this
+/// generation was ACTUALLY built with — not a re-derivation, and not a constant.
+///
+/// The existing B1 pin, `arming_must_not_re_derive_from_mutable_sources_3314`,
+/// is a NEGATIVE source-grep: it proves `spawn_flags`/`which::which` have not
+/// come back, and nothing more. It cannot see whether the replacement reads the
+/// real argv. An exact-head adversarial review demonstrated the gap by forcing
+/// `argv_has_dev_channel_flag: true` in `capture`, which arms EVERY generation
+/// regardless of argv and survived every target — a fail-open on an
+/// auto-keystroke gate, hidden behind a pin that only watched the old code.
+///
+/// This drives the real `build_command` in both directions and compares the
+/// provenance against the argv computed from the same `CommandBuilder`. The
+/// per-case direction is asserted too: equality alone would hold vacuously if
+/// both sides collapsed to false.
+#[test]
+fn spawn_provenance_flag_matches_the_built_argv_3315() {
+    const FLAG: &str = "--dangerously-load-development-channels";
+
+    // (label, mcp-config.json contents, the flag this workspace must produce)
+    let cases: [(&str, &str, bool); 2] = [
+        (
+            "bridge-declared",
+            r#"{"mcpServers":{"agend-claude-channel":{"command":"agend-channel"}}}"#,
+            true,
+        ),
+        (
+            "no-bridge",
+            r#"{"mcpServers":{"other":{"command":"x"}}}"#,
+            false,
+        ),
+    ];
+
+    for (label, mcp_config, expected_flag) in cases {
+        let workspace = resolve_test_home(&format!("provenance-argv-3315-{label}"));
+        std::fs::create_dir_all(workspace.join(".claude")).expect(".claude dir");
+        std::fs::write(workspace.join(".claude/agend.md"), "fleet instructions").expect("agend.md");
+        std::fs::write(workspace.join("mcp-config.json"), mcp_config).expect("mcp-config.json");
+
+        let config = SpawnConfig {
+            name: "provenance-argv-3315",
+            backend: Some(&Backend::ClaudeCode),
+            backend_command: "claude",
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: Some(&workspace),
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: None,
+        };
+
+        let (cmd, _detected, provenance) = build_command(&config).expect("build_command");
+        let argv: Vec<String> = cmd
+            .get_argv()
+            .iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        let argv_carries_flag = argv.iter().any(|arg| arg == FLAG);
+
+        assert_eq!(
+            argv_carries_flag,
+            expected_flag,
+            "[{label}] fixture check: this workspace must build an argv that \
+             {} {FLAG}; argv={argv:?}",
+            if expected_flag { "carries" } else { "omits" }
+        );
+        assert_eq!(
+            provenance.argv_has_dev_channel_flag,
+            argv_carries_flag,
+            "[{label}] #3314 B1: provenance must be a fact ABOUT THE BUILT ARGV. \
+             It reported {} while the argv it was captured from {} the flag — so a \
+             generation could be armed on something other than what it is running. \
+             argv={argv:?}",
+            provenance.argv_has_dev_channel_flag,
+            if argv_carries_flag {
+                "carries"
+            } else {
+                "omits"
+            }
+        );
+    }
+}
+
+/// #3329: `build_command` pins the executable handed to `spawn_command`.
+/// Claude's installer flips `~/.local/bin/claude` between retained binaries;
+/// an already-built command must not silently follow that later swap.
+#[cfg(unix)]
+#[test]
+fn build_command_pins_the_executable_across_symlink_swap_3329() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let root = resolve_test_home("spawn-path-swap-3329");
+    let workspace = root.join("workspace");
+    let versions = root.join("versions");
+    let launcher = root.join("claude");
+    std::fs::create_dir_all(workspace.join(".claude")).expect(".claude dir");
+    std::fs::create_dir_all(&versions).expect("versions dir");
+    std::fs::write(workspace.join(".claude/agend.md"), "fleet instructions").expect("agend.md");
+    std::fs::write(
+        workspace.join("mcp-config.json"),
+        r#"{"mcpServers":{"agend-claude-channel":{"command":"agend-channel"}}}"#,
+    )
+    .expect("mcp-config.json");
+
+    let validated = versions.join("2.1.240");
+    let replacement = versions.join("2.1.999");
+    for binary in [&validated, &replacement] {
+        std::fs::write(binary, b"#!/bin/sh\nexit 0\n").expect("fake executable");
+        std::fs::set_permissions(binary, std::fs::Permissions::from_mode(0o755))
+            .expect("executable permissions");
+    }
+    symlink(&validated, &launcher).expect("initial launcher symlink");
+
+    let backend_command = launcher.to_string_lossy().into_owned();
+    let config = SpawnConfig {
+        name: "spawn-path-swap-3329",
+        backend: Some(&Backend::ClaudeCode),
+        backend_command: &backend_command,
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: Some(&workspace),
+        submit_key: "\r",
+        home: None,
+        crash_tx: None,
+        shutdown: None,
+    };
+
+    let (cmd, _, _) = build_command(&config).expect("build_command");
+    std::fs::remove_file(&launcher).expect("remove old launcher symlink");
+    symlink(&replacement, &launcher).expect("flip launcher symlink");
+
+    let argv0 = std::path::PathBuf::from(&cmd.get_argv()[0]);
+    assert_eq!(
+        argv0,
+        validated.canonicalize().expect("validated target"),
+        "the command must exec the concrete binary resolved while it was built; \
+         leaving argv[0] as {launcher:?} lets an updater swap it to {replacement:?}"
+    );
 }
 
 /// #2801 RED: the declared backend is authoritative even when `command:` is
@@ -1879,7 +2317,7 @@ fn build_command_wrapper_uses_declared_backend_for_presets_and_flags_2801() {
         shutdown: None,
     };
 
-    let (cmd, detected) = build_command(&config).expect("build_command");
+    let (cmd, detected, _prov) = build_command(&config).expect("build_command");
     assert_eq!(
         detected,
         Some(Backend::ClaudeCode),
@@ -1966,7 +2404,7 @@ fn build_command_without_declared_backend_keeps_legacy_inference_2801() {
         shutdown: None,
     };
 
-    let (cmd, detected) = build_command(&config).expect("build_command");
+    let (cmd, detected, _prov) = build_command(&config).expect("build_command");
     assert_eq!(detected, Some(Backend::ClaudeCode));
     let argv: Vec<String> = cmd
         .get_argv()
@@ -2011,7 +2449,7 @@ fn build_command_allows_operator_backend_credential_2106() {
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, _) = build_command(&config).expect("build_command");
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
     assert_eq!(
         cmd.get_env("ANTHROPIC_AUTH_TOKEN")
             .map(|v| v.to_string_lossy().into_owned()),
@@ -2029,6 +2467,104 @@ fn build_command_allows_operator_backend_credential_2106() {
             .map(|v| v.to_string_lossy().into_owned()),
         Some("ok".to_string()),
         "benign fleet.yaml env must pass unchanged"
+    );
+}
+
+struct ScopedEnv3540 {
+    key: &'static str,
+    prior: Option<std::ffi::OsString>,
+}
+
+impl ScopedEnv3540 {
+    fn set(key: &'static str, value: &str) -> Self {
+        let prior = std::env::var_os(key);
+        // SAFETY: this test is serialized with every other `serial_test::serial(env)` test.
+        unsafe { std::env::set_var(key, value) };
+        Self { key, prior }
+    }
+}
+
+impl Drop for ScopedEnv3540 {
+    fn drop(&mut self) {
+        // SAFETY: the owning test remains inside the same serial-test critical section.
+        unsafe {
+            match self.prior.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+}
+
+#[test]
+#[serial_test::serial(env)]
+fn fleet_env_from_env_expands_then_applies_destination_key_policy_3540() {
+    const SOURCE: &str = "AGEND_TEST_3540_SHARED_SECRET";
+    const SECRET: &str = "secret-from-process-env-3540";
+    let _source = ScopedEnv3540::set(SOURCE, SECRET);
+    let yaml = format!(
+        r#"
+defaults:
+  env:
+    LITERAL_DOLLAR: "${{UNCHANGED}}"
+instances:
+  worker:
+    backend: claude
+    env:
+      ANTHROPIC_AUTH_TOKEN: {{ from_env: {SOURCE} }}
+      LD_PRELOAD: {{ from_env: {SOURCE} }}
+      SERVICE_TOKEN_ALIAS: {{ from_env: {SOURCE} }}
+"#
+    );
+    assert!(
+        !yaml.contains(SECRET),
+        "fleet.yaml must contain only the source variable name, never its secret value"
+    );
+    let fleet: crate::fleet::FleetConfig =
+        serde_yaml_ng::from_str(&yaml).expect("structured env references parse");
+    let resolved = fleet.resolve_instance("worker").expect("source is set");
+    assert_eq!(
+        resolved.env.get("LITERAL_DOLLAR").map(String::as_str),
+        Some("${UNCHANGED}")
+    );
+    assert_eq!(
+        resolved.env.get("SERVICE_TOKEN_ALIAS").map(String::as_str),
+        Some(SECRET)
+    );
+
+    let config = SpawnConfig {
+        name: "worker",
+        backend: Some(&resolved.backend),
+        backend_command: &resolved.backend_command,
+        args: &resolved.args,
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: Some(&resolved.env),
+        working_dir: None,
+        submit_key: &resolved.submit_key,
+        home: None,
+        crash_tx: None,
+        shutdown: None,
+    };
+    let (cmd, _, _prov) = build_command(&config).expect("build command");
+    assert_eq!(
+        cmd.get_env("ANTHROPIC_AUTH_TOKEN")
+            .map(|v| v.to_string_lossy().into_owned()),
+        Some(SECRET.to_string()),
+        "#2106 backend credential exception must still key off the destination name"
+    );
+    assert_eq!(
+        cmd.get_env("SERVICE_TOKEN_ALIAS")
+            .map(|v| v.to_string_lossy().into_owned()),
+        Some(SECRET.to_string()),
+        "a benign destination key must receive the referenced value"
+    );
+    assert_ne!(
+        cmd.get_env("LD_PRELOAD")
+            .map(|v| v.to_string_lossy().into_owned()),
+        Some(SECRET.to_string()),
+        "deny-list must still key off the destination name, not inspect the referenced value"
     );
 }
 
@@ -2059,7 +2595,7 @@ fn build_command_credential_override_is_per_backend_2106() {
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, _) = build_command(&config).expect("build_command");
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
     assert_ne!(
         cmd.get_env("ANTHROPIC_AUTH_TOKEN")
             .map(|v| v.to_string_lossy().into_owned()),
@@ -2106,7 +2642,7 @@ fn build_command_disables_opencode_autoupdate_only_for_opencode() {
         crate::backend::SpawnMode::Fresh,
         crate::backend::SpawnMode::Resume,
     ] {
-        let (oc, _) = build_command(&cfg("opencode", mode)).expect("build_command opencode");
+        let (oc, _, _prov) = build_command(&cfg("opencode", mode)).expect("build_command opencode");
         let content = oc
             .get_env("OPENCODE_CONFIG_CONTENT")
             .and_then(|v| v.to_str().map(String::from))
@@ -2128,7 +2664,7 @@ fn build_command_disables_opencode_autoupdate_only_for_opencode() {
     }
     // Non-OpenCode backends must NOT receive either env (no cross-backend leakage).
     for cmd in ["claude", "codex", "echo"] {
-        let (c, _) =
+        let (c, _, _prov) =
             build_command(&cfg(cmd, crate::backend::SpawnMode::Fresh)).expect("build_command");
         assert!(
             c.get_env("OPENCODE_CONFIG_CONTENT").is_none(),
@@ -2180,7 +2716,7 @@ fn build_command_reinjects_agend_home_under_env_isolation_med5() {
         None => std::env::remove_var("AGEND_ENV_ISOLATION"),
     }
 
-    let (cmd, _) = built.expect("build_command");
+    let (cmd, _, _prov) = built.expect("build_command");
     let v = cmd
         .get_env("AGEND_HOME")
         .expect("MED-5: AGEND_HOME must survive env_clear under isolation");
@@ -2188,6 +2724,56 @@ fn build_command_reinjects_agend_home_under_env_isolation_med5() {
         v.to_string_lossy(),
         home.to_string_lossy(),
         "MED-5: AGEND_HOME must equal the daemon home"
+    );
+}
+
+/// t-20260905025935845604-95750-65 (#1504 family): the agentic-git shim on the
+/// spawned agent's PATH derives its own self-exclusion directory from
+/// `AGENTIC_GIT_HOME`, falling back to `AGEND_HOME`. Tests that scope
+/// `AGEND_HOME` to a temp dir (`ScopedAgendHome`) and then spawn `git` therefore
+/// make the shim resolve to itself and trip its recursion guard — about 40
+/// deterministic failures in every agent shell that CI (no shim on PATH) never
+/// sees. The daemon pins the PRIMARY name to its own home at spawn, and a
+/// caller-supplied env must not be able to redirect it (same class as
+/// `AGEND_HOME`, which the deny-list already protects).
+#[test]
+fn build_command_pins_agentic_git_home_to_daemon_home_1504() {
+    let home = std::path::PathBuf::from("/tmp/agend-1504-shim-home-pin");
+    let mut caller_env = HashMap::new();
+    caller_env.insert(
+        "AGENTIC_GIT_HOME".to_string(),
+        "/tmp/agend-1504-somewhere-else".to_string(),
+    );
+    let config = SpawnConfig {
+        name: "shim-home-pin",
+        backend: None,
+        backend_command: "echo",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: Some(&caller_env),
+        working_dir: None,
+        submit_key: "\r",
+        home: Some(&home),
+        crash_tx: None,
+        shutdown: None,
+    };
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
+    let pinned = cmd
+        .get_env("AGENTIC_GIT_HOME")
+        .expect("#1504: AGENTIC_GIT_HOME must be injected at spawn");
+    assert_eq!(
+        pinned.to_string_lossy(),
+        home.to_string_lossy(),
+        "#1504: AGENTIC_GIT_HOME must equal the daemon home the agent is spawned \
+         with, never a caller-supplied redirect"
+    );
+    assert_eq!(
+        cmd.get_env("AGEND_HOME")
+            .map(|v| v.to_string_lossy().into_owned()),
+        Some(home.to_string_lossy().into_owned()),
+        "#1504: the legacy AGEND_HOME injection stays in place beside the primary name"
     );
 }
 
@@ -2225,7 +2811,7 @@ fn build_agy_cmd(
         crash_tx: None,
         shutdown: None,
     };
-    let (cmd, backend) = build_command(&config).expect("build_command");
+    let (cmd, backend, _prov) = build_command(&config).expect("build_command");
     assert_eq!(backend, Some(Backend::Agy));
     (cmd, crate::agy_workspace::link_path(home, "agy-int"))
 }
@@ -2392,13 +2978,23 @@ fn broadcast_registry_releases_lock_before_inject_1146() {
 /// re-open the freeze class (registry held across inject), so this pins it gone.
 #[test]
 fn inject_handle_footgun_removed_uses_snapshots_f1() {
+    // The ban covers every agent-module source carrying this surface: 31e14e16
+    // extracted the readiness waiters into `bootstrap_wait.rs`, and a mod.rs-only
+    // scan is evaded by re-homing the banned fn there (measured). Explicit list —
+    // no directory walk; `inject_footgun_ban_covers_…` pins the list itself.
+    for (source, text) in [
+        ("mod.rs", include_str!("mod.rs")),
+        ("bootstrap_wait.rs", include_str!("bootstrap_wait.rs")),
+    ] {
+        assert!(
+            !text.contains("pub fn inject_to_agent("),
+            "#1530/F1: inject_to_agent(&AgentHandle) must stay removed — found in \
+             `{source}`. It lets a caller hold the registry across a blocking \
+             inject; use inject_with_target_gated (snapshot under lock → drop → \
+             inject)"
+        );
+    }
     let src = include_str!("mod.rs");
-    assert!(
-        !src.contains("pub fn inject_to_agent("),
-        "#1530/F1: inject_to_agent(&AgentHandle) must stay removed — it lets a caller \
-         hold the registry across a blocking inject; use inject_with_target_gated \
-         (snapshot under lock → drop → inject)"
-    );
     assert!(
         src.contains("pub(crate) fn inject_with_target_gated("),
         "#1530/F1: the snapshot inject API inject_with_target_gated must exist"
@@ -2407,6 +3003,34 @@ fn inject_handle_footgun_removed_uses_snapshots_f1() {
         src.contains("pub(crate) fn write_to_pty("),
         "#1530/F1: the snapshot write API write_to_pty must exist"
     );
+}
+
+/// t-…-75305-27 RED: the footgun ban above reads ONE file. `bootstrap_wait.rs`
+/// was extracted out of `mod.rs` carrying exactly this surface — the readiness
+/// waiters that hand back an `InjectTarget` — so `pub fn inject_to_agent(` can be
+/// re-homed into that sibling and the ban stays green while the footgun is back.
+/// Pin the COVERAGE, not just the absence: the ban must read every agent-module
+/// source that carries the surface. Explicit list, no directory walk.
+///
+/// Structural and deterministic: it reads the guard's own body, so it fails the
+/// moment the ban's file set stops naming a source the surface lives in.
+#[test]
+fn inject_footgun_ban_covers_the_extracted_bootstrap_wait_sibling_f1() {
+    let suite = include_str!("tests.rs").replace('\r', "");
+    let start = suite
+        .find("fn inject_handle_footgun_removed_uses_snapshots_f1()")
+        .expect("the #1530/F1 footgun guard must exist");
+    let rest = &suite[start..];
+    let end = rest.find("\n}\n").expect("guard body is brace-terminated");
+    let guard_body = &rest[..end];
+    for source in ["mod.rs", "bootstrap_wait.rs"] {
+        assert!(
+            guard_body.contains(&format!("include_str!(\"{source}\")")),
+            "#1530/F1 coverage: the footgun ban must scan `{source}` — a source \
+             carrying the inject-target surface that is not scanned is a free \
+             re-home for the banned `pub fn inject_to_agent(`"
+        );
+    }
 }
 
 /// #1146 reviewer fix: inject_with_target must skip if the agent
@@ -3034,6 +3658,7 @@ fn pty_read_error_triggers_cleanup() {
     );
 
     let ctx = PtyReadContext {
+        dev_modal_armed: false,
         name: agent_name.to_string(),
         instance_id,
         core,
@@ -3182,6 +3807,7 @@ fn run_pty_close_capturing_crash(
     let (tx, rx) = crossbeam_channel::unbounded();
     let tx_guard = tx.clone();
     let ctx = PtyReadContext {
+        dev_modal_armed: false,
         name: "rank4-guard".to_string(),
         instance_id: id,
         core,
@@ -3337,6 +3963,49 @@ impl std::io::Read for ChunkReader {
     }
 }
 
+struct TimedChunkReader {
+    chunks: Vec<(&'static [u8], std::time::Duration)>,
+    next: usize,
+    wait_for_dismiss: Option<&'static str>,
+    wait_for_first_write: Option<Arc<Mutex<Vec<u8>>>>,
+}
+
+impl std::io::Read for TimedChunkReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let Some((chunk, delay)) = self.chunks.get(self.next) else {
+            if let Some(name) = self.wait_for_dismiss {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+                while dismiss::dismiss_in_flight_for_test(name)
+                    && std::time::Instant::now() < deadline
+                {
+                    std::thread::yield_now();
+                }
+            }
+            return Ok(0);
+        };
+        if self.next == 1 {
+            if let Some(written) = &self.wait_for_first_write {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+                while written.lock().is_empty() && std::time::Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                if let Some(name) = self.wait_for_dismiss {
+                    while dismiss::dismiss_in_flight_for_test(name)
+                        && std::time::Instant::now() < deadline
+                    {
+                        std::thread::yield_now();
+                    }
+                }
+            }
+        }
+        std::thread::sleep(*delay);
+        self.next += 1;
+        let n = chunk.len().min(buf.len());
+        buf[..n].copy_from_slice(&chunk[..n]);
+        Ok(n)
+    }
+}
+
 #[derive(Clone)]
 struct RecordingWriter {
     bytes: Arc<Mutex<Vec<u8>>>,
@@ -3353,39 +4022,74 @@ impl std::io::Write for RecordingWriter {
     }
 }
 
+/// Simulates a starved CI runner for `self_kick_legacy_arm_precedes_delete_lane_acquisition`:
+/// once the test releases the blocked PTY write, the bootstrap's arm path is
+/// held back this long before it can arm. It deliberately exceeds the 1s
+/// wall-clock budget the test used to wait on, so re-introducing any bounded
+/// wait for the arm fails deterministically here instead of flaking only on a
+/// loaded runner. It stays well inside `PTY_WRITE_TIMEOUT` (5s), which bounds
+/// the whole blocked write from the bootstrap's side.
+const SELF_KICK_ARM_PATH_STALL: std::time::Duration = std::time::Duration::from_millis(1500);
+
+/// Test-only PTY writer that blocks its first write until the test releases it.
+///
+/// `inject_with_target` runs it on the bootstrap's `pty_write_timeout` helper
+/// thread while the bootstrap itself holds the transport lane, so `entered`
+/// is the explicit "lane acquired, about to block" signal the test
+/// synchronises on. `release` is a channel rather than a flag: the test
+/// releases by sending, and a test that panics first drops its sender, which
+/// unblocks the write with an error instead of leaving the detached bootstrap
+/// behind a wall-clock self-release deadline.
 struct BlockingWriter {
     bytes: Arc<Mutex<Vec<u8>>>,
-    entered: Arc<std::sync::atomic::AtomicBool>,
-    release: Arc<std::sync::atomic::AtomicBool>,
+    entered: Option<std::sync::mpsc::Sender<()>>,
+    release: std::sync::mpsc::Receiver<()>,
+    post_release_stall: std::time::Duration,
 }
 
 impl std::io::Write for BlockingWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         self.bytes.lock().extend_from_slice(buf);
-        if !self.entered.swap(true, std::sync::atomic::Ordering::SeqCst) {
-            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
-            while !self.release.load(std::sync::atomic::Ordering::SeqCst)
-                && std::time::Instant::now() < deadline
-            {
-                std::thread::yield_now();
-            }
-            if !self.release.load(std::sync::atomic::Ordering::SeqCst) {
-                // A failed ordering assertion must not leave the detached
-                // bootstrap thread spinning forever; return a visible I/O
-                // failure after the bounded self-release deadline.
-                self.release
-                    .store(true, std::sync::atomic::Ordering::SeqCst);
+        if let Some(entered) = self.entered.take() {
+            if entered.send(()).is_err() || self.release.recv().is_err() {
                 return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    "BlockingWriter release deadline exceeded",
+                    std::io::ErrorKind::BrokenPipe,
+                    "BlockingWriter: the test went away before releasing the write",
                 ));
             }
+            std::thread::sleep(self.post_release_stall);
         }
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
         Ok(())
+    }
+}
+
+/// Wait for a signal the detached self-kick bootstrap emits, without a
+/// wall-clock budget. The wait ends when the signal arrives or when the
+/// bootstrap thread has exited without sending it; the short poll period only
+/// bounds how quickly that exit is noticed, never how long the signal may take.
+fn recv_from_self_kick_bootstrap<T>(
+    rx: &std::sync::mpsc::Receiver<T>,
+    bootstrap: &std::thread::JoinHandle<()>,
+    what: &str,
+) -> T {
+    use std::sync::mpsc::RecvTimeoutError;
+    loop {
+        match rx.recv_timeout(std::time::Duration::from_millis(10)) {
+            Ok(value) => return value,
+            Err(RecvTimeoutError::Disconnected) => panic!("{what}: signal sender dropped"),
+            Err(RecvTimeoutError::Timeout) if !bootstrap.is_finished() => {}
+            Err(RecvTimeoutError::Timeout) => {
+                // The exit was observed after this poll timed out; a send that
+                // preceded the exit is still queued, so drain once more.
+                return rx.try_recv().unwrap_or_else(|_| {
+                    panic!("{what}: self-kick bootstrap exited without signalling")
+                });
+            }
+        }
     }
 }
 
@@ -3407,6 +4111,7 @@ fn run_pty_read_loop_for_r8(
         observed_status: None,
     }));
     let ctx = PtyReadContext {
+        dev_modal_armed: false,
         name: "r8-dismiss-test".to_string(),
         instance_id: crate::types::InstanceId::default(),
         core,
@@ -3423,6 +4128,297 @@ fn run_pty_read_loop_for_r8(
     let capture = crate::capture::make_capture_writer(None, "r8-dismiss-test", backend.name());
     pty_read_loop(&mut reader, &ctx, capture);
     written
+}
+
+fn run_dev_modal_pty_read_loop_3333(
+    chunks: Vec<(&'static [u8], std::time::Duration)>,
+) -> Arc<Mutex<Vec<u8>>> {
+    run_dev_modal_pty_read_loop_with_ordering_3333(chunks, false)
+}
+
+fn run_dev_modal_pty_read_loop_with_ordering_3333(
+    chunks: Vec<(&'static [u8], std::time::Duration)>,
+    second_chunk_follows_first_write: bool,
+) -> Arc<Mutex<Vec<u8>>> {
+    let written = Arc::new(Mutex::new(Vec::new()));
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+        bytes: Arc::clone(&written),
+    })));
+    let backend = Backend::ClaudeCode;
+    let core = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+        vterm: VTerm::new(160, 40),
+        subscribers: Vec::new(),
+        state: StateTracker::new(Some(&backend)),
+        health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+    let patterns: Vec<(String, Vec<u8>)> = backend
+        .preset()
+        .dismiss_patterns
+        .iter()
+        .map(|p| (p.label.to_string(), p.sequence.to_vec()))
+        .collect();
+    let ctx = PtyReadContext {
+        dev_modal_armed: true,
+        name: "dev-modal-3333".to_string(),
+        instance_id: crate::types::InstanceId::default(),
+        core,
+        pty_writer: writer,
+        registry: Arc::new(Mutex::new(std::collections::HashMap::new())),
+        home: None,
+        crash_tx: None,
+        dismiss_patterns: dismiss::prepare_dismiss_patterns(&patterns),
+        shutdown: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+        deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+    };
+    let mut reader = TimedChunkReader {
+        chunks,
+        next: 0,
+        wait_for_dismiss: Some("dev-modal-3333"),
+        wait_for_first_write: second_chunk_follows_first_write.then(|| Arc::clone(&written)),
+    };
+    let capture = crate::capture::make_capture_writer(None, "dev-modal-3333", "claude");
+    pty_read_loop(&mut reader, &ctx, capture);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    while dismiss::dismiss_in_flight_for_test("dev-modal-3333")
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
+    assert!(
+        !dismiss::dismiss_in_flight_for_test("dev-modal-3333"),
+        "#3333: production dismiss worker did not finish before the bounded test deadline"
+    );
+    written
+}
+
+#[test]
+fn pty_read_loop_answers_one_static_dev_modal_frame_3333() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![(modal, std::time::Duration::ZERO)]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "#3333: the production PTY entry point must answer a complete static modal without a second child frame"
+    );
+}
+
+#[test]
+fn pty_read_loop_rearms_after_repaint_preserves_dev_modal() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (modal, std::time::Duration::ZERO),
+        (b"\x1b[?25h", std::time::Duration::from_millis(25)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "a late child repaint that leaves the complete modal visible must restart the stability window instead of stranding the prompt"
+    );
+}
+
+#[test]
+fn pty_read_loop_holds_back_when_modal_vanishes_after_repaint() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (modal, std::time::Duration::ZERO),
+        // Publish both invalidating frames before the 300ms dismiss worker can
+        // write. A 250ms sleep could overshoot that deadline on a loaded runner,
+        // testing scheduler luck instead of the repaint/vanish ordering.
+        (b"\x1b[?25h", std::time::Duration::ZERO),
+        (
+            b"\x1b[2J\x1b[H$ the modal is gone\r\n",
+            std::time::Duration::ZERO,
+        ),
+    ]);
+
+    assert!(
+        written.lock().is_empty(),
+        "a repaint followed by the modal vanishing must not be answered"
+    );
+}
+
+#[test]
+fn pty_read_loop_answers_dev_modal_inside_trust_cooldown_3314() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    let written = run_dev_modal_pty_read_loop_with_ordering_3333(
+        vec![
+            (trust, std::time::Duration::ZERO),
+            (modal, std::time::Duration::ZERO),
+        ],
+        true,
+    );
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r\r",
+        "#3314: the static startup modal must not be stranded by the preceding trust-dismiss cooldown"
+    );
+}
+
+#[test]
+fn pty_read_loop_keeps_non_dev_prompt_inside_trust_cooldown_3314() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+    let proceed = b"\x1b[2J\x1b[H quoted: WARNING: Loading development channels\r\n quoted: --dangerously-load-development-channels is for local channel development only. Do not use this option to run channels you have downloaded off the internet.\r\n quoted: Please use --channels to run a list of approved channels.\r\n quoted: Channels: server:agend-claude-channel\r\n quoted: I am using this for local development\r\n\r\n Do you want to continue?\r\n\r\n   1. No\r\n \xe2\x9d\xaf 2. Yes, proceed\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (trust, std::time::Duration::ZERO),
+        (proceed, std::time::Duration::from_millis(350)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "#3314: a non-development-channel prompt must remain suppressed by the trust-dismiss cooldown"
+    );
+}
+
+/// t-…-72553-65 / d-…-14 — CURRENT Claude renders the trust modal with the Yes
+/// row UNSELECTED and the cursor on `No, exit`. The shipped preset matched any
+/// `Yes, I trust` line and sent a bare Enter, which on this shape CONFIRMS
+/// `No, exit` and makes Claude exit (operator saw the pane go Crashed).
+/// Transcribed from the operator screenshot.
+#[test]
+fn pty_read_loop_moves_off_selected_no_on_current_trust_prompt_65() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n   Yes, I trust this folder\r\n \xe2\x9d\xaf No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![(trust, std::time::Duration::ZERO)]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\x1b[B\r",
+        "a SELECTED `No, exit` must be stepped off before confirming — a bare Enter here confirms No and exits Claude"
+    );
+}
+
+/// Control: the OLD shape (cursor already on the numbered Yes row) must keep the
+/// single-Enter path #996 established. The new pattern must not disturb it.
+#[test]
+fn pty_read_loop_keeps_single_enter_for_old_selected_yes_trust_prompt_65() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![(trust, std::time::Duration::ZERO)]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "the old selected-Yes shape must still confirm with a single Enter"
+    );
+}
+
+/// Negative control: `No, exit` appearing WITHOUT a leading selection marker —
+/// quoted prose, or the unselected row of the old shape — must not make the new
+/// pattern send anything. Nothing on this screen is a live modal.
+#[test]
+fn pty_read_loop_ignores_quoted_or_unselected_no_exit_65() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let quoted = b"\x1b[2J\x1b[H operator: the prompt offered No, exit and I declined\r\n   2. No, exit\r\n done\r\n";
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![(quoted, std::time::Duration::ZERO)]);
+
+    assert!(
+        written.lock().is_empty(),
+        "an unselected or quoted `No, exit` is not a live modal and must send nothing: {:?}",
+        written.lock().as_slice()
+    );
+}
+
+#[test]
+fn pty_read_loop_does_not_reanswer_trust_without_complete_dev_modal_3314() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+    let second_trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test-2\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+
+    let written = run_dev_modal_pty_read_loop_with_ordering_3333(
+        vec![
+            (trust, std::time::Duration::ZERO),
+            (second_trust, std::time::Duration::ZERO),
+        ],
+        true,
+    );
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "#3314: cooldown bypass requires a complete development-channel modal"
+    );
+}
+
+#[test]
+fn pty_read_loop_keeps_dev_modal_inside_cooldown_after_idle_3314() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+    let idle = b"\x1b[2J\x1b[H bypass permissions on\r\n \xe2\x9d\xaf ";
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (trust, std::time::Duration::ZERO),
+        (idle, std::time::Duration::from_millis(2_500)),
+        (modal, std::time::Duration::from_millis(350)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "#3314: the cooldown bypass must close permanently once Claude has reached idle"
+    );
+}
+
+#[test]
+fn pty_read_loop_new_child_output_cancels_pending_dev_modal_cr_3333() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (modal, std::time::Duration::ZERO),
+        (
+            b"\x1b[2J\x1b[HClaude ready\n> ",
+            std::time::Duration::from_millis(25),
+        ),
+    ]);
+
+    assert!(
+        written.lock().is_empty(),
+        "#3333: newer child output must invalidate the delayed modal Enter before the production writer fires"
+    );
 }
 
 #[test]
@@ -3483,8 +4479,13 @@ fn r8_startup_dialog_still_dismisses_before_latch_off() {
         .iter()
         .map(|p| (p.label.to_string(), p.sequence.to_vec()))
         .collect();
+    // #3317: the codex trust-directory matcher was REMOVED (answering that
+    // prompt makes codex persist a per-workspace trust entry in the operator's
+    // config). This test is about the LATCH mechanics, not about that specific
+    // prompt, so it now drives another real codex startup modal with the same
+    // `\r` keystroke — the assertions below are unchanged.
     let written = run_pty_read_loop_for_r8(
-        vec![b"\x1b[2J\x1b[HDo you trust this folder?\nYes, continue"],
+        vec![b"\x1b[2J\x1b[HPlease restart the app to finish updating"],
         Backend::Codex,
         patterns,
     );
@@ -3500,6 +4501,121 @@ fn r8_startup_dialog_still_dismisses_before_latch_off() {
         b"\r",
         "R8: startup trust dialog must still send the configured dismiss keystroke"
     );
+}
+
+/// #3315 B2 (unit): forced unwind with the guard live. BOTH halves of the
+/// end-of-generation must happen — cancel the in-flight CR and stop tracking the
+/// writer. The two used to be trailing statements in `pty_read_loop`, which an
+/// unwind skips; `dismiss::InFlightGuard` is the same shape for the same reason.
+///
+/// The panic is injected, not awaited: no timing, no backend, no PTY.
+#[test]
+fn generation_guard_ends_the_generation_on_unwind_3315() {
+    let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+        bytes: Arc::new(Mutex::new(Vec::new())),
+    })));
+    let (guard, gate) = crate::agent::dev_modal::arm_generation(
+        &writer,
+        true,
+        Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        "generation-guard-3315",
+    );
+    // The snapshot a queued keystroke carries into its 300ms sleep.
+    let barrier = gate.write_barrier();
+    assert!(
+        barrier.still_valid() && crate::agent::dev_modal::epoch_is_armed(&writer),
+        "precondition: the generation is live and tracked before the unwind"
+    );
+
+    let h = std::thread::Builder::new()
+        .name("gen-guard-panic-3315".into())
+        .spawn(move || {
+            let _guard = guard;
+            panic!("injected unwind before any normal end-of-generation");
+        })
+        .expect("spawn");
+    assert!(h.join().is_err(), "the injected panic must propagate");
+
+    assert!(
+        !barrier.still_valid(),
+        "#3315 B2: an unwind must CANCEL the generation — a CR still queued \
+         behind the 300ms write delay would otherwise pass its barrier and land \
+         on a PTY whose read loop is already gone"
+    );
+    assert!(
+        !crate::agent::dev_modal::epoch_is_armed(&writer),
+        "#3315 B2: an unwind must also stop tracking this writer — a leaked epoch \
+         entry keeps counting for a dead generation and is inherited by the next \
+         writer allocated at the same address"
+    );
+}
+
+/// #3315 B2 (integration): the unit test above proves the guard's Drop does the
+/// right thing; this one proves the REAL `pty_read_loop` is what arms it, by
+/// making the loop die the way trailing statements cannot survive — a panic out
+/// of `read()`, not EOF. Deterministic: the panic is in the fixture reader.
+///
+/// The normal-exit half is asserted too, because moving teardown into a Drop is
+/// only safe if the ordinary EOF path still tears down exactly as before.
+#[test]
+fn pty_read_loop_ends_the_generation_on_both_exits_3315() {
+    struct PanickingReader;
+    impl Read for PanickingReader {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            panic!("injected read-loop unwind (#3315 B2)");
+        }
+    }
+
+    for (label, panicking) in [("EOF", false), ("unwind", true)] {
+        let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
+            bytes: Arc::new(Mutex::new(Vec::new())),
+        })));
+        let ctx = PtyReadContext {
+            dev_modal_armed: true,
+            name: format!("gen-guard-{label}-3315"),
+            instance_id: crate::types::InstanceId::default(),
+            core: Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+                vterm: VTerm::new(80, 24),
+                subscribers: Vec::new(),
+                state: StateTracker::new(Some(&Backend::ClaudeCode)),
+                health: HealthTracker::new(),
+                api_activity: crate::agent::ApiActivity::default(),
+                observed_status: None,
+            })),
+            pty_writer: Arc::clone(&writer),
+            registry: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            home: None,
+            crash_tx: None,
+            dismiss_patterns: Vec::new(),
+            shutdown: Some(Arc::new(std::sync::atomic::AtomicBool::new(true))),
+            deleted: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            generation: crate::agent::crash_disposition::SpawnGeneration::default(),
+        };
+        let capture = crate::capture::make_capture_writer(None, "gen-guard-3315", "claude");
+        let ran = std::thread::Builder::new()
+            .name(format!("read-loop-{label}-3315"))
+            .spawn(move || {
+                let mut eof = ChunkReader {
+                    chunks: Vec::new(),
+                    next: 0,
+                };
+                let mut boom = PanickingReader;
+                let reader: &mut dyn Read = if panicking { &mut boom } else { &mut eof };
+                pty_read_loop(reader, &ctx, capture);
+            })
+            .expect("spawn")
+            .join();
+        assert_eq!(
+            ran.is_err(),
+            panicking,
+            "fixture check: the {label} run must exit the way this case intends"
+        );
+        assert!(
+            !crate::agent::dev_modal::epoch_is_armed(&writer),
+            "#3315 B2: `pty_read_loop` must stop tracking the writer on its {label} \
+             exit. A trailing statement covers only the first case; a Drop covers both"
+        );
+    }
 }
 
 /// #1145: write_with_timeout stuck thread must clear WRITE_IN_PROGRESS
@@ -3849,6 +4965,69 @@ fn wait_for_idle_inject_target_already_registered_absence_aborts_without_wall_cl
         Some(IdleInjectWaitTerminal::DisappearedAfterSeen)
     );
     assert_eq!(logical_now.get(), Duration::ZERO);
+}
+
+/// #3462-v3 RED-A: shutdown is observed ONLY at this waiter's loop top. Once the
+/// readiness break happens the waiter still sleeps the 500ms settle, then
+/// snapshots and returns a live `InjectTarget` — so a shutdown that lands during
+/// the settle still hands the caller a target and the caller writes into an agent
+/// the daemon is tearing down.
+///
+/// The settle must be fenced. This drives the production waiter with an injected
+/// clock (no wall-clock time passes) and flips the flag from inside the settle
+/// sleep; the result must be the `Shutdown` terminal, not a target.
+///
+/// The fence belongs HERE, not in `wait_for_respawn_inject_target`: this waiter
+/// has three callers (instructions bootstrap, self-kick bootstrap, crash-respawn
+/// notice) and all three inherit the window.
+#[test]
+fn wait_for_idle_inject_target_fences_shutdown_during_the_settle_delay() {
+    use std::cell::Cell;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = crate::types::InstanceId::new();
+    registry.lock().insert(id, mk_handle_1441("boot", id));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let logical_now = Cell::new(Duration::ZERO);
+    let shutdown_for_sleep = Arc::clone(&shutdown);
+    let mut now = || logical_now.get();
+    let mut sleep = |interval: Duration| {
+        logical_now.set(logical_now.get() + interval);
+        // `StructuredTransport` + an already-registered handle is ready on the
+        // first iteration, so the settle is the ONLY sleep reached. Pinning the
+        // interval keeps this test honest if that ever stops being true.
+        assert_eq!(
+            interval,
+            Duration::from_millis(500),
+            "the settle delay must be the only sleep this policy reaches"
+        );
+        shutdown_for_sleep.store(true, Ordering::Relaxed);
+    };
+
+    let result = wait_for_bootstrap_inject_target_with_clock(
+        &registry,
+        id,
+        Duration::from_secs(10),
+        BootstrapWaitPolicy::StructuredTransport(BootstrapRegistrationState::AlreadyRegistered),
+        Some(&shutdown),
+        &mut now,
+        &mut sleep,
+    );
+
+    assert!(
+        result.target.is_none(),
+        "a shutdown observed during the settle must not yield an inject target"
+    );
+    assert_eq!(
+        result.terminal,
+        Some(IdleInjectWaitTerminal::Shutdown),
+        "the settle window must end in the Shutdown terminal, not a live target"
+    );
+    for handle in registry.lock().values() {
+        let _ = handle.child.lock().kill();
+    }
 }
 
 /// (1) Invariant: after a managed spawn, `registry key == handle.id ==
@@ -4321,6 +5500,24 @@ fn opencode_attach_command_uses_one_model_parse_result() {
     .is_err());
 }
 
+/// #3398: a codex spawn with no session locator (no `home`, so
+/// `prepare_codex_tui_session` never runs and `codex_attach_locator` returns `None`)
+/// falls back to the `Backend::Codex` preset args. A global `resume --last` there
+/// adopts whatever thread the cwd used last — another fleet instance's when they
+/// share one. Exact-vector so the subcommand cannot reappear at any position; the
+/// locator path is pinned by `codex_managed_tui_resume_targets_the_persisted_thread`.
+#[test]
+fn codex_resume_preset_without_a_locator_starts_isolated_3398() {
+    assert_eq!(
+        Backend::Codex.preset_spawn_args(crate::backend::SpawnMode::Resume),
+        vec![
+            "-c",
+            "check_for_update_on_startup=false",
+            "--dangerously-bypass-approvals-and-sandbox",
+        ]
+    );
+}
+
 #[test]
 fn codex_managed_tui_resume_targets_the_persisted_thread() {
     let locator = crate::transport::SessionLocator::codex(
@@ -4331,6 +5528,7 @@ fn codex_managed_tui_resume_targets_the_persisted_thread() {
         &locator,
         &["--model=gpt-5".to_string()],
         crate::backend::SpawnMode::Resume,
+        &[],
     )
     .expect("managed Codex resume argv");
     assert_eq!(
@@ -4342,28 +5540,25 @@ fn codex_managed_tui_resume_targets_the_persisted_thread() {
             "check_for_update_on_startup=false",
             "resume",
             "thread-1",
-            "--dangerously-bypass-approvals-and-sandbox",
             "--model=gpt-5",
         ]
     );
 }
 
 #[test]
-fn codex_managed_tui_resume_falls_back_to_last_thread_in_cwd() {
+fn codex_managed_tui_resume_without_thread_starts_isolated_session() {
     let locator = crate::transport::SessionLocator::codex(
         std::path::PathBuf::from("/tmp/codex-managed.sock"),
         None,
     );
     assert_eq!(
-        codex_remote_command_args(&locator, &[], crate::backend::SpawnMode::Resume)
-            .expect("managed Codex resume fallback argv"),
+        codex_remote_command_args(&locator, &[], crate::backend::SpawnMode::Resume, &[])
+            .expect("managed Codex isolated fallback argv"),
         vec![
             "--remote",
             "unix:///tmp/codex-managed.sock",
             "-c",
             "check_for_update_on_startup=false",
-            "resume",
-            "--last",
             "--dangerously-bypass-approvals-and-sandbox",
         ]
     );
@@ -4376,7 +5571,7 @@ fn codex_managed_tui_does_not_require_a_precreated_thread() {
         Some("stale-thread".to_string()),
     );
     assert_eq!(
-        codex_remote_command_args(&locator, &[], crate::backend::SpawnMode::Fresh)
+        codex_remote_command_args(&locator, &[], crate::backend::SpawnMode::Fresh, &[])
             .expect("TUI-first remote argv"),
         vec![
             "--remote",
@@ -4510,7 +5705,8 @@ fn broadcast_full_channel_does_not_block_and_drops() {
     // go. The OLD blocking `send` would deadlock here; `try_send` drops instead.
     let (tx, _rx) = crossbeam_channel::bounded::<Vec<u8>>(1);
     tx.send(vec![0u8]).expect("prime the single slot");
-    let mut subs = vec![tx];
+    let live = std::sync::Arc::new(());
+    let mut subs = vec![(tx, std::sync::Arc::downgrade(&live))];
     let mut dropped = 0u64;
     // If this blocks, the test harness hangs — that IS the failure signal.
     broadcast_pty_output(&mut subs, b"more output", &mut dropped, "agent-x");
@@ -4529,7 +5725,8 @@ fn broadcast_full_channel_does_not_block_and_drops() {
 fn broadcast_removes_disconnected_subscriber() {
     let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(1024);
     drop(rx); // consumer gone → Disconnected
-    let mut subs = vec![tx];
+    let live = std::sync::Arc::new(());
+    let mut subs = vec![(tx, std::sync::Arc::downgrade(&live))];
     let mut dropped = 0u64;
     broadcast_pty_output(&mut subs, b"x", &mut dropped, "agent-x");
     assert!(subs.is_empty(), "a disconnected subscriber must be removed");
@@ -4539,7 +5736,8 @@ fn broadcast_removes_disconnected_subscriber() {
 #[test]
 fn broadcast_delivers_to_healthy_subscriber() {
     let (tx, rx) = crossbeam_channel::bounded::<Vec<u8>>(1024);
-    let mut subs = vec![tx];
+    let live = std::sync::Arc::new(());
+    let mut subs = vec![(tx, std::sync::Arc::downgrade(&live))];
     let mut dropped = 0u64;
     broadcast_pty_output(&mut subs, b"hello", &mut dropped, "agent-x");
     assert_eq!(subs.len(), 1, "a healthy subscriber is kept");
@@ -4548,6 +5746,52 @@ fn broadcast_delivers_to_healthy_subscriber() {
         rx.try_recv().ok(),
         Some(b"hello".to_vec()),
         "output must be delivered"
+    );
+}
+
+/// #3682: a TUI client that connects and disconnects leaves a dead `Sender`
+/// behind. With NO PTY output ever produced (a quiet agent), the only other
+/// removal site — `broadcast_pty_output`'s `retain` — never runs, so the dead
+/// tap lingers forever. A subsequent connect MUST reclaim it (subscribe-time
+/// liveness sweep).
+#[test]
+fn subscribe_prunes_dead_subscriber_without_pty_output_3682() {
+    let id = crate::types::InstanceId::new();
+    let handle = mk_test_handle("quiet-liveness-3682", id);
+
+    // Client 1 connects, then disconnects. This handle emits no PTY output, so
+    // the broadcast-time prune never runs.
+    let (sub, _dump) = subscribe_with_dump(&handle);
+    assert_eq!(handle.core.lock().subscribers.len(), 1);
+    drop(sub);
+
+    // Client 2 connects — this event ALONE must reclaim client 1's dead tap.
+    let (_sub2, _dump2) = subscribe_with_dump(&handle);
+    assert_eq!(
+        handle.core.lock().subscribers.len(),
+        1,
+        "a dead tap from a disconnected client must be pruned at subscribe time \
+         even when the agent produced zero PTY output"
+    );
+}
+
+/// #3682 guard: the subscribe-time sweep must reclaim ONLY dead taps — a live
+/// subscriber (its `Subscription` still held) must survive the sweep.
+#[test]
+fn subscribe_sweep_keeps_live_subscriber_3682() {
+    let id = crate::types::InstanceId::new();
+    let handle = mk_test_handle("live-liveness-3682", id);
+
+    let (sub1, _d1) = subscribe_with_dump(&handle);
+    let (_sub2, _d2) = subscribe_with_dump(&handle);
+    assert_eq!(handle.core.lock().subscribers.len(), 2);
+
+    drop(sub1); // only the first consumer disconnects
+    let (_sub3, _d3) = subscribe_with_dump(&handle);
+    assert_eq!(
+        handle.core.lock().subscribers.len(),
+        2,
+        "the sweep must drop the one dead tap and keep both live ones"
     );
 }
 
@@ -4920,4 +6164,780 @@ fn write_to_pty_surfaces_backpressure_reject_immediately_not_after_full_timeout_
     );
 
     let _ = child.kill();
+}
+
+// ---------------------------------------------------------------------------
+// #3317: per-invocation Codex MCP injection.
+//
+// codex 0.148/0.149 ignore a project-local `.codex/config.toml` until the
+// directory is a TRUSTED project, so a freshly spawned codex instance silently
+// loses every agend MCP tool. The remedy registers the bridge on the child argv
+// with `-c` overrides — the same per-invocation mechanism #1626 already uses for
+// `check_for_update_on_startup` — which bypasses trust entirely and writes
+// nothing to the operator's global `~/.codex/config.toml`.
+//
+// Verified interactively at codex 0.149.0 before implementing: a `-c`-injected
+// server is LAUNCHED by the interactive session, which then issues `initialize`
+// and `tools/list` against it, on Fresh and on `resume --last`.
+// ---------------------------------------------------------------------------
+
+/// Collect a built command's argv as owned strings.
+fn argv_of_3317(cmd: &CommandBuilder) -> Vec<String> {
+    cmd.get_argv()
+        .iter()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect()
+}
+
+/// A codex `SpawnConfig` over a scratch home + workspace. `home` is what the
+/// bridge receives as `AGEND_HOME`, so the caller can vary it to pin encoding.
+fn codex_cfg_dirs_3317(tag: &str, home_leaf: &str) -> (std::path::PathBuf, std::path::PathBuf) {
+    let base = std::env::temp_dir().join(format!("agend-3317-{tag}-{}", uuid::Uuid::new_v4()));
+    let home = base.join(home_leaf);
+    // The workspace must sit under an allowed root of `home` (spawn-time
+    // `validate_working_directory`), which is where a real instance lives.
+    let workspace = home.join("workspace").join(format!("codex-3317-{tag}"));
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    (home, workspace)
+}
+
+fn codex_argv_3317(
+    home: &std::path::Path,
+    workspace: &std::path::Path,
+    name: &str,
+    mode: crate::backend::SpawnMode,
+) -> Vec<String> {
+    let args: Vec<String> = Vec::new();
+    let config = SpawnConfig {
+        name,
+        backend: Some(&Backend::Codex),
+        backend_command: "codex",
+        args: &args,
+        spawn_mode: mode,
+        cols: 80,
+        rows: 24,
+        env: None,
+        working_dir: Some(workspace),
+        submit_key: "\r",
+        home: Some(home),
+        crash_tx: None,
+        shutdown: None,
+    };
+    let (cmd, detected, _provenance) = build_command(&config).expect("build_command codex");
+    assert_eq!(detected, Some(Backend::Codex));
+    argv_of_3317(&cmd)
+}
+
+/// #3317 RED: a Fresh codex spawn must carry the bridge registration on its own
+/// argv. Without it the instance boots with zero fleet tools whenever its
+/// workspace is not a trusted codex project — which is every new instance.
+#[test]
+fn codex_fresh_argv_carries_mcp_bridge_overrides_3317() {
+    let (home, workspace) = codex_cfg_dirs_3317("fresh", "home");
+    let argv = codex_argv_3317(
+        &home,
+        &workspace,
+        "codex-3317-fresh",
+        crate::backend::SpawnMode::Fresh,
+    );
+    assert!(
+        argv.iter()
+            .any(|a| a.starts_with("mcp_servers.agend-terminal.command=")),
+        "#3317: fresh codex argv must register the bridge command; argv={argv:?}"
+    );
+    assert!(
+        argv.iter()
+            .any(|a| a.starts_with("mcp_servers.agend-terminal.env.AGEND_HOME=")),
+        "#3317: fresh codex argv must pass AGEND_HOME to the bridge; argv={argv:?}"
+    );
+    assert!(
+        argv.iter()
+            .any(|a| a == "mcp_servers.agend-terminal.env.AGEND_INSTANCE_NAME='codex-3317-fresh'"),
+        "#3317: the bridge needs THIS instance's name to route fleet traffic; argv={argv:?}"
+    );
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
+/// #3317 RED: the overrides must precede any subcommand. `-c` is accepted after
+/// `resume` on 0.149, but the affected boundary includes 0.148, where the
+/// preset's own comment records that `-c` is a global option that must come
+/// first. Placing them ahead of the preset is correct on BOTH versions.
+#[test]
+fn codex_resume_argv_places_mcp_overrides_before_the_resume_subcommand_3317() {
+    let (home, workspace) = codex_cfg_dirs_3317("resume", "home");
+    let argv = codex_argv_3317(
+        &home,
+        &workspace,
+        "codex-3317-resume",
+        crate::backend::SpawnMode::Resume,
+    );
+    let first_mcp = argv
+        .iter()
+        .position(|a| a.starts_with("mcp_servers.agend-terminal."))
+        .unwrap_or_else(|| panic!("#3317: resume argv must register the bridge; argv={argv:?}"));
+    // #3398: this argv has no session locator, so it no longer carries a
+    // subcommand at all. The ordering guarantee is what #3317 pins, so assert it
+    // wherever a subcommand exists and assert the absence of the global fallback
+    // that #3398 removed.
+    if let Some(resume_at) = argv.iter().position(|a| a == "resume") {
+        assert!(
+            first_mcp < resume_at,
+            "#3317: `-c` overrides must precede the `resume` subcommand (0.148 treats \
+             `-c` as global-only); first_mcp={first_mcp} resume_at={resume_at} argv={argv:?}"
+        );
+    }
+    assert!(
+        !argv.iter().any(|a| a == "--last"),
+        "#3398: a locator-less codex resume must not adopt the cwd's last thread; argv={argv:?}"
+    );
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
+/// #3317 RED (encoding): an `AGEND_HOME` containing an apostrophe cannot be a
+/// single-line TOML literal, so it must fall back to an escaped basic string.
+/// This is the `toml_string_value` contract, pinned on the argv path — the same
+/// class of bug that produced the Windows-path failures behind `722140bd`.
+#[test]
+fn codex_mcp_overrides_encode_an_apostrophe_home_as_a_basic_string_3317() {
+    let (home, workspace) = codex_cfg_dirs_3317("quote", "it's-home");
+    let argv = codex_argv_3317(
+        &home,
+        &workspace,
+        "codex-3317-quote",
+        crate::backend::SpawnMode::Fresh,
+    );
+    let entry = argv
+        .iter()
+        .find(|a| a.starts_with("mcp_servers.agend-terminal.env.AGEND_HOME="))
+        .unwrap_or_else(|| panic!("#3317: AGEND_HOME override missing; argv={argv:?}"));
+    let value = entry.split_once('=').expect("key=value").1;
+    assert!(
+        value.starts_with('"') && value.ends_with('"'),
+        "#3317: a home containing `'` must use an escaped BASIC string, not a \
+         literal that cannot represent the apostrophe; value={value}"
+    );
+    assert!(
+        value.contains("it's-home"),
+        "#3317: the apostrophe must survive verbatim inside the basic string; value={value}"
+    );
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
+/// #3317: no cross-backend leakage. Only codex takes `-c` config overrides.
+#[test]
+fn non_codex_backends_get_no_mcp_overrides_3317() {
+    let (home, workspace) = codex_cfg_dirs_3317("leak", "home");
+    for (command, backend) in [("claude", Backend::ClaudeCode), ("echo", Backend::Shell)] {
+        let args: Vec<String> = Vec::new();
+        let config = SpawnConfig {
+            name: "codex-3317-leak",
+            backend: Some(&backend),
+            backend_command: command,
+            args: &args,
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: Some(&workspace),
+            submit_key: "\r",
+            home: Some(&home),
+            crash_tx: None,
+            shutdown: None,
+        };
+        let (cmd, _, _) = build_command(&config).expect("build_command");
+        let argv = argv_of_3317(&cmd);
+        assert!(
+            !argv
+                .iter()
+                .any(|a| a.contains("mcp_servers.agend-terminal")),
+            "#3317: {command} must not receive codex `-c` overrides; argv={argv:?}"
+        );
+    }
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
+/// #3317 RED: the NativeShared remote/attach path assembles its argv separately
+/// (`codex_remote_command_args`) and must inject too, or every attached instance
+/// stays toolless. Placement matches the existing `check_for_update_on_startup`
+/// override: after the endpoint flags, before the `resume` subcommand.
+#[test]
+fn codex_remote_attach_argv_carries_mcp_overrides_before_resume_3317() {
+    let locator = crate::transport::SessionLocator::codex(
+        std::path::PathBuf::from("/tmp/codex-3317.sock"),
+        Some("thread-3317".to_string()),
+    );
+    let mcp: Vec<String> = vec![
+        "-c".to_string(),
+        "mcp_servers.agend-terminal.command='/opt/agend-mcp-bridge'".to_string(),
+    ];
+    let argv = codex_remote_command_args(&locator, &[], crate::backend::SpawnMode::Resume, &mcp)
+        .expect("remote argv");
+    let first_mcp = argv
+        .iter()
+        .position(|a| a.starts_with("mcp_servers.agend-terminal."))
+        .unwrap_or_else(|| panic!("#3317: remote argv must register the bridge; argv={argv:?}"));
+    let resume_at = argv
+        .iter()
+        .position(|a| a == "resume")
+        .expect("resume subcommand");
+    assert!(
+        first_mcp < resume_at,
+        "#3317: remote overrides must precede `resume`; argv={argv:?}"
+    );
+    assert_eq!(
+        argv.first().map(String::as_str),
+        Some("--remote"),
+        "#3317: the endpoint flag must stay first; argv={argv:?}"
+    );
+    assert!(
+        !argv
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"),
+        "remote resume must not carry a permission override; argv={argv:?}"
+    );
+}
+
+fn codex_project_override_3402(argv: &[String]) -> &str {
+    argv.iter()
+        .find(|arg| arg.starts_with("projects={"))
+        .map(String::as_str)
+        .unwrap_or_else(|| panic!("#3402: invocation-scoped project trust missing; argv={argv:?}"))
+}
+
+/// #3402 RED: managed Codex must trust only its canonical workspace for this
+/// invocation. This enables project-local config/hooks without accepting the
+/// interactive prompt that persists into the operator's global config.
+#[test]
+fn codex_fresh_argv_carries_canonical_invocation_project_trust_3402() {
+    let (home, workspace) = codex_cfg_dirs_3317("trust-fresh", "home");
+    let argv = codex_argv_3317(
+        &home,
+        &workspace,
+        "codex-3402-fresh",
+        crate::backend::SpawnMode::Fresh,
+    );
+    let canonical = std::fs::canonicalize(&workspace).expect("canonical workspace");
+    let override_arg = codex_project_override_3402(&argv);
+    assert!(
+        override_arg.contains(&canonical.to_string_lossy().to_string()),
+        "#3402: trust must target the canonical workspace; override={override_arg}"
+    );
+    assert!(
+        override_arg.contains("trust_level='trusted'"),
+        "#3402: project override must grant invocation-only trust; override={override_arg}"
+    );
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
+/// #3402 RED: `-c` is a global Codex option, so the trust override must be
+/// placed before the remote `resume` subcommand just like the bridge override.
+#[test]
+fn codex_resume_argv_places_invocation_project_trust_before_resume_3402() {
+    let (home, workspace) = codex_cfg_dirs_3317("trust-resume", "home");
+    let argv = codex_argv_3317(
+        &home,
+        &workspace,
+        "codex-3402-resume",
+        crate::backend::SpawnMode::Resume,
+    );
+    let trust_at = argv
+        .iter()
+        .position(|arg| arg.starts_with("projects={"))
+        .unwrap_or_else(|| panic!("#3402: trust override missing; argv={argv:?}"));
+    if let Some(resume_at) = argv.iter().position(|arg| arg == "resume") {
+        assert!(
+            trust_at < resume_at,
+            "#3402: trust override must precede resume; argv={argv:?}"
+        );
+    }
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
+/// #3402: the NativeShared attach branch is assembled separately from preset
+/// spawns, so pin the production `build_command` route through a saved locator.
+#[test]
+fn codex_remote_attach_argv_carries_invocation_project_trust_3402() {
+    let (home, workspace) = codex_cfg_dirs_3317("trust-remote", "home");
+    let name = "codex-3402-remote";
+    let locator = crate::transport::SessionLocator::codex(
+        std::path::PathBuf::from("/tmp/codex-3402.sock"),
+        Some("thread-3402".to_string()),
+    );
+    crate::transport::save_session_locator(&home, name, &locator).expect("save Codex locator");
+
+    let argv = codex_argv_3317(&home, &workspace, name, crate::backend::SpawnMode::Resume);
+    let trust_at = argv
+        .iter()
+        .position(|arg| arg.starts_with("projects={"))
+        .unwrap_or_else(|| panic!("#3402: remote trust override missing; argv={argv:?}"));
+    let remote_at = argv
+        .iter()
+        .position(|arg| arg == "--remote")
+        .expect("remote endpoint flag");
+    let resume_at = argv
+        .iter()
+        .position(|arg| arg == "resume")
+        .expect("remote resume subcommand");
+    assert!(remote_at < trust_at, "#3402: argv={argv:?}");
+    assert!(trust_at < resume_at, "#3402: argv={argv:?}");
+
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
+/// #3402 RED: constructing a managed spawn must never persist trust into the
+/// operator's config. The pre-existing bytes are the invariant.
+#[test]
+fn codex_invocation_project_trust_does_not_mutate_global_config_3402() {
+    let (home, workspace) = codex_cfg_dirs_3317("trust-global", "home");
+    let codex_home = home.join("operator-codex-home");
+    std::fs::create_dir_all(&codex_home).expect("codex home");
+    let config = codex_home.join("config.toml");
+    let before = b"model = 'operator-choice'\n";
+    std::fs::write(&config, before).expect("seed operator config");
+
+    let argv = codex_argv_3317(
+        &home,
+        &workspace,
+        "codex-3402-global",
+        crate::backend::SpawnMode::Fresh,
+    );
+    codex_project_override_3402(&argv);
+    assert_eq!(
+        std::fs::read(&config).expect("read operator config"),
+        before,
+        "#3402: command construction must not write persistent trust"
+    );
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_invocation_project_trust_resolves_workspace_symlink_3402() {
+    let (home, workspace) = codex_cfg_dirs_3317("trust-symlink", "home");
+    let alias = home.join("workspace-alias");
+    std::os::unix::fs::symlink(&workspace, &alias).expect("workspace symlink");
+    let argv = codex_argv_3317(
+        &home,
+        &alias,
+        "codex-3402-symlink",
+        crate::backend::SpawnMode::Fresh,
+    );
+    let canonical = std::fs::canonicalize(&workspace).expect("canonical workspace");
+    let override_arg = codex_project_override_3402(&argv);
+    assert!(
+        override_arg.contains(&canonical.to_string_lossy().to_string()),
+        "#3402: override must use symlink target; override={override_arg}"
+    );
+    assert!(
+        !override_arg.contains(&alias.to_string_lossy().to_string()),
+        "#3402: alias must not become a distinct project identity; override={override_arg}"
+    );
+    if let Some(base) = home.parent() {
+        std::fs::remove_dir_all(base).ok();
+    }
+}
+
+/// #3317: the Codex trust-dismiss matcher must NOT exist.
+///
+/// Measured at codex 0.149.0: the "Do you trust the contents of this
+/// directory?" prompt is still ANSWERABLE — it renders even under
+/// `--dangerously-bypass-approvals-and-sandbox` — and pressing Enter makes
+/// codex WRITE `[projects."<workspace>"] trust_level = "trusted"` into the
+/// operator's `$CODEX_HOME/config.toml`. A working matcher would therefore add
+/// one permanent entry per instance workspace, forever, with no cleanup on
+/// delete — exactly the accumulation `722140bd` removed, only authored by codex
+/// instead of by us and so indistinguishable from the operator's own entries.
+/// Fleet tools come from the per-invocation `-c` bridge registration instead;
+/// granting project trust is not ours to do.
+///
+/// Lives here rather than in `src/backend.rs` because that file sits 3 lines
+/// under the 2500-LOC anti-monolith ceiling (`tests/src_file_size_invariant.rs`)
+/// and the preset is reachable from any module in the crate.
+#[test]
+fn codex_preset_has_no_trust_dismiss_matcher_3317() {
+    let codex = Backend::Codex.preset();
+    assert!(
+        !codex
+            .dismiss_patterns
+            .iter()
+            .any(|dp| dp.label.contains("Do you trust")),
+        "#3317: a codex trust-dismiss would silently re-create per-instance \
+         persistent trust entries in the operator's codex config; patterns={:?}",
+        codex
+            .dismiss_patterns
+            .iter()
+            .map(|dp| dp.label)
+            .collect::<Vec<_>>()
+    );
+}
+
+#[test]
+#[cfg(unix)]
+#[allow(clippy::unwrap_used)]
+fn scheduled_job_pty_exit_retains_original_child_for_runner() {
+    for (exit_code, phase) in [(0, "running"), (143, "running"), (0, "succeeded")] {
+        assert_scheduled_job_exit_retains_child(exit_code, phase);
+    }
+}
+
+#[cfg(unix)]
+#[allow(clippy::unwrap_used)]
+fn assert_scheduled_job_exit_retains_child(exit_code: i32, phase: &str) {
+    let home = std::env::temp_dir().join(format!("job-pty-exit-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&home).unwrap();
+    let id = crate::types::InstanceId::new();
+    let name = "job-exit-fixture";
+    let mut handle = mk_test_handle(name, id);
+    handle.child.lock().wait().unwrap();
+    let pair = native_pty_system()
+        .openpty(PtySize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        })
+        .unwrap();
+    let mut command = CommandBuilder::new("sh");
+    command.args(["-c", &format!("exit {exit_code}")]);
+    let mut child = pair.slave.spawn_command(command).unwrap();
+    child.wait().unwrap();
+    handle.child = Arc::new(Mutex::new(child));
+    handle.spawned_at = std::time::Instant::now() - std::time::Duration::from_secs(120);
+    let original_child = Arc::clone(&handle.child);
+    let core = Arc::clone(&handle.core);
+    let deleted = Arc::clone(&handle.deleted);
+    let generation = handle.generation;
+    let registry: AgentRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    registry.lock().insert(id, handle);
+    // Cleanup exists before the real exit handler can create a shell on RED.
+    struct Cleanup(std::path::PathBuf, AgentRegistry);
+    impl Drop for Cleanup {
+        fn drop(&mut self) {
+            for handle in self.1.lock().values() {
+                handle
+                    .deleted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                let mut child = handle.child.lock();
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    let _cleanup = Cleanup(home.clone(), Arc::clone(&registry));
+    std::fs::write(home.join("fleet.yaml"), format!("instances:\n  {name}:\n    id: {}\n    backend: codex\n    created_by: system:schedule_job\n", id.full())).unwrap();
+    let run = serde_json::json!({
+        "id":"j-exit", "schedule_id":"s-exit", "scheduled_at":0,"created_by":"test",
+        "message":"test", "config":{"backends":["codex"],"artifact_directory":home.join("artifacts")},
+        "phase":phase,"revision":0,
+        "attempt":{"number":1,"name":name,"uuid":id.full(),"backend":"codex","started_at":0},
+        "previous_attempts":[],"task_id":null,"result":null,"error":null,"next_attempt_at":0,
+        "deadline":i64::MAX,"cleanup_pending":false,"task_settled":false,
+        "notification":"not_requested","notification_receipt":null,"notification_error":null
+    });
+    std::fs::write(
+        home.join("schedule-jobs.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "version":1,"watermarks":{},"runs":[run],"overlap_skips":{}
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    assert!(crate::schedule_jobs::owns_worker(&home, name));
+    handle_pty_close(
+        name,
+        &id,
+        &registry,
+        &Some(home.clone()),
+        &None,
+        &None,
+        &deleted,
+        &core,
+        generation,
+    );
+    let reg = registry.lock();
+    assert!(
+        reg.get(&id)
+            .is_some_and(|h| Arc::ptr_eq(&h.child, &original_child)),
+        "Job PTY exit must retain the original child; no shell replacement or registry removal"
+    );
+}
+
+/// t-20260913052851207170-74631-0 (vii) RED: a cursor/query repaint tail must
+/// not silently cancel the scheduled dismiss with no retry.
+///
+/// True 2.1.269 read() edges at 80 columns (`live_modal_2_1_269_80col.raw`):
+/// head 1067B paints most of the modal (digest incomplete, state trips Idle),
+/// body 55B completes it (Schedule opens the detached writer), tail 12B is a
+/// screen-identical repaint (`\x1b[>0q\x1b[?u\x1b[c`) that only bumps the epoch.
+/// The tail frame never consults (dedup: screen unchanged, pre-Idle dead after
+/// the transient Idle), so no second worker opens — and the first worker wakes
+/// to candidate_epoch != current and cancels. The trailing 5s-delayed pad only
+/// holds PTY EOF past the worker's verdict so the death is (1) epoch, not (2)
+/// generation-over.
+#[test]
+fn pty_read_loop_survives_cursor_tail_after_schedule_269() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let raw = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_269_80col.raw");
+    assert_eq!(raw.len(), 1134, "fixture edges are byte-exact");
+    assert_eq!(
+        &raw[1122..],
+        b"\x1b[>0q\x1b[?u\x1b[c",
+        "tail packet is screen-identical repaint"
+    );
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (&raw[..1067], std::time::Duration::ZERO),
+        (&raw[1067..1122], std::time::Duration::from_millis(50)),
+        (&raw[1122..], std::time::Duration::from_millis(100)),
+        (&[0x1b], std::time::Duration::from_secs(5)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "t-20260913052851207170-74631-0: the repaint tail must refresh the candidate, not kill the only writer"
+    );
+}
+
+#[test]
+fn pty_read_loop_dev_modal_after_sgr_and_partial_modal_269() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let raw = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_269_80col.raw");
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (&raw[..43], std::time::Duration::ZERO),
+        (&raw[43..1067], std::time::Duration::from_millis(50)),
+        (&raw[1067..1122], std::time::Duration::from_millis(100)),
+        (&raw[1122..], std::time::Duration::from_millis(150)),
+        (&[0x1b], std::time::Duration::from_secs(5)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "dev modal must still be dismissed when preceded by pure SGR chunk and partial modal chunk"
+    );
+}
+
+#[test]
+fn pty_read_loop_dev_modal_consult_on_warning_hint_without_state_change_269() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    const DEV_MODAL_WITHOUT_ESC_FOOTER: &[u8] = b"\
+\x1b[2J\x1b[H\
+\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\r\n\
+  WARNING: Loading development channels\r\n\
+\r\n\
+  --dangerously-load-development-channels is for local channel development\r\n\
+  only. Do not use this option to run channels you have downloaded off the\r\n\
+  internet.\r\n\
+\r\n\
+  Please use --channels to run a list of approved channels.\r\n\
+\r\n\
+  Channels:   server:agend-claude-channel\r\n\
+\r\n\
+  \xe2\x9d\xaf 1. I am using this for local development\r\n\
+  2. Exit\r\n\
+\r\n\
+  Enter to confirm\r\n";
+
+    // Chunk 1: transient idle prompt that closes startup latch and sets ever_idle=true
+    // Chunk 2: complete modal but state stays Idle (does not transition to PermissionPrompt)
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (b"\x1b[2J\x1b[H\xe2\x9d\xaf ", std::time::Duration::ZERO),
+        (
+            DEV_MODAL_WITHOUT_ESC_FOOTER,
+            std::time::Duration::from_millis(50),
+        ),
+        (b"\x1b[?25h", std::time::Duration::from_millis(100)),
+        (&[0x1b], std::time::Duration::from_secs(5)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "dev modal must be dismissed when warning hint appears even if preceded by transient idle and state classification does not transition to PermissionPrompt"
+    );
+}
+
+/// t-20260913083736497384-27902-0: Harness 複刻假說 (2) —
+/// Chunk 1 包含 WARNING（半幀），Chunk 2 輸出很多行將 WARNING 頂出 tail 視區。
+/// 在舊代碼（53504fa2）下，screen.contains("WARNING") 變為 false，gate 永不再 consult，
+/// 最終 written 為空，tally 凍結在 NoCompleteModal: 1，完整複刻生產 stall 現象。
+#[test]
+fn pty_read_loop_repro_warning_scrolled_out_of_tail_269() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let chunk1 = b"\x1b[2J\x1b[H  WARNING: Loading development channels\r\n";
+    // 輸出 45 行滾動行將 WARNING 頂出 40 行的 tail 視區，然後輸出 modal 剩餘行
+    let mut chunk2 = Vec::new();
+    for _ in 0..45 {
+        chunk2.extend_from_slice(b"some scrollback noise line\r\n");
+    }
+    chunk2.extend_from_slice(
+        b"\
+  --dangerously-load-development-channels is for local channel development\r\n\
+  only. Do not use this option to run channels you have downloaded off the\r\n\
+  internet.\r\n\
+\r\n\
+  Please use --channels to run a list of approved channels.\r\n\
+\r\n\
+  Channels:   server:agend-claude-channel\r\n\
+\r\n\
+  \xe2\x9d\xaf 1. I am using this for local development\r\n\
+  2. Exit\r\n\
+\r\n\
+  Enter to confirm\r\n",
+    );
+
+    let chunk2: &'static [u8] = Box::leak(chunk2.into_boxed_slice());
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (chunk1, std::time::Duration::ZERO),
+        (chunk2, std::time::Duration::from_millis(50)),
+        (&[0x1b], std::time::Duration::from_secs(5)),
+    ]);
+
+    assert!(
+        written.lock().is_empty(),
+        "t-20260913083736497384-27902-0 假說 (2) 複刻：WARNING 被頂出 tail 視區後，在舊邏輯下 gate 再無 consult，written 為空且 stall"
+    );
+    let summary =
+        crate::agent::dev_modal::refuse_summary("dev-modal-3333").expect("tally must exist");
+    assert!(summary.contains("answered=0"), "tally must have answered=0");
+    assert!(
+        summary.contains("NoCompleteModal:1"),
+        "tally must reflect exactly one refuse from chunk1"
+    );
+}
+
+/// t-20260913083736497384-27902-0 RED:
+/// 首包半幀（只有 WARNING），中間幀暫時缺少 WARNING（例如中間滾動或噪聲），
+/// 後續幀完整重繪 modal 但處於無狀態轉移幀（state_changed = false）。
+///
+/// 舊代碼缺陷：consult 條件只看當前屏的 contains("WARNING: Loading development channels")，
+/// 一旦中間幀缺少 WARNING，consult 閘門即刻關閉，後續無狀態轉移重繪幀無法觸發 consult，
+/// 導致 modal 停留屏上卻永遠零響應。
+///
+/// 修法：consult 條件不能只看當前屏 —— 記住 hint 見過 (dev_modal_hint_seen) 且 modal 未解
+/// (!dev_modal_gate.is_answered())，在後續完整 modal 出現時持續維持 consult 閘門開啟，
+/// 成功 auto-dismiss 並寫入 Enter (\r)。
+#[test]
+fn pty_read_loop_dev_modal_consult_retains_seen_hint_when_unresolved_269() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    // Chunk 1: 首包半幀（只含 WARNING）
+    let chunk1 = b"\x1b[2J\x1b[H  WARNING: Loading development channels\r\n";
+
+    // Chunk 2: 中間幀（暫時無 WARNING，模擬中間狀態或滾動），且觸發 latch off
+    let chunk2 = b"\x1b[2J\x1b[H\xe2\x9d\xaf some intermediate output without warning\r\n";
+
+    // Chunk 3: 完整 modal 重新繪製（包含 WARNING，採樣自 sub-helper 實際快照）
+    const SNAPSHOT_MODAL: &[u8] = b"\x1b[2J\x1b[H\
+\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\r\n\
+\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\xe2\x94\x80\r\n\
+  WARNING: Loading development channels\r\n\
+\r\n\
+  --dangerously-load-development-channels is for local channel development only. Do not use this option to run\r\n\
+  channels you have downloaded off the internet.\r\n\
+\r\n\
+  Please use --channels to run a list of approved channels.\r\n\
+\r\n\
+  Channels: server:agend-claude-channel\r\n\
+\r\n\
+  \xe2\x9d\xaf 1. I am using this for local development\r\n\
+    2. Exit\r\n\
+\r\n\
+  Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (chunk1, std::time::Duration::ZERO),
+        (chunk2, std::time::Duration::from_millis(50)),
+        (SNAPSHOT_MODAL, std::time::Duration::from_millis(100)),
+        (b"\x1b[?25h", std::time::Duration::from_millis(150)),
+        (&[0x1b], std::time::Duration::from_secs(5)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r",
+        "t-20260913083736497384-27902-0: dev-modal consult 必須記住 hint 見過且未解，在後續完整幀成功 dismiss"
+    );
+}
+
+/// PR #3616 rework F2 RED:
+/// When an earlier dismiss (such as trust prompt) has set dismiss_cooldown_until,
+/// and the dev-channel modal arrives within the 10s cooldown while ever_idle has become true,
+/// the read loop must not permanently drop the modal if no subsequent PTY packet arrives.
+///
+/// Under unfixed code, because `dev_modal_visible && !dismiss_agent_ever_idle` requires `!ever_idle`,
+/// the cooldown bypass is inactive. If no more PTY bytes arrive, the pane strands in modal forever.
+///
+/// The fix must ensure that the dev modal either safely bypasses cooldown or retries so that
+/// it auto-dismisses and emits Enter (\r).
+#[test]
+fn pty_read_loop_dev_modal_dismissed_even_if_in_cooldown_after_idle_3616() {
+    let _guard = R8_DISMISS_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+
+    let trust = b"\x1b[2J\x1b[H Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n Quick safety check: Is this a project you created or one you trust?\r\n\r\n \xe2\x9d\xaf 1. Yes, I trust this folder\r\n   2. No, exit\r\n Enter to confirm \xc2\xb7 Esc to cancel\r\n";
+    let idle = b"\x1b[2J\x1b[H bypass permissions on\r\n \xe2\x9d\xaf ";
+    let modal = include_bytes!("../../tests/fixtures/devchannel-3314/live_modal_2_1_241.txt");
+
+    // Set cooldown to 3s for this test
+    dismiss::set_dismiss_cooldown_for_test(Some(std::time::Duration::from_millis(3_000)));
+    struct ResetCooldown;
+    impl Drop for ResetCooldown {
+        fn drop(&mut self) {
+            dismiss::set_dismiss_cooldown_for_test(None);
+        }
+    }
+    let _reset = ResetCooldown;
+
+    // Chunk 1: trust dialog at 0ms (dismissed, arms 3s cooldown until 3,000ms)
+    // Chunk 2: idle at 2,500ms (sets ever_idle=true via hysteresis)
+    // Chunk 3: complete dev modal at 2,850ms (inside the 3s cooldown!)
+    // Chunk 4: delayed empty read / 1s sleep after cooldown expiry (at 3,850ms, cooldown expired at 3,000ms)
+    // Under unfixed code: no PTY bytes arrive after 2,850ms, so modal is never dismissed (written is b"\r").
+    // Under F2 fix: modal in cooldown past idle is retried upon cooldown expiry, emitting second CR (written is b"\r\r").
+    let written = run_dev_modal_pty_read_loop_3333(vec![
+        (trust, std::time::Duration::ZERO),
+        (idle, std::time::Duration::from_millis(2_500)),
+        (modal, std::time::Duration::from_millis(350)),
+        (b"", std::time::Duration::from_millis(1_000)),
+    ]);
+
+    assert_eq!(
+        written.lock().as_slice(),
+        b"\r\r",
+        "PR #3616 F2: dev modal arriving in cooldown past idle must retry upon cooldown expiry even without subsequent PTY output"
+    );
 }

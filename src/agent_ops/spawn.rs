@@ -23,6 +23,8 @@ pub struct SpawnParams<'a> {
     pub layout: &'a str,
     pub spawner: Option<&'a str>,
     pub target_pane: Option<&'a str>,
+    pub restart_id: Option<&'a str>,
+    pub old_instance_ref: Option<crate::types::InstanceRef>,
 }
 
 /// Fully resolved SPAWN request. All precedence decisions happen once here.
@@ -40,14 +42,48 @@ pub struct SpawnRequest {
     pub layout: String,
     pub spawner: Option<String>,
     pub target_pane: Option<String>,
+    pub restart_id: Option<String>,
+    pub old_instance_ref: Option<crate::types::InstanceRef>,
 }
 
 /// Runtime-owned state required by the neutral SPAWN service.
 pub struct SpawnContext<'a> {
     pub home: &'a Path,
     pub registry: &'a AgentRegistry,
+    /// #3417: the live config map. Every surface that reaches this service
+    /// already owned one for its DELETE path; the spawn side has to record into
+    /// the same map or the instance it creates is invisible to the snapshot
+    /// writer and ineligible for crash respawn.
+    pub configs: &'a crate::api::ConfigRegistry,
     pub externals: &'a ExternalRegistry,
     pub notifier: Option<&'a Arc<dyn ApiNotifier>>,
+}
+
+/// The `AgentConfig` a resolved request describes: the invocation this spawn
+/// actually asked for, rather than the desired one in fleet.yaml.
+///
+/// Scope of that claim, stated because a shell fallback makes it easy to overread:
+/// this records what the daemon spawned FOR THIS AGENT. If the agent later exits
+/// cleanly and `on_clean_exit_shell_fallback` puts a plain shell in the pane, the
+/// map does NOT follow it there — that path holds no config handle and
+/// deliberately so. `handle_clean_exit` has already removed the entry (a clean
+/// exit means no respawn), and the fallback shell is a pane convenience, not a
+/// managed agent: giving it a config would make crash respawn resurrect a SHELL
+/// in place of the agent it replaced. So an instance showing a fallback shell has
+/// no config, and both readers behave correctly on that — the snapshot reports no
+/// args for something that is not a managed invocation, and crash respawn
+/// declines rather than respawning the wrong process.
+pub(crate) fn config_for_request(request: &SpawnRequest) -> crate::daemon::AgentConfig {
+    crate::daemon::AgentConfig {
+        name: request.name.clone(),
+        backend: Some(request.declared_backend.clone()),
+        backend_command: request.backend.clone(),
+        args: request.args.clone(),
+        env: request.env.clone(),
+        working_dir: Some(request.working_directory.clone()),
+        submit_key: crate::agent_ops::preset_submit_key(Some(&request.declared_backend))
+            .to_string(),
+    }
 }
 
 #[derive(Debug)]
@@ -57,9 +93,15 @@ pub struct SpawnOutcome {
 
 /// Resolve command, argv, model, declared backend, environment, and wire
 /// metadata with the same precedence as the direct API SPAWN handler.
-pub fn resolve_spawn_request(home: &Path, params: &SpawnParams<'_>) -> SpawnRequest {
+pub fn resolve_spawn_request(
+    home: &Path,
+    params: &SpawnParams<'_>,
+) -> Result<SpawnRequest, crate::fleet::EnvResolveError> {
     let fleet = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home)).ok();
-    let fleet_resolved = fleet.as_ref().and_then(|f| f.resolve_instance(params.name));
+    let fleet_resolved = match fleet.as_ref() {
+        Some(fleet) => fleet.resolve_instance_checked(params.name)?,
+        None => None,
+    };
     let command = params
         .backend
         .map(|s| Backend::parse_str(s).command_string())
@@ -97,8 +139,13 @@ pub fn resolve_spawn_request(home: &Path, params: &SpawnParams<'_>) -> SpawnRequ
     {
         Backend::push_model_arg(&mut args, &declared_backend, model);
     }
+    if let Some(effort) = fleet_resolved.as_ref().and_then(|r| r.effort.as_deref()) {
+        // #3541: same DECLARED-identity + capability gate as model above;
+        // unsupported backends / out-of-range values fail-soft inside.
+        Backend::push_effort_arg(&mut args, &declared_backend, effort);
+    }
 
-    SpawnRequest {
+    Ok(SpawnRequest {
         name: params.name.to_string(),
         backend: command,
         args,
@@ -118,7 +165,9 @@ pub fn resolve_spawn_request(home: &Path, params: &SpawnParams<'_>) -> SpawnRequ
         layout: params.layout.to_string(),
         spawner: params.spawner.map(str::to_string),
         target_pane: params.target_pane.map(str::to_string),
-    }
+        restart_id: params.restart_id.map(str::to_string),
+        old_instance_ref: params.old_instance_ref,
+    })
 }
 
 /// Execute the shared SPAWN behavior. Caller-specific fleet persistence,
@@ -164,17 +213,27 @@ pub fn spawn_instance(
     )
     .map_err(|e| format!("provisioning refused: {e}"))?;
 
-    let _mode = super::spawn_one(
+    let mut recorded = config_for_request(request);
+    recorded.working_dir = Some(work_dir.clone());
+    let _mode = super::spawn_one_recording_config(
         context.home,
-        context.registry,
+        context.configs,
         &request.name,
-        &request.backend,
-        &request.args,
-        request.mode,
-        &work_dir,
-        crossterm::terminal::size().unwrap_or((120, 40)),
-        request.env.as_ref(),
-        Some(&request.declared_backend),
+        recorded,
+        || {
+            super::spawn_one(
+                context.home,
+                context.registry,
+                &request.name,
+                &request.backend,
+                &request.args,
+                request.mode,
+                &work_dir,
+                crossterm::terminal::size().unwrap_or((120, 40)),
+                request.env.as_ref(),
+                Some(&request.declared_backend),
+            )
+        },
     )
     .map_err(|e| e.to_string())?;
 
@@ -185,7 +244,7 @@ pub fn spawn_instance(
                 .preset()
                 .ready_timeout_secs
                 .saturating_add(15);
-            agent::spawn_self_kick_bootstrap(
+            let _ = agent::spawn_self_kick_bootstrap(
                 std::sync::Arc::clone(context.registry),
                 id,
                 request.name.clone(),
@@ -217,6 +276,13 @@ pub fn spawn_instance(
     if let Some(notifier) = context.notifier {
         notifier.notify(crate::api::ApiEvent::InstanceCreated {
             name: request.name.clone(),
+            instance_ref: agent::instance_ref_for_name(
+                context.registry,
+                context.home,
+                &request.name,
+            ),
+            restart_id: request.restart_id.clone(),
+            old_instance_ref: request.old_instance_ref,
             layout: crate::api::LayoutHint::parse(&request.layout),
             spawner: request.spawner.clone(),
             target_pane: request.target_pane.clone(),

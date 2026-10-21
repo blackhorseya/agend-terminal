@@ -25,9 +25,17 @@ use std::path::Path;
 /// matched), or an `Err` carrying the underlying replay / append
 /// failure detail for the caller to surface into its audit chain.
 pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, String> {
+    orphan_tasks_for_owner_at(
+        home,
+        &crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT),
+        owner_name,
+    )
+}
+
+fn orphan_tasks_for_owner_at(home: &Path, board: &Path, owner_name: &str) -> Result<usize, String> {
     use crate::task_events::{InstanceName, TaskEvent, TaskStatus};
 
-    let state = crate::task_events::replay(home).map_err(|e| e.to_string())?;
+    let state = crate::task_events::projected_state_at(board).map_err(|e| e.to_string())?;
     let affected: Vec<crate::task_events::TaskId> = state
         .tasks
         .values()
@@ -57,7 +65,7 @@ pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, St
             routed_to: None,
         })
         .collect();
-    crate::task_events::append_batch(home, &emitter, events).map_err(|e| e.to_string())?;
+    crate::task_events::append_batch_at(board, &emitter, events).map_err(|e| e.to_string())?;
     // #1916: an orphaned task has NO owner → clear its dispatch-idle sidecar so the
     // watchdog stops nudging the (now-removed) former owner. Same helper as the
     // reassign path, with owner=None. Best-effort, post-append (the orphan is
@@ -91,7 +99,7 @@ pub fn orphan_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, St
 pub fn cancel_tasks_for_owner(home: &Path, owner_name: &str) -> Result<usize, String> {
     use crate::task_events::{InstanceName, TaskEvent, TaskStatus};
 
-    let state = crate::task_events::replay(home).map_err(|e| e.to_string())?;
+    let state = crate::task_events::projected_state(home).map_err(|e| e.to_string())?;
     let affected: Vec<crate::task_events::TaskId> = state
         .tasks
         .values()
@@ -167,7 +175,7 @@ pub fn release_inprogress_orphans_with_live(
     live: &std::collections::HashSet<String>,
 ) -> Vec<crate::task_events::TaskId> {
     use crate::task_events::{InstanceName, TaskEvent};
-    let state = match crate::task_events::replay(home) {
+    let state = match crate::task_events::projected_state(home) {
         Ok(s) => s,
         Err(e) => {
             tracing::warn!(error = %e, "boot orphan sweep: task_events replay failed — skipping");
@@ -321,10 +329,61 @@ pub struct OrphanScanResult {
     pub soft: std::collections::BTreeMap<String, Vec<crate::task_events::TaskId>>,
 }
 
-/// #829 pure scan. Walks `state.tasks` and classifies each non-
-/// terminal task's owner via [`classify_owner`]. Terminal-status tasks
-/// (Done / Cancelled) are skipped — their ACL is already disabled at
-/// the event-log layer, so re-orphaning would be noise.
+/// Read-only policy planner for strict ghost owners on InReview tasks.
+/// InReview is never auto-orphaned; an apply request is rejected explicitly
+/// so callers cannot mistake an approval-shaped response for a mutation.
+pub fn plan_strict_in_review_ghosts(
+    state: &crate::task_events::TaskBoardState,
+    live: &std::collections::HashSet<String>,
+    fleet_instances: &std::collections::HashSet<String>,
+    apply: bool,
+    _confirm_ids: &std::collections::HashSet<String>,
+    _audit_reason: &str,
+) -> Value {
+    let mut candidates = std::collections::BTreeMap::<String, Value>::new();
+    for record in state.tasks.values() {
+        let Some(owner) = record.owner.as_ref() else {
+            continue;
+        };
+        if record.status == TaskStatus::InReview
+            && classify_owner(owner.0.as_str(), live, fleet_instances)
+                == OwnerClassification::Strict
+        {
+            candidates.insert(
+                record.id.0.clone(),
+                serde_json::json!({
+                    "id": record.id,
+                    "owner": owner.0,
+                    "status": "in_review"
+                }),
+            );
+        }
+    }
+    let candidate_ids: std::collections::BTreeSet<String> = candidates.keys().cloned().collect();
+    if apply {
+        return serde_json::json!({
+            "error": "apply=true is unsupported for the report-only InReview ghost-owner policy",
+            "code": "report_only_policy",
+            "policy": "strict_ghost_owner_in_review",
+            "mutation": "none",
+            "hint": "use apply=false to inspect candidates",
+        });
+    }
+    serde_json::json!({
+        "dry_run": true,
+        "policy": "strict_ghost_owner_in_review",
+        "candidates": candidates.values().collect::<Vec<_>>(),
+        "candidate_ids": candidate_ids,
+        "total_candidates": candidates.len(),
+        "to_apply_hint": "apply=true is unsupported; this policy is report-only",
+    })
+}
+
+/// #829 pure scan. Walks `state.tasks` and classifies each auto-actionable
+/// task's owner via [`classify_owner`]. Terminal-status tasks (Done /
+/// Cancelled) are skipped — their ACL is already disabled at the event-log
+/// layer, so re-orphaning would be noise. InReview tasks are also excluded:
+/// [`plan_strict_in_review_ghosts`] owns their report-only policy surface.
 ///
 /// `live` MUST come from `crate::api::call(LIST)` — the canonical
 /// runtime registry. `fleet_instances` MUST come from
@@ -397,53 +456,100 @@ pub fn reconcile_orphan_owners_with_live(home: &Path, live: &std::collections::H
             .ok()
             .map(|c| c.instances.keys().cloned().collect())
             .unwrap_or_default();
-    let state = match crate::task_events::replay(home) {
-        Ok(s) => s,
-        Err(e) => {
+    let empty_confirm_ids = std::collections::HashSet::new();
+    let boards = match crate::tasks::list_all_boards_checked(home) {
+        Ok(boards) => boards
+            .into_iter()
+            .map(|(project, _)| project)
+            .collect::<Vec<_>>(),
+        Err(error) => {
             tracing::warn!(
-                error = %e,
-                "#829: task_events replay failed — skipping orphan-owner sweep"
+                %error,
+                "#829: task board enumeration failed — skipping orphan-owner sweep"
             );
             return;
         }
     };
 
-    let result = scan_orphan_candidates(&state, live, &fleet_instances);
-    if result.strict.is_empty() && result.soft.is_empty() {
-        tracing::debug!("#829: orphan-owner sweep clean — no ghost owners detected");
-        return;
-    }
+    let mut found_candidate = false;
+    for project in boards {
+        let board = crate::task_events::board_root(home, &project);
+        let state = match crate::task_events::projected_state_at(&board) {
+            Ok(state) => state,
+            Err(error) => {
+                tracing::warn!(
+                    %project,
+                    %error,
+                    "#829: task_events board replay failed — skipping board"
+                );
+                continue;
+            }
+        };
+        let in_review_plan = plan_strict_in_review_ghosts(
+            &state,
+            live,
+            &fleet_instances,
+            false,
+            &empty_confirm_ids,
+            "",
+        );
+        if in_review_plan["total_candidates"]
+            .as_u64()
+            .unwrap_or_default()
+            > 0
+        {
+            tracing::warn!(
+                %project,
+                candidates = in_review_plan["total_candidates"]
+                    .as_u64()
+                    .unwrap_or_default(),
+                "#829: strict ghost owners on InReview tasks are report-only; no mutation applied"
+            );
+        }
 
-    // Strict bucket → auto-apply via orphan_tasks_for_owner.
-    for (owner, task_ids) in &result.strict {
-        match orphan_tasks_for_owner(home, owner) {
-            Ok(n) => tracing::info!(
-                owner = %owner,
-                tasks = task_ids.len(),
-                orphaned = n,
-                "#829: orphan-owner sweep applied (strict — owner fully gone)"
-            ),
-            Err(e) => tracing::warn!(
-                owner = %owner,
-                error = %e,
-                "#829: orphan-owner sweep failed for strict candidate"
-            ),
+        let result = scan_orphan_candidates(&state, live, &fleet_instances);
+        if result.strict.is_empty() && result.soft.is_empty() {
+            continue;
+        }
+        found_candidate = true;
+
+        // Strict bucket → auto-apply via the board-local event log.
+        for (owner, task_ids) in &result.strict {
+            match orphan_tasks_for_owner_at(home, &board, owner) {
+                Ok(n) => tracing::info!(
+                    %project,
+                    owner = %owner,
+                    tasks = task_ids.len(),
+                    orphaned = n,
+                    "#829: orphan-owner sweep applied (strict — owner fully gone)"
+                ),
+                Err(e) => tracing::warn!(
+                    %project,
+                    owner = %owner,
+                    error = %e,
+                    "#829: orphan-owner sweep failed for strict candidate"
+                ),
+            }
+        }
+
+        // Soft bucket → dry-run + warn (no mutation).
+        if !result.soft.is_empty() {
+            let soft_summary: Vec<(String, usize)> = result
+                .soft
+                .iter()
+                .map(|(owner, ids)| (owner.clone(), ids.len()))
+                .collect();
+            tracing::warn!(
+                %project,
+                ?soft_summary,
+                "#829: detected tasks owned by configured-but-not-live agents \
+                 (in fleet.yaml ∧ ∉ live registry); operator may run `task action=sweep` \
+                 to apply orphan cleanup"
+            );
         }
     }
-
-    // Soft bucket → dry-run + warn (no mutation).
-    if !result.soft.is_empty() {
-        let soft_summary: Vec<(String, usize)> = result
-            .soft
-            .iter()
-            .map(|(owner, ids)| (owner.clone(), ids.len()))
-            .collect();
-        tracing::warn!(
-            ?soft_summary,
-            "#829: detected tasks owned by configured-but-not-live agents \
-             (in fleet.yaml ∧ ∉ live registry); operator may run `task action=sweep` \
-             to apply orphan cleanup"
-        );
+    if !found_candidate {
+        tracing::debug!("#829: orphan-owner sweep clean — no ghost owners detected");
     }
 }
 
@@ -454,7 +560,7 @@ pub fn scan_orphan_candidates(
 ) -> OrphanScanResult {
     let mut result = OrphanScanResult::default();
     for record in state.tasks.values() {
-        if record.status.is_terminal() {
+        if record.status.is_terminal() || record.status == TaskStatus::InReview {
             continue;
         }
         let Some(owner) = record.owner.as_ref() else {
@@ -482,7 +588,7 @@ const STALE_BLOCKED_WARN_THRESHOLD: usize = 10;
 /// #830: structured-recommendations health response. Pure pub fn so
 /// tests can drive it with synthesized inputs (no daemon spawn).
 ///
-/// `state` — `crate::task_events::replay(home)` output
+/// `state` — `crate::task_events::projected_state(home)` output
 /// `live` — `crate::runtime::list_live_agents(home)` — `None` when
 ///   the daemon is unreachable (surfaced as a degraded-mode hint in
 ///   the response).
@@ -506,6 +612,7 @@ pub fn build_health_response(
     let mut by_status: std::collections::BTreeMap<&'static str, usize> =
         std::collections::BTreeMap::new();
     let mut non_terminal_ages_days: Vec<i64> = Vec::new();
+    let mut total_terminal = 0;
     for record in state.tasks.values() {
         let key = match record.status {
             TaskStatus::Backlog => "backlog",
@@ -520,7 +627,9 @@ pub fn build_health_response(
             TaskStatus::Superseded => "superseded",
         };
         *by_status.entry(key).or_insert(0) += 1;
-        if !record.status.is_terminal() {
+        if record.status.is_terminal() {
+            total_terminal += 1;
+        } else {
             if let Ok(dt) = DateTime::parse_from_rfc3339(&record.created_at) {
                 let age = now.signed_duration_since(dt.with_timezone(&chrono::Utc));
                 non_terminal_ages_days.push(age.num_days());
@@ -528,8 +637,6 @@ pub fn build_health_response(
         }
     }
     let total_all: usize = by_status.values().copied().sum();
-    let total_terminal = by_status.get("done").copied().unwrap_or(0)
-        + by_status.get("cancelled").copied().unwrap_or(0);
     let total_non_terminal = total_all.saturating_sub(total_terminal);
 
     // ── Ghost owners (reuse #829 scan_orphan_candidates) ──

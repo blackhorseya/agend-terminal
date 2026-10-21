@@ -788,6 +788,39 @@ fn flat_unbound_registered_fixture(
     flat_unbound_fixture(tag, agent, branch, true)
 }
 
+fn nested_unbound_registered_fixture(
+    tag: &str,
+    agent: &str,
+    branch: &str,
+) -> (PathBuf, PathBuf, PathBuf) {
+    let home = tmp_home(&format!("{tag}-home"));
+    let repo = tmp_repo(&format!("{tag}-repo"));
+    let target = daemon_managed_worktree_root(&home).join(agent).join(branch);
+    std::fs::create_dir_all(target.parent().expect("nested target parent")).unwrap();
+    let branch_result = crate::git_helpers::git_bypass(&repo, &["branch", branch]);
+    assert!(
+        branch_result.as_ref().is_ok_and(|out| out.status.success()),
+        "fixture branch creation failed: {branch_result:?}"
+    );
+    let target_str = target.to_str().expect("UTF-8 target");
+    let add_result =
+        crate::git_helpers::git_bypass(&repo, &["worktree", "add", "--detach", target_str, branch]);
+    assert!(
+        add_result.as_ref().is_ok_and(|out| out.status.success()),
+        "fixture worktree add failed: {add_result:?}"
+    );
+    std::fs::write(
+        target.join(MANAGED_MARKER),
+        format!(
+            "agent={agent}\nbranch={branch}\nsource_repo={}\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    assert!(crate::binding::read(&home, agent).is_none());
+    (home, repo, target)
+}
+
 fn flat_unbound_fixture(
     tag: &str,
     agent: &str,
@@ -933,6 +966,68 @@ fn p0x_release_full_happy_path_removes_worktree_and_binding() {
     assert!(outcome.error.is_none(), "no error: {:?}", outcome.error);
     assert!(!l.path.exists(), "worktree dir must be gone post-release");
     assert!(crate::binding::read(&home, "agent-h").is_none());
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// t-…-87866-27 RED: the release path mutates the worktree at a PATH, but every
+/// lock it takes is keyed by AGENT (`acquire_agent_mutation_lock`,
+/// `acquire_binding_file_lock`) or by BRANCH (`acquire_branch_lease_lock`). None
+/// of those is visible to a DIFFERENT agent operating on the SAME normalized
+/// path — and `ci/checkout.rs` provisions that same path while holding the
+/// canonical per-path flock (`checkout_txn::acquire_path_lock`), whose own doc
+/// names repo-release as its next consumer. So probe the shared domain at the
+/// destructive moment: while this release is about to remove the worktree, the
+/// per-path lock for that worktree must NOT be free.
+///
+/// Deterministic and sleepless: the probe runs inside the existing
+/// `BeforeWorktreeRemove` phase seam, and `try_acquire_path_lock` is
+/// non-blocking, so the observation is a pure function of who holds the flock at
+/// that instant.
+#[test]
+fn release_holds_the_canonical_path_lock_while_removing_the_worktree() {
+    let home = tmp_home("path-lock-release");
+    let repo = tmp_repo("path-lock-release-repo");
+    let lease = lease_bound(&home, &repo, "agent-pl", "feat/pl");
+    assert!(lease.path.exists(), "pre: worktree must exist");
+
+    let path_was_free = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let probed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let outcome = {
+        let observed = std::sync::Arc::clone(&path_was_free);
+        let reached = std::sync::Arc::clone(&probed);
+        let probe_home = home.clone();
+        let probe_path = lease.path.clone();
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::BeforeWorktreeRemove {
+                reached.store(true, std::sync::atomic::Ordering::SeqCst);
+                let free = crate::mcp::handlers::ci::checkout_txn::try_acquire_path_lock(
+                    &probe_home,
+                    &probe_path,
+                    "same-path-probe",
+                )
+                .is_some();
+                observed.store(free, std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        release_full(&home, "agent-pl", false)
+    };
+
+    assert!(
+        probed.load(std::sync::atomic::Ordering::SeqCst),
+        "the release must reach the destructive phase for this probe to mean anything"
+    );
+    assert!(
+        outcome.released,
+        "release must still succeed under the path lock: {:?}",
+        outcome.error
+    );
+    assert!(
+        !path_was_free.load(std::sync::atomic::Ordering::SeqCst),
+        "the canonical per-path lock was FREE while the release removed the worktree — a \
+         same-path checkout by another agent could interleave with this teardown"
+    );
 
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
@@ -1313,6 +1408,73 @@ fn auto_release_exact_fingerprint_cannot_release_new_generation_s1() {
 }
 
 #[test]
+fn stale_auto_release_preserves_current_generation_recovery_journal_3696() {
+    let home = tmp_home("stale-auto-current-recovery");
+    let repo = tmp_repo("stale-auto-current-recovery-repo");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-stale-current-recovery",
+        "feat/stale-generation-a",
+    );
+    let expected_a =
+        match crate::binding::snapshot_guarded_binding(&home, "agent-stale-current-recovery")
+            .expect("snapshot generation A")
+        {
+            crate::binding::GuardedBinding::Known { fingerprint, .. } => fingerprint,
+            other => panic!("expected Known generation A, got {other:?}"),
+        };
+    let binding_path = crate::paths::binding_path(&home, "agent-stale-current-recovery");
+    let signature_path = crate::paths::runtime_dir(&home)
+        .join("agent-stale-current-recovery")
+        .join("binding.json.sig");
+    std::fs::remove_file(&binding_path).expect("remove generation A binding");
+    std::fs::remove_file(&signature_path).expect("remove generation A signature");
+    crate::binding::bind_full(
+        &home,
+        "agent-stale-current-recovery",
+        "T-generation-b",
+        "feat/stale-generation-b",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("install generation B");
+    prepare_release_journal(&home, "agent-stale-current-recovery")
+        .expect("generation B journal should be durable");
+    std::fs::remove_dir_all(&lease.path).expect("simulate generation B removal");
+    mark_release_recovery_required(&home, "agent-stale-current-recovery")
+        .expect("mark generation B recovery required");
+    let tombstone_path =
+        crate::agent::deletion_recovery::path(&home, "agent-stale-current-recovery");
+    let tombstone_before = std::fs::read(&tombstone_path).expect("read generation B tombstone");
+
+    let outcome = release_full_exact(&home, "agent-stale-current-recovery", &expected_a, false);
+
+    assert!(
+        outcome.stale_fingerprint && !outcome.released,
+        "stale generation A must not release generation B: {outcome:?}"
+    );
+    assert_eq!(
+        std::fs::read(&tombstone_path).expect("generation B tombstone must remain"),
+        tombstone_before,
+        "stale generation A must not clear generation B recovery authority"
+    );
+    assert_eq!(
+        crate::binding::read(&home, "agent-stale-current-recovery")
+            .expect("generation B binding must remain")["branch"],
+        "feat/stale-generation-b"
+    );
+    assert!(
+        !lease.path.exists(),
+        "generation B residue remains absent for recovery"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
 fn dirty_release_begins_notice_emit_after_all_transaction_flocks_drop_s1() {
     let home = tmp_home("s1-notice-unlocked");
     let repo = tmp_repo("s1-notice-unlocked-repo");
@@ -1485,6 +1647,49 @@ fn release_full_flat_unbound_registered_fails_closed() {
         after.lines().filter(|l| l.starts_with("worktree ")).count(),
         2,
         "failed-closed release must preserve Git registration: {after}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// #3583 RED: an authenticated nested survivor must be observable through the
+/// absent-binding release route, rather than being mistaken for an idempotent
+/// no-op. The target and Git registration must remain untouched for recovery.
+#[test]
+fn release_full_nested_unbound_registered_fails_closed_3583() {
+    let agent = "agent-3583-nested";
+    let branch = "feat/3583-nested";
+    let (home, repo, target) = nested_unbound_registered_fixture("3583-nested", agent, branch);
+    let before = worktree_list(&repo);
+    assert_eq!(
+        before
+            .lines()
+            .filter(|l| l.starts_with("worktree "))
+            .count(),
+        2,
+        "fixture must be Git-registered before release: {before}"
+    );
+
+    let outcome = release_full(&home, agent, false);
+
+    assert!(
+        !outcome.released,
+        "nested survivor must not be reported released: {outcome:?}"
+    );
+    let error = outcome.error.as_deref().unwrap_or("");
+    assert!(
+        error.contains("nested") && error.contains("preserved"),
+        "refusal must identify the nested survivor and preservation route: {outcome:?}"
+    );
+    assert!(
+        target.exists(),
+        "failed-closed release must preserve target"
+    );
+    assert_eq!(
+        worktree_list(&repo),
+        before,
+        "failed-closed release must preserve Git registration"
     );
 
     std::fs::remove_dir_all(&home).ok();
@@ -1673,10 +1878,8 @@ fn p0x_release_full_missing_worktree_path_clears_binding_anyway() {
 fn p0x_release_full_unmanaged_worktree_skipped_safely() {
     // R14 safety: if the binding points at a worktree that lacks the
     // .agend-managed marker (operator-created, not daemon-leased), the
-    // release MUST NOT remove the worktree. #1879 (WT-LEAK-2): the stale
-    // binding IS cleared, though — leaving it leaked the binding and blocked
-    // a same-agent re-bind. The worktree (operator data) survives for
-    // investigation; the daemon's binding to it does not.
+    // release MUST NOT remove the worktree. A refused removal is an incomplete
+    // release transaction, so the binding stays as durable recovery evidence.
     let home = tmp_home("p0x-unmanaged");
     let unmanaged_wt = tmp_home("p0x-unmanaged-wt-target");
     // Hand-craft a binding pointing at an unmanaged path.
@@ -1706,9 +1909,11 @@ fn p0x_release_full_unmanaged_worktree_skipped_safely() {
         outcome
     );
     assert!(
-        outcome.binding_removed,
-        "#1879 WT-LEAK-2: the stale binding must be CLEARED even when the unmanaged worktree removal is refused"
+        !outcome.binding_removed,
+        "failed removal must retain binding"
     );
+    assert_eq!(outcome.code, Some("release_incomplete"));
+    assert_eq!(outcome.stage, Some("worktree_remove"));
     assert!(
         outcome
             .error
@@ -1720,8 +1925,8 @@ fn p0x_release_full_unmanaged_worktree_skipped_safely() {
     );
     assert!(unmanaged_wt.exists(), "operator-created dir must survive");
     assert!(
-        crate::binding::read(&home, "agent-u").is_none(),
-        "#1879 WT-LEAK-2: the binding must be cleared (no leak / re-bind block)"
+        crate::binding::read(&home, "agent-u").is_some(),
+        "failed removal must preserve the binding for retry/recovery"
     );
 
     std::fs::remove_dir_all(&home).ok();
@@ -3691,6 +3896,88 @@ fn gc_run_force_reclaim_archives_never_hard_deletes() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// Lifecycle race coverage: GC acquiring the permit first must exclude a
+/// competing release/delete attempt until archive completion. The hook is a
+/// deterministic rendezvous; this test uses no sleep or timing assumption.
+#[test]
+fn gc_remove_one_holds_lifecycle_permit_through_archive() {
+    let home = tmp_home("gc-permit-first");
+    let repo = tmp_repo("gc-permit-first-repo");
+    let lease = lease(&home, &repo, "gc-permit-agent", "feat/x").expect("lease");
+    backdate_lease(&lease.path, force_reclaim_age_days() + 5);
+    let live = std::collections::HashSet::new();
+    let candidate = evaluate_candidate(&home, &lease.path, &live)
+        .expect("backdated lease is a force-reclaim candidate");
+    let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+    let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+    *super::gc::PERMIT_ACQUIRED_HOOK.lock() = Some((
+        home.clone(),
+        Box::new(move || {
+            entered_tx.send(()).expect("GC acquired lifecycle permit");
+            resume_rx.recv().expect("resume GC archive");
+        }),
+    ));
+    let home_for_gc = home.clone();
+    let gc_thread = std::thread::spawn(move || gc_remove_one(&home_for_gc, &candidate));
+
+    entered_rx.recv().expect("GC reached permit rendezvous");
+    let competing = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        &home,
+        "gc-permit-agent",
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Delete,
+    );
+    assert!(
+        competing
+            .as_ref()
+            .is_err_and(|error| error.contains("lifecycle transaction already in flight")),
+        "release/delete must wait behind GC's permit: {competing:?}"
+    );
+    resume_tx.send(()).expect("resume GC");
+    let result = gc_thread.join().expect("GC thread");
+    assert!(result.removed, "GC archive should complete: {result:?}");
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+/// Reverse race order: an existing lifecycle actor must make GC fail closed
+/// before it can inspect or remove the candidate.
+#[test]
+fn gc_remove_one_refuses_when_lifecycle_permit_is_already_held() {
+    let home = tmp_home("gc-permit-contended");
+    let repo = tmp_repo("gc-permit-contended-repo");
+    let lease = lease(&home, &repo, "gc-contended-agent", "feat/x").expect("lease");
+    backdate_lease(&lease.path, force_reclaim_age_days() + 5);
+    let live = std::collections::HashSet::new();
+    let candidate = evaluate_candidate(&home, &lease.path, &live)
+        .expect("backdated lease is a force-reclaim candidate");
+    let permit = crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
+        &home,
+        "gc-contended-agent",
+        crate::mcp::handlers::dispatch_hook::LifecycleOperation::Bind,
+    )
+    .expect("contending permit");
+
+    let result = gc_remove_one(&home, &candidate);
+    assert!(
+        !result.removed,
+        "GC must not remove under contention: {result:?}"
+    );
+    assert!(
+        result
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("lifecycle permit unavailable")),
+        "GC contention must be reported: {result:?}"
+    );
+    assert!(
+        lease.path.exists(),
+        "contended GC must preserve the worktree"
+    );
+    drop(permit);
+    let _ = std::fs::remove_dir_all(&home);
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
 /// PR-D·D4 (spike-vet, NON-NEGOTIABLE): the UNCONDITIONAL `gc_remove_one`
 /// archive-only invariant for ForceReclaim. t-worktree-leak PR-2's load-bearing
 /// safety property — a ForceReclaim MUST NEVER be hard-deleted — currently rests
@@ -3889,17 +4176,15 @@ fn agent_from_layout_is_layout_aware_2234() {
     std::fs::remove_dir_all(&home).ok();
 }
 
-/// RED→GREEN end-to-end: a clean-released cure-(B) `workspace/<agent>` worktree
-/// whose marker lacks `agent=` (forces the fallback) must yield a GcCandidate
-/// whose `agent` is the workspace dir name — RED (old parent-file_name): the
-/// candidate's agent was `"workspace"`, so the force-reclaim liveness guard
-/// would key on a non-agent and could reclaim a LIVE agent's workspace cwd.
+/// A clean-released cure-(B) `workspace/<agent>` worktree whose marker lacks
+/// `agent=` has no authoritative owner and must fail closed. A destructive GC
+/// path must not derive an owner from the directory layout.
 #[test]
-fn evaluate_candidate_workspace_worktree_resolves_real_agent_2234() {
+fn evaluate_candidate_workspace_worktree_without_marker_owner_fails_closed() {
     let home = tmp_home("eval-ws-agent");
     let repo = tmp_repo("eval-ws-agent-repo");
     let wt = managed_workspace_worktree(&home, &repo, "devw", "fix/x");
-    // Clean-released past grace, NO agent= field → exercises the path fallback.
+    // Clean-released past grace, NO agent= field → no authoritative owner.
     let old = (chrono::Utc::now() - chrono::Duration::hours(48)).to_rfc3339();
     std::fs::write(
         wt.join(MANAGED_MARKER),
@@ -3907,11 +4192,9 @@ fn evaluate_candidate_workspace_worktree_resolves_real_agent_2234() {
     )
     .unwrap();
     let live = std::collections::HashSet::new();
-    let cand =
-        evaluate_candidate(&home, &wt, &live).expect("clean-released worktree is a candidate");
-    assert_eq!(
-        cand.agent, "devw",
-        "#2234: agent must resolve to the workspace dir name 'devw', NOT the parent 'workspace'"
+    assert!(
+        evaluate_candidate(&home, &wt, &live).is_none(),
+        "markerless owner identity must fail closed"
     );
     std::fs::remove_dir_all(&home).ok();
     std::fs::remove_dir_all(&repo).ok();
@@ -4648,6 +4931,429 @@ fn release_full_preserves_dirty_wip_to_recovery_ref() {
 }
 
 #[test]
+fn release_recovery_snapshot_excludes_gitignored_build_cache() {
+    let home = tmp_home("release-ignored-cache");
+    let repo = tmp_repo("release-ignored-cache-repo");
+    let lease = lease_bound(&home, &repo, "agent-ignored", "feat/ignored-cache");
+    std::fs::write(lease.path.join(".gitignore"), b"target/\n").unwrap();
+    git_in(&lease.path, &["add", ".gitignore"]);
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "ignore build cache",
+        ],
+    );
+    std::fs::write(lease.path.join("precious.txt"), b"preserve me").unwrap();
+    std::fs::create_dir_all(lease.path.join("target/debug")).unwrap();
+    std::fs::write(lease.path.join("target/debug/artifact"), b"do not snapshot").unwrap();
+
+    let outcome = release_full(&home, "agent-ignored", false);
+    assert!(outcome.released, "{outcome:?}");
+    let refs = recovery_refs(&repo, "feat/ignored-cache");
+    assert_eq!(refs.len(), 1, "{refs:?}");
+    let files = ls_tree_names(&repo, &refs[0]);
+    assert!(files.contains("precious.txt"), "{files}");
+    assert!(!files.contains("target/"), "{files}");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn release_cleans_ignored_target_before_git_worktree_remove() {
+    let home = tmp_home("release-target-order");
+    let repo = tmp_repo("release-target-order-repo");
+    let lease = lease_bound(&home, &repo, "agent-target", "feat/target-order");
+    std::fs::write(lease.path.join(".gitignore"), b"target/\n").unwrap();
+    git_in(&lease.path, &["add", ".gitignore"]);
+    git_in(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "ignore target",
+        ],
+    );
+    let target = lease.path.join("target/debug");
+    std::fs::create_dir_all(&target).unwrap();
+    std::fs::write(target.join("large-artifact"), vec![b'x'; 1024 * 1024]).unwrap();
+    let target_existed_at_remove = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = std::sync::Arc::clone(&target_existed_at_remove);
+    let target_root = lease.path.join("target");
+    let outcome = {
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::BeforeWorktreeRemove {
+                observed.store(target_root.exists(), std::sync::atomic::Ordering::SeqCst);
+            }
+        });
+        release_full(&home, "agent-target", false)
+    };
+
+    assert!(outcome.released, "{outcome:?}");
+    assert!(
+        !target_existed_at_remove.load(std::sync::atomic::Ordering::SeqCst),
+        "ignored target cache must be gone before git worktree remove starts"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn release_remove_failure_retains_binding_with_structured_stage() {
+    let home = tmp_home("release-remove-failure");
+    let repo = tmp_repo("release-remove-failure-repo");
+    let lease = lease_bound(&home, &repo, "agent-fail", "feat/remove-fail");
+    let doomed_repo = repo.clone();
+    let response = {
+        let _hook = release_test_seam::install(move |phase| {
+            if phase == ReleaseTestPhase::BeforeWorktreeRemove {
+                std::fs::remove_dir_all(&doomed_repo).expect("remove fixture source repo");
+            }
+        });
+        crate::mcp::handlers::worktree_test_release(
+            &home,
+            &serde_json::json!({"instance": "agent-fail"}),
+        )
+    };
+
+    assert_eq!(response["released"], false, "{response}");
+    assert_eq!(response["code"], "release_incomplete", "{response}");
+    assert_eq!(response["stage"], "worktree_remove", "{response}");
+    assert_eq!(
+        response["path"],
+        lease.path.display().to_string(),
+        "{response}"
+    );
+    assert!(response["bytes_remaining"].as_u64().is_some(), "{response}");
+    assert!(
+        crate::binding::read(&home, "agent-fail").is_some(),
+        "a failed worktree removal must retain binding authority"
+    );
+    assert!(lease.path.exists(), "failed target must remain inspectable");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// #3696 RED: the real normal release path must journal the exact signed
+/// binding before removing the worktree.  An interruption after physical
+/// removal and before binding clear must leave a durable recovery fence so a
+/// daemon restart can route the residue to operator recovery.
+#[test]
+fn normal_release_interruption_retains_durable_recovery_journal_3696() {
+    let home = tmp_home("release-journal-red");
+    let repo = tmp_repo("release-journal-red-repo");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-release-journal",
+        "feat/release-journal",
+    );
+    let binding_path = crate::paths::binding_path(&home, "agent-release-journal");
+    let signature_path = crate::paths::runtime_dir(&home)
+        .join("agent-release-journal")
+        .join("binding.json.sig");
+    let binding_before = std::fs::read(&binding_path).expect("read binding before release");
+    let signature_before =
+        std::fs::read(&signature_path).expect("read binding signature before release");
+
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _hook = release_test_seam::install(|phase| {
+            if phase == ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear {
+                panic!("simulate daemon interruption after physical removal");
+            }
+        });
+        release_full(&home, "agent-release-journal", false);
+    }));
+
+    assert!(
+        interrupted.is_err(),
+        "the seam must simulate an interruption"
+    );
+    assert!(
+        !lease.path.exists(),
+        "physical remove must have happened first"
+    );
+    assert_eq!(
+        std::fs::read(&binding_path).expect("binding remains after interruption"),
+        binding_before
+    );
+    assert_eq!(
+        std::fs::read(&signature_path).expect("signature remains after interruption"),
+        signature_before
+    );
+    let journal = crate::agent::deletion_recovery::read(&home, "agent-release-journal")
+        .expect("read release recovery journal")
+        .expect("normal release must persist a recovery journal before removal");
+    assert_eq!(
+        journal.state,
+        crate::agent::deletion_recovery::State::RecoveryRequired
+    );
+
+    let report = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        &home,
+        "operator",
+        "archive interrupted normal release residue",
+        "agent-release-journal",
+        "feat/release-journal",
+        &lease.path,
+        &repo,
+    )
+    .expect("restart recovery must archive the exact release residue");
+    let manifest: serde_json::Value = serde_json::from_slice(
+        &std::fs::read(report.archive.join(".agend-recovery-manifest.json"))
+            .expect("read release recovery manifest"),
+    )
+    .expect("parse release recovery manifest");
+    assert_eq!(manifest["instance"], "agent-release-journal");
+    assert_eq!(manifest["branch"], "feat/release-journal");
+    assert!(report
+        .archive
+        .join(".agend-recovery-binding.json")
+        .is_file());
+    assert!(report
+        .archive
+        .join(".agend-recovery-binding.json.sig")
+        .is_file());
+    assert!(crate::binding::read(&home, "agent-release-journal").is_none());
+    assert_eq!(
+        crate::agent::deletion_recovery::read(&home, "agent-release-journal")
+            .expect("read completed recovery journal")
+            .expect("recovery receipt remains durable")
+            .state,
+        crate::agent::deletion_recovery::State::Recovered
+    );
+    let retry = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        &home,
+        "operator",
+        "idempotent retry after normal release recovery",
+        "agent-release-journal",
+        "feat/release-journal",
+        &lease.path,
+        &repo,
+    )
+    .expect("identical recovery retry must succeed");
+    assert_eq!(retry.archive, report.archive);
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn exact_bound_release_journals_before_remove_3696() {
+    let home = tmp_home("exact-release-journal");
+    let repo = tmp_repo("exact-release-journal-repo");
+    let lease = lease_bound(&home, &repo, "agent-exact-journal", "feat/exact-journal");
+    let expected = match crate::binding::snapshot_guarded_binding(&home, "agent-exact-journal")
+        .expect("snapshot exact binding")
+    {
+        crate::binding::GuardedBinding::Known { fingerprint, .. } => fingerprint,
+        other => panic!("expected known binding, got {other:?}"),
+    };
+
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _hook = release_test_seam::install(|phase| {
+            if phase == ReleaseTestPhase::AfterWorktreeRemoveBeforeBindingClear {
+                panic!("simulate exact release interruption");
+            }
+        });
+        release_bound_target_exact(&home, "agent-exact-journal", &expected, &lease.path, &repo);
+    }));
+
+    assert!(interrupted.is_err());
+    assert!(!lease.path.exists());
+    assert_eq!(
+        crate::agent::deletion_recovery::read(&home, "agent-exact-journal")
+            .expect("read exact release journal")
+            .expect("exact bound release must journal signed binding")
+            .state,
+        crate::agent::deletion_recovery::State::RecoveryRequired
+    );
+    let report = crate::admin::worktree_recovery::recover_markerless_bound_worktree(
+        &home,
+        "operator",
+        "recover exact release interruption",
+        "agent-exact-journal",
+        "feat/exact-journal",
+        &lease.path,
+        &repo,
+    )
+    .expect("exact release residue must be recoverable");
+    assert!(report
+        .archive
+        .join(".agend-recovery-manifest.json")
+        .is_file());
+    assert!(crate::binding::read(&home, "agent-exact-journal").is_none());
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn stale_normal_release_clears_only_the_superseded_generation_journal_3696() {
+    let home = tmp_home("release-journal-stale-generation");
+    let repo = tmp_repo("release-journal-stale-generation-repo");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-release-journal-stale",
+        "feat/release-journal-a",
+    );
+    prepare_release_journal(&home, "agent-release-journal-stale")
+        .expect("generation A journal should be durable");
+
+    let binding_path = crate::paths::binding_path(&home, "agent-release-journal-stale");
+    let signature_path = crate::paths::runtime_dir(&home)
+        .join("agent-release-journal-stale")
+        .join("binding.json.sig");
+    let settled_archive = home
+        .join(".trash")
+        .join("worktrees")
+        .join("superseded-generation");
+    let _hook = release_test_seam::install({
+        let home = home.clone();
+        let binding_path = binding_path.clone();
+        let signature_path = signature_path.clone();
+        let worktree = lease.path.clone();
+        let repo = repo.clone();
+        let settled_archive = settled_archive.clone();
+        move |phase| {
+            if phase == ReleaseTestPhase::AfterBindingSnapshot {
+                std::fs::remove_file(&binding_path).expect("remove generation A binding");
+                std::fs::remove_file(&signature_path).expect("remove generation A signature");
+                std::fs::create_dir_all(&settled_archive).expect("create settled archive");
+                crate::agent::deletion_recovery::mark_recovered(
+                    &home,
+                    "agent-release-journal-stale",
+                    &settled_archive,
+                )
+                .expect("settle generation A recovery before replacement bind");
+                crate::binding::bind_full(
+                    &home,
+                    "agent-release-journal-stale",
+                    "",
+                    "feat/release-journal-b",
+                    &worktree,
+                    &repo,
+                    false,
+                )
+                .expect("install replacement generation B");
+            }
+        }
+    });
+    let outcome = release_full(&home, "agent-release-journal-stale", false);
+
+    assert!(
+        outcome.stale_fingerprint,
+        "replacement generation must win CAS"
+    );
+    assert!(crate::binding::read(&home, "agent-release-journal-stale").is_some());
+    assert!(
+        crate::agent::deletion_recovery::read(&home, "agent-release-journal-stale")
+            .expect("read generation journal")
+            .is_none(),
+        "stale generation A journal must not fence replacement generation B"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn release_journal_clear_failure_is_settled_by_restart_retry_3696() {
+    let home = tmp_home("release-journal-clear-failure");
+    let repo = tmp_repo("release-journal-clear-failure-repo");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-release-journal-clear",
+        "feat/release-journal-clear",
+    );
+    let outcome = {
+        let _failure = crate::agent::deletion_recovery::force_clear_failure();
+        release_full(&home, "agent-release-journal-clear", false)
+    };
+
+    assert!(!outcome.released, "unlink failure must not report success");
+    assert!(!lease.path.exists(), "physical teardown already completed");
+    assert!(crate::binding::read(&home, "agent-release-journal-clear").is_none());
+    assert_eq!(
+        crate::agent::deletion_recovery::read(&home, "agent-release-journal-clear")
+            .expect("read retained recovery journal")
+            .expect("journal remains after clear failure")
+            .state,
+        crate::agent::deletion_recovery::State::RecoveryRequired
+    );
+
+    let retry = release_full(&home, "agent-release-journal-clear", false);
+    assert!(
+        retry.released,
+        "restart retry must settle completed release: {retry:?}"
+    );
+    assert!(retry.already_released);
+    assert!(
+        crate::agent::deletion_recovery::read(&home, "agent-release-journal-clear")
+            .expect("read settled journal")
+            .is_none()
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_signature_sidecar_is_present_invalid_and_fails_closed_3696() {
+    use std::os::unix::fs::symlink;
+
+    let home = tmp_home("release-journal-dangling-signature");
+    let repo = tmp_repo("release-journal-dangling-signature-repo");
+    let lease = lease_bound(
+        &home,
+        &repo,
+        "agent-release-journal-dangling",
+        "feat/release-journal-dangling",
+    );
+    let signature_path = crate::paths::runtime_dir(&home)
+        .join("agent-release-journal-dangling")
+        .join("binding.json.sig");
+    std::fs::remove_file(&signature_path).expect("remove valid signature sidecar");
+    symlink("missing-signature", &signature_path).expect("create dangling signature sidecar");
+
+    let outcome = release_full(&home, "agent-release-journal-dangling", false);
+
+    assert!(
+        !outcome.released,
+        "dangling signature must not release: {outcome:?}"
+    );
+    assert!(
+        outcome
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("signature")),
+        "failure must identify invalid signature evidence: {outcome:?}"
+    );
+    assert!(
+        lease.path.exists(),
+        "fail-closed release must preserve target"
+    );
+    assert!(
+        crate::binding::read(&home, "agent-release-journal-dangling").is_some(),
+        "fail-closed release must preserve binding"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
 fn release_full_clean_worktree_creates_no_recovery_ref() {
     let home = tmp_home("release-clean-noref");
     let repo = tmp_repo("release-clean-noref-repo");
@@ -5288,6 +5994,8 @@ fn seed_disposable_task(home: &Path, task_id: &str, branch: &str, terminal: bool
             eta_secs: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -5406,6 +6114,8 @@ fn active_task_branch_mismatch_preserves_review_branch() {
             eta_secs: None,
             tags: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .unwrap();
@@ -5727,6 +6437,8 @@ fn seed_active_task_for_branch(home: &Path, task_id: &str, branch: &str) {
             owner: None,
             depends_on: Vec::new(),
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
             branch: Some(branch.to_string()),
             due_at: None,
             routed_to: None,
@@ -5839,4 +6551,1166 @@ fn seed_task_done(home: &Path, task_id: &str) {
             },
         },
     );
+}
+
+/// RED (t-…-43938-5, scope correction d-20260901132326253721-16): the merge
+/// check inside `cleanup_merged_branch` compares the branch against the LOCAL
+/// `refs/heads/<default>` ref, which the release path never advances — its own
+/// pre-check `fetch --prune <remote>` is refspec-less and only updates
+/// `refs/remotes/<remote>/*`. The daemon provisions every worktree at the
+/// CURRENT protected head, which is at or ahead of that lagging local ref, so a
+/// branch whose work is PROVABLY already in the freshly fetched
+/// `origin/<default>` is judged "not merged" and preserved forever.
+///
+/// Deterministic and network-free: a local `origin` repo is advanced by pushing
+/// the branch tip onto its default, so after the release's own fetch the tip is
+/// an ancestor of `refs/remotes/origin/main` while `refs/heads/main` in the
+/// source clone still points at the older commit.
+#[test]
+fn release_reaps_branch_already_in_fetched_origin_default_despite_stale_local_main() {
+    fn git(dir: &std::path::Path, args: &[&str]) -> std::process::Output {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git")
+    }
+    fn out(o: std::process::Output) -> String {
+        String::from_utf8_lossy(&o.stdout).trim().to_string()
+    }
+
+    let home = tmp_home("stale-local-default");
+    let origin = tmp_repo("stale-local-default-origin");
+    // Origin must accept a push to its checked-out branch (plain repo, not bare).
+    git(&origin, &["config", "receive.denyCurrentBranch", "ignore"]);
+    let source = tmp_home("stale-local-default-src");
+    git(
+        std::path::Path::new("/"),
+        &[
+            "clone",
+            &origin.display().to_string(),
+            &source.display().to_string(),
+        ],
+    );
+    let base = out(git(&source, &["rev-parse", "main"]));
+
+    // Managed lease → branch created at the clone's current HEAD.
+    let lease = lease_bound(&home, &source, "agent-stale", "feat/stale");
+    // One real commit on the branch, then publish it as origin's new default.
+    std::fs::write(lease.path.join("f.txt"), "work\n").expect("write");
+    git(&lease.path, &["add", "f.txt"]);
+    git(
+        &lease.path,
+        &[
+            "-c",
+            "user.name=test",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    );
+    let tip = out(git(&lease.path, &["rev-parse", "HEAD"]));
+    git(&lease.path, &["push", "origin", "feat/stale:main"]);
+
+    // Pre-conditions that make this test meaningful rather than vacuous.
+    assert_ne!(tip, base, "the branch must carry a real commit");
+    assert_eq!(
+        out(git(&source, &["rev-parse", "main"])),
+        base,
+        "pre: the source clone's LOCAL main must still lag at the older commit"
+    );
+    assert_eq!(
+        out(git(&origin, &["rev-parse", "main"])),
+        tip,
+        "pre: origin's default must now contain the branch tip"
+    );
+
+    let outcome = release_full(&home, "agent-stale", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+    assert!(
+        outcome.branch_deleted,
+        "a branch whose tip is an ancestor of the freshly fetched origin default \
+         carries no unpreserved work and must be reaped; kept instead with reason {:?}",
+        outcome.branch_cleanup_skipped_reason
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&source).ok();
+    std::fs::remove_dir_all(&origin).ok();
+}
+
+// ── B1/B2 (t-…-43938-5, d-20260901132326253721-16): owner-facing retention
+// obligation + escheatment. A branch that survives release with real work can
+// never acquire the ledger's only settlement authority (`merged == true`) when
+// its lane is dispatched local-only, so the release must ASK the recorded owner
+// instead of leaving the intent immortal and unattributed.
+
+/// Make `runtime::list_agents_with_fallback` report exactly `agents` as live.
+/// `find_active_run_dir` accepts `run/<pid>/` when the pid is alive and the
+/// `.daemon` file's first field matches it, so the test process's own pid is a
+/// valid, deterministic stand-in for a running daemon.
+fn plant_live_agents(home: &Path, agents: &[&str]) {
+    let run = home.join("run").join(std::process::id().to_string());
+    std::fs::create_dir_all(&run).expect("run dir");
+    std::fs::write(run.join(".daemon"), format!("{}:0", std::process::id())).expect(".daemon");
+    for a in agents {
+        std::fs::write(run.join(format!("{a}.port")), "1234").expect("port file");
+    }
+}
+
+fn retention_tasks(home: &Path) -> Vec<crate::task_events::TaskRecord> {
+    retention_tasks_at(home, crate::task_events::DEFAULT_PROJECT)
+}
+
+fn retention_tasks_at(home: &Path, project: &str) -> Vec<crate::task_events::TaskRecord> {
+    crate::task_events::projected_state_at(&crate::task_events::board_root(home, project))
+        .map(|state| {
+            state
+                .tasks
+                .into_values()
+                .filter(|t| t.tags.iter().any(|tag| tag == "branch-retention"))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[test]
+fn retention_obligation_uses_owning_repository_board() {
+    let home = tmp_home("retention-project-route");
+    let repo = tmp_repo("retention-project-route-repo");
+    let project = crate::tasks::project_id_from_source_repo(&repo);
+    plant_live_agents(&home, &["agent-route"]);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  agent-route:\n    backend: codex\nteams:\n  route-team:\n    members: [agent-route]\n    source_repo: {}\n",
+            repo.display()
+        ),
+    )
+    .expect("fleet");
+    let created = crate::tasks::handle(
+        &home,
+        "agent-route",
+        &serde_json::json!({
+            "action": "create",
+            "title": "origin",
+            "assignee": "agent-route"
+        }),
+    );
+    let origin_id = created["id"].as_str().expect("origin id").to_string();
+
+    let lease = lease(&home, &repo, "agent-route", "feat/project-route").expect("lease");
+    crate::binding::bind_full(
+        &home,
+        "agent-route",
+        &origin_id,
+        "feat/project-route",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("bind");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+
+    release_full(&home, "agent-route", false);
+
+    assert!(
+        retention_tasks(&home).is_empty(),
+        "a repository-routed obligation must not leak onto the default board"
+    );
+    let obligations = retention_tasks_at(&home, &project);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "the obligation must live on its repository's board"
+    );
+    let answered = crate::tasks::handle(
+        &home,
+        "agent-route",
+        &serde_json::json!({
+            "action": "done",
+            "id": obligations[0].id.0.clone(),
+            "result": "delete: no longer needed"
+        }),
+    );
+    assert_eq!(
+        answered["status"], "done",
+        "the accountable owner must pass the routed board ACL: {answered}"
+    );
+    crate::cleanup_intents::sweep_settle_merged(&home);
+    assert!(
+        crate::git_helpers::git_cmd(
+            &repo,
+            &["show-ref", "--verify", "refs/heads/feat/project-route"],
+        )
+        .is_err(),
+        "the settlement reader must find the answer on the routed project board"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn missing_origin_routes_retention_to_owners_repository_board() {
+    let home = tmp_home("retention-missing-origin");
+    let repo = tmp_repo("retention-missing-origin-repo");
+    let project = "owner-board";
+    plant_live_agents(&home, &["agent-missing"]);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  agent-missing:\n    backend: codex\nteams:\n  route-team:\n    members: [agent-missing]\n    source_repo: {}\n    project_id: {project}\n",
+            repo.display()
+        ),
+    )
+    .expect("fleet");
+    let lease = lease(&home, &repo, "agent-missing", "feat/missing-origin").expect("lease");
+    crate::binding::bind_full(
+        &home,
+        "agent-missing",
+        "t-origin-gone",
+        "feat/missing-origin",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("bind");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+
+    release_full(&home, "agent-missing", false);
+
+    assert!(
+        retention_tasks(&home).is_empty(),
+        "the real creator must not leak the obligation onto the default board"
+    );
+    let obligations = retention_tasks_at(&home, project);
+    assert_eq!(obligations.len(), 1, "the obligation must not disappear");
+    let answered = crate::tasks::handle(
+        &home,
+        "agent-missing",
+        &serde_json::json!({
+            "action": "done",
+            "id": obligations[0].id.0.clone(),
+            "result": "delete: no longer needed"
+        }),
+    );
+    assert_eq!(answered["status"], "done");
+    crate::cleanup_intents::sweep_settle_merged(&home);
+    assert!(
+        crate::git_helpers::git_cmd(
+            &repo,
+            &["show-ref", "--verify", "refs/heads/feat/missing-origin"],
+        )
+        .is_err(),
+        "the settlement reader must consume the repository-board answer"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// RED B1: a branch preserved at release with real work must leave exactly ONE
+/// owner-assigned retention obligation on the board, carrying the repo, branch,
+/// originating task id and exact head so the owner can answer without guessing.
+#[test]
+fn release_records_one_owner_assigned_branch_retention_obligation() {
+    let home = tmp_home("retention-b1");
+    let repo = tmp_repo("retention-b1-repo");
+    plant_live_agents(&home, &["agent-own"]);
+    let lease = lease_bound(&home, &repo, "agent-own", "feat/keepme");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+    let head = String::from_utf8_lossy(
+        &std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git")
+            .stdout,
+    )
+    .trim()
+    .to_string();
+
+    let outcome = release_full(&home, "agent-own", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+    assert!(
+        !outcome.branch_deleted,
+        "pre: a branch carrying real work must be preserved, not reaped"
+    );
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "exactly one retention obligation must be recorded, got {}",
+        obligations.len()
+    );
+    let t = &obligations[0];
+    assert_eq!(
+        t.owner.as_ref().map(|o| o.0.as_str()),
+        Some("agent-own"),
+        "the live recorded owner is accountable"
+    );
+    for needle in [repo.display().to_string().as_str(), "feat/keepme", &head] {
+        assert!(
+            t.description.contains(needle),
+            "obligation description must carry {needle}: {}",
+            t.description
+        );
+    }
+    assert!(t.due_at.is_some(), "obligation must carry a due date");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Write a file and commit it in `wt` — the shared "release survives with
+/// real unmerged work" fixture step used by the open-PR-guard tests below.
+fn commit_work(wt: &Path, name: &str) {
+    std::fs::write(wt.join(name), "work\n").expect("write");
+    for args in [
+        vec!["add", name],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(wt)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+}
+
+// ── #3503: an open PR on the lane means merge — not the owner — will settle
+// the intent, so no retention row should be raised; and when that PR merges,
+// any row raised in the meantime must be retired automatically. ──
+
+/// RED (a): a clean pre-merge release on a branch with an OPEN PR must create
+/// no retention row — merge will settle the intent minutes later.
+#[test]
+fn open_pr_branch_release_creates_no_retention_obligation() {
+    let home = tmp_home("retention-openpr-a");
+    let repo = tmp_repo("retention-openpr-a-repo");
+    crate::git_helpers::git_bypass(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/repo.git",
+        ],
+    )
+    .expect("add origin");
+    let provider =
+        crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::Branches(vec![
+            "feat/openpr".to_string(),
+        ]));
+    let _provider_guard = crate::scm::set_test_scm_provider(provider);
+
+    plant_live_agents(&home, &["agent-own"]);
+    let lease = lease_bound(&home, &repo, "agent-own", "feat/openpr");
+    commit_work(&lease.path, "w.txt");
+
+    let outcome = release_full(&home, "agent-own", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+    assert!(
+        !outcome.branch_deleted,
+        "pre: a branch carrying real work must be preserved, not reaped"
+    );
+
+    let obligations = retention_tasks(&home);
+    assert!(
+        obligations.is_empty(),
+        "an open-PR lane must raise NO retention obligation — merge will settle it; got {}",
+        obligations.len()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Fourth (cheap) test pinning the fail-closed half of the same idiom: a
+/// non-GitHub remote makes `open_pr_status` return `Unknown`, which must be
+/// treated like `Open` — no row is created either.
+#[test]
+fn unknown_pr_status_branch_release_creates_no_retention_obligation() {
+    let home = tmp_home("retention-openpr-unknown");
+    let repo = tmp_repo("retention-openpr-unknown-repo");
+    crate::git_helpers::git_bypass(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://example.com/not-github.git",
+        ],
+    )
+    .expect("add origin");
+
+    plant_live_agents(&home, &["agent-own"]);
+    let lease = lease_bound(&home, &repo, "agent-own", "feat/unknownpr");
+    commit_work(&lease.path, "w.txt");
+
+    let outcome = release_full(&home, "agent-own", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+
+    let obligations = retention_tasks(&home);
+    assert!(
+        obligations.is_empty(),
+        "Unknown open-PR status must fail closed the same as Open — no row; got {}",
+        obligations.len()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// NEGATIVE CONTROL — the most important test in the ticket: a genuine
+/// local-only lane (no `origin` remote at all, so `open_pr_status` is
+/// deterministically `NotOpen`) must STILL get its retention row. A fix that
+/// makes this fail has destroyed the feature, not fixed it.
+#[test]
+fn local_only_branch_release_still_creates_retention_obligation() {
+    let home = tmp_home("retention-openpr-negctrl");
+    let repo = tmp_repo("retention-openpr-negctrl-repo");
+    // Deliberately no `origin` remote — a genuine local-only lane.
+
+    plant_live_agents(&home, &["agent-own"]);
+    let lease = lease_bound(&home, &repo, "agent-own", "feat/localonly");
+    commit_work(&lease.path, "w.txt");
+
+    let outcome = release_full(&home, "agent-own", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+    assert!(
+        !outcome.branch_deleted,
+        "pre: a branch carrying real work must be preserved, not reaped"
+    );
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "a genuine local-only lane must still raise exactly one retention obligation, got {}",
+        obligations.len()
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// RED (b): an existing OPEN retention row whose branch's PR merges must be
+/// terminated by the merged-settle path (`cleanup_intents::settle_intent`,
+/// the chokepoint both the CI-watch event and the periodic sweep funnel
+/// through once `merged` is authoritative).
+#[test]
+fn merged_branch_retires_open_retention_obligation() {
+    let home = tmp_home("retention-openpr-b");
+    let repo = tmp_repo("retention-openpr-b-repo");
+    // No origin remote: NotOpen at release time raises the row exactly like
+    // the negative control — the row exists to be retired by the merge below.
+
+    plant_live_agents(&home, &["agent-own"]);
+    let lease = lease_bound(&home, &repo, "agent-own", "feat/willmerge");
+    commit_work(&lease.path, "w.txt");
+
+    let outcome = release_full(&home, "agent-own", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "setup: exactly one open retention obligation must exist before merge, got {}",
+        obligations.len()
+    );
+    assert!(
+        !obligations[0].status.is_terminal(),
+        "setup: the obligation must be open before merge"
+    );
+
+    // The branch's PR merges — drive the merged-settle chokepoint directly,
+    // as both `sweep_settle_merged` and the CI-watch event path do.
+    let repo_str = repo.display().to_string();
+    crate::cleanup_intents::settle_intent(&home, &repo_str, "feat/willmerge", true, None);
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "the row must still exist, now terminal"
+    );
+    assert!(
+        obligations[0].status.is_terminal(),
+        "merge must retire the open retention row, got status {:?}",
+        obligations[0].status
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// RED B1 idempotency: while an open obligation exists for (repo, branch), a
+/// later release at a new head must be a no-op rather than creating another row.
+#[test]
+fn second_release_creates_no_duplicate_retention_obligation() {
+    let home = tmp_home("retention-b1-idem");
+    let repo = tmp_repo("retention-b1-idem-repo");
+    plant_live_agents(&home, &["agent-idem"]);
+    let lease = lease_bound(&home, &repo, "agent-idem", "feat/twice");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+    release_full(&home, "agent-idem", false);
+    let first = retention_tasks(&home).remove(0);
+
+    // Advance the same branch before releasing again. The open lane-level
+    // obligation remains authoritative until its owner answers it.
+    let l2 = lease_bound(&home, &repo, "agent-idem", "feat/twice");
+    std::fs::write(l2.path.join("w2.txt"), "more work\n").expect("write");
+    for args in [
+        vec!["add", "w2.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "more work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&l2.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+    release_full(&home, "agent-idem", false);
+
+    let after = retention_tasks(&home);
+    assert_eq!(
+        after.len(),
+        1,
+        "an open (repo, branch) obligation must suppress later releases"
+    );
+    assert_eq!(after[0].id, first.id, "the existing open task must remain");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// RED B2 escheatment: agents are ephemeral. When the recorded owner is no
+/// longer live, accountability falls to the orchestrator that created the
+/// originating task — never silently to nobody.
+#[test]
+fn retention_obligation_escheats_to_originating_created_by_when_owner_not_live() {
+    let home = tmp_home("retention-b2-esch");
+    let repo = tmp_repo("retention-b2-esch-repo");
+    // The orchestrator is live; the branch owner is NOT in the live set.
+    plant_live_agents(&home, &["orch-live"]);
+    crate::task_events::append(
+        &home,
+        &crate::task_events::InstanceName("orch-live".into()),
+        crate::task_events::TaskEvent::Created {
+            task_id: crate::task_events::TaskId("t-origin-esch".into()),
+            title: "origin".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: Some(crate::task_events::InstanceName("agent-dead".into())),
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: Some("feat/esch".into()),
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
+        },
+    )
+    .expect("seed originating task");
+
+    let lease = lease(&home, &repo, "agent-dead", "feat/esch").expect("lease");
+    crate::binding::bind_full(
+        &home,
+        "agent-dead",
+        "t-origin-esch",
+        "feat/esch",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("bind_full");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+
+    release_full(&home, "agent-dead", false);
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "one obligation must still be recorded"
+    );
+    assert_eq!(
+        obligations[0].owner.as_ref().map(|o| o.0.as_str()),
+        Some("orch-live"),
+        "a dead owner escheats to the originating task's created_by"
+    );
+    assert!(
+        !obligations[0]
+            .tags
+            .iter()
+            .any(|t| t == "branch-retention-orphan"),
+        "an escheated obligation has an owner and must NOT be tagged orphan"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// RED B2 orphan: neither the owner nor the originating orchestrator is live —
+/// the obligation must surface in board hygiene rather than vanish or be
+/// silently immortal.
+#[test]
+fn retention_obligation_is_orphan_tagged_when_neither_owner_nor_orchestrator_live() {
+    let home = tmp_home("retention-b2-orphan");
+    let repo = tmp_repo("retention-b2-orphan-repo");
+    // Someone unrelated is live; neither the owner nor the task creator is.
+    plant_live_agents(&home, &["someone-else"]);
+    crate::task_events::append(
+        &home,
+        &crate::task_events::InstanceName("orch-gone".into()),
+        crate::task_events::TaskEvent::Created {
+            task_id: crate::task_events::TaskId("t-origin-orphan".into()),
+            title: "origin".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: Some(crate::task_events::InstanceName("agent-gone".into())),
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: Some("feat/orphan".into()),
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
+        },
+    )
+    .expect("seed originating task");
+
+    let lease = lease(&home, &repo, "agent-gone", "feat/orphan").expect("lease");
+    crate::binding::bind_full(
+        &home,
+        "agent-gone",
+        "t-origin-orphan",
+        "feat/orphan",
+        &lease.path,
+        &repo,
+        false,
+    )
+    .expect("bind_full");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+
+    release_full(&home, "agent-gone", false);
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "one obligation must still be recorded"
+    );
+    assert!(
+        obligations[0].owner.is_none(),
+        "with neither owner nor orchestrator live the obligation stays unassigned"
+    );
+    assert!(
+        obligations[0]
+            .tags
+            .iter()
+            .any(|t| t == "branch-retention-orphan"),
+        "an unassignable obligation must be tagged for board hygiene: {:?}",
+        obligations[0].tags
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Once the owner answers the existing lane obligation, a later release at a
+/// different head must raise a fresh task for the newly unreviewed work.
+#[test]
+fn release_at_a_new_head_raises_a_fresh_retention_obligation() {
+    fn commit(dir: &Path, name: &str) {
+        std::fs::write(dir.join(name), "work\n").expect("write");
+        for args in [
+            vec!["add", name],
+            vec![
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-m",
+                name,
+            ],
+        ] {
+            std::process::Command::new("git")
+                .args(&args)
+                .current_dir(dir)
+                .env("AGEND_GIT_BYPASS", "1")
+                .output()
+                .expect("git");
+        }
+    }
+
+    let home = tmp_home("retention-newhead");
+    let repo = tmp_repo("retention-newhead-repo");
+    plant_live_agents(&home, &["agent-nh"]);
+
+    let l1 = lease_bound(&home, &repo, "agent-nh", "feat/moving");
+    commit(&l1.path, "a.txt");
+    release_full(&home, "agent-nh", false);
+    assert_eq!(
+        retention_tasks(&home).len(),
+        1,
+        "first head raises one obligation"
+    );
+    let first = retention_tasks(&home).remove(0);
+    let answered = crate::tasks::handle(
+        &home,
+        "agent-nh",
+        &serde_json::json!({
+            "action": "done",
+            "id": first.id.0,
+            "result": "keep: still needed"
+        }),
+    );
+    assert_eq!(answered["status"], "done");
+
+    // Same branch, one more commit after the prior task was answered.
+    let l2 = lease_bound(&home, &repo, "agent-nh", "feat/moving");
+    commit(&l2.path, "b.txt");
+    release_full(&home, "agent-nh", false);
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        2,
+        "both obligation records remain auditable"
+    );
+    assert_eq!(
+        obligations
+            .iter()
+            .filter(|task| !task.status.is_terminal())
+            .count(),
+        1,
+        "only the newest head may remain actionable"
+    );
+    assert_eq!(
+        obligations
+            .iter()
+            .filter(|task| task.status == crate::task_events::TaskStatus::Done)
+            .count(),
+        1,
+        "the answered older-head task remains auditable"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// AUTHORITY PROOF (required before B3 can treat a `delete:` answer as an
+/// authority to destroy a branch): completing a retention obligation is gated by
+/// the EXISTING task ACL, not by anything this feature invents. An agent that is
+/// neither the owner nor an orchestrator of the owner must be refused.
+#[test]
+fn a_third_party_cannot_answer_someone_elses_retention_obligation() {
+    let home = tmp_home("retention-authz-deny");
+    let repo = tmp_repo("retention-authz-deny-repo");
+    plant_live_agents(&home, &["agent-acct"]);
+    let lease = lease_bound(&home, &repo, "agent-acct", "feat/authz");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+    release_full(&home, "agent-acct", false);
+    let obligation = retention_tasks(&home).remove(0);
+
+    let denied = crate::tasks::handle(
+        &home,
+        "some-other-agent",
+        &serde_json::json!({"action": "done", "id": obligation.id.0, "result": "delete: not mine to give"}),
+    );
+    assert_ne!(
+        denied["status"], "done",
+        "a non-owner must not be able to stamp a delete: answer: {denied}"
+    );
+    // The negative control needs its own control: prove the refusal is an
+    // AUTHORITY refusal, not some unrelated error that would also make the
+    // assertion above pass.
+    let reason = denied["error"].as_str().unwrap_or_default().to_lowercase();
+    assert!(
+        reason.contains("not authorized"),
+        "the refusal must be an AUTHORITY refusal naming owner vs caller, not an \
+         incidental failure that would also satisfy the assertion above: {denied}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// AUTHORITY PROOF, the other direction — a gate nobody can pass is not a gate,
+/// it is a dead mechanism. The accountable owner MUST be able to answer after the
+/// worktree is gone, which is exactly why the obligation is branchless:
+/// `assignee_completion_guard` demands an exact live binding from the assignee of
+/// a BRANCH-carrying task, and the owner no longer has one at that point.
+#[test]
+fn the_accountable_owner_can_answer_the_retention_obligation_after_release() {
+    let home = tmp_home("retention-authz-allow");
+    let repo = tmp_repo("retention-authz-allow-repo");
+    plant_live_agents(&home, &["agent-acct2"]);
+    let lease = lease_bound(&home, &repo, "agent-acct2", "feat/authz2");
+    std::fs::write(lease.path.join("w.txt"), "work\n").expect("write");
+    for args in [
+        vec!["add", "w.txt"],
+        vec![
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    ] {
+        std::process::Command::new("git")
+            .args(&args)
+            .current_dir(&lease.path)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git");
+    }
+    release_full(&home, "agent-acct2", false);
+    let obligation = retention_tasks(&home).remove(0);
+    assert_eq!(
+        obligation.owner.as_ref().map(|o| o.0.as_str()),
+        Some("agent-acct2"),
+        "pre: the obligation is owned by the branch opener"
+    );
+
+    let answered = crate::tasks::handle(
+        &home,
+        "agent-acct2",
+        &serde_json::json!({"action": "done", "id": obligation.id.0, "result": "keep: still needed"}),
+    );
+    assert_eq!(
+        answered["status"], "done",
+        "the accountable owner must be able to answer once the worktree is released: {answered}"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// GAP 1 (#3503 mutation-kill): a clean pre-merge release on an OPEN-PR
+/// branch must still persist the release intent — merge is what settles it
+/// later — even though (as the sibling test above already pins) no
+/// retention row is raised. `persist_release_intent` sits above the
+/// open-PR guard in `branch_cleanup.rs`; a mutation that pulls it inside
+/// the guard would silently break merge-driven cleanup on exactly the
+/// lanes this ticket is about, yet leave every other assertion green.
+#[test]
+fn open_pr_branch_release_creates_no_retention_obligation_but_persists_intent() {
+    let home = tmp_home("retention-openpr-intent");
+    let repo = tmp_repo("retention-openpr-intent-repo");
+    crate::git_helpers::git_bypass(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/repo.git",
+        ],
+    )
+    .expect("add origin");
+    let provider =
+        crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::Branches(vec![
+            "feat/openpr-intent".to_string(),
+        ]));
+    let _provider_guard = crate::scm::set_test_scm_provider(provider);
+
+    plant_live_agents(&home, &["agent-own"]);
+    let lease = lease_bound(&home, &repo, "agent-own", "feat/openpr-intent");
+    commit_work(&lease.path, "w.txt");
+
+    let outcome = release_full(&home, "agent-own", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+    assert!(
+        !outcome.branch_deleted,
+        "pre: a branch carrying real work must be preserved, not reaped"
+    );
+
+    assert!(
+        crate::cleanup_intents::has_intent(
+            &home,
+            &repo.display().to_string(),
+            "feat/openpr-intent"
+        ),
+        "an open-PR lane must still persist its release intent — merge settles it later"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// GAP 2 (#3503 mutation-kill): retirement must correlate by the LANE key
+/// (repo, branch) rather than the exact (repo, branch, head) key, because
+/// the head recorded at release time can drift from the head at merge
+/// time. A retention row is raised at head A; the branch then advances to
+/// a different head B before the merge-settle chokepoint runs — the row
+/// must still be found and closed.
+#[test]
+fn merged_branch_retires_retention_obligation_despite_head_drift() {
+    let home = tmp_home("retention-lanekey-drift");
+    let repo = tmp_repo("retention-lanekey-drift-repo");
+    // No origin remote: NotOpen at release time raises the row, exactly
+    // like the negative control.
+
+    plant_live_agents(&home, &["agent-own"]);
+    let lease = lease_bound(&home, &repo, "agent-own", "feat/willdrift");
+    commit_work(&lease.path, "w.txt");
+
+    let outcome = release_full(&home, "agent-own", false);
+    assert!(
+        outcome.released,
+        "release must succeed: {:?}",
+        outcome.error
+    );
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "setup: exactly one open retention obligation must exist before merge, got {}",
+        obligations.len()
+    );
+    let head_a = crate::git_helpers::git_cmd(&repo, &["rev-parse", "feat/willdrift"])
+        .expect("head A")
+        .trim()
+        .to_string();
+    assert!(
+        obligations[0]
+            .tags
+            .contains(&crate::worktree_pool::retention_key(
+                &repo.display().to_string(),
+                "feat/willdrift",
+                &head_a,
+            )),
+        "setup: the obligation must carry the exact key for head A"
+    );
+
+    // Advance the branch to a different head B — no second release, just
+    // more work landing on the same lane before the merge is observed.
+    let lease2 = lease_bound(&home, &repo, "agent-own", "feat/willdrift");
+    commit_work(&lease2.path, "w2.txt");
+    let head_b = crate::git_helpers::git_cmd(&repo, &["rev-parse", "feat/willdrift"])
+        .expect("head B")
+        .trim()
+        .to_string();
+    assert_ne!(
+        head_a, head_b,
+        "setup: the branch must actually have advanced"
+    );
+
+    // The branch's PR merges at head B — drive the merged-settle chokepoint
+    // directly, as both `sweep_settle_merged` and the CI-watch event path do.
+    let repo_str = repo.display().to_string();
+    crate::cleanup_intents::settle_intent(&home, &repo_str, "feat/willdrift", true, None);
+
+    let obligations = retention_tasks(&home);
+    assert_eq!(
+        obligations.len(),
+        1,
+        "the row must still exist, now terminal"
+    );
+    assert!(
+        obligations[0].status.is_terminal(),
+        "merge must retire the retention row despite head drift, correlating by lane not exact head; got status {:?}",
+        obligations[0].status
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
 }

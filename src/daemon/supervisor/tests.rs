@@ -912,6 +912,62 @@ fn tick_emitters_run_after_core_lock_drops_1644() {
     }
 }
 
+/// #3671-C RED: the transition-log file append must run AFTER the per-agent
+/// core lock drops — never inside it. `log_state_transition_at` now runs
+/// through `append_line_with_retention` (blocking companion-flock +
+/// read_dir/metadata/remove/rename), so calling it under `core.lock()`
+/// holds the per-agent core mutex across filesystem latency and lock
+/// contention, stalling the PTY read-loop `feed` (the CR-2026-06-14
+/// blocking-IO-under-core-lock class). Collect the drained rows under the
+/// lock, emit them after it drops — same collect→drop→emit shape as #1644.
+/// Brace-matches the same `let action = { … }` block; scoped to the `tick`
+/// fn body so it never matches its own needle literals.
+#[test]
+fn transition_log_emitted_after_core_lock_drops_3671() {
+    let src = include_str!("../supervisor.rs");
+    let tick_start = src.find("\nfn tick(").expect("tick fn must exist");
+    let after = &src[tick_start..];
+    let tick_end = after[1..]
+        .find("\nfn ")
+        .map(|i| i + 1)
+        .unwrap_or(after.len());
+    let tick = &after[..tick_end];
+
+    let anchor = ["let action", ": Option<NoticeAction> = {"].concat();
+    let astart = tick.find(&anchor).expect("tick core-lock block present");
+    let open = astart + tick[astart..].find('{').expect("block opens");
+    let mut depth = 0usize;
+    let mut close = open;
+    for (i, c) in tick[open..].char_indices() {
+        match c {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    close = open + i;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    assert!(close > open, "core-lock block must close");
+    let in_block = &tick[open..=close];
+    let after_block = &tick[close..];
+
+    let emitter = ["log_state_transition", "_at("].concat();
+    assert!(
+        !in_block.contains(&emitter),
+        "#3671-C: `{emitter}` takes a blocking companion flock plus retention \
+         filesystem IO and must NOT run inside the core-lock block \
+         (collect→drop→emit; CR-2026-06-14 blocking-IO class)"
+    );
+    assert!(
+        after_block.contains(&emitter),
+        "#3671-C: `{emitter}` must run AFTER the core lock drops"
+    );
+}
+
 // ── #1523: AuthError content-FP stability gate ──────────────────────
 
 /// The stability window must exceed the observed self-heal time (~31s) by a
@@ -4107,22 +4163,19 @@ fn supervisor_tick_loop_has_catch_unwind() {
 
 /// #986 source-pin (INVERTED from #1002 Phase 2): the supervisor's per-tick
 /// loop must NOT scan pr_state. The `PrStateScanHandler` per-tick handler is the
-/// SINGLE scanner+worker in EVERY mode — it runs in `run_core`'s handler vec
-/// (daemon) AND in `app::app_tick_handlers` (app standalone, attached AND owned,
-/// since `pr_state_scan` is not in `APP_TICK_ALLOWLIST`). The #1002-era direct
-/// supervisor scan was a vestigial belt from when the handler was run_core-only;
-/// with the handler now live in every mode it was a redundant second scanner +
-/// (post-#986) a second gh-poll worker. This pin guards against re-adding it.
+/// SINGLE scanner+worker in the daemon — it runs in `run_core`'s canonical
+/// handler pipeline. The #1002-era direct supervisor scan was a redundant second
+/// scanner + (post-#986) a second gh-poll worker. This pin guards against
+/// re-adding it.
 #[test]
 fn pr_state_scan_wired_into_supervisor_loop() {
     let source = std::fs::read_to_string("src/daemon/supervisor.rs")
         .or_else(|_| std::fs::read_to_string("agend-terminal/src/daemon/supervisor.rs"))
         .expect("source file must be readable from test cwd");
     // #986: the supervisor loop must NOT scan pr_state. `PrStateScanHandler`
-    // is the SINGLE scanner+worker in ALL modes (run_core handler vec + app
-    // `app_tick_handlers`, both attached and owned). A supervisor scan would be
-    // a redundant SECOND scanner + a SECOND gh-poll worker. Guard against
-    // re-adding it. The needle is assembled from fragments so this assertion's
+    // is the SINGLE scanner+worker in the run_core handler pipeline. A supervisor
+    // scan would be a redundant SECOND scanner + a SECOND gh-poll worker. Guard
+    // against re-adding it. The needle is assembled from fragments so this assertion's
     // own source does not match (the file never contains the verbatim call).
     let needle = format!("{}{}", "scan_and", "_emit");
     assert!(
@@ -4570,4 +4623,343 @@ fn intra_tick_prompt_release_raises_no_member_reaction_3294() {
         }],
         "#3294 r3: a prompt still latched at the tick must raise exactly one normal reaction"
     );
+}
+
+// ───────────── #78207-1: stale Stall notice after a normal full_delete ─────────────
+
+use crate::channel::{
+    BindingOpts, BindingRef, Channel, ChannelCapabilities, ChannelError, ChannelEvent, MsgRef,
+    OutMsg,
+};
+
+/// Records notices and, on the FIRST authorized notify, synchronously flips the
+/// co-tenant's captured `deleted` flag — the delete lands mid-tick, after the
+/// snapshot and before the other agent's emit, with no thread, sleep or spin.
+/// Whichever agent the registry happens to yield first is the live control, so
+/// the test is order-independent.
+///
+/// Twelve of the fourteen methods below are required by the trait and carry no
+/// meaning. `outbound_authorized` does: it defaults to `false`, which drops the
+/// notice inside `gated_notify` and would make the control vacuously quiet.
+struct StallRecorder {
+    caps: ChannelCapabilities,
+    seen: parking_lot::Mutex<Vec<String>>,
+    peers: parking_lot::Mutex<HashMap<String, Arc<std::sync::atomic::AtomicBool>>>,
+    /// Only these instances are recorded. The active channel is process-GLOBAL
+    /// and `#[serial]` only orders this test against other `#[serial]` ones, so
+    /// a parallel sibling test emits into whichever recorder is registered right
+    /// now. Such a foreign notice would both inflate the count AND — by landing
+    /// first, making `seen` non-empty — suppress the co-tenant flip that the
+    /// whole harness depends on. Scoping to this test's own agents is what makes
+    /// the counts deterministic.
+    watched: parking_lot::Mutex<Vec<String>>,
+}
+
+impl StallRecorder {
+    fn arc() -> Arc<Self> {
+        Arc::new(Self {
+            caps: ChannelCapabilities::default(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+            peers: parking_lot::Mutex::new(HashMap::new()),
+            watched: parking_lot::Mutex::new(Vec::new()),
+        })
+    }
+    /// Notifying `agent` deletes `peer`.
+    fn pair(&self, agent: &str, peer: Arc<std::sync::atomic::AtomicBool>) {
+        self.peers.lock().insert(agent.to_string(), peer);
+    }
+    /// Restrict recording to this harness's own agents (see `watched`).
+    fn watch(&self, agents: &[&str]) {
+        let mut w = self.watched.lock();
+        w.extend(agents.iter().map(|a| a.to_string()));
+    }
+    fn seen(&self) -> Vec<String> {
+        self.seen.lock().clone()
+    }
+}
+
+impl Channel for StallRecorder {
+    fn notify(
+        &self,
+        instance: &str,
+        _: NotifySeverity,
+        _: &str,
+        _: bool,
+    ) -> Result<(), ChannelError> {
+        // Ignore anything that is not one of this harness's agents.
+        if !self.watched.lock().iter().any(|w| w == instance) {
+            return Ok(());
+        }
+        let mut seen = self.seen.lock();
+        if seen.is_empty() {
+            if let Some(peer) = self.peers.lock().get(instance) {
+                peer.store(true, std::sync::atomic::Ordering::Release);
+            }
+        }
+        seen.push(instance.to_string());
+        Ok(())
+    }
+    fn outbound_authorized(&self) -> bool {
+        true
+    }
+    fn kind(&self) -> &'static str {
+        "telegram"
+    }
+    fn caps(&self) -> &ChannelCapabilities {
+        &self.caps
+    }
+    fn poll_event(&self) -> Option<ChannelEvent> {
+        None
+    }
+    fn send(&self, _: &BindingRef, _: OutMsg) -> anyhow::Result<MsgRef> {
+        anyhow::bail!("unused")
+    }
+    fn edit(&self, _: &MsgRef, _: OutMsg) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn delete(&self, _: &MsgRef) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn create_binding(&self, _: &str, _: BindingOpts) -> anyhow::Result<BindingRef> {
+        anyhow::bail!("unused")
+    }
+    fn remove_binding(&self, _: &BindingRef) -> anyhow::Result<()> {
+        Ok(())
+    }
+    fn has_binding(&self, _: &str) -> bool {
+        false
+    }
+    fn record_binding(&self, _: &str, _: BindingRef, _: String) {}
+    fn take_binding(&self, _: &str) -> Option<BindingRef> {
+        None
+    }
+    fn attach_registry(&self, _: crate::agent::AgentRegistry) {}
+}
+
+/// A `Starting` agent silent past `AWAITING_OP_SILENCE` (30s), default
+/// `IdleExpectation::Active`, no productive output — the sleep-free route to a
+/// `NoticeAction::Stall`. Back-dating the `Instant` is the technique
+/// `state/tests.rs` already uses.
+fn armed_stall_agent(name: &str) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
+    let (handle, reader) = mock_agent_handle(name, crate::state::AgentState::Starting);
+    handle.core.lock().state.last_output = Instant::now() - Duration::from_secs(45);
+    (handle, reader)
+}
+
+/// An `Idle` agent with fresh output — `check_awaiting_operator` needs BOTH
+/// `silent > 30s` and a prompt state, so this trips neither Stall branch and
+/// falls through to `take_recovery_notice`. The episode is armed via the
+/// state-local seam because `blocked_since` is private and the actionable gate
+/// wants a 30s block, which is otherwise only reachable by waiting.
+fn armed_recovered_agent(name: &str) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>) {
+    let (handle, reader) = mock_agent_handle(name, crate::state::AgentState::Idle);
+    handle
+        .core
+        .lock()
+        .state
+        .arm_recovery_notice_for_test(crate::state::RecoveryEpisode {
+            block_duration: RECOVERY_NOTICE_MIN_BLOCK,
+            notice_sent: true,
+        });
+    (handle, reader)
+}
+
+/// Two armed agents in one tick, each paired to delete the other. The first
+/// authorized notice flips its co-tenant's captured flag synchronously, so the
+/// delete always lands after the snapshot and before the second emit —
+/// whichever order the registry yields.
+///
+/// The no-flip control is what makes the fenced count meaningful: it proves
+/// BOTH agents were armed and the channel was authorized, so `1` is suppression
+/// rather than a setup that only ever produced one notice.
+///
+/// `arm` selects which notice the pair is armed for, so the identical
+/// synchronous harness covers both `NoticeAction` variants.
+fn two_armed_agents_tick_with(
+    tag: &str,
+    ch: &Arc<StallRecorder>,
+    delete_co_tenant: bool,
+    arm: fn(&str) -> (crate::agent::AgentHandle, Box<dyn std::io::Read + Send>),
+) -> Vec<String> {
+    let home = tmp_home(tag);
+    let registry: AgentRegistry = Arc::new(parking_lot::Mutex::new(HashMap::new()));
+    let (a, _a_reader) = arm("agent-a");
+    let (b, _b_reader) = arm("agent-b");
+    ch.watch(&["agent-a", "agent-b"]);
+    if delete_co_tenant {
+        ch.pair("agent-a", Arc::clone(&b.deleted));
+        ch.pair("agent-b", Arc::clone(&a.deleted));
+    }
+    registry.lock().insert(a.id, a);
+    registry.lock().insert(b.id, b);
+    super::tick(
+        &home,
+        &registry,
+        &mut Default::default(),
+        &mut Default::default(),
+        &mut Default::default(),
+        past_boot_grace(),
+        &HashMap::new(),
+    );
+    let seen = ch.seen();
+    std::fs::remove_dir_all(&home).ok();
+    seen
+}
+
+/// The `Stall` arming, which is what the original #78207-1 regression covers.
+fn two_armed_agents_tick(
+    tag: &str,
+    ch: &Arc<StallRecorder>,
+    delete_co_tenant: bool,
+) -> Vec<String> {
+    two_armed_agents_tick_with(tag, ch, delete_co_tenant, armed_stall_agent)
+}
+
+/// The supervisor snapshots live handles under the registry lock and emits the
+/// stall notice later, after dropping the per-agent core lock. A normal
+/// `full_delete` sets the handle's flag in Step 1 and removes it in Step 4, so
+/// the flag can flip INSIDE that window — and the operator gets a stall notice
+/// for an instance that no longer exists (observed 2026-08-20: 3.4s after the
+/// delete finished).
+///
+/// Serialised against every other global-active-channel test (including the
+/// `Recovered` sibling below) — a function-local lock would not have covered
+/// the two of them against each other.
+#[test]
+#[serial_test::serial]
+fn stall_notice_is_fenced_when_the_handle_is_deleted_after_the_snapshot_78207_1() {
+    // Control: nothing is deleted, so both armed agents must be notified.
+    crate::channel::reset_active_channel_for_test();
+    let control = StallRecorder::arc();
+    crate::channel::register_active_channel(control.clone());
+    let control_seen = two_armed_agents_tick("stall-control", &control, false);
+    assert_eq!(
+        control_seen.len(),
+        2,
+        "control: both agents must be armed and the channel authorized — got {control_seen:?}"
+    );
+
+    // Fenced: the first notice deletes its co-tenant mid-tick.
+    crate::channel::reset_active_channel_for_test();
+    let fenced = StallRecorder::arc();
+    crate::channel::register_active_channel(fenced.clone());
+    let fenced_seen = two_armed_agents_tick("stall-fenced", &fenced, true);
+    assert_eq!(
+        fenced_seen.len(),
+        1,
+        "a handle deleted after the snapshot must not produce an operator stall \
+         notice — got {fenced_seen:?}"
+    );
+
+    crate::channel::reset_active_channel_for_test();
+}
+
+/// `Recovered` rides the SAME snapshot and the same post-lock emit as `Stall`,
+/// so it had the same post-delete window: the guard lived inside the `Stall`
+/// arm while this arm never re-read the flag. Emitting here is worse than a
+/// stale stall — "✅ 已就緒，可以繼續對話" tells the operator to keep talking to
+/// an instance that is being torn down. Hoisting the one guard above `match
+/// action` covers both arms with the same handle-scoped `Arc`.
+#[test]
+#[serial_test::serial]
+fn recovery_notice_is_fenced_when_the_handle_is_deleted_after_the_snapshot_78207_1() {
+    // Control: nothing is deleted, so both armed agents must be notified.
+    crate::channel::reset_active_channel_for_test();
+    let control = StallRecorder::arc();
+    crate::channel::register_active_channel(control.clone());
+    let control_seen =
+        two_armed_agents_tick_with("recovery-control", &control, false, armed_recovered_agent);
+    assert_eq!(
+        control_seen.len(),
+        2,
+        "control: both agents must be armed and the channel authorized — got {control_seen:?}"
+    );
+
+    // Fenced: the first notice deletes its co-tenant mid-tick.
+    crate::channel::reset_active_channel_for_test();
+    let fenced = StallRecorder::arc();
+    crate::channel::register_active_channel(fenced.clone());
+    let fenced_seen =
+        two_armed_agents_tick_with("recovery-fenced", &fenced, true, armed_recovered_agent);
+    assert_eq!(
+        fenced_seen.len(),
+        1,
+        "a handle deleted after the snapshot must not produce an operator recovery \
+         notice — got {fenced_seen:?}"
+    );
+
+    crate::channel::reset_active_channel_for_test();
+}
+
+/// #3547 P0-near Task3 RED: stalled 升級時必須把當時畫面存一份快照
+/// （best-effort：成功回 Some(path)，失敗回 None 且不拋）。
+#[test]
+fn stalled_snapshot_saves_tail_and_fails_soft_3547() {
+    let dir = std::env::temp_dir().join(format!(
+        "agend-stalled-snap-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let path = super::save_stalled_snapshot(&dir, "snap-agent", "frozen pane tail")
+        .expect("snapshot save must succeed on a writable home");
+    let body = std::fs::read_to_string(&path).expect("snapshot file must be readable");
+    assert!(
+        body.contains("frozen pane tail"),
+        "snapshot must carry the stalled tail, got: {body:?}"
+    );
+    assert!(
+        path.to_string_lossy().contains("snap-agent"),
+        "snapshot path must name the instance, got: {path:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// #3547 RED-3: the stalled capture must carry the gate's OWN account of what it
+/// did, not just the pane tail. Without it a dismiss-miss capture shows a frozen
+/// modal and nothing about why it was never answered — and #3548's first-Refuse
+/// log cannot fill the gap, because the first reads of every healthy generation
+/// precede the modal being painted, so `NoCompleteModal` is the first refuse on
+/// successful dismisses too.
+#[test]
+fn stalled_snapshot_carries_the_dev_modal_refuse_tally_3547() {
+    use crate::agent::dev_modal::{DevModalGate, LogicalMs};
+    let name = "snap-tally-agent";
+    let dir = std::env::temp_dir().join(format!(
+        "agend-stalled-tally-{}-{}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    ));
+    let tally = crate::agent::dev_modal::publish_tally(name, true);
+    let mut gate = DevModalGate::with_epoch(
+        true,
+        std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+        std::sync::Arc::clone(&tally),
+    );
+    gate.observe("a frame with no modal in it", LogicalMs(0));
+    gate.observe("still no modal", LogicalMs(1));
+
+    let path = super::save_stalled_snapshot(&dir, name, "frozen pane tail")
+        .expect("snapshot save must succeed on a writable home");
+    let body = std::fs::read_to_string(&path).expect("snapshot file must be readable");
+    assert!(
+        body.contains("last_refuse=NoCompleteModal"),
+        "capture must name the LAST refuse reason, got: {body:?}"
+    );
+    assert!(
+        body.contains("NoCompleteModal:2"),
+        "capture must carry the refuse distribution, got: {body:?}"
+    );
+    assert!(
+        body.contains("armed=true"),
+        "capture must state whether the generation was armed at all, got: {body:?}"
+    );
+    std::fs::remove_dir_all(&dir).ok();
 }

@@ -14,10 +14,13 @@ mod registry;
 
 pub(crate) use envelope::{DeliveryEnvelope, DeliveryKind, SessionLocator};
 pub(crate) use receipt::{
-    delivery_path_for_instance, safe_component, DeliveryReceipt, DeliveryState, ReceiptStore,
+    delivery_path_for_instance, safe_component, DeliveryReceipt, DeliveryState, DroppedNoticeDebt,
+    PendingNotice, ReceiptStore,
 };
 #[cfg(test)]
 pub(crate) use registry::mode_for_backend;
+#[cfg(test)]
+pub(crate) use registry::save_session_locator;
 #[cfg(test)]
 pub(crate) use registry::test_support;
 
@@ -27,15 +30,35 @@ pub(crate) use registry::{
 };
 
 pub(crate) use registry::{
-    codex_attach_args, codex_attach_locator, codex_thread_for_spawn, opencode_attach_args,
-    opencode_attach_locator, parse_opencode_model_args, prepare_codex_tui_session,
-    prepare_opencode_tui_session,
+    codex_attach_args, codex_attach_locator, codex_resume_available, codex_thread_for_spawn,
+    opencode_attach_args, opencode_attach_locator, parse_opencode_model_args,
+    prepare_codex_tui_session, prepare_opencode_tui_session,
 };
 
+pub(crate) use codex_app_server::{checkpoint_codex_session, checkpoint_codex_sessions_strict};
+
+/// #3515 follow-up: ask an instance's resident transport workers to stop, without
+/// waiting for any of them. Pairs with [`remove_instance_delivery_state`], which
+/// still does the removal and the waiting per instance — calling this for the
+/// WHOLE set first is what lets those waits overlap instead of accumulating
+/// (a worker can take until its read timeout to notice, and paying that once per
+/// instance made shutdown grow with fleet size).
+pub(crate) fn signal_instance_transport_stop(home: &std::path::Path, instance: &str) {
+    claude_channel::signal_instance_stop(home, instance);
+    // Same shape, smaller window: the OpenCode resident loop re-checks its flag
+    // between reads that can block for `IO_TIMEOUT`. Both transports that keep a
+    // resident worker are pre-signalled, so the linearity is gone for a mixed
+    // fleet too, not just an all-Claude one.
+    opencode_server::signal_instance_stop(home, instance);
+}
+
+/// See [`receipt::remove_instance_delivery_state`] for the policy: this is the
+/// one receipt-store writer allowed to discard unfinished notice debt, and the
+/// returned rows are the audit evidence that it never does so silently.
 pub(crate) fn remove_instance_delivery_state(
     home: &std::path::Path,
     instance: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<DroppedNoticeDebt>> {
     codex_app_server::stop_instance_server(home, instance)?;
     opencode_server::stop_instance_server(home, instance);
     opencode_server::remove_instance_rollover_state(home, instance)?;

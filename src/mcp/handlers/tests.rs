@@ -563,6 +563,75 @@ fn answer_decision_records_and_notifies_author_2305() {
 }
 
 #[test]
+fn update_decision_can_record_retroactive_supersession_3507() {
+    let _g = fleet_test_guard();
+    let (_rec, home) = setup_recorder("decision_retroactive_supersedes_3507");
+    std::env::remove_var("AGEND_INSTANCE_NAME");
+
+    let predecessor = handle_tool(
+        "decision",
+        &json!({
+            "action": "post",
+            "title": "old policy",
+            "content": "the earlier policy",
+        }),
+        "author",
+    );
+    let predecessor_id = predecessor["id"].as_str().expect("predecessor id");
+    let successor = handle_tool(
+        "decision",
+        &json!({
+            "action": "post",
+            "title": "replacement policy",
+            "content": "the later policy",
+        }),
+        "author",
+    );
+    let successor_id = successor["id"].as_str().expect("successor id");
+
+    // Drive the real MCP decision/update dispatch path. The relationship is
+    // discovered after both decisions were posted, which is the repair case
+    // that #3507 adds without permitting arbitrary rewrites.
+    let updated = handle_tool(
+        "decision",
+        &json!({
+            "action": "update",
+            "id": successor_id,
+            "supersedes": predecessor_id,
+        }),
+        "author",
+    );
+    assert_eq!(updated["status"], "updated", "update result: {updated}");
+
+    let predecessor_after = handle_tool(
+        "decision",
+        &json!({"action": "get", "id": predecessor_id}),
+        "author",
+    );
+    assert_eq!(
+        predecessor_after["decision"]["archived"], true,
+        "retroactive supersession must archive predecessor: {predecessor_after}"
+    );
+    assert_eq!(
+        predecessor_after["decision"]["superseded_by"], successor_id,
+        "predecessor must point at successor: {predecessor_after}"
+    );
+
+    let successor_after = handle_tool(
+        "decision",
+        &json!({"action": "get", "id": successor_id}),
+        "author",
+    );
+    assert_eq!(
+        successor_after["decision"]["supersedes"], predecessor_id,
+        "successor must point at predecessor: {successor_after}"
+    );
+
+    std::env::remove_var("AGEND_HOME");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
 fn broadcast_emits_with_resolved_recipients() {
     let _g = fleet_test_guard();
     let (rec, home) = setup_recorder("fleet_broadcast");
@@ -1054,6 +1123,7 @@ fn agent_picked_up_emitted_on_inbox_drain() {
             ci_handoff_episode: None,
             ci_handoff_class: None,
             ci_handoff_settlement: None,
+            idempotency_key: None,
             delivery_nonce: None,
             review_assignment: None,
         },
@@ -1135,6 +1205,7 @@ fn agent_picked_up_fires_for_all_pending_messages() {
             ci_handoff_episode: None,
             ci_handoff_class: None,
             ci_handoff_settlement: None,
+            idempotency_key: None,
             delivery_nonce: None,
             review_assignment: None,
         },
@@ -1301,6 +1372,7 @@ fn test_describe_message_shows_delivery_mode() {
         ci_handoff_episode: None,
         ci_handoff_class: None,
         ci_handoff_settlement: None,
+        idempotency_key: None,
         delivery_nonce: None,
         review_assignment: None,
     };
@@ -1625,7 +1697,7 @@ fn test_dispatch_dedup_rejects_same_branch() {
     crate::tasks::handle(
         &home,
         "sender",
-        &json!({"action": "create", "title": "first task", "assignee": "target", "branch": "feat/x"}),
+        &json!({"action": "create", "title": "first task", "assignee": "target", "branch": "feat/x", "review_class": "single"}),
     );
     let tasks = crate::tasks::handle(&home, "target", &json!({"action": "list"}));
     let tid = tasks["tasks"][0]["id"].as_str().unwrap();
@@ -1664,7 +1736,7 @@ fn test_dispatch_dedup_force_bypasses_branch_gate() {
     crate::tasks::handle(
         &home,
         "sender",
-        &json!({"action": "create", "title": "first task", "assignee": "target", "branch": "feat/x"}),
+        &json!({"action": "create", "title": "first task", "assignee": "target", "branch": "feat/x", "review_class": "single"}),
     );
     let tasks = crate::tasks::handle(&home, "target", &json!({"action": "list"}));
     let tid = tasks["tasks"][0]["id"].as_str().unwrap();
@@ -1676,9 +1748,11 @@ fn test_dispatch_dedup_force_bypasses_branch_gate() {
             "instance": "target",
             "message": "force override",
             "request_kind": "task",
-            "task_id": "t-test-force",
+            "task_id": tid,
             "branch": "feat/x",
             "bind": false,
+            "repository": "owner/repo",
+            "review_class": "single",
             "force": true,
             "force_reason": "re-dispatch after fix"
         }),
@@ -1719,7 +1793,9 @@ fn test_dispatch_dedup_different_branch_passes() {
             "message": "different branch work",
             "request_kind": "task",
             "task_id": "t-test-diff",
-            "branch": "feat/y"
+            "branch": "feat/y",
+            "repository": "owner/repo",
+            "review_class": "single"
         }),
         "sender",
     );
@@ -2303,9 +2379,14 @@ fn create_instance_relative_path_rejection() {
 fn create_instance_explicit_working_directory_used() {
     let _g = fleet_test_guard();
     let (_rec, _home) = setup_recorder("explicit-wd");
+    let working_directory = if cfg!(windows) {
+        r"C:\tmp\my-workspace"
+    } else {
+        "/tmp/my-workspace"
+    };
     let r = super::handle_tool(
         "create_instance",
-        &json!({"name": "test-explicit", "backend": "claude", "working_directory": "/tmp/my-workspace"}),
+        &json!({"name": "test-explicit", "backend": "claude", "working_directory": working_directory}),
         "operator",
     );
     // Explicit valid path must pass validation (.. and absolute checks)
@@ -3779,6 +3860,8 @@ teams:
                 "request_kind": "task",
                 "branch": branch,
                 "bind": false,
+                "repository": "owner/repo",
+                "review_class": "single",
             }),
             "sender",
         )
@@ -3861,6 +3944,8 @@ teams:
             "request_kind": "task",
             "branch": "fix/3141-a",
             "bind": false,
+            "repository": "owner/repo",
+            "review_class": "single",
             "force": true,
             "force_reason": "operator-approved retry",
         }),
@@ -3882,6 +3967,8 @@ teams:
             "task_id": first_task_id,
             "branch": "fix/3141-a",
             "bind": false,
+            "repository": "owner/repo",
+            "review_class": "single",
         }),
         "sender",
     );
@@ -4640,7 +4727,10 @@ templates:
     );
     assert_eq!(projected_args, vec!["--fixture", "value"]);
     assert_eq!(projected_model.as_deref(), Some("sonnet"));
-    assert_eq!(projected_marker.as_deref(), Some("present"));
+    assert_eq!(
+        projected_marker,
+        Some(crate::fleet::FleetEnvValue::Literal("present".to_string()))
+    );
     assert_eq!(projected_topic_binding.as_deref(), Some("skip"));
     assert_eq!(
         teardown["status"].as_str(),
@@ -4725,11 +4815,27 @@ fn deployment_runtime_some_teardown_reaches_typed_delete_owner_slice14() {
     std::env::set_var("AGEND_HOME", &home);
     let working_directory = home.join("workspace").join("slice14-lead");
     std::fs::create_dir_all(&working_directory).unwrap();
+    let generation_id = "slice14-generation";
+    let canonical_working_directory =
+        crate::paths::canonical_workspace_path(&working_directory).unwrap();
+    std::fs::write(
+        working_directory.join(".agend-deployment-owner"),
+        serde_json::json!({
+            "schema_version": 2,
+            "deployment": "slice14",
+            "instance": "slice14-lead",
+            "directory": canonical_working_directory,
+            "generation_id": generation_id
+        })
+        .to_string(),
+    )
+    .unwrap();
     std::fs::write(
         crate::fleet::fleet_yaml_path(&home),
         format!(
-            "instances:\n  slice14-lead:\n    backend: shell\n    working_directory: {}\nteams:\n  slice14:\n    members: [slice14-lead]\n    created_at: now\n",
-            working_directory.display()
+            "instances:\n  slice14-lead:\n    backend: shell\n    working_directory: {}\n    deployment_generation: {}\nteams:\n  slice14:\n    members: [slice14-lead]\n    created_at: now\n",
+            working_directory.display(),
+            generation_id
         ),
     )
     .unwrap();
@@ -4741,6 +4847,7 @@ fn deployment_runtime_some_teardown_reaches_typed_delete_owner_slice14() {
                 "name": "slice14",
                 "template": "slice14",
                 "instances": ["slice14-lead"],
+                "generation_id": generation_id,
                 "team": "slice14",
                 "directory": home.join("workspace").display().to_string(),
                 "created_at": "now"
@@ -4794,7 +4901,7 @@ fn deployment_runtime_some_teardown_reaches_typed_delete_owner_slice14() {
     assert!(
         events.iter().any(|event| matches!(
             event,
-            crate::api::ApiEvent::InstanceDeleted { name } if name == "slice14-lead"
+            crate::api::ApiEvent::InstanceDeleted { name, .. } if name == "slice14-lead"
         )),
         "runtime-present teardown must invoke typed DELETE and emit InstanceDeleted: {events:?}"
     );
@@ -4862,7 +4969,7 @@ fn runtime_present_mcp_no_listener_matrix_2454() {
     assert!(
         recorder.events.lock().iter().any(|event| matches!(
             event,
-            crate::api::ApiEvent::InstanceDeleted { name } if name == "matrix-agent"
+            crate::api::ApiEvent::InstanceDeleted { name, .. } if name == "matrix-agent"
         )),
         "RuntimeContext=Some team delete must cascade through the typed DELETE owner: {result}"
     );
@@ -5395,6 +5502,8 @@ fn mcp_terminal_report_settlement_refusal_is_disclosed_3295() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             crate::task_events::TaskEvent::Claimed {
                 task_id: tid.clone(),

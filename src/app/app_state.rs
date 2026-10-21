@@ -5,6 +5,196 @@
 
 #[allow(clippy::wildcard_imports)]
 use super::*;
+use crate::team_view::TeamView;
+use crate::types::InstanceRef;
+#[path = "app_state_remote.rs"]
+mod app_state_remote;
+
+#[derive(Debug, Default, PartialEq, Eq)]
+struct RemoteRosterNames {
+    to_add: std::collections::HashSet<String>,
+    gone: std::collections::HashSet<String>,
+}
+
+fn reconcile_remote_roster_names(
+    current: &std::collections::HashSet<String>,
+    known: &std::collections::HashSet<String>,
+    mode: crate::runtime::AgentListMode,
+) -> RemoteRosterNames {
+    if !matches!(mode, crate::runtime::AgentListMode::Live) {
+        return RemoteRosterNames::default();
+    }
+    RemoteRosterNames {
+        to_add: current.difference(known).cloned().collect(),
+        gone: known.difference(current).cloned().collect(),
+    }
+}
+
+fn remote_attach_candidates(
+    current: &std::collections::HashSet<String>,
+    known: &std::collections::HashSet<String>,
+    is_disconnected: impl Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut candidates: Vec<String> = current
+        .iter()
+        .filter(|name| !known.contains(*name) || is_disconnected(name))
+        .cloned()
+        .collect();
+    candidates.sort();
+    candidates
+}
+
+fn reconcile_remote_roster_candidates(
+    current: &std::collections::HashSet<String>,
+    known: &std::collections::HashSet<String>,
+    mode: crate::runtime::AgentListMode,
+    is_disconnected: impl Fn(&str) -> bool,
+) -> RemoteRosterNames {
+    let mut names = reconcile_remote_roster_names(current, known, mode);
+    if matches!(mode, crate::runtime::AgentListMode::Live) {
+        names.to_add = remote_attach_candidates(current, known, is_disconnected)
+            .into_iter()
+            .collect();
+    }
+    names
+}
+
+/// #3505 P0(b): bounded attach retry. Consecutive failures for the same
+/// agent defer the next attempt instead of retrying at full 2s cadence
+/// forever — a Live-but-unreachable entry (stale registry/empty port
+/// shell) would otherwise spam `attach failed` warns once per sync.
+///
+/// Pure rule so unit tests pin it without sockets: attempts 1–2 retry
+/// immediately, attempt 3+ is deferred on a FIXED skip cycle (no
+/// exponential delay exists — each deferred pass simply skips one 2s
+/// sync). A deferred pass RE-AGES the counter (r1 F1: a frozen counter
+/// would cap at 3 and strand the pane); at `STALE_HINT_AFTER` the caller
+/// emits the stale hint (periodically — once per hint cycle, not once
+/// ever), past it the counter resets into the retry window so attempts
+/// resume — defer + eventual hint + recovery, never abandon. A success
+/// (or gone) resets the count to zero. Counters are retained against the
+/// CURRENT roster (a re-appeared name keeps its history; gone clears it).
+pub(super) const ATTACH_FAIL_FAST_RETRIES: u32 = 2;
+pub(super) const STALE_HINT_AFTER: u32 = 5;
+
+/// Returns true when an attach for a name with `consecutive_failures`
+/// prior failures should be attempted on this sync pass.
+fn attach_retry_due(consecutive_failures: u32) -> bool {
+    consecutive_failures <= ATTACH_FAIL_FAST_RETRIES
+}
+
+/// #3505 r2 B2: the deferred-pass transition, shared by the
+/// `reconcile_remote_roster` skip branch and its tests. Takes the stored
+/// failure count, returns `(next_counter, emit_hint)`. Re-ages the counter
+/// so the stale hint stays reachable; at `STALE_HINT_AFTER` the caller
+/// emits the hint once; past it the counter resets into the retry window
+/// so attempts resume — never abandon.
+fn advance_deferred(fails: u32) -> (u32, bool) {
+    let aged = fails + 1;
+    if aged == STALE_HINT_AFTER {
+        (aged, true)
+    } else if aged > STALE_HINT_AFTER {
+        (ATTACH_FAIL_FAST_RETRIES, false)
+    } else {
+        (aged, false)
+    }
+}
+
+#[cfg(test)]
+fn attach_retry_due_for_test(consecutive_failures: u32) -> bool {
+    attach_retry_due(consecutive_failures)
+}
+
+#[cfg(test)]
+fn advance_deferred_for_test(fails: u32) -> (u32, bool) {
+    advance_deferred(fails)
+}
+
+/// #3627: how many consecutive Live snapshots at the SAME daemon generation
+/// must agree that an exact instance ref is absent before the poll fallback
+/// removes its panes. Two snapshots keep a single racing poll from destroying
+/// a just-deleted-then-recreated instance; a generation change resets the
+/// count so a daemon restart can never accumulate confirmations across boots.
+pub(super) const CONFIRMED_RETIREMENT_SNAPSHOTS: u8 = 2;
+
+/// #3627: poll-fallback retirement candidate for one exact instance ref.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct RetirementCandidate {
+    /// Daemon generation token (`.daemon` identity) the count belongs to.
+    generation: String,
+    /// Consecutive Live snapshots at `generation` that saw the ref absent.
+    confirmations: u8,
+}
+
+/// #3627 pure policy. Advance the confirmed-retirement tracker for one Live
+/// snapshot and return the exact refs whose retirement is now CONFIRMED.
+///
+/// Callers MUST only reach this with definitive reads: the daemon reported
+/// `Live`, and the fleet + registry snapshot reads succeeded. Under those
+/// preconditions a ref is removed only when:
+/// - it is currently rendered on a pane, yet absent from the exact live
+///   roster, AND
+/// - [`CONFIRMED_RETIREMENT_SNAPSHOTS`] consecutive snapshots at the SAME
+///   daemon `generation` agree, AND
+/// - no restart/reconnect is in flight for it.
+///
+/// A ref that reappears, moves generation, or has an in-flight restart is
+/// dropped from the tracker (its pane is retained). Candidates for refs no
+/// longer rendered are purged, so the operation stays idempotent.
+fn confirmed_retirements(
+    candidates: &mut HashMap<InstanceRef, RetirementCandidate>,
+    rendered: &[InstanceRef],
+    live_refs: &std::collections::HashSet<InstanceRef>,
+    generation: &str,
+    restart_in_flight: &std::collections::HashSet<InstanceRef>,
+) -> Vec<InstanceRef> {
+    let rendered_set: std::collections::HashSet<InstanceRef> = rendered.iter().copied().collect();
+    candidates.retain(|reference, _| rendered_set.contains(reference));
+    let mut confirmed = Vec::new();
+    let mut counted: std::collections::HashSet<InstanceRef> = std::collections::HashSet::new();
+    for reference in rendered.iter().copied() {
+        // A ref rendered on more than one pane is still ONE ref: it must not
+        // accumulate multiple confirmations in a single snapshot.
+        if !counted.insert(reference) {
+            continue;
+        }
+        if live_refs.contains(&reference) || restart_in_flight.contains(&reference) {
+            candidates.remove(&reference);
+            continue;
+        }
+        let entry = candidates
+            .entry(reference)
+            .or_insert_with(|| RetirementCandidate {
+                generation: generation.to_string(),
+                confirmations: 0,
+            });
+        if entry.generation != generation {
+            entry.generation = generation.to_string();
+            entry.confirmations = 0;
+        }
+        entry.confirmations = entry.confirmations.saturating_add(1);
+        if entry.confirmations >= CONFIRMED_RETIREMENT_SNAPSHOTS {
+            confirmed.push(reference);
+        }
+    }
+    confirmed
+}
+
+/// #3627: a Live snapshot may only prove an exact ref ABSENT when its ref set
+/// is trustworthy. A daemon that stops emitting `instance_ref` fields
+/// (downgrade/regression) still returns names, so an untrusted snapshot would
+/// read as "every ref is gone" and wrongly retire panes after two polls. Fail
+/// toward retention: require at least one parseable ref AND one ref per live
+/// name, so a ref-bearing snapshot with a genuinely absent ref stays provable
+/// while a ref-less one is never definitive.
+fn snapshot_is_ref_authoritative(
+    names: &std::collections::HashSet<String>,
+    refs: &HashMap<String, InstanceRef>,
+) -> bool {
+    !refs.is_empty() && names.len() == refs.len()
+}
+
+use crate::channel::TelegramStatus;
 
 /// #2453 R2: bounded typed owner for the app owner-restart in-flight state.
 /// At most one probe at a time (the gate CAS-serializes at the handler).
@@ -19,6 +209,18 @@ pub(super) struct RestartState {
     pub(super) restart_commit_pending: Option<CommitPending>,
 }
 
+struct RemoteRestartPending {
+    request: commands::RemoteRestartRequest,
+    successor_instance_ref: Option<crate::types::InstanceRef>,
+    conflicted: bool,
+    provisional: bool,
+    created_at: std::time::Instant,
+}
+
+const REMOTE_RESTART_CAPACITY: usize = 16;
+const REMOTE_RESTART_PROVISIONAL_CAPACITY: usize = 4;
+const REMOTE_RESTART_PENDING_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// #2453: root owner of `run_app`'s durable render-loop state. The only
 /// mutable lifecycle locals permitted OUTSIDE this struct are `attach_jobs`
 /// and `attach_workers` (startup/teardown-scoped). Channels, registries, and
@@ -31,6 +233,35 @@ pub(super) struct AppState {
     /// publishes for each live agent; periodic sync diffs this against the
     /// filesystem so hot-reload-added agents auto-materialize as tabs.
     pub(super) known_remote_agents: std::collections::HashSet<String>,
+    /// #3505 P0(b): consecutive attach-failure counts per agent name.
+    /// Bounds the 2s-cadence `attach failed` warn loop: after
+    /// `ATTACH_FAIL_FAST_RETRIES` the sync pass skips the attempt
+    /// (backoff, re-aging the counter); at `STALE_HINT_AFTER` it emits
+    /// one actionable stale hint, past it the counter resets into the
+    /// retry window so attempts resume (never abandon). Cleared on
+    /// successful attach or gone.
+    pub(super) remote_attach_failures: std::collections::HashMap<String, u32>,
+    /// Last daemon-authoritative state snapshot for attached panes. Missing
+    /// entries intentionally remain unknown to render; they must not become
+    /// a locally invented `Idle` state.
+    pub(super) remote_agent_states: rpc::AgentStateSnapshot,
+    /// Successful Live state snapshots waiting for the next pre-select roster
+    /// reconciliation. Non-Live outcomes never populate this queue.
+    pub(super) pending_remote_roster_names: Option<std::collections::HashSet<String>>,
+    pub(super) pending_remote_roster_refs:
+        Option<std::collections::HashMap<String, crate::types::InstanceRef>>,
+    /// Exact identities from the most recent live daemon roster. Remote panes
+    /// stay untrusted when this map has no entry (legacy/fallback roster).
+    pub(super) remote_instance_refs: std::collections::HashMap<String, crate::types::InstanceRef>,
+    /// Source/sequence fence for the daemon lifecycle stream.
+    pub(super) event_source: Option<String>,
+    pub(super) event_sequence: u64,
+    pub(super) event_resync_required: bool,
+    /// Transition gates for the reconnect supervisor and its terminal
+    /// receiver safety fallback. A worker outage is reported once until a
+    /// Connected outcome arrives; a closed receiver is handled once.
+    pub(super) event_stream_disconnected: bool,
+    pub(super) event_stream_receiver_closed: bool,
     /// Placeholder forwarder senders, keyed by pane id, retained until the
     /// matching AttachOutcome is applied (or the pane is closed first).
     pub(super) pending_fwd: HashMap<usize, crossbeam_channel::Sender<Vec<u8>>>,
@@ -42,6 +273,9 @@ pub(super) struct AppState {
     /// that a fleet.yaml reload (daemon tick is 10s) feels timely but long
     /// enough that the readdir cost is trivial.
     pub(super) last_remote_sync: std::time::Instant,
+    /// Throttle for daemon-authoritative pane-state refreshes. Kept separate
+    /// from roster discovery so continuous UI events cannot starve it.
+    pub(super) last_remote_state_sync: std::time::Instant,
     /// #1479: throttled, change-gated session.json persistence. Graceful exit
     /// already saves; this periodically persists the current layout so a
     /// kill -9 / power loss preserves what's on screen.
@@ -66,6 +300,15 @@ pub(super) struct AppState {
     /// alongside `last_decision_sync`; read at render time by both `render()`
     /// call sites (mirrors how `binary_stale` is snapshotted once per draw).
     pub(super) pending_decisions_total: usize,
+    /// Existing runtime discovery mode, surfaced directly in the status bar.
+    pub(super) daemon_list_mode: crate::runtime::AgentListMode,
+    /// Authoritative team metadata + live roster snapshot consumed by render.
+    pub(super) team_view: TeamView,
+    pub(super) team_view_dirty: bool,
+    pub(super) team_view_epoch: u64,
+    pub(super) last_team_view_refresh: std::time::Instant,
+    /// Last daemon-confirmed task list; APP never reconstructs it from JSONL.
+    pub(super) task_snapshot: Vec<crate::tasks::Task>,
     /// #freeze-4 (t-…2324) restart-flood boot phase: until the pre-restart
     /// backlog flood is drained, the loop runs a bounded "loading" phase — a
     /// TIME-capped drain ([`render::drain_all_panes_until`]) that clears the
@@ -81,6 +324,21 @@ pub(super) struct AppState {
     pub(super) attaches_expected: usize,
     /// #2453 R2: app owner-restart in-flight state (bounded typed sub-owner).
     pub(super) restart: RestartState,
+    /// Correlated remote restarts waiting for both the daemon result and the
+    /// roster attach. Bounded to the worker queue capacity; terminal outcomes
+    /// remove entries immediately and delayed outcomes expire during ticks.
+    remote_restarts: HashMap<String, RemoteRestartPending>,
+    /// #3627: poll-fallback confirmed-retirement tracker, keyed by exact
+    /// instance ref. Bounded by the number of distinct rendered refs; purged
+    /// whenever a ref reappears, changes daemon generation, or leaves the
+    /// layout, so it can never retain panes past a definitive retirement nor
+    /// remove one on transient evidence.
+    retirement_candidates: HashMap<InstanceRef, RetirementCandidate>,
+    /// #3627: a retirement session-write failure that arrived while another
+    /// overlay was open. The notice is held here and promoted to the dismissable
+    /// notice overlay as soon as no other overlay is showing, so the operator
+    /// always sees that retirement is pending retry — never a lost log line.
+    pending_retirement_notice: Option<String>,
 }
 
 /// #render-first attach pipeline handles: (keepalive sender, outcome
@@ -115,6 +373,10 @@ pub(super) struct AppDeps<'a> {
     pub attached_run_dir: &'a Option<std::path::PathBuf>,
     pub attached_mode: bool,
     pub size_debug: bool,
+    pub task_rpc_tx: &'a crossbeam_channel::Sender<rpc::TaskRequest>,
+    pub remote_state_rpc_tx: &'a crossbeam_channel::Sender<rpc::AgentStateRequest>,
+    pub remote_restart_request_tx: &'a crossbeam_channel::Sender<commands::RemoteRestartRequest>,
+    pub remote_restart_worker_tx: &'a crossbeam_channel::Sender<commands::RemoteRestartRequest>,
 }
 
 /// #2453 Slice 2: the extracted run_app loop/setup logic, method-by-method.
@@ -136,9 +398,20 @@ impl AppState {
                 mouse_state: mouse::MouseState::default(),
             },
             known_remote_agents: std::collections::HashSet::new(),
+            remote_attach_failures: std::collections::HashMap::new(),
+            remote_agent_states: HashMap::new(),
+            pending_remote_roster_names: None,
+            pending_remote_roster_refs: None,
+            remote_instance_refs: std::collections::HashMap::new(),
+            event_source: None,
+            event_sequence: 0,
+            event_resync_required: false,
+            event_stream_disconnected: false,
+            event_stream_receiver_closed: false,
             pending_fwd: HashMap::new(),
             needs_resize: true,
             last_remote_sync: std::time::Instant::now(),
+            last_remote_state_sync: std::time::Instant::now(),
             last_session_save: std::time::Instant::now(),
             last_session_json: None,
             last_draw: None,
@@ -146,6 +419,12 @@ impl AppState {
             last_notif_sync: None,
             last_decision_sync: None,
             pending_decisions_total: 0,
+            daemon_list_mode: crate::runtime::AgentListMode::Live,
+            team_view: TeamView::empty(),
+            team_view_dirty: true,
+            team_view_epoch: 0,
+            last_team_view_refresh: std::time::Instant::now(),
+            task_snapshot: Vec::new(),
             booting: true,
             boot_start: std::time::Instant::now(),
             attaches_expected: 0,
@@ -154,6 +433,9 @@ impl AppState {
                 restart_probe: None,
                 restart_commit_pending: None,
             },
+            remote_restarts: HashMap::new(),
+            retirement_candidates: HashMap::new(),
+            pending_retirement_notice: None,
         }
     }
 
@@ -339,6 +621,7 @@ impl AppState {
         // its baselines from HERE — without this, the first loop iteration could
         // trigger an immediate remote sync / session save the old code never did.
         self.last_remote_sync = std::time::Instant::now();
+        self.last_remote_state_sync = std::time::Instant::now();
         self.last_session_save = std::time::Instant::now();
         // #freeze-4 boot phase anchors (see `AppState::booting`).
         self.boot_start = std::time::Instant::now();
@@ -425,17 +708,21 @@ impl AppState {
         LoopFlow::Continue
     }
 
-    pub(super) fn close_dead_scratch_shell(&mut self, deps: &AppDeps<'_>) {
-        let AppDeps { home, registry, .. } = *deps;
+    pub(super) fn close_dead_scratch_shell(
+        &mut self,
+        deps: &AppDeps<'_>,
+        reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
+    ) {
+        let AppDeps { registry, .. } = *deps;
         // Auto-close the scratch shell overlay once its backing process
         // exits (user ran `exit`, hit Ctrl+D, or the shell crashed). The
         // 50ms `default` arm of the main `select!` below guarantees this
         // runs at least every 50ms even without new PTY output.
         if let Overlay::ScratchShell { pane } = &self.ui.overlay {
-            if !agent_is_alive(registry, &pane.agent_name) {
-                let name = pane.agent_name.clone();
+            if !agent_is_alive(registry, pane.instance_id) {
+                let instance_id = pane.instance_id;
                 self.ui.overlay = Overlay::None;
-                kill_agent(home, registry, &name);
+                kill_unmanaged_agent(registry, instance_id, reap_workers);
             }
         }
     }
@@ -497,6 +784,57 @@ impl AppState {
                 }
             }
         }
+    }
+
+    fn live_team_roster(
+        &self,
+        deps: &AppDeps<'_>,
+    ) -> Option<std::collections::HashMap<String, crate::types::InstanceRef>> {
+        if deps.attached_run_dir.is_some() {
+            if self.event_resync_required
+                || !matches!(self.daemon_list_mode, crate::runtime::AgentListMode::Live)
+            {
+                return None;
+            }
+            return Some(self.remote_instance_refs.clone());
+        }
+        let registry = crate::agent::lock_registry(deps.registry);
+        Some(
+            registry
+                .values()
+                .map(|handle| {
+                    (
+                        handle.name.to_string(),
+                        crate::types::InstanceRef::new(handle.id, handle.generation.value()),
+                    )
+                })
+                .collect(),
+        )
+    }
+
+    fn invalidate_team_view(&mut self) {
+        self.team_view_epoch = self.team_view_epoch.wrapping_add(1);
+        self.team_view.invalidate();
+        self.team_view_dirty = true;
+        self.dirty = true;
+    }
+
+    fn refresh_team_view(&mut self, deps: &AppDeps<'_>) {
+        const TEAM_VIEW_REFRESH: std::time::Duration = std::time::Duration::from_secs(2);
+        if !self.team_view_dirty && self.last_team_view_refresh.elapsed() < TEAM_VIEW_REFRESH {
+            return;
+        }
+        let previous = self.team_view.clone();
+        let roster = self.live_team_roster(deps);
+        // Event-driven refreshes must not be satisfied by the mtime+size cache:
+        // an external edit can preserve both values. The render closure never
+        // reaches the filesystem; this bounded pre-select path owns the read.
+        crate::fleet::invalidate_cache();
+        self.team_view_epoch = self.team_view_epoch.wrapping_add(1);
+        self.team_view = TeamView::load_path(deps.fleet_path, roster, Some(&previous));
+        self.last_team_view_refresh = std::time::Instant::now();
+        self.team_view_dirty = false;
+        self.dirty = true;
     }
 
     pub(super) fn render_frame(
@@ -593,7 +931,7 @@ impl AppState {
                         "frame.area() in draw"
                     );
                 }
-                render::render(
+                render::render_with_team(
                     frame,
                     &mut self.ui.layout,
                     repeat_mode,
@@ -601,6 +939,9 @@ impl AppState {
                     telegram_status,
                     binary_stale,
                     self.pending_decisions_total,
+                    self.daemon_list_mode,
+                    deps.attached_mode.then_some(&self.remote_agent_states),
+                    Some(&self.team_view),
                 );
                 // &mut because ScratchShell needs to drain output and maybe
                 // resize its pane's VTerm/PTY during render.
@@ -691,6 +1032,7 @@ impl AppState {
         ev: Result<Event, crossbeam_channel::RecvError>,
         terminal: &mut DefaultTerminal,
         deps: &AppDeps<'_>,
+        reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
     ) -> LoopFlow {
         let AppDeps {
             home,
@@ -700,13 +1042,17 @@ impl AppState {
             ..
         } = *deps;
         // #2453: loop-stable shared deps for handle_key_event/handle_mouse_event.
-        let ui_deps = UiDeps {
+        let mut ui_deps = UiDeps {
             registry,
             home,
             fleet_path,
             wakeup_tx,
+            task_rpc_tx: deps.task_rpc_tx,
+            restart_request_tx: Some(deps.remote_restart_request_tx),
+            task_snapshot: &self.task_snapshot,
+            reap_workers,
+            team_view: Some(&self.team_view),
         };
-        let ui_deps = &ui_deps;
         self.dirty = true; // input may change the display → redraw next due frame
         let ev = match ev {
             Ok(e) => e,
@@ -719,7 +1065,7 @@ impl AppState {
             Event::Key(key) if key.kind != KeyEventKind::Press => {}
             Event::Key(key) => {
                 // #2453: former inline overlay/dispatch branch, now behind UiState.
-                let out = self.ui.handle_key_event(key, ui_deps);
+                let out = self.ui.handle_key_event(key, &mut ui_deps);
                 if out.needs_resize {
                     self.needs_resize = true;
                 }
@@ -735,7 +1081,7 @@ impl AppState {
             // panes. The modal-swallow guard + mouse routing now live in
             // UiState::handle_mouse_event (mirrors the Event::Key branch).
             Event::Mouse(mouse_evt) => {
-                if self.ui.handle_mouse_event(mouse_evt, ui_deps) {
+                if self.ui.handle_mouse_event(mouse_evt, &ui_deps) {
                     self.needs_resize = true;
                 }
             }
@@ -784,9 +1130,9 @@ impl AppState {
         &mut self,
         outcome: Result<pane_factory::AttachOutcome, crossbeam_channel::RecvError>,
         deps: &AppDeps<'_>,
+        reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
     ) {
         let AppDeps {
-            home,
             registry,
             wakeup_tx,
             ..
@@ -803,42 +1149,514 @@ impl AppState {
             if let Some(fwd_tx) = self.pending_fwd.remove(&pane_id) {
                 if let Some(pane) = self.ui.layout.find_pane_mut(pane_id) {
                     pane_factory::apply_attach_outcome(pane, registry, outcome, fwd_tx, wakeup_tx);
-                } else if let pane_factory::AttachOutcome::Ready { name, .. } = &outcome {
+                } else if let pane_factory::AttachOutcome::Ready {
+                    instance_id,
+                    unmanaged,
+                    ..
+                } = &outcome
+                {
                     // F1 (r4): the pane was closed while the attach was in
-                    // flight → the agent is already spawned + registered with
-                    // no host pane. Kill it so it doesn't run orphaned until
-                    // quit (fwd_tx already removed above → forwarder/rx drop).
-                    kill_agent(home, registry, name);
+                    // flight. Reap only a TUI-local unmanaged shell; managed
+                    // fleet agents are daemon-owned lifecycle state and closing
+                    // their view must not delete them.
+                    if *unmanaged {
+                        kill_unmanaged_agent(registry, *instance_id, reap_workers);
+                    }
                 }
             }
         }
     }
 
-    pub(super) fn handle_tui_event(
+    pub(super) fn handle_task_rpc_outcome(
         &mut self,
-        ev: Result<TuiEvent, crossbeam_channel::RecvError>,
+        outcome: Result<rpc::TaskOutcome, crossbeam_channel::RecvError>,
+    ) {
+        let (items, notice) = match outcome {
+            Ok(rpc::TaskOutcome::Snapshot(items))
+            | Ok(rpc::TaskOutcome::MutationApplied { snapshot: items }) => (Some(items), None),
+            Ok(rpc::TaskOutcome::MutationAppliedRefreshFailed { error }) => (
+                None,
+                Some(format!(
+                    "task mutation applied; refresh failed; state may be stale: {error}"
+                )),
+            ),
+            Ok(rpc::TaskOutcome::MutationFailedUnknown { error }) => (None, Some(error)),
+            Ok(rpc::TaskOutcome::Failed { error }) => (None, Some(error)),
+            Err(_) => (None, Some("task RPC worker stopped".to_string())),
+        };
+        if let Some(items) = items {
+            self.task_snapshot = items;
+        }
+        if let Overlay::Tasks {
+            items,
+            col,
+            row,
+            pending,
+            notice: overlay_notice,
+            ..
+        } = &mut self.ui.overlay
+        {
+            if notice.is_none() {
+                *items = self.task_snapshot.clone();
+                *col = (*col).min(4);
+                let columns = crate::render::task_board_columns(items);
+                *row = (*row).min(crate::render::selectable_len(&columns, *col).saturating_sub(1));
+            }
+            *pending = false;
+            *overlay_notice = notice;
+        }
+        self.dirty = true;
+    }
+
+    pub(super) fn handle_agent_state_rpc_outcome(
+        &mut self,
+        outcome: Result<rpc::AgentStateOutcome, crossbeam_channel::RecvError>,
+    ) {
+        match outcome {
+            Ok(Ok(result)) => {
+                self.remote_agent_states = result.snapshot;
+                self.daemon_list_mode = result.mode;
+                self.pending_remote_roster_names =
+                    matches!(result.mode, crate::runtime::AgentListMode::Live)
+                        .then_some(result.names);
+                self.pending_remote_roster_refs =
+                    matches!(result.mode, crate::runtime::AgentListMode::Live)
+                        .then_some(result.instance_refs);
+                self.remote_instance_refs =
+                    if matches!(result.mode, crate::runtime::AgentListMode::Live) {
+                        self.pending_remote_roster_refs.clone().unwrap_or_default()
+                    } else {
+                        std::collections::HashMap::new()
+                    };
+                if matches!(result.mode, crate::runtime::AgentListMode::Live) {
+                    self.event_resync_required = false;
+                    self.team_view_dirty = true;
+                } else {
+                    self.invalidate_team_view();
+                }
+            }
+            Ok(Err(error)) => {
+                self.remote_agent_states.clear();
+                self.pending_remote_roster_names = None;
+                self.pending_remote_roster_refs = None;
+                self.daemon_list_mode = error.mode;
+                self.invalidate_team_view();
+                tracing::warn!(error = %error.error, "daemon agent-state snapshot unavailable");
+            }
+            Err(_) => {
+                self.remote_agent_states.clear();
+                self.pending_remote_roster_names = None;
+                self.pending_remote_roster_refs = None;
+                self.invalidate_team_view();
+                tracing::warn!("daemon agent-state RPC worker stopped");
+            }
+        }
+        self.dirty = true;
+    }
+
+    pub(super) fn handle_event_stream_outcome(
+        &mut self,
+        outcome: Result<rpc::EventStreamOutcome, crossbeam_channel::RecvError>,
         deps: &AppDeps<'_>,
     ) {
-        let AppDeps {
-            registry,
-            wakeup_tx,
-            ..
-        } = *deps;
+        match outcome {
+            Ok(rpc::EventStreamOutcome::Connected { source }) => {
+                if source.is_empty() || source == "unknown" {
+                    self.handle_event_stream_disconnected(
+                        "event stream has unverifiable source".to_string(),
+                        deps,
+                    );
+                    return;
+                }
+                self.invalidate_team_view();
+                self.event_source = Some(source);
+                self.event_sequence = 0;
+                self.event_resync_required = true;
+                self.daemon_list_mode = crate::runtime::AgentListMode::FallbackDaemonStuck;
+                self.event_stream_disconnected = false;
+                self.event_stream_receiver_closed = false;
+                tracing::info!("daemon event stream connected");
+                self.request_event_refresh(deps);
+            }
+            Ok(rpc::EventStreamOutcome::Event(event)) => {
+                if event.source.is_empty() || event.source == "unknown" || event.sequence == 0 {
+                    self.invalidate_team_view();
+                    self.event_source = None;
+                    self.event_sequence = 0;
+                    self.event_resync_required = true;
+                    self.daemon_list_mode = crate::runtime::AgentListMode::FallbackDaemonStuck;
+                    self.request_event_refresh(deps);
+                    self.dirty = true;
+                    return;
+                }
+                if let Some(source) = self.event_source.as_deref() {
+                    if source != event.source {
+                        self.invalidate_team_view();
+                        self.event_resync_required = true;
+                        self.event_sequence = 0;
+                        self.event_source = None;
+                        self.daemon_list_mode = crate::runtime::AgentListMode::FallbackDaemonStuck;
+                        self.request_event_refresh(deps);
+                        self.dirty = true;
+                        return;
+                    }
+                } else {
+                    self.event_source = Some(event.source.clone());
+                }
+                if event.sequence <= self.event_sequence {
+                    return;
+                }
+                if self.event_sequence != 0 && event.sequence != self.event_sequence + 1 {
+                    self.invalidate_team_view();
+                    self.event_resync_required = true;
+                    self.request_event_refresh(deps);
+                }
+                self.event_sequence = event.sequence;
+                if matches!(
+                    &event.event,
+                    crate::api::ApiEvent::TeamCreated { .. }
+                        | crate::api::ApiEvent::TeamMembersChanged { .. }
+                        | crate::api::ApiEvent::ConfigChanged { .. }
+                ) {
+                    self.invalidate_team_view();
+                }
+                if !self.event_resync_required {
+                    match event.event {
+                        crate::api::ApiEvent::InstanceDeleted {
+                            name,
+                            instance_ref: Some(instance_ref),
+                            restart_id,
+                            ..
+                        } => {
+                            let retained_for_restart = restart_id
+                                .as_deref()
+                                .map(|restart_id| {
+                                    self.register_provisional_remote_restart(
+                                        &name,
+                                        restart_id,
+                                        instance_ref,
+                                    )
+                                })
+                                .unwrap_or_else(|| {
+                                    self.remote_restarts.values_mut().any(|pending| {
+                                        pending.request.old_instance_ref == Some(instance_ref)
+                                    })
+                                });
+                            if !retained_for_restart {
+                                // #3627: an exact InstanceDeleted event is
+                                // definitive retirement proof — remove the
+                                // pane(s) now and durably flush the layout so a
+                                // hard restart cannot revive a stale view.
+                                self.commit_confirmed_retirements(&[instance_ref], deps.home);
+                            }
+                        }
+                        crate::api::ApiEvent::InstanceCreated {
+                            restart_id: Some(restart_id),
+                            instance_ref,
+                            old_instance_ref,
+                            ..
+                        } => {
+                            if let Some(pending) = self.remote_restarts.get_mut(&restart_id) {
+                                if pending.request.old_instance_ref.is_some()
+                                    && pending.request.old_instance_ref == old_instance_ref
+                                {
+                                    pending.successor_instance_ref = instance_ref;
+                                } else {
+                                    pending.conflicted = true;
+                                }
+                            }
+                        }
+                        crate::api::ApiEvent::InstanceRestartFailed {
+                            name,
+                            restart_id,
+                            old_instance_ref: Some(old_instance_ref),
+                            error,
+                        } => {
+                            let correlated =
+                                self.remote_restarts
+                                    .get(&restart_id)
+                                    .is_some_and(|pending| {
+                                        pending.request.name == name
+                                            && pending.request.old_instance_ref
+                                                == Some(old_instance_ref)
+                                    });
+                            if correlated {
+                                for tab in &mut self.ui.layout.tabs {
+                                    for pane_id in tab.root().pane_ids() {
+                                        if let Some(pane) = tab.root_mut().find_pane_mut(pane_id) {
+                                            if pane.instance_ref == Some(old_instance_ref) {
+                                                pane.mark_disconnected();
+                                                pane.set_restart_error(&error);
+                                            }
+                                        }
+                                    }
+                                }
+                                self.remote_restarts.remove(&restart_id);
+                                tracing::warn!(
+                                    agent = %name,
+                                    restart_id = %restart_id,
+                                    error = %error,
+                                    "correlated remote restart failed"
+                                );
+                            } else {
+                                tracing::warn!(
+                                    agent = %name,
+                                    restart_id = %restart_id,
+                                    "ignored uncorrelated remote restart failure"
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                self.request_event_refresh(deps);
+            }
+            Ok(rpc::EventStreamOutcome::Disconnected(error)) => {
+                self.handle_event_stream_disconnected(error, deps);
+            }
+            Err(_) => {
+                if self.event_stream_receiver_closed {
+                    return;
+                }
+                self.event_stream_receiver_closed = true;
+                self.invalidate_team_view();
+                self.event_source = None;
+                self.event_sequence = 0;
+                self.event_resync_required = true;
+                self.daemon_list_mode = crate::runtime::AgentListMode::FallbackDaemonStuck;
+                tracing::warn!("daemon event stream worker stopped");
+                self.request_event_refresh(deps);
+            }
+        }
         self.dirty = true;
-        if let Ok(event) = ev {
-            tui_events::handle_tui_event(event, &mut self.ui.layout, registry, wakeup_tx);
-            self.needs_resize = true;
+    }
+
+    fn register_provisional_remote_restart(
+        &mut self,
+        name: &str,
+        restart_id: &str,
+        old_instance_ref: crate::types::InstanceRef,
+    ) -> bool {
+        self.reap_remote_restart_state();
+        if let Some(existing) = self.remote_restarts.get_mut(restart_id) {
+            if existing.request.name == name
+                && existing.request.old_instance_ref == Some(old_instance_ref)
+            {
+                return true;
+            }
+            existing.conflicted = true;
+            tracing::warn!(
+                restart_id,
+                agent = name,
+                "conflicting provisional remote restart delete ignored"
+            );
+            return false;
+        }
+        if self.remote_restarts.values().any(|pending| {
+            pending.request.old_instance_ref == Some(old_instance_ref)
+                && pending.request.name == name
+        }) {
+            tracing::warn!(
+                restart_id,
+                agent = name,
+                "duplicate remote restart predecessor has a different correlation id"
+            );
+            return false;
+        }
+        let provisional_count = self
+            .remote_restarts
+            .values()
+            .filter(|pending| pending.provisional)
+            .count();
+        if provisional_count >= REMOTE_RESTART_PROVISIONAL_CAPACITY {
+            tracing::warn!(
+                restart_id,
+                agent = name,
+                "provisional remote restart quota is full"
+            );
+            return false;
+        }
+        let Some((tab_index, pane_id)) =
+            self.ui
+                .layout
+                .tabs
+                .iter()
+                .enumerate()
+                .find_map(|(tab_index, tab)| {
+                    tab.root().pane_ids().into_iter().find_map(|pane_id| {
+                        tab.root()
+                            .find_pane(pane_id)
+                            .filter(|pane| pane.instance_ref == Some(old_instance_ref))
+                            .map(|_| (tab_index, pane_id))
+                    })
+                })
+        else {
+            tracing::warn!(
+                restart_id,
+                agent = name,
+                "remote restart predecessor pane is unavailable"
+            );
+            return false;
+        };
+        self.remote_restarts.insert(
+            restart_id.to_string(),
+            RemoteRestartPending {
+                request: commands::RemoteRestartRequest {
+                    restart_id: restart_id.to_string(),
+                    old_instance_ref: Some(old_instance_ref),
+                    tab_index,
+                    pane_id,
+                    name: name.to_string(),
+                },
+                successor_instance_ref: None,
+                conflicted: false,
+                provisional: true,
+                created_at: std::time::Instant::now(),
+            },
+        );
+        true
+    }
+
+    fn handle_event_stream_disconnected(&mut self, error: String, deps: &AppDeps<'_>) {
+        if self.event_stream_disconnected {
+            return;
+        }
+        self.event_stream_disconnected = true;
+        self.invalidate_team_view();
+        self.event_source = None;
+        self.event_sequence = 0;
+        self.event_resync_required = true;
+        self.daemon_list_mode = crate::runtime::AgentListMode::FallbackDaemonStuck;
+        tracing::warn!(error = %error, "daemon event stream unavailable");
+        self.request_event_refresh(deps);
+        self.dirty = true;
+    }
+
+    pub(super) fn handle_remote_restart_request(
+        &mut self,
+        request: commands::RemoteRestartRequest,
+        deps: &AppDeps<'_>,
+    ) {
+        self.reap_remote_restart_state();
+        if request.old_instance_ref.is_none() {
+            tracing::warn!(
+                restart_id = %request.restart_id,
+                "remote restart refused without predecessor identity"
+            );
+            return;
+        }
+        if let Some(existing) = self.remote_restarts.get(&request.restart_id) {
+            if existing.request == request {
+                tracing::debug!(restart_id = %request.restart_id, "duplicate remote restart request ignored");
+            } else {
+                tracing::warn!(restart_id = %request.restart_id, "conflicting remote restart request ignored");
+            }
+            return;
+        }
+        let operator_count = self
+            .remote_restarts
+            .values()
+            .filter(|pending| !pending.provisional)
+            .count();
+        if operator_count >= REMOTE_RESTART_CAPACITY {
+            tracing::warn!(restart_id = %request.restart_id, "remote restart registry is full");
+            return;
+        }
+        let restart_id = request.restart_id.clone();
+        self.remote_restarts.insert(
+            restart_id.clone(),
+            RemoteRestartPending {
+                request: request.clone(),
+                successor_instance_ref: None,
+                conflicted: false,
+                provisional: false,
+                created_at: std::time::Instant::now(),
+            },
+        );
+        if deps.remote_restart_worker_tx.try_send(request).is_err() {
+            self.remote_restarts.remove(&restart_id);
+            tracing::warn!("remote restart worker queue is full or stopped");
+        }
+        self.dirty = true;
+    }
+
+    pub(super) fn handle_remote_restart_outcome(
+        &mut self,
+        outcome: Result<rpc::RemoteRestartOutcome, crossbeam_channel::RecvError>,
+        deps: &AppDeps<'_>,
+    ) {
+        let Ok(outcome) = outcome else {
+            self.dirty = true;
+            return;
+        };
+        let restart_id = outcome.request.restart_id.clone();
+        let Some(pending) = self.remote_restarts.get_mut(&restart_id) else {
+            return;
+        };
+        match outcome.result {
+            Ok(result)
+                if pending.request.old_instance_ref.is_some()
+                    && result.old_instance_ref == pending.request.old_instance_ref
+                    && result.successor_instance_ref.is_some()
+                    && !pending.conflicted =>
+            {
+                pending.successor_instance_ref = result.successor_instance_ref;
+                self.request_event_refresh(deps);
+            }
+            Ok(_) => {
+                self.remote_restarts.remove(&restart_id);
+                tracing::warn!(restart_id = %restart_id, "remote restart identity correlation failed");
+            }
+            Err(error) => {
+                tracing::warn!(restart_id = %restart_id, error = %error, "remote restart failed");
+                self.remote_restarts.remove(&restart_id);
+            }
+        }
+        self.dirty = true;
+    }
+
+    fn request_event_refresh(&mut self, deps: &AppDeps<'_>) {
+        if deps.attached_run_dir.is_some() {
+            let _ = deps
+                .remote_state_rpc_tx
+                .try_send(rpc::AgentStateRequest::Refresh);
+        }
+    }
+
+    fn reap_remote_restart_state(&mut self) {
+        let now = std::time::Instant::now();
+        let expired_restarts: Vec<(String, Option<crate::types::InstanceRef>)> = self
+            .remote_restarts
+            .iter()
+            .filter(|(_, pending)| {
+                now.saturating_duration_since(pending.created_at) >= REMOTE_RESTART_PENDING_TTL
+            })
+            .map(|(restart_id, pending)| (restart_id.clone(), pending.request.old_instance_ref))
+            .collect();
+        for (restart_id, old_instance_ref) in expired_restarts {
+            if let Some(old_instance_ref) = old_instance_ref {
+                for tab in &mut self.ui.layout.tabs {
+                    for pane_id in tab.root().pane_ids() {
+                        if let Some(pane) = tab.root_mut().find_pane_mut(pane_id) {
+                            if pane.instance_ref == Some(old_instance_ref) {
+                                pane.mark_disconnected();
+                            }
+                        }
+                    }
+                }
+            }
+            self.remote_restarts.remove(&restart_id);
+            tracing::warn!(restart_id = %restart_id, "remote restart correlation expired");
         }
     }
 
     pub(super) fn handle_idle_tick(&mut self, deps: &AppDeps<'_>) {
         let AppDeps {
             home,
-            fleet_path,
-            wakeup_tx,
             attached_run_dir,
             ..
         } = *deps;
+        self.reap_remote_restart_state();
         // #t-84833-10: periodic idle refresh — mark self.dirty so the cap above
         // redraws (catches non-wakeup state changes; ~50ms cadence when idle).
         self.dirty = true;
@@ -866,90 +1684,309 @@ impl AppState {
                 // daemon.log — only Live↔Fallback transitions
                 // emit (validated by `runtime::tests::
                 // helper_steady_state_does_not_log_per_call`).
-                let current: std::collections::HashSet<String> =
-                    crate::runtime::list_agents_with_fallback(home)
-                        .into_iter()
-                        .collect();
-                let mut to_add: Vec<String> = current
-                    .difference(&self.known_remote_agents)
-                    .cloned()
-                    .collect();
-                to_add.sort();
-                for name in &to_add {
-                    let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
-                    match pane_factory::create_remote_pane(
-                        name,
-                        home,
-                        fleet_path,
-                        &mut self.ui.layout,
-                        dc.saturating_sub(2),
-                        dr.saturating_sub(4),
-                        wakeup_tx,
-                    ) {
-                        Ok(pane) => {
-                            let tab_name = pane.agent_name.clone();
-                            self.known_remote_agents.insert(tab_name.to_string());
-                            // #1591: this sync is add-only — a gone
-                            // agent's tab is RETAINED (stale output) so
-                            // scrollback survives. If a same-named agent
-                            // re-appears (recovery respawn / operator
-                            // create-after-delete churn), REUSE the
-                            // retained single-pane tab in place (the
-                            // fresh pane reconnects to the new instance;
-                            // the stale dead-connection pane is dropped)
-                            // instead of appending a DUPLICATE tab.
-                            // Preserves tab position + focus.
-                            if let Some(idx) =
-                                self.ui.layout.single_pane_tab_index_for_agent(&tab_name)
-                            {
-                                self.ui.layout.tabs[idx] =
-                                    crate::layout::Tab::new(tab_name.to_string(), pane);
-                                tracing::info!(
-                                    agent = %name,
-                                    "reused retained tab for re-appeared remote agent (no duplicate)"
-                                );
-                            } else {
-                                self.ui
-                                    .layout
-                                    .push_tab_preserve_focus(crate::layout::Tab::new(
-                                        tab_name.to_string(),
-                                        pane,
-                                    ));
-                                tracing::info!(
-                                    agent = %name,
-                                    "opened tab for newly-appeared remote agent"
-                                );
-                            }
-                            self.needs_resize = true;
-                        }
-                        Err(e) => tracing::warn!(
-                            agent = %name,
-                            error = %e,
-                            "remote pane attach failed during sync",
-                        ),
-                    }
-                }
-                let gone: Vec<String> = self
-                    .known_remote_agents
-                    .difference(&current)
-                    .cloned()
-                    .collect();
-                for name in &gone {
-                    tracing::warn!(
-                        agent = %name,
-                        "daemon-side agent gone; pane retained with stale output",
-                    );
-                    self.known_remote_agents.remove(name);
-                }
+                let (agents, mode) = crate::runtime::list_agents_with_fallback_with_mode(home);
+                self.daemon_list_mode = mode;
+                let current: std::collections::HashSet<String> = agents.into_iter().collect();
+                self.reconcile_remote_roster(&current, mode, deps);
                 self.last_remote_sync = std::time::Instant::now();
             }
         }
     }
 
+    fn reconcile_remote_roster(
+        &mut self,
+        current: &std::collections::HashSet<String>,
+        mode: crate::runtime::AgentListMode,
+        deps: &AppDeps<'_>,
+    ) {
+        let AppDeps {
+            home,
+            fleet_path,
+            wakeup_tx,
+            ..
+        } = *deps;
+        let names =
+            reconcile_remote_roster_candidates(current, &self.known_remote_agents, mode, |name| {
+                self.ui.layout.agent_pane_is_disconnected(name)
+            });
+        let mut names = names;
+        // A same-name replacement does not change the roster set. Compare the
+        // daemon's exact identity against the retained view so a new bridge is
+        // attached even when the old pane is still marked connected.
+        if matches!(mode, crate::runtime::AgentListMode::Live) {
+            for name in current {
+                let Some(expected) = self.remote_instance_refs.get(name).copied() else {
+                    continue;
+                };
+                let current_ref =
+                    self.ui
+                        .layout
+                        .find_agent_pane(name)
+                        .and_then(|(tab_idx, pane_id)| {
+                            self.ui.layout.tabs[tab_idx]
+                                .root()
+                                .find_pane(pane_id)
+                                .and_then(Pane::instance_ref)
+                        });
+                if current_ref != Some(expected) {
+                    names.to_add.insert(name.clone());
+                }
+            }
+        }
+        let mut to_add: Vec<String> = names.to_add.into_iter().collect();
+        to_add.sort();
+        let mut pane_builder = |name: &str, layout: &mut Layout| {
+            let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
+            pane_factory::create_remote_pane(
+                name,
+                home,
+                fleet_path,
+                layout,
+                dc.saturating_sub(2),
+                dr.saturating_sub(4),
+                wakeup_tx,
+            )
+        };
+        self.place_remote_team_grouped(&to_add, home, &mut pane_builder);
+        let mut gone: Vec<String> = names.gone.into_iter().collect();
+        gone.sort();
+        for name in &gone {
+            tracing::warn!(
+                agent = %name,
+                "daemon-side agent gone; pane retained with stale output",
+            );
+            self.known_remote_agents.remove(name);
+            self.remote_attach_failures.remove(name);
+        }
+    }
+
+    fn place_correlated_remote_pane(&mut self, pane: Pane) -> Option<Pane> {
+        let Some(successor_ref) = pane.instance_ref else {
+            return Some(pane);
+        };
+        let Some((restart_id, request)) = self.remote_restarts.iter().find_map(|(id, pending)| {
+            (!pending.conflicted
+                && pending.successor_instance_ref == Some(successor_ref)
+                && (pending.request.name
+                    == pane.fleet_instance_name.as_deref().unwrap_or_default()
+                    || pending.request.name == pane.agent_name.as_str()))
+            .then(|| (id.clone(), pending.request.clone()))
+        }) else {
+            return Some(pane);
+        };
+        let Some(old_ref) = request.old_instance_ref else {
+            return Some(pane);
+        };
+        match self.ui.layout.replace_agent_pane_at_exact(
+            request.tab_index,
+            request.pane_id,
+            old_ref,
+            pane,
+        ) {
+            Ok(()) => {
+                self.remote_restarts.remove(&restart_id);
+                self.needs_resize = true;
+                None
+            }
+            Err(pane) => Some(*pane),
+        }
+    }
+
+    fn reconcile_pending_remote_roster(&mut self, deps: &AppDeps<'_>) {
+        let Some(names) = self.pending_remote_roster_names.take() else {
+            return;
+        };
+        let live_refs = self.pending_remote_roster_refs.take().unwrap_or_default();
+        // A healthy Live snapshot owns this roster pass and refreshes the
+        // idle-sync throttle, preventing the fallback poll from starving the
+        // Live path with a competing reconciliation.
+        self.reconcile_remote_roster(&names, crate::runtime::AgentListMode::Live, deps);
+        self.last_remote_sync = std::time::Instant::now();
+        // #3627: the same Live snapshot is the poll fallback's evidence. Only
+        // an exact ref proven absent twice at one daemon generation is removed;
+        // every transient case retains its pane.
+        self.apply_confirmed_retirements(&names, &live_refs, deps);
+    }
+
+    /// #3627: turn one Live registry snapshot into confirmed retirements. The
+    /// fallback removes panes ONLY when all of the following hold — otherwise
+    /// every pane is retained:
+    /// - the daemon reported `Live` (the caller only queues Live snapshots);
+    /// - the snapshot carries parseable exact refs for every live name
+    ///   ([`snapshot_is_ref_authoritative`]) — a ref-less snapshot never counts
+    ///   as proof of absence;
+    /// - fleet metadata is readable (a parse/read error cannot prove config
+    ///   deletion);
+    /// - the exact ref is absent from the snapshot's live roster;
+    /// - the same daemon generation confirms it absent on two consecutive
+    ///   snapshots (see [`confirmed_retirements`]);
+    /// - no restart/reconnect is in flight for the ref.
+    fn apply_confirmed_retirements(
+        &mut self,
+        names: &std::collections::HashSet<String>,
+        live_refs: &HashMap<String, InstanceRef>,
+        deps: &AppDeps<'_>,
+    ) {
+        let Some(run_dir) = deps.attached_run_dir.as_ref() else {
+            return;
+        };
+        // A snapshot whose live names have no parseable refs proves nothing
+        // about any exact ref: retain every pane rather than misread a daemon
+        // regression (or downgrade) as "all refs absent".
+        if !snapshot_is_ref_authoritative(names, live_refs) {
+            tracing::debug!(
+                names = names.len(),
+                refs = live_refs.len(),
+                "roster snapshot is not ref-authoritative; retirement polling held"
+            );
+            return;
+        }
+        // "fleet read success": a missing or unparsable fleet.yaml means the
+        // instance could still be configured, so nothing may be removed.
+        let Ok(fleet) = crate::fleet::FleetConfig::load(deps.fleet_path) else {
+            return;
+        };
+        // An instance still declared in fleet metadata is config-present, not
+        // retired — retain it even when its process is momentarily unreachable
+        // (mid spawn / bridge down). Only a config-deleted ref can be removed.
+        let configured: std::collections::HashSet<crate::types::InstanceId> = fleet
+            .instances
+            .values()
+            .filter_map(|instance| {
+                instance
+                    .id
+                    .as_deref()
+                    .and_then(crate::types::InstanceId::parse)
+            })
+            .collect();
+        let generation = crate::daemon::event_hub::source_id(run_dir);
+        if generation.is_empty() || generation == "unknown" {
+            return;
+        }
+        let live: std::collections::HashSet<InstanceRef> = live_refs.values().copied().collect();
+        let rendered: Vec<InstanceRef> = self
+            .rendered_instance_refs()
+            .into_iter()
+            .filter(|reference| !configured.contains(&reference.instance_id))
+            .collect();
+        let restart_in_flight: std::collections::HashSet<InstanceRef> = self
+            .remote_restarts
+            .values()
+            .flat_map(|pending| {
+                pending
+                    .request
+                    .old_instance_ref
+                    .into_iter()
+                    .chain(pending.successor_instance_ref)
+            })
+            .collect();
+        let confirmed = confirmed_retirements(
+            &mut self.retirement_candidates,
+            &rendered,
+            &live,
+            &generation,
+            &restart_in_flight,
+        );
+        if !confirmed.is_empty() {
+            self.commit_confirmed_retirements(&confirmed, deps.home);
+        }
+    }
+
+    /// #3627: every exact ref currently rendered on a pane anywhere in the
+    /// layout. Panes without a trusted identity are omitted — they can never
+    /// be removed by the poll fallback.
+    fn rendered_instance_refs(&self) -> Vec<InstanceRef> {
+        let mut refs = Vec::new();
+        for tab in &self.ui.layout.tabs {
+            for pane_id in tab.root().pane_ids() {
+                if let Some(reference) = tab.root().find_pane(pane_id).and_then(Pane::instance_ref)
+                {
+                    refs.push(reference);
+                }
+            }
+        }
+        refs
+    }
+
+    /// #3627: remove the panes for confirmed-retired exact refs across ALL tabs
+    /// (target-only tabs close, mixed tabs keep their other panes), then flush
+    /// the session immediately — never waiting for the 10s throttle — and, if
+    /// the layout cannot be made durable, surface a retryable notice. Safe to
+    /// call with a ref whose panes are already gone: nothing then happens.
+    fn commit_confirmed_retirements(&mut self, refs: &[InstanceRef], home: &std::path::Path) {
+        let mut removed = false;
+        for &reference in refs {
+            if self.ui.layout.remove_fleet_instance_views_exact(reference) {
+                removed = true;
+            }
+        }
+        if !removed {
+            return;
+        }
+        self.needs_resize = true;
+        self.dirty = true;
+        let session_saved = session::save_session(home, &self.ui.layout);
+        let durable = session_saved
+            || refs
+                .iter()
+                .all(|&reference| session::record_retired_ref(home, reference));
+        if !durable {
+            let message = "Instance retirement removed pane(s), but the session \
+                 layout could not be saved; retirement is pending retry.";
+            tracing::error!(?refs, "retired pane session flush failed");
+            self.surface_retirement_notice(message.to_string());
+        }
+    }
+
+    /// #3627: make a retryable retirement notice impossible to lose. It is
+    /// shown immediately when no overlay is active; otherwise it is queued and
+    /// [`Self::promote_pending_retirement_notice`] surfaces it the moment the
+    /// operator's overlay closes, so a write failure is never just a log line.
+    fn surface_retirement_notice(&mut self, message: String) {
+        if matches!(self.ui.overlay, Overlay::None) {
+            self.ui.overlay = Overlay::ReconnectNotice { message };
+        } else {
+            self.pending_retirement_notice = Some(message);
+        }
+    }
+
+    /// Promote a queued retirement notice once the overlay slot is free. A
+    /// still-open overlay keeps it queued (not dropped).
+    fn promote_pending_retirement_notice(&mut self) {
+        if !matches!(self.ui.overlay, Overlay::None) {
+            return;
+        }
+        if let Some(message) = self.pending_retirement_notice.take() {
+            self.ui.overlay = Overlay::ReconnectNotice { message };
+        }
+    }
+
+    fn request_remote_agent_state_refresh(&mut self, deps: &AppDeps<'_>) {
+        if deps.attached_run_dir.is_some()
+            && self.last_remote_state_sync.elapsed() >= std::time::Duration::from_secs(2)
+            && deps
+                .remote_state_rpc_tx
+                .try_send(rpc::AgentStateRequest::Refresh)
+                .is_ok()
+        {
+            self.last_remote_state_sync = std::time::Instant::now();
+        }
+    }
+
     /// Per-iteration housekeeping before the select!: scratch-shell reap,
     /// pending resize, and the badge/flush sync throttles.
-    pub(super) fn pre_select(&mut self, terminal: &mut DefaultTerminal, deps: &AppDeps<'_>) {
-        self.close_dead_scratch_shell(deps);
+    pub(super) fn pre_select(
+        &mut self,
+        terminal: &mut DefaultTerminal,
+        deps: &AppDeps<'_>,
+        reap_workers: &mut Vec<std::thread::JoinHandle<()>>,
+    ) {
+        self.promote_pending_retirement_notice();
+        self.refresh_team_view(deps);
+        self.reap_remote_restart_state();
+        self.reconcile_pending_remote_roster(deps);
+        self.request_remote_agent_state_refresh(deps);
+        self.close_dead_scratch_shell(deps, reap_workers);
         self.apply_pending_resize(terminal, deps);
         self.sync_badges(deps);
     }
@@ -960,17 +1997,107 @@ impl AppState {
         while wakeup_rx.try_recv().is_ok() {}
         self.dirty = true;
     }
+}
 
-    /// One owned-mode maintenance tick (see `run_owned_maintenance_tick`).
-    pub(super) fn handle_maintenance_tick(
-        &mut self,
-        app_cycle: &Option<crate::daemon::owned_maintenance::OwnedMaintenanceCycle>,
-        deps: &AppDeps<'_>,
-        app_externals: &crate::agent::ExternalRegistry,
-        app_configs: &crate::api::ConfigRegistry,
-    ) {
-        let AppDeps { home, registry, .. } = *deps;
-        self.dirty = true;
-        run_owned_maintenance_tick(app_cycle, home, registry, app_externals, app_configs);
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "app_state_tests.rs"]
+mod tests;
+
+#[cfg(test)]
+mod attach_backoff_3505_tests {
+    /// #3505 P0(b) RED: repeated attach failures for the same agent must be
+    /// bounded with backoff, not retried at full 2s cadence forever. The
+    /// pure backoff rule: after N consecutive failures, the next attempt is
+    /// deferred on a fixed skip cycle, and the agent is flagged stale so
+    /// the operator gets an actionable hint.
+    #[test]
+    fn attach_backoff_defers_retry_after_repeated_failures_3505() {
+        // Attempt due immediately on first failure.
+        assert!(super::attach_retry_due_for_test(1));
+        // After repeated failures the retry must be deferred.
+        assert!(!super::attach_retry_due_for_test(5));
+    }
+
+    /// #3505 r2 B2: the deferred-pass transition is pinned through the
+    /// SHARED `advance_deferred` (the same fn the skip branch calls) — an
+    /// inline copy in either place would let them drift. Author mutations
+    /// (drop the re-age; drop the reset) must go red here.
+    /// Drives 12 consecutive failing passes from a fresh counter and
+    /// asserts: (1) the hint fires exactly at `STALE_HINT_AFTER`,
+    /// (2) a later pass attempts again (recovery, never abandon).
+    #[test]
+    fn attach_backoff_reages_on_skip_hint_fires_attempts_resume_3505() {
+        let mut fails = 0u32;
+        let mut hint_at: Option<u32> = None;
+        let mut resumed = false;
+        // Simulate 12 consecutive sync passes with no success.
+        for _ in 0..12 {
+            if super::attach_retry_due_for_test(fails) {
+                // An attempt would run and fail → counter advances.
+                if fails >= super::ATTACH_FAIL_FAST_RETRIES {
+                    resumed = hint_at.is_some();
+                }
+                fails += 1;
+            } else {
+                // Skip branch MUST go through the shared transition.
+                let (next, emit_hint) = super::advance_deferred_for_test(fails);
+                if emit_hint && hint_at.is_none() {
+                    hint_at = Some(next);
+                }
+                fails = next;
+            }
+        }
+        assert_eq!(
+            hint_at,
+            Some(super::STALE_HINT_AFTER),
+            "the stale hint must fire (skip must re-age the counter)"
+        );
+        assert!(
+            resumed,
+            "attempts must resume after the hint cycle (never abandon)"
+        );
+    }
+
+    /// #3505 r2 B2: `advance_deferred` step table — re-age below the
+    /// threshold, hint exactly at it, reset past it.
+    #[test]
+    fn advance_deferred_step_table_3505() {
+        // Below threshold: re-age, no hint.
+        assert_eq!(super::advance_deferred_for_test(3), (4, false));
+        assert_eq!(super::advance_deferred_for_test(4), (5, true));
+        // Exactly at threshold input (5): aged to 6 > threshold → reset.
+        assert_eq!(
+            super::advance_deferred_for_test(5),
+            (super::ATTACH_FAIL_FAST_RETRIES, false)
+        );
+    }
+
+    /// #3505 r2 B2: `attach_retry_due` boundary — pins `<=` vs `<`.
+    /// 0,1,2 attempt; 3 defers.
+    #[test]
+    fn attach_retry_due_boundary_3505() {
+        assert!(super::attach_retry_due_for_test(0));
+        assert!(super::attach_retry_due_for_test(1));
+        assert!(super::attach_retry_due_for_test(2));
+        assert!(!super::attach_retry_due_for_test(3));
+    }
+
+    /// #3505 r2 B2 structural: the `reconcile_remote_roster` skip branch
+    /// must route through the SHARED `advance_deferred` — an inline copy
+    /// of the transition in the branch would let the two drift (the exact
+    /// failure the author flagged: tests pinning a copy, not production).
+    /// Reintroducing inline arithmetic here must go red.
+    #[test]
+    fn skip_branch_routes_through_shared_advance_deferred_3505() {
+        let body = include_str!("app_state_remote.rs");
+        assert!(
+            body.contains("advance_deferred(fails)"),
+            "skip branch must call the shared advance_deferred(fails)"
+        );
+        assert!(
+            !body.contains("fails + 1"),
+            "skip branch must not carry inline counter arithmetic"
+        );
     }
 }

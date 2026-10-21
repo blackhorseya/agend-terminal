@@ -2,13 +2,18 @@
 
 # AgEnD Terminal — Documentation
 
+> **Status:** Current documentation index
+> **Audience:** Operators, agents, reviewers, and contributors
+> **Authority:** This index plus each linked topic owner
+> **Last verified:** 2026-09-22 at `main@62b28f36`
+
 Everything beyond the [project README](../README.md), mapped by topic. Every
 repository-authored Markdown document is maintained as an English /
 Traditional-Chinese pair; neither language is allowed to silently omit a
 section, table, code block, or link target.
 
-> New here? Start with [Quick Start](FEATURE-quickstart.md), then
-> [Fleet Configuration](FEATURE-fleet.md).
+> **Start here:** Use the [goal router](START-HERE.md) to choose Operator,
+> Agent, Reviewer, or Incident. New operators can then open [Quick Start](FEATURE-quickstart.md).
 
 ## Placement and maintenance policy
 
@@ -52,6 +57,7 @@ believed then, not a current contract.
 
 | Document | EN | 中文 | Covers |
 |---|---|---|---|
+| Start Here | [EN](START-HERE.md) | [中文](START-HERE.zh-TW.md) | Goal-based routing for operators, agents, reviewers, and incidents |
 | Quick Start | [EN](FEATURE-quickstart.md) | [中文](FEATURE-quickstart.zh-TW.md) | Install through first live fleet |
 | Fleet Configuration | [EN](FEATURE-fleet.md) | [中文](FEATURE-fleet.zh-TW.md) | `fleet.yaml`, backends, roles, teams, and workspaces |
 | Usage Guide | [EN](USAGE.md) | [中文](USAGE.zh-TW.md) | Daily operation and common flows |
@@ -99,6 +105,8 @@ believed then, not a current contract.
 | Architecture-14 Ledger | [EN](ARCHITECTURE-14-LEDGER.md) | [中文](ARCHITECTURE-14-LEDGER.zh-TW.md) | Current convergence outcomes and evidence |
 | Daemon Lock Ordering | [EN](DAEMON-LOCK-ORDERING.md) | [中文](DAEMON-LOCK-ORDERING.zh-TW.md) | Lock hierarchy and deadlock prevention |
 | Hung-State Contract | [EN](HUNG-STATE-TRANSITIONS.md) | [中文](HUNG-STATE-TRANSITIONS.zh-TW.md) | Detection transitions and productive-output gate |
+| Detection Rules Spike | [EN](DETECTION-RULES-SPIKE-3647.md) | [中文](DETECTION-RULES-SPIKE-3647.zh-TW.md) | Data-driven screen-detection design for issue #3647 |
+| Sidebar Spike | [EN](SIDEBAR-SPIKE-3645.md) | [中文](SIDEBAR-SPIKE-3645.zh-TW.md) | Persistent spaces/agents sidebar and attention queue for issue #3645 |
 | Recovery Stages | [EN](RECOVERY-STAGES.md) | [中文](RECOVERY-STAGES.zh-TW.md) | Staged automatic recovery |
 | Backend Matrix | [EN](BACKEND-CAPABILITY-MATRIX.md) | [中文](BACKEND-CAPABILITY-MATRIX.zh-TW.md) | Backend signals, providers, resume, and MCP |
 | MCP Tools | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | Tool registry and bridge/proxy contract |

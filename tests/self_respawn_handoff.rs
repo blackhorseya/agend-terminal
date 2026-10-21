@@ -32,6 +32,12 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
+const PROBE_ID: &str = "11111111-1111-4111-8111-111111111111";
+const SIBLING_ID: &str = "22222222-2222-4222-8222-222222222222";
+const MISMATCH_ID: &str = "33333333-3333-4333-8333-333333333333";
+const SELF_KICK_PROBE: &str = "fresh-restart self-kick injected agent=probe";
+const SELF_KICK_SIBLING: &str = "fresh-restart self-kick injected agent=sibling";
+
 fn bin() -> PathBuf {
     assert_cmd::cargo::cargo_bin("agend-terminal")
 }
@@ -55,7 +61,7 @@ enum SuccessorFault {
 /// Boot a real daemon with self-respawn ON, NO external-supervisor env, and a
 /// single no-auth shell probe agent (fleet size 1). `fault` injects a successor
 /// failure seam for the abort-path tests.
-fn boot(home: &Path, fault: SuccessorFault) -> Child {
+fn write_test_fleet(home: &Path) {
     // Define `probe` via fleet.yaml (NOT `--agents`) so BOTH the first boot AND
     // the handoff successor resolve it IDENTICALLY to a shell agent. The
     // `--agents probe:/bin/sh` path registers a DEFAULT fleet entry (no
@@ -67,9 +73,20 @@ fn boot(home: &Path, fault: SuccessorFault) -> Child {
     std::fs::create_dir_all(home).ok();
     std::fs::write(
         home.join("fleet.yaml"),
-        "instances:\n  probe:\n    backend: shell\n    command: /bin/sh\n",
+        format!(
+            "instances:\n  probe:\n    id: {PROBE_ID}\n    backend: shell\n    command: /bin/sh\n  sibling:\n    id: {SIBLING_ID}\n    backend: shell\n    command: /bin/sh\n"
+        ),
     )
     .expect("write fleet.yaml");
+}
+
+fn boot_with_handoff_env(
+    home: &Path,
+    fault: SuccessorFault,
+    requester: Option<&str>,
+    handoff: Option<&str>,
+) -> Child {
+    write_test_fleet(home);
     let mut cmd = Command::new(bin());
     cmd.env("AGEND_HOME", home)
         .env("AGEND_RESTART_HANDOFF", "1")
@@ -85,6 +102,7 @@ fn boot(home: &Path, fault: SuccessorFault) -> Child {
         .env_remove("XPC_SERVICE_NAME")
         .env_remove("INVOCATION_ID")
         .env_remove("AGEND_SUCCESSOR_HANDOFF")
+        .env_remove("AGEND_SUCCESSOR_REQUESTER")
         .env_remove("AGEND_FORCE_SUCCESSOR_FAIL")
         .env_remove("AGEND_FORCE_SUCCESSOR_FAIL_AFTER_CONTROL_READY")
         .env_remove("AGEND_FORCE_SUCCESSOR_FAIL_DURING_TEARDOWN")
@@ -92,6 +110,12 @@ fn boot(home: &Path, fault: SuccessorFault) -> Child {
         .args(["start", "--foreground"])
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    if let Some(requester) = requester {
+        cmd.env("AGEND_SUCCESSOR_REQUESTER", requester);
+    }
+    if let Some(handoff) = handoff {
+        cmd.env("AGEND_SUCCESSOR_HANDOFF", handoff);
+    }
     match fault {
         SuccessorFault::None => {}
         SuccessorFault::OnLaunch => {
@@ -110,6 +134,11 @@ fn boot(home: &Path, fault: SuccessorFault) -> Child {
         }
     }
     cmd.spawn().expect("daemon must spawn")
+}
+
+/// Boot a normal real daemon with no inherited handoff requester authority.
+fn boot(home: &Path, fault: SuccessorFault) -> Child {
+    boot_with_handoff_env(home, fault, None, None)
 }
 
 fn pid_alive(pid: u32) -> bool {
@@ -192,6 +221,43 @@ fn ls_lists_probe_within(home: &Path, budget: Duration) -> bool {
     false
 }
 
+fn daemon_log_occurrences(home: &Path, needle: &str) -> usize {
+    let mut seen = std::collections::HashSet::new();
+    std::fs::read_dir(home).map_or(0, |entries| {
+        entries
+            .flatten()
+            .filter_map(|entry| {
+                if !entry.file_name().to_string_lossy().starts_with("daemon.") {
+                    return None;
+                }
+                let path = std::fs::canonicalize(entry.path()).ok()?;
+                if !seen.insert(path.clone()) {
+                    return None;
+                }
+                std::fs::read_to_string(path).ok()
+            })
+            .map(|log| log.matches(needle).count())
+            .sum()
+    })
+}
+
+fn daemon_log_occurrences_within(
+    home: &Path,
+    needle: &str,
+    minimum: usize,
+    budget: Duration,
+) -> usize {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        let occurrences = daemon_log_occurrences(home, needle);
+        if occurrences >= minimum {
+            return occurrences;
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+    daemon_log_occurrences(home, needle)
+}
+
 /// Set operator mode to Active via the real `mode` CLI (api MODE → signed
 /// operator-mode.json + immediate in-memory update). REQUIRED before triggering
 /// restart: a fresh daemon with no signed operator-mode.json locks down to
@@ -217,8 +283,14 @@ fn hex(bytes: &[u8]) -> String {
 /// the daemon's real wire protocol: the NDJSON cookie handshake
 /// (`{"auth":"<hex>"}` → `{"ok":true}`) FIRST, then the `mcp_tool` request. The
 /// cookie file is raw 32 bytes (see `auth_cookie::issue`); hex-encode it for the
-/// handshake. Best-effort: on the happy path the predecessor may exit before the
-/// reply lands, so commit-expecting callers poll process state, not the reply.
+/// handshake. The reply is MANDATORY, not best-effort: all five call sites reject
+/// `None`. Three self-respawn paths call `assert_restart_accepted` and require
+/// ACCEPTED; the failed-successor abort path uses `if let`/`else-panic` to require
+/// the expected REFUSED result; and the app-mode route uses an explicit `expect`
+/// before checking ACCEPTED. #3421 item 3 closed exactly the gap the old wording
+/// described: call sites that discarded the reply could not tell an accepted
+/// restart from a refused one. Callers still poll process state as well, because
+/// an accepted reply says the restart was admitted, not that the successor is up.
 fn trigger_restart(home: &Path, active_pid: u32) -> Option<serde_json::Value> {
     let run_dir = home.join("run").join(active_pid.to_string());
     let port: u16 = std::fs::read_to_string(run_dir.join("api.port"))
@@ -245,13 +317,78 @@ fn trigger_restart(home: &Path, active_pid: u32) -> Option<serde_json::Value> {
     // The real restart_daemon tool call.
     let req = serde_json::json!({
         "method": "mcp_tool",
-        "params": { "tool": "restart_daemon", "arguments": {} },
+        "params": { "tool": "restart_daemon", "instance": "probe", "arguments": {} },
     });
     writeln!(writer, "{req}").ok()?;
     writer.flush().ok();
     let mut line = String::new();
     reader.read_line(&mut line).ok()?;
     serde_json::from_str(line.trim()).ok()
+}
+
+/// Open the successor's dedicated authenticated event stream and return the
+/// source advertised by its subscription hello. This uses the real handoff
+/// run directory instead of generic discovery because the successor is
+/// intentionally undiscoverable until it acquires the daemon flock.
+fn event_stream_source(home: &Path, pid: u32) -> Option<String> {
+    let run_dir = home.join("run").join(pid.to_string());
+    let port: u16 = std::fs::read_to_string(run_dir.join("api.port"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()?;
+    // Event streaming is a direct API method; use the full-capability operator
+    // token rather than the Agent-only MCP tunnel cookie.
+    let cookie_bytes = std::fs::read(run_dir.join("api.operator")).ok()?;
+    let stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    let mut writer = stream.try_clone().ok()?;
+    let mut reader = BufReader::new(stream);
+    writeln!(writer, "{{\"auth\":\"{}\"}}", hex(&cookie_bytes)).ok()?;
+    writer.flush().ok()?;
+    let mut line = String::new();
+    reader.read_line(&mut line).ok()?;
+    let auth: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    if auth.get("ok").and_then(|ok| ok.as_bool()) != Some(true) {
+        return None;
+    }
+    writeln!(
+        writer,
+        "{}",
+        serde_json::json!({"method": "subscribe_events", "params": {}})
+    )
+    .ok()?;
+    writer.flush().ok()?;
+    line.clear();
+    reader.read_line(&mut line).ok()?;
+    let hello: serde_json::Value = serde_json::from_str(line.trim()).ok()?;
+    hello
+        .get("event_stream")
+        .and_then(|stream| stream.get("source"))
+        .and_then(|source| source.as_str())
+        .map(ToOwned::to_owned)
+}
+
+/// #3421 item 3: assert a restart was ACCEPTED, not merely that a reply arrived.
+///
+/// The mcp_tool tunnel wraps handler output as `{ok:true, result:{...}}`, so a
+/// business refusal is `result.ok == false` with the outer envelope still `ok:true`
+/// — `is_some()` alone cannot see it. Three call sites used to discard the reply
+/// entirely; a refusal there surfaced later as a confusing downstream assertion
+/// instead of "restart refused, reason X". `context` names the call site so the
+/// failure says which restart was refused.
+fn assert_restart_accepted(resp: Option<serde_json::Value>, context: &str) {
+    let resp =
+        resp.unwrap_or_else(|| panic!("{context}: restart_daemon returned no parseable reply"));
+    let result_ok = resp
+        .get("result")
+        .and_then(|r| r.get("ok"))
+        .and_then(|b| b.as_bool());
+    assert_eq!(
+        result_ok,
+        Some(true),
+        "{context}: restart_daemon must be ACCEPTED (result.ok == true); reply was {resp}"
+    );
 }
 
 /// Kill any daemon still alive under `home/run` and remove the dir. Handoff
@@ -281,6 +418,7 @@ fn cleanup_test_home(home: &Path) {
 /// is the brick-class fix: restart can't strand the control plane even with no
 /// supervisor to respawn the process.
 #[test]
+#[serial_test::serial(self_respawn_handoff)]
 fn self_respawn_succeeds_with_no_external_supervisor() {
     let home = std::env::temp_dir().join(format!("agend-selfrespawn-ok-{}", std::process::id()));
     std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
@@ -305,7 +443,7 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
     set_mode_active(&home);
 
     // Real restart over the real api → spawns + health-gates a real successor.
-    let _ = trigger_restart(&home, old_pid);
+    let restart_resp = trigger_restart(&home, old_pid);
 
     // A DIFFERENT pid must become the single active daemon (the successor
     // promoted). We assert via `active_pids` (run dir + api.port + live pid),
@@ -314,22 +452,64 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
     // reports a zombie as alive — a false "still alive". `active_pids` instead
     // sees old vanish the moment it removes its own run dir on exit, leaving
     // exactly the successor.
-    let new_pid = wait_for_single_active(&home, Duration::from_secs(60), |p| p != old_pid);
+    let new_pid = wait_for_single_active(&home, Duration::from_secs(60), |p| {
+        p != old_pid
+            && home
+                .join("run")
+                .join(p.to_string())
+                .join(".daemon")
+                .exists()
+    });
+
+    let advertised_source = new_pid.and_then(|pid| event_stream_source(&home, pid));
+    let daemon_source = new_pid.and_then(|pid| {
+        std::fs::read_to_string(home.join("run").join(pid.to_string()).join(".daemon"))
+            .ok()
+            .map(|source| source.trim().to_string())
+    });
 
     // The successor's agents must be re-spawned (probe served by the new pid).
     let served = new_pid.is_some() && ls_lists_probe_within(&home, Duration::from_secs(30));
+    let requester_kicks = if new_pid.is_some() {
+        daemon_log_occurrences_within(&home, SELF_KICK_PROBE, 1, Duration::from_secs(30))
+    } else {
+        0
+    };
+    // A duplicate scheduler should surface promptly after the first injection;
+    // allow it a bounded stabilization window before asserting exactly once.
+    std::thread::sleep(Duration::from_secs(2));
+    let requester_kicks = requester_kicks.max(daemon_log_occurrences(&home, SELF_KICK_PROBE));
+    let sibling_kicks = daemon_log_occurrences(&home, SELF_KICK_SIBLING);
     let single_after = active_pids(&home).len() == 1;
 
     // The original child handle is the OLD daemon (now exited 0); reap it.
     let _ = d1.wait();
     cleanup_test_home(&home);
 
+    assert_restart_accepted(restart_resp, "self-respawn with no external supervisor");
     let new_pid =
         new_pid.expect("a NEW daemon pid must serve after self-respawn (old must be dead)");
     assert_ne!(new_pid, old_pid, "successor must be a distinct process");
     assert!(
         served,
         "successor must re-spawn agents (probe served by new pid)"
+    );
+    assert_eq!(
+        advertised_source, daemon_source,
+        "successor event stream must advertise its promoted daemon identity"
+    );
+    assert_ne!(
+        advertised_source.as_deref(),
+        Some("unknown"),
+        "successor event stream must not retain pre-promotion unknown identity"
+    );
+    assert_eq!(
+        requester_kicks, 1,
+        "successor must self-kick the restart_daemon requester exactly once"
+    );
+    assert_eq!(
+        sibling_kicks, 0,
+        "successor must not self-kick a sibling of the restart requester"
     );
     assert!(
         single_after,
@@ -341,6 +521,7 @@ fn self_respawn_succeeds_with_no_external_supervisor() {
 /// crash-on-launch), the predecessor must NOT shut down — the SAME pid keeps
 /// serving and `restart_daemon` reports ok:false. No brick, agents intact.
 #[test]
+#[serial_test::serial(self_respawn_handoff)]
 fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
     let home = std::env::temp_dir().join(format!("agend-selfrespawn-fail-{}", std::process::id()));
     std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
@@ -355,6 +536,10 @@ fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
             panic!("first boot never became the single active daemon");
         }
     };
+    assert!(
+        ls_lists_probe_within(&home, Duration::from_secs(30)),
+        "first boot must register the probe before restart"
+    );
 
     // Operator gate allows restart only when Active (fresh daemon → Away).
     set_mode_active(&home);
@@ -368,6 +553,8 @@ fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
     std::thread::sleep(Duration::from_secs(2));
     let still_old = active_pids(&home) == vec![old_pid] && pid_alive(old_pid);
     let still_serves = ls_lists_probe_within(&home, Duration::from_secs(10));
+    let requester_kicks = daemon_log_occurrences(&home, SELF_KICK_PROBE);
+    let sibling_kicks = daemon_log_occurrences(&home, SELF_KICK_SIBLING);
 
     let _ = d1.kill();
     let _ = d1.wait();
@@ -396,6 +583,86 @@ fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
         still_serves,
         "predecessor must keep serving its agents after abort"
     );
+    assert_eq!(
+        requester_kicks, 0,
+        "aborted handoff must not self-kick the requester"
+    );
+    assert_eq!(
+        sibling_kicks, 0,
+        "aborted handoff must not self-kick a sibling"
+    );
+}
+
+/// A normal cold boot must ignore an inherited requester value. Only a
+/// committed `AGEND_SUCCESSOR_HANDOFF` may authorize a post-boot resume.
+#[test]
+#[serial_test::serial(self_respawn_handoff)]
+fn cold_boot_with_stale_requester_wakes_nobody() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-selfrespawn-cold-requester-{}",
+        std::process::id()
+    ));
+    let mut daemon = boot_with_handoff_env(&home, SuccessorFault::None, Some(PROBE_ID), None);
+
+    let active = wait_for_single_active(&home, Duration::from_secs(30), pid_alive);
+    let served = active.is_some() && ls_lists_probe_within(&home, Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(2));
+    let requester_kicks = daemon_log_occurrences(&home, SELF_KICK_PROBE);
+    let sibling_kicks = daemon_log_occurrences(&home, SELF_KICK_SIBLING);
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    cleanup_test_home(&home);
+
+    assert!(
+        served,
+        "cold boot must serve its fleet before the wake assertion"
+    );
+    assert_eq!(
+        requester_kicks, 0,
+        "cold boot must not consume a stale requester"
+    );
+    assert_eq!(sibling_kicks, 0, "cold boot must not wake a sibling");
+}
+
+/// A legitimate handoff marker with a requester UUID absent from the fleet
+/// must still promote and serve, but must fail closed with zero synthetic wake.
+#[test]
+#[serial_test::serial(self_respawn_handoff)]
+fn handoff_with_mismatched_requester_wakes_nobody() {
+    let home = std::env::temp_dir().join(format!(
+        "agend-selfrespawn-mismatch-requester-{}",
+        std::process::id()
+    ));
+    let mut daemon = boot_with_handoff_env(
+        &home,
+        SuccessorFault::None,
+        Some(MISMATCH_ID),
+        Some("999999:test-mismatch"),
+    );
+
+    let active = wait_for_single_active(&home, Duration::from_secs(30), pid_alive);
+    let served = active.is_some() && ls_lists_probe_within(&home, Duration::from_secs(30));
+    std::thread::sleep(Duration::from_secs(2));
+    let requester_kicks = daemon_log_occurrences(&home, SELF_KICK_PROBE);
+    let sibling_kicks = daemon_log_occurrences(&home, SELF_KICK_SIBLING);
+
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    cleanup_test_home(&home);
+
+    assert!(
+        served,
+        "mismatched handoff must still promote and serve its fleet"
+    );
+    assert_eq!(
+        requester_kicks, 0,
+        "UUID mismatch must fail closed with zero wake"
+    );
+    assert_eq!(
+        sibling_kicks, 0,
+        "UUID mismatch must not redirect wake to a sibling"
+    );
 }
 
 /// #1814 FIX2 (reviewer race High): the successor passes Phase-1 (answers a
@@ -405,6 +672,7 @@ fn self_respawn_aborts_and_old_stays_alive_when_successor_fails() {
 /// predecessor (SAME pid) is still the single active daemon, still serving, a
 /// while after the commit window.
 #[test]
+#[serial_test::serial(self_respawn_handoff)]
 fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
     let home = std::env::temp_dir().join(format!(
         "agend-selfrespawn-postphase1-{}",
@@ -422,11 +690,15 @@ fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
             panic!("first boot never became the single active daemon");
         }
     };
+    assert!(
+        ls_lists_probe_within(&home, Duration::from_secs(30)),
+        "first boot must register the probe before restart"
+    );
     set_mode_active(&home);
 
     // Commit happens (successor answers Phase-1), then the successor dies before
     // the flock. The predecessor's loop recheck must abort + stay alive.
-    let _ = trigger_restart(&home, old_pid);
+    let restart_resp = trigger_restart(&home, old_pid);
 
     // Wait past the predecessor's tick-latency recheck window (the loop notices
     // the shutdown flag + rechecks the dead successor on its next ~10s tick).
@@ -445,6 +717,10 @@ fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
     let _ = d1.wait();
     cleanup_test_home(&home);
 
+    assert_restart_accepted(
+        restart_resp,
+        "successor dies after Phase-1 commit (the restart itself must still be accepted)",
+    );
     assert!(
         still_old,
         "predecessor must abort-stay-alive (SAME pid) when the successor dies in the commit→exit window — no brick"
@@ -469,6 +745,7 @@ fn self_respawn_aborts_when_successor_dies_after_phase1_commit() {
 /// brick. (`SELF_RESPAWN_SETTLE_SECS=12` widens the recheck window so the
 /// cross-process death lands inside it deterministically.)
 #[test]
+#[serial_test::serial(self_respawn_handoff)]
 fn self_respawn_recovers_as_primary_when_successor_dies_during_teardown() {
     let home =
         std::env::temp_dir().join(format!("agend-selfrespawn-teardown-{}", std::process::id()));
@@ -484,9 +761,13 @@ fn self_respawn_recovers_as_primary_when_successor_dies_during_teardown() {
             panic!("first boot never became the single active daemon");
         }
     };
+    assert!(
+        ls_lists_probe_within(&home, Duration::from_secs(30)),
+        "first boot must register the probe before restart"
+    );
     set_mode_active(&home);
 
-    let _ = trigger_restart(&home, old_pid);
+    let restart_resp = trigger_restart(&home, old_pid);
 
     // Wait out: loop-break tick (~10s) + shutdown_sequence (~2s) + settle (12s) +
     // re-spawn/resume + margin. Successor dies at control-ready+15s, inside the
@@ -505,6 +786,10 @@ fn self_respawn_recovers_as_primary_when_successor_dies_during_teardown() {
     let _ = d1.wait();
     cleanup_test_home(&home);
 
+    assert_restart_accepted(
+        restart_resp,
+        "successor dies during teardown (the restart itself must still be accepted)",
+    );
     assert!(
         still_old,
         "predecessor must recover-as-primary (SAME pid) when the successor dies during teardown — no brick"
@@ -555,6 +840,7 @@ fn boot_capturing_stderr(home: &Path) -> Child {
 /// become a second daemon. (§3.9: real binaries competing for the real flock,
 /// no mock.)
 #[test]
+#[serial_test::serial(self_respawn_handoff)]
 fn flag_on_concurrent_respawn_cannot_double_bind_via_flock_1814() {
     let home = std::env::temp_dir().join(format!("agend-1814-dualbind-{}", std::process::id()));
     std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
@@ -783,92 +1069,74 @@ fn api_status_once(home: &Path, pid: u32) -> Option<bool> {
     Some(reply.is_object())
 }
 
-/// #2453 R2 (supersedes the #2098 app-mode fail-closed placeholder): `agend-terminal
-/// app` owner-restart now RE-EXECS in place. The pre-R2 handler fail-closed as a
-/// stopgap against the #2098 app-mode brick; R2 replaces it with a real in-place
-/// re-exec. This is the real-entry lifecycle witness that consolidates the ordering
-/// and exec-lifecycle merge-blockers. A real `restart_daemon` MCP call over the LIVE
-/// app api socket must:
-///
-/// 1. return `prepared` — receiving it proves the reply crossed the socket BEFORE
-///    teardown dropped it (ORDERING: reply precedes teardown/exec). `prepared` (not
-///    `committing`) is the honest pre-ack wording: the commit happens only after the
-///    transport ack the TUI polls for, so the reply is an indeterminate attempt;
-/// 2. re-exec IN PLACE — the SAME pid stays alive across the exec (exec, not a
-///    spawned successor; execve preserves the pid);
-/// 3. bring the control plane back on the RE-READ api.port and serve a real
-///    request (NO BRICK). We do NOT require the port VALUE to change — the OS may
-///    legitimately reuse the same ephemeral port after close+rebind, so asserting
-///    a change would flake (per #2453 R2 review);
-/// 4. leave EXACTLY ONE active pid — no successor / RESTART_PENDING / flock
-///    competitor. This is why the #2098 brick class cannot recur under R2:
-///    re-exec sets no RESTART_PENDING and spawns no flock rival.
-///
-/// The #2098 brick guarantee is preserved here by assertions 3 + 4. The sibling
-/// `self_respawn_*` tests keep DAEMON-mode (`start --foreground`) fail-close /
-/// regression coverage SEPARATELY. The app runs under a PTY so `ratatui::init`
-/// succeeds headlessly. Unix-only (in-place exec is Unix-only; Windows fail-closes
-/// at the handler — covered by the `#[cfg(windows)]` unit test in restart.rs). Per
-/// decision d-20260712034222169749-5.
+/// #3383: closing the permanent thin-client app must not tear down the daemon.
+/// Notifications remain daemon-owned, so there is no app-restart delivery gap.
 #[cfg(unix)]
 #[test]
-fn app_mode_restart_reexecs_in_place_2453() {
+#[serial_test::serial(self_respawn_handoff)]
+fn thin_client_exit_keeps_detached_daemon_serving_3383() {
+    let home = std::env::temp_dir().join(format!("agend-3383-app-exit-{}", std::process::id()));
+    let mut child = boot_app_under_pty(&home);
+
+    let daemon_pid = match wait_for_single_active(&home, Duration::from_secs(30), |pid| {
+        api_status_once(&home, pid) == Some(true)
+    }) {
+        Some(pid) => pid,
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            cleanup_test_home(&home);
+            panic!("app did not start a serving detached daemon");
+        }
+    };
+
+    child.kill().expect("stop thin-client app");
+    child.wait().expect("reap thin-client app");
+    let daemon_still_serves =
+        pid_alive(daemon_pid) && api_status_once(&home, daemon_pid) == Some(true);
+
+    cleanup_test_home(&home);
+
+    assert!(
+        daemon_still_serves,
+        "closing the thin client must leave the same detached daemon serving"
+    );
+}
+
+/// Permanent-thin-client regression: starting `app` without a daemon must boot a
+/// detached daemon, and `restart_daemon` must use that daemon's normal self-respawn
+/// lifecycle. The app process remains only a client throughout.
+#[cfg(unix)]
+#[test]
+#[serial_test::serial(self_respawn_handoff)]
+fn app_mode_restart_routes_to_detached_daemon_2453() {
     let home = std::env::temp_dir().join(format!("agend-2453-reexec-{}", std::process::id()));
     std::fs::create_dir_all(&home).expect("mkdir AGEND_HOME");
 
     let mut child = boot_app_under_pty(&home);
 
-    // The app's in-process api server must come up (run dir + api.port + live pid).
-    let pid = match wait_for_single_active(&home, Duration::from_secs(30), pid_alive) {
+    let original_pid = match wait_for_single_active(&home, Duration::from_secs(30), pid_alive) {
         Some(p) => p,
         None => {
             let _ = child.kill();
             let _ = child.wait();
             cleanup_test_home(&home);
-            panic!("app-mode api server never became the single active daemon");
+            panic!("app did not start its detached daemon");
         }
     };
+    assert!(
+        ls_lists_probe_within(&home, Duration::from_secs(30)),
+        "detached daemon must register the probe before restart"
+    );
 
     // Operator gate allows restart only when Active (fresh daemon → Away).
     set_mode_active(&home);
 
-    // Real restart_daemon over the real app api socket. Receiving the `prepared`
-    // reply IS the ordering proof: it crossed the socket BEFORE teardown dropped it
-    // (the arm replies `prepared`, the transport flushes it, then the TUI polls the
-    // post-flush ack and commits → ordered teardown + exec).
-    let resp = trigger_restart(&home, pid);
-
-    // Bounded, EVENT-DRIVEN settle for the in-place re-exec. execve preserves the
-    // pid and the process NEVER exits (`child.try_wait()` stays `None`); the
-    // disabled-exec RED path runs `exit(70)` after teardown (`try_wait` returns
-    // `Some`). The re-exec'd control plane then serves again on the RE-READ api.port
-    // (`api_status_once` re-reads run_dir/api.port each attempt, so a rebound port —
-    // same OR different value — is handled). We conclude "re-exec'd" ONLY after the
-    // process has been continuously alive AND serving for a stability window that
-    // OUTLASTS the RED teardown→exit — this rejects the brief "old server answers
-    // mid-teardown" transient (which occurs on BOTH the exec and the exit path) that
-    // a one-shot alive+serving check would mistake for success.
-    const STABLE: Duration = Duration::from_secs(4);
-    let deadline = Instant::now() + Duration::from_secs(40);
-    let mut exited = false;
-    let mut serving_since: Option<Instant> = None;
-    let mut reexec_confirmed = false;
-    while Instant::now() < deadline {
-        if let Ok(Some(_)) = child.try_wait() {
-            exited = true; // process exited → did NOT re-exec in place (the RED path)
-            break;
-        }
-        if api_status_once(&home, pid) == Some(true) {
-            if serving_since.get_or_insert_with(Instant::now).elapsed() >= STABLE {
-                reexec_confirmed = true; // alive + serving continuously past teardown→exit
-                break;
-            }
-        } else {
-            serving_since = None; // teardown/exec gap (not serving) → reset the timer
-        }
-        std::thread::sleep(Duration::from_millis(150));
-    }
-    let single_active = active_pids(&home) == vec![pid];
+    let resp = trigger_restart(&home, original_pid);
+    let successor_pid = wait_for_single_active(&home, Duration::from_secs(40), |pid| {
+        pid != original_pid && api_status_once(&home, pid) == Some(true)
+    });
+    let app_stayed_alive = child.try_wait().expect("query app child").is_none();
 
     // Cleanup BEFORE asserting so a failure never leaks the child. (The drain
     // thread is detached — see boot_app_under_pty — nothing to join.)
@@ -876,8 +1144,7 @@ fn app_mode_restart_reexecs_in_place_2453() {
     let _ = child.wait();
     cleanup_test_home(&home);
 
-    // (1) ORDERING: the `prepared` reply was received before the socket dropped.
-    let resp = resp.expect("app-mode restart must return a prepared reply before the socket drops");
+    let resp = resp.expect("daemon restart must return a reply");
     let result_ok = resp
         .get("result")
         .and_then(|r| r.get("ok"))
@@ -889,33 +1156,19 @@ fn app_mode_restart_reexecs_in_place_2453() {
     assert_eq!(
         result_ok,
         Some(true),
-        "app-mode restart_daemon must report result.ok=true (re-exec prepared), got {resp}"
+        "thin-client restart_daemon must report result.ok=true, got {resp}"
     );
     assert_eq!(
         restart,
-        Some("prepared"),
-        "app-mode restart_daemon must report restart=prepared (reply precedes teardown/exec), got {resp}"
+        Some("self-respawn"),
+        "thin-client app must route restart to the detached daemon, got {resp}"
     );
-
-    // (2) EXEC-NOT-SPAWN + NO BRICK: the ORIGINAL pid stayed alive across the exec
-    // (never exited) AND the re-exec'd control plane serves again on the re-read
-    // api.port for a stable window. A disabled exec would exit(70) after teardown →
-    // `exited` and this fails RED.
     assert!(
-        !exited && reexec_confirmed,
-        "the app must re-exec IN PLACE: the SAME pid stays alive across the exec (execve preserves \
-         the pid; a disabled exec exits instead) AND serves again on the re-read api.port (no brick) \
-         — exited={exited}, reexec_confirmed={reexec_confirmed}"
+        app_stayed_alive,
+        "daemon self-respawn must not terminate the thin-client app"
     );
-    // (3) EXACTLY ONE active pid — no successor / flock competitor / RESTART_PENDING latch.
     assert!(
-        single_active,
-        "exactly one active pid (the re-exec'd original) — no successor double-bind or flock competitor"
-    );
-
-    eprintln!(
-        "#2453 R2 evidence: app-mode in-place re-exec lifecycle verified on {} (pid {} survived exec + served again)",
-        std::env::consts::OS,
-        pid
+        successor_pid.is_some(),
+        "daemon self-respawn must settle on one live successor with a serving API"
     );
 }

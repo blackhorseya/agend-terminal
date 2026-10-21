@@ -6,6 +6,7 @@ use crate::bridge_client::BridgeClient;
 use crate::vterm::VTerm;
 use parking_lot::Mutex;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -16,7 +17,7 @@ use std::time::Instant;
 /// `BridgeClient` that speaks to a daemon-hosted agent over TCP.
 pub enum PaneSource {
     Local,
-    Remote(Arc<Mutex<BridgeClient>>),
+    Remote(Arc<Mutex<BridgeClient>>, Arc<AtomicBool>),
 }
 
 /// A single pane displaying one agent's terminal output.
@@ -31,6 +32,10 @@ pub struct Pane {
     /// inbox identity and cannot drift when a name is reused. Carries
     /// `InstanceId::default()` for non-fleet test panes (never routed).
     pub instance_id: crate::types::InstanceId,
+    /// Exact daemon process identity. `None` is reserved for local shells and
+    /// pre-attach placeholders; managed panes must populate this before they
+    /// can be used by identity-sensitive lifecycle operations.
+    pub instance_ref: Option<crate::types::InstanceRef>,
     pub vterm: VTerm,
     pub rx: crossbeam_channel::Receiver<Vec<u8>>,
     pub id: usize,
@@ -39,6 +44,9 @@ pub struct Pane {
     pub working_dir: Option<PathBuf>,
     /// User-defined display name (shown in pane border). agent_name is used if None.
     pub display_name: Option<String>,
+    /// Bounded terminal error from the most recent correlated daemon restart.
+    /// Kept on the pane so the failure remains visible until replacement.
+    pub restart_error: Option<String>,
     /// Scroll offset (lines from bottom). 0 = live view.
     pub scroll_offset: usize,
     /// True when an unread `[from:...]` message was detected.
@@ -152,6 +160,34 @@ fn thread_cpu_time_us() -> Option<u64> {
 }
 
 impl Pane {
+    pub fn instance_ref(&self) -> Option<crate::types::InstanceRef> {
+        self.instance_ref
+    }
+
+    pub fn is_disconnected(&self) -> bool {
+        matches!(&self.source, PaneSource::Remote(_, connected) if !connected.load(Ordering::Acquire))
+    }
+
+    pub fn mark_disconnected(&self) {
+        if let PaneSource::Remote(_, connected) = &self.source {
+            connected.store(false, Ordering::Release);
+        }
+    }
+
+    pub fn set_restart_error(&mut self, error: &str) {
+        const MAX_RESTART_ERROR_CHARS: usize = 160;
+        let sanitized: String = error
+            .chars()
+            .filter(|character| !character.is_control())
+            .take(MAX_RESTART_ERROR_CHARS)
+            .collect();
+        self.restart_error = Some(sanitized);
+    }
+
+    pub fn restart_error(&self) -> Option<&str> {
+        self.restart_error.as_deref()
+    }
+
     /// Max scroll-back offset for THIS pane's render path. Off-thread mode
     /// (`AGEND_OFFTHREAD_PARSE`) renders the parser thread's published snapshot and
     /// leaves the main-thread `vterm` idle (drain no-ops), so its `max_scroll()` is 0
@@ -411,9 +447,13 @@ impl Pane {
                 // clear the audited turn without warning.
                 crate::reply_ledger::clear_turn(&self.agent_name);
             }
-            PaneSource::Remote(client) => {
-                let mut c = client.lock();
-                let _ = c.send_input(bytes);
+            PaneSource::Remote(client, connected) => {
+                if connected.load(Ordering::Acquire) {
+                    let mut c = client.lock();
+                    if c.send_input(bytes).is_err() {
+                        connected.store(false, Ordering::Release);
+                    }
+                }
             }
         }
     }
@@ -455,9 +495,13 @@ impl Pane {
                     }
                 }
             }
-            PaneSource::Remote(client) => {
-                let mut c = client.lock();
-                let _ = c.send_resize(cols, rows);
+            PaneSource::Remote(client, connected) => {
+                if connected.load(Ordering::Acquire) {
+                    let mut c = client.lock();
+                    if c.send_resize(cols, rows).is_err() {
+                        connected.store(false, Ordering::Release);
+                    }
+                }
             }
         }
     }
@@ -513,16 +557,50 @@ mod tests {
         );
     }
 
+    /// A Claude startup modal schedules its confirmation before the TUI may
+    /// attach and resize the pane. Claude emits no redraw input on resize, so a
+    /// resize with no subsequent PTY output must not strand that confirmation.
+    #[test]
+    fn claude_resize_without_repaint_keeps_dev_modal_barrier_valid() {
+        let registry: AgentRegistry = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let instance_id = crate::types::InstanceId::new();
+        let handle = crate::agent::mk_test_handle("claude-resize", instance_id);
+        let writer = Arc::clone(&handle.pty_writer);
+        let epoch = crate::agent::dev_modal::arm_epoch(&writer);
+        let gate = crate::agent::dev_modal::DevModalGate::with_epoch(
+            true,
+            epoch,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            Arc::new(crate::agent::dev_modal::RefuseTally::default()),
+        );
+        let barrier = gate.write_barrier();
+        agent::lock_registry(&registry).insert(instance_id, handle);
+
+        let mut pane = leaf(1, "claude-resize");
+        pane.instance_id = instance_id;
+        pane.backend = Some(Backend::ClaudeCode);
+        pane.resize_pty(&registry, 120, 40);
+
+        assert!(
+            barrier.still_valid(),
+            "a resize with no child repaint must not cancel the only scheduled startup-modal confirmation"
+        );
+        crate::agent::dev_modal::disarm_epoch(&writer);
+    }
+
     fn leaf(id: usize, name: &str) -> Pane {
         Pane {
             agent_name: name.into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -646,12 +724,14 @@ mod tests {
         Pane {
             agent_name: "agent".into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(cols, rows),
             rx,
             id: 1,
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,

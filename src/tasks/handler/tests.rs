@@ -40,10 +40,250 @@ fn create_task(home: &std::path::Path, task_id: &str) {
             eta_secs: None,
             tags: vec![],
             parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
         },
     )
     .expect("create task");
     let _ = args;
+}
+
+#[test]
+fn orphan_reconcile_preview_reaches_real_task_dispatch_entry_3584() {
+    let home = tmp_home("orphan-reconcile-preview-red-3584");
+    let response = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "orphan_reconcile_preview",
+            "decision_id": "d-20260922032524703479-91",
+            "board": "Hack_agend-terminal",
+            "audit_reason": "red-first dispatch seam",
+            "mappings": [],
+        }),
+    );
+    assert_eq!(
+        response["code"], "invalid_request",
+        "the real task dispatch entry must own request validation: {response}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn orphan_reconcile_apply_reaches_real_task_dispatch_entry_3584() {
+    let home = tmp_home("orphan-reconcile-apply-red-3584");
+    let response = handle(
+        &home,
+        "operator",
+        &serde_json::json!({
+            "action": "orphan_reconcile_apply",
+            "confirmation": "not-a-uuid",
+        }),
+    );
+    assert_eq!(
+        response["code"], "invalid_confirmation",
+        "the real task dispatch entry must validate the confirmation: {response}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn governed_create_persists_atomic_authority_3419() {
+    let home = tmp_home("governed-create-3419");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governed",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id");
+    let created = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "implementation",
+            "governing_decision_id": decision_id,
+        }),
+    );
+    let task_id = created["id"].as_str().expect("task id");
+    let task = read_task_record(&home, task_id).expect("created task");
+    assert_eq!(
+        task.metadata
+            .get("governing_decision_id")
+            .and_then(|v| v.as_str()),
+        Some(decision_id),
+        "Created must atomically persist the governing decision id: {created}"
+    );
+    assert_eq!(
+        task.metadata.get("review_class").and_then(|v| v.as_str()),
+        Some("dual"),
+        "Created must atomically persist the resolved review class: {created}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn governed_create_rejects_review_class_mismatch_3419() {
+    let home = tmp_home("governed-mismatch-3419");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governed",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id");
+    let created = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "implementation",
+            "governing_decision_id": decision_id,
+            "review_class": "single",
+        }),
+    );
+    assert_eq!(created["code"], "governing_decision_review_class_mismatch");
+    assert!(
+        created["id"].is_null(),
+        "mismatch must not create a task: {created}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+#[serial_test::serial]
+fn governed_create_holds_decision_lock_through_created_3419() {
+    use std::sync::mpsc::sync_channel;
+    use std::time::Duration;
+
+    let home = tmp_home("governed-lock-3419");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governed",
+            "content": "dual review required",
+            "review_class": "dual",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id").to_string();
+    let (resolved_tx, resolved_rx) = sync_channel(0);
+    let (release_tx, release_rx) = sync_channel(0);
+    crate::tasks::governance::install_authority_resolved_hook(Box::new(move |_| {
+        resolved_tx.send(()).expect("signal authority resolution");
+        release_rx.recv().expect("release authority hook");
+    }));
+
+    let create_home = home.clone();
+    let create_decision_id = decision_id.clone();
+    let create_thread = std::thread::spawn(move || {
+        handle(
+            &create_home,
+            "lead",
+            &serde_json::json!({
+                "action": "create",
+                "title": "implementation",
+                "governing_decision_id": create_decision_id,
+            }),
+        )
+    });
+    resolved_rx
+        .recv_timeout(Duration::from_secs(2))
+        .expect("create must reach resolved-authority seam");
+
+    let lock_path = home.join("decisions").join(format!("{decision_id}.lock"));
+    assert!(
+        crate::store::try_acquire_file_lock(&lock_path)
+            .expect("probe decision lock")
+            .is_none(),
+        "the decision flock must remain held between resolution and Created"
+    );
+
+    let supersede_home = home.clone();
+    let supersede_id = decision_id.clone();
+    let supersede_thread = std::thread::spawn(move || {
+        crate::decisions::post(
+            &supersede_home,
+            "lead",
+            &serde_json::json!({
+                "title": "replacement",
+                "content": "new authority",
+                "review_class": "single",
+                "supersedes": supersede_id,
+            }),
+        )
+    });
+    release_tx.send(()).expect("release create");
+    let created = create_thread.join().expect("create thread");
+    let superseded = supersede_thread.join().expect("supersede thread");
+    assert!(
+        created["id"].as_str().is_some(),
+        "create must commit: {created}"
+    );
+    assert_eq!(
+        superseded["status"], "posted",
+        "supersede must commit: {superseded}"
+    );
+    let raw = std::fs::read_to_string(home.join("decisions").join(format!("{decision_id}.json")))
+        .expect("read original decision");
+    let original: crate::decisions::Decision = serde_json::from_str(&raw).expect("parse original");
+    assert!(
+        original.archived,
+        "supersede must archive only after Created releases the lock"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn governing_fields_reject_direct_metadata_mutation_3419() {
+    let home = tmp_home("governed-metadata-3419");
+    let decision = crate::decisions::post(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "title": "governed",
+            "content": "single review required",
+            "review_class": "single",
+        }),
+    );
+    let decision_id = decision["id"].as_str().expect("decision id");
+    let created = handle(
+        &home,
+        "lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "implementation",
+            "governing_decision_id": decision_id,
+        }),
+    );
+    let task_id = created["id"].as_str().expect("task id");
+    for (key, value) in [
+        ("review_class", serde_json::json!("dual")),
+        ("governing_decision_id", serde_json::json!("forged")),
+    ] {
+        let result = handle(
+            &home,
+            "lead",
+            &serde_json::json!({
+                "action": "metadata_set",
+                "id": task_id,
+                "metadata_key": key,
+                "metadata_value": value,
+            }),
+        );
+        assert_eq!(
+            result["code"], "create_only_metadata",
+            "{key} must be create-only: {result}"
+        );
+    }
+    std::fs::remove_dir_all(&home).ok();
 }
 
 /// #78445-2 (d): a cascade parent-cancel is terminal for EACH child — every
@@ -71,6 +311,8 @@ fn cascade_cancel_settles_each_child_dispatch_tracking_78445_2() {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: parent.map(|p| crate::task_events::TaskId(p.into())),
+                governing_decision_id: None,
+                review_class: None,
             },
         )
         .expect("seed");
@@ -145,7 +387,6 @@ fn inlock_precond_rejects_unauthorized_nonstatus_update_231() {
         &home,
         "intruder",
         "t-231-a",
-        false,
         None,
         &Some(crate::task_events::InstanceName::from("dev-agent")),
     );
@@ -171,7 +412,6 @@ fn inlock_precond_rejects_status_update_after_owner_reassign_231() {
         &home,
         "dev-agent",
         "t-231-b",
-        false,
         Some(crate::task_events::TaskStatus::InProgress),
         &Some(crate::task_events::InstanceName::from("dev-agent")),
     );
@@ -198,7 +438,6 @@ fn inlock_precond_rejects_done_when_by_owner_drifted_231() {
         &home,
         "system:task_sweep", // ACL bypassed → only the drift check can reject
         "t-231-c",
-        false,
         Some(crate::task_events::TaskStatus::Done),
         &Some(crate::task_events::InstanceName::from("dev-agent")),
     );
@@ -222,7 +461,6 @@ fn inlock_precond_allows_legitimate_authorized_update_231() {
         &home,
         "dev-agent",
         "t-231-d",
-        false,
         Some(crate::task_events::TaskStatus::InProgress),
         &Some(crate::task_events::InstanceName::from("dev-agent")),
     );
@@ -1140,6 +1378,8 @@ fn seed_claimed(home: &std::path::Path, task_id: &str, owner: &str) {
                 eta_secs: None,
                 tags: vec![],
                 parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
             },
             TaskEvent::Claimed {
                 task_id: tid,
@@ -3177,6 +3417,12 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
     let remote = home.join("remote.git");
     std::fs::create_dir_all(&repo).expect("repo");
     let branch = "fix/s1-control";
+    let review_branch_drift = mode.starts_with("review-branch-drift");
+    let task_branch = if review_branch_drift {
+        "fix/review-subject"
+    } else {
+        branch
+    };
     let git = |args: &[&str]| {
         assert!(
             std::process::Command::new("git")
@@ -3214,13 +3460,15 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
             | "review-mismatch"
             | "review-malformed"
             | "review-unpushed"
-    ) {
+    ) || review_branch_drift
+    {
         git(&["-C", r, "commit", "--allow-empty", "-qm", "feature"]);
     }
     if matches!(
         mode,
         "pushed" | "review" | "review-dirty" | "review-mismatch" | "review-malformed"
-    ) {
+    ) || review_branch_drift
+    {
         git(&["-C", r, "push", "-q", "-u", "origin", branch]);
     }
     if matches!(mode, "dirty" | "review-dirty") {
@@ -3243,7 +3491,7 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
     let created = handle(
         &home,
         "test:operator",
-        &serde_json::json!({"action":"create","title":"S1","assignee":"dev-agent","branch":branch}),
+        &serde_json::json!({"action":"create","title":"S1","assignee":"dev-agent","branch":task_branch}),
     );
     let id = created["id"].as_str().expect("task id").to_string();
     let claimed = handle(
@@ -3261,6 +3509,7 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
                 .expect("mismatched provisioned head"),
         ),
         "review-malformed" => Some("not-a-commit".to_string()),
+        _ if review_branch_drift => Some(provisioned_head.clone()),
         _ => None,
     };
     if let Some(provisioned_head) = review_provenance.as_deref() {
@@ -3273,8 +3522,77 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
             &repo,
             false,
             Some(crate::binding::BindingProvenance::DaemonProvisionedReview { provisioned_head }),
+            false, // #3546: this fixture makes no claim about the base's freshness
         )
         .expect("binding");
+        if review_branch_drift {
+            let lease_kind = if mode == "review-branch-drift-wrong-kind" {
+                "implementation"
+            } else {
+                "review"
+            };
+            let assignment_id = if mode == "review-branch-drift-bad-id" {
+                "not-a-uuid".to_string()
+            } else {
+                uuid::Uuid::new_v4().to_string()
+            };
+            let expected_head = if mode == "review-branch-drift-wrong-head" {
+                crate::git_helpers::git_cmd(&repo, &["rev-parse", "origin/main"])
+                    .expect("wrong expected head")
+            } else {
+                provisioned_head.to_string()
+            };
+            crate::binding::augment_binding_with_lease(
+                &home,
+                "dev-agent",
+                lease_kind,
+                &assignment_id,
+                &expected_head,
+            )
+            .expect("typed review lease");
+            // The lease names an assignment; until #F6 nothing checked that the
+            // assignment existed, so this fixture never planted one. It has to
+            // now, or the legitimate reviewer is refused for the same reason the
+            // dead-assignment case is — which would make the allow-test pass on
+            // a lie. `-dead-assignment` deliberately keeps the old shape: a
+            // well-formed id with no row behind it.
+            if mode != "review-branch-drift-dead-assignment" {
+                if let Ok(parsed) = uuid::Uuid::parse_str(&assignment_id) {
+                    let mut assignment =
+                        crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+                            "owner/repo",
+                            branch,
+                            "dev-agent",
+                            crate::types::InstanceId::new(),
+                            1,
+                            provisioned_head,
+                            crate::review_receipt::ReviewSlot::Primary,
+                            "test:operator",
+                            &id,
+                            crate::daemon::pr_state::ReviewClass::Single,
+                            crate::mcp::handlers::comms_gates::ReviewAuthor::External(
+                                "external-author".into(),
+                            ),
+                            "s1 fixture typed review assignment",
+                            None,
+                            None,
+                            "2026-09-05T00:00:00Z",
+                        );
+                    assignment.assignment_id = parsed;
+                    crate::daemon::assignment_authority::persist(&home, &assignment)
+                        .expect("plant the assignment the lease names");
+                }
+            }
+            if mode == "review-branch-drift-bad-signature" {
+                std::fs::write(
+                    crate::paths::runtime_dir(&home)
+                        .join("dev-agent")
+                        .join("binding.json.sig"),
+                    "invalid-signature",
+                )
+                .expect("invalidate binding signature");
+            }
+        }
     } else {
         crate::binding::bind_full(&home, "dev-agent", &id, branch, &repo, &repo, false)
             .expect("binding");
@@ -3286,6 +3604,67 @@ fn s1_fixture(name: &str, mode: &str) -> (std::path::PathBuf, String, std::path:
         std::fs::rename(repo.join(".git"), repo.join(".git-hidden")).expect("Git error fixture");
     }
     (home, id, repo, branch.to_string())
+}
+
+#[test]
+fn task_done_allows_owned_disposable_review_branch_but_denies_third_party() {
+    let (home, id, _repo, _branch) = s1_fixture("s1-review-branch-drift", "review-branch-drift");
+
+    let denied = handle(
+        &home,
+        "other-agent",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+    assert!(
+        denied.get("error").is_some(),
+        "third party must not settle the review task: {denied}"
+    );
+    assert_eq!(
+        read_task_record(&home, &id).expect("task").status,
+        crate::task_events::TaskStatus::Claimed
+    );
+
+    let done = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+    assert!(
+        done.get("error").is_none(),
+        "the assigned reviewer must be able to settle its own disposable review task: {done}"
+    );
+    assert_eq!(
+        read_task_record(&home, &id).expect("task").status,
+        crate::task_events::TaskStatus::Done
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn task_done_denies_disposable_review_branch_drift_without_every_typed_lease_proof() {
+    for mode in [
+        "review-branch-drift-wrong-kind",
+        "review-branch-drift-bad-id",
+        "review-branch-drift-wrong-head",
+        "review-branch-drift-bad-signature",
+    ] {
+        let (home, id, _repo, _branch) = s1_fixture(mode, mode);
+        let denied = handle(
+            &home,
+            "dev-agent",
+            &serde_json::json!({"action":"done","id":id}),
+        );
+        assert!(
+            denied.get("error").is_some(),
+            "branch drift without every typed lease proof must be denied for {mode}: {denied}"
+        );
+        assert_eq!(
+            read_task_record(&home, &id).expect("task").status,
+            crate::task_events::TaskStatus::Claimed,
+            "denied task must remain claimed for {mode}"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
 
 #[test]
@@ -3476,8 +3855,12 @@ fn task_done_assignee_completion_controls_s1() {
         &serde_json::json!({"action":"done","id":id,"force":true,"force_reason":"S1"}),
     );
     assert!(
-        result.get("error").is_none(),
-        "force bypass denied: {result}"
+        result.get("error").is_some(),
+        "public force bypass must be denied: {result}"
+    );
+    assert_eq!(
+        result["code"], "force_not_supported",
+        "public force bypass must fail at the task boundary: {result}"
     );
     std::fs::remove_dir_all(&home).ok();
 
@@ -3491,6 +3874,221 @@ fn task_done_assignee_completion_controls_s1() {
     assert!(
         result.get("error").is_none(),
         "orchestrator bypass denied: {result}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// F6 RED: the guard checks that `review_assignment_id` PARSES, never that the
+/// assignment it names is still live (src/tasks/mod.rs:122-125). A binding can
+/// therefore carry an id whose assignment row is gone — revoked, retired, or
+/// never persisted — and the typed disposable-review lease still settles the
+/// task.
+///
+/// Containment today is a neighbour, not this predicate: `revoke` and `retire`
+/// both call `cancel_review_assignment_task` first, so the task is already
+/// terminal by the time the id goes stale, and `transfer` — the one path that
+/// keeps the task alive — has no callers in src/. This test puts the predicate
+/// in exactly the state those neighbours happen to prevent: assignment absent,
+/// task live. It is deliberately NOT written by calling `revoke`, because that
+/// cancels the task and the settle would then fail for the neighbour's reason
+/// rather than the guard's.
+///
+/// The sibling path does revalidate rather than assume — pr_state/mod.rs:1740-1762
+/// re-checks under the assignment branch lock "so revoke/transfer cannot cross
+/// the final check→PR-state mutation boundary".
+#[test]
+fn task_done_refuses_a_disposable_review_lease_whose_assignment_is_not_live() {
+    let (home, id, _repo, _branch) =
+        s1_fixture("s1-dead-assignment", "review-branch-drift-dead-assignment");
+
+    let binding = crate::binding::read(&home, "dev-agent").expect("binding");
+    let assignment_id = binding["review_assignment_id"]
+        .as_str()
+        .expect("the typed lease carries an assignment id");
+    let parsed = uuid::Uuid::parse_str(assignment_id).expect("id parses — all the guard checks");
+    assert!(
+        crate::daemon::assignment_authority::lookup_by_assignment_id_strict(&home, parsed).is_err(),
+        "precondition: no assignment row answers to the id this lease carries"
+    );
+
+    let done = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+
+    assert!(
+        done.get("error").is_some(),
+        "a lease naming an assignment that is not live must not settle the task: {done}"
+    );
+    assert_eq!(
+        read_task_record(&home, &id).expect("task").status,
+        crate::task_events::TaskStatus::Claimed,
+        "and the task must stay open"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Pins the reason `lease_assignment_still_authorizes` takes no assignment lock.
+///
+/// The sibling path holds the assignment branch lock across check→PR-state
+/// mutation. The completion path cannot: it runs underneath the task board, and
+/// the documented order is assignment-OUTER / pr_state-INNER, so acquiring the
+/// assignment lock here would invert it. That leaves a window — a revoke landing
+/// between the liveness lookup and the Done event — and this test shows what
+/// closes it: revoke CANCELS the review task before the row disappears, and a
+/// cancelled task cannot transition to Done. The containment is real, it just
+/// lives next door, and this pins it so the next reader does not have to take
+/// the comment's word for it.
+#[test]
+fn revoke_cancels_the_review_task_before_removing_the_row() {
+    let (home, id, _repo, branch) = s1_fixture("s1-revoke-cancels", "review-branch-drift");
+    let binding = crate::binding::read(&home, "dev-agent").expect("binding");
+    let parsed = uuid::Uuid::parse_str(
+        binding["review_assignment_id"]
+            .as_str()
+            .expect("assignment id"),
+    )
+    .expect("uuid");
+    assert!(
+        crate::daemon::assignment_authority::lookup_by_assignment_id_strict(&home, parsed).is_ok(),
+        "precondition: the assignment the lease names is live"
+    );
+
+    let revoked = crate::daemon::assignment_authority::revoke(
+        &home,
+        "owner/repo",
+        &branch,
+        "dev-agent",
+        "2026-09-05T01:00:00Z",
+    )
+    .expect("revoke");
+    assert!(revoked, "the live assignment must be revoked");
+
+    assert!(
+        crate::daemon::assignment_authority::lookup_by_assignment_id_strict(&home, parsed).is_err(),
+        "revoke removes the row, so the id keeps its shape but loses its authority"
+    );
+    let status = read_task_record(&home, &id).expect("task").status;
+    assert!(
+        status.is_terminal(),
+        "revoke cancels the review task before the row goes — that is what closes \
+         the unlocked window, not the guard: {status:?}"
+    );
+
+    let done = handle(
+        &home,
+        "dev-agent",
+        &serde_json::json!({"action":"done","id":id}),
+    );
+    assert!(
+        done.get("error").is_some(),
+        "and a settle after revoke is refused: {done}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// Where a non-assignee's authority to settle actually comes from.
+///
+/// `CompletionGate::NotApplicable(NotTheAssignee)` is not a permit — it says the
+/// guard had no opinion. The permission is granted upstream by
+/// `can_mutate_record`, which admits `is_orchestrator_of` and the owner's team
+/// orchestrator. This pins that the ACL is the decider, so anyone reading the
+/// guard and concluding "only the assignee can settle a branch-carrying task"
+/// is corrected by a test rather than by an incident.
+///
+/// This is deliberately NOT a proposal to change the permission. The fleet uses
+/// it: an orchestrator closes a review task for a reviewer who cannot settle its
+/// own. Whether it SHOULD survive is a separate question, deferred on the ticket.
+#[test]
+fn a_team_orchestrator_settles_a_non_owned_branch_task_by_the_acl_not_the_guard() {
+    let home = tmp_home("acl-decides-not-the-guard");
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "teams:\n  dev:\n    members: [dev-lead, dev-impl-2]\n    \
+         orchestrator: dev-lead\n    created_at: \"2026-04-27T00:00:00Z\"\n",
+    )
+    .expect("write fleet.yaml");
+    let created = handle(
+        &home,
+        "dev-lead",
+        &serde_json::json!({
+            "action": "create",
+            "title": "branch-carrying work",
+            "assignee": "dev-impl-2",
+            "branch": "feat/owned-by-someone-else",
+        }),
+    );
+    let id = created["id"].as_str().expect("task id").to_string();
+    handle(
+        &home,
+        "dev-impl-2",
+        &serde_json::json!({"action": "claim", "id": id}),
+    );
+
+    // dev-lead holds no binding for this task and is not its assignee. The guard
+    // returns NotApplicable(NotTheAssignee); the ACL is what lets this through.
+    let done = handle(
+        &home,
+        "dev-lead",
+        &serde_json::json!({"action": "done", "id": id, "result": "settled by the orchestrator"}),
+    );
+    assert!(
+        done.get("error").is_none(),
+        "the team orchestrator settles by the ACL, with no binding of its own: {done}"
+    );
+    assert_eq!(
+        read_task_record(&home, &id).expect("task").status,
+        crate::task_events::TaskStatus::Done
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The ownerless row, pinned as it behaves today rather than as it reads.
+///
+/// A branch-retention obligation is raised with `owner: None` whenever neither
+/// the branch opener nor the origin task's creator is live
+/// (`worktree_pool::branch_cleanup`, pinned by
+/// `retention_obligation_is_orphan_tagged_when_neither_owner_nor_orchestrator_live`).
+/// Any caller can complete such a row, and the reason is upstream of this guard:
+/// `can_mutate_record` returns `true` for `owner: None` before the guard is ever
+/// consulted (acl.rs), and the guard itself only reaches
+/// `NotApplicable(Branchless)` because retention rows are deliberately branchless.
+///
+/// This is current behaviour, deliberately unchanged here: tightening it means
+/// changing `can_mutate_record`'s membership, which is out of this ticket's
+/// scope and is deferred as its own permission question. The test exists so the
+/// next reader finds the fact stated instead of inferring containment.
+#[test]
+fn an_ownerless_row_is_completable_by_any_caller_because_the_acl_admits_everyone() {
+    let home = tmp_home("ownerless-row-any-caller");
+    let created = handle(
+        &home,
+        "system:branch-retention",
+        &serde_json::json!({
+            "action": "create",
+            "title": "branch-retention: confirm 'feat/orphaned' is still needed",
+        }),
+    );
+    let id = created["id"].as_str().expect("task id").to_string();
+    let record = read_task_record(&home, &id).expect("task");
+    assert!(
+        record.owner.is_none(),
+        "precondition: the row is ownerless, the shape branch_cleanup projects"
+    );
+    assert!(
+        record.branch.is_none(),
+        "precondition: retention rows are branchless by design"
+    );
+
+    let done = handle(
+        &home,
+        "an-unrelated-agent",
+        &serde_json::json!({"action": "done", "id": id, "result": "delete: not mine"}),
+    );
+    assert!(
+        done.get("error").is_none(),
+        "current behaviour: an unrelated caller completes an ownerless row: {done}"
     );
     std::fs::remove_dir_all(&home).ok();
 }

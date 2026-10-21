@@ -11,6 +11,7 @@ use ratatui::layout::Rect;
 
 use crate::agent::AgentRegistry;
 use crate::layout::{DragTabTarget, Layout, MovePlacement, SplitBorderHit, SplitDir};
+use crate::team_view::TeamView;
 
 use super::overlay::Overlay;
 
@@ -47,6 +48,7 @@ pub(super) fn handle(
     state: &mut MouseState,
     fleet_path: &Path,
     registry: &AgentRegistry,
+    team_view: Option<&TeamView>,
 ) -> MouseOutcome {
     let mut out = MouseOutcome::default();
 
@@ -90,10 +92,24 @@ pub(super) fn handle(
     // pane id under the cursor that wants mouse + SGR; we then call
     // `write_to_pane` (sibling of `write_to_focused`) to deliver bytes to
     // that specific pane's PTY.
-    if let Some((pane_id, inner_x, inner_y)) = pane_for_mouse_forward(layout, &mouse) {
-        if let Some(encoded) = crate::mouse_forward::encode_sgr(&mouse, inner_x, inner_y) {
-            super::write_to_pane(&crate::home_dir(), layout, registry, pane_id, &encoded);
-            return out;
+    // #3657: once a title-bar drag owns the left-button gesture, keep its
+    // Drag/Up continuation in the local pane-drag state machine. The source
+    // title Down was local, so forwarding these events would both create an
+    // orphan backend gesture and prevent target selection/release cleanup.
+    // Restrict this exemption to left Drag/Up: right/middle gestures and
+    // scroll events must retain ordinary backend forwarding semantics.
+    let local_pane_drag_continuation = matches!(
+        mouse.kind,
+        MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left)
+    ) && layout
+        .active_tab()
+        .is_some_and(|tab| tab.dragging_pane.is_some());
+    if !local_pane_drag_continuation {
+        if let Some((pane_id, inner_x, inner_y)) = pane_for_mouse_forward(layout, &mouse) {
+            if let Some(encoded) = crate::mouse_forward::encode_sgr(&mouse, inner_x, inner_y) {
+                super::write_to_pane(&crate::home_dir(), layout, registry, pane_id, &encoded);
+                return out;
+            }
         }
     }
 
@@ -101,7 +117,9 @@ pub(super) fn handle(
         MouseEventKind::ScrollUp => super::scroll_focused(layout, 3),
         MouseEventKind::ScrollDown => super::scroll_focused(layout, -3),
         MouseEventKind::Down(MouseButton::Left) => {
-            handle_down(mouse, layout, state, fleet_path, registry, &mut out);
+            handle_down(
+                mouse, layout, state, fleet_path, registry, team_view, &mut out,
+            );
         }
         MouseEventKind::Drag(MouseButton::Left) => {
             handle_drag(mouse, layout, state);
@@ -120,10 +138,11 @@ fn handle_down(
     state: &mut MouseState,
     fleet_path: &Path,
     registry: &AgentRegistry,
+    team_view: Option<&TeamView>,
     out: &mut MouseOutcome,
 ) {
     if crate::layout::is_tab_bar_row(mouse.row) {
-        match tab_bar_hit_test(layout, mouse.column) {
+        match tab_bar_hit_test_with_team(layout, mouse.column, team_view) {
             Some(TabBarClick::Tab(idx)) => {
                 out.new_last_tab = Some(layout.active);
                 layout.goto_tab(idx);
@@ -134,7 +153,7 @@ fn handle_down(
             }
             Some(TabBarClick::NewTab) => {
                 out.new_overlay = Some(Overlay::NewTabMenu {
-                    items: super::build_menu_items(fleet_path, registry),
+                    items: super::build_menu_items(fleet_path, registry, layout),
                     selected: 0,
                 });
             }
@@ -156,7 +175,7 @@ fn handle_down(
         .then(|| {
             layout
                 .active_tab()
-                .and_then(|tab| tab.title_bar_at(mouse.column, mouse.row))
+                .and_then(|tab| tab.title_bar_at_with_team(mouse.column, mouse.row, team_view))
         })
         .flatten();
     if let Some(pane_id) = title_hit {
@@ -361,6 +380,14 @@ enum TabBarClick {
 /// Caching tab positions would save ~5 iterations but adds invalidation
 /// complexity. Kept as-is — n_tabs is typically 1-5.
 fn tab_bar_hit_test(layout: &Layout, col: u16) -> Option<TabBarClick> {
+    tab_bar_hit_test_with_team(layout, col, None)
+}
+
+fn tab_bar_hit_test_with_team(
+    layout: &Layout,
+    col: u16,
+    team_view: Option<&TeamView>,
+) -> Option<TabBarClick> {
     use unicode_width::UnicodeWidthStr;
     let mut x: u16 = 0;
     for (i, tab) in layout.tabs.iter().enumerate() {
@@ -368,7 +395,7 @@ fn tab_bar_hit_test(layout: &Layout, col: u16) -> Option<TabBarClick> {
             x += 1;
         } // separator space
         let is_active = i == layout.active;
-        let label = tab.tab_bar_label(is_active);
+        let label = tab.tab_bar_label_with_team(is_active, team_view);
         let tab_w = 1 + label.width() as u16; // "*" dot + label
         if col >= x && col < x + tab_w {
             return Some(TabBarClick::Tab(i));
@@ -579,17 +606,20 @@ mod tests {
     use crate::layout::{DragTabTarget, Pane, PaneSource, SplitDir, Tab};
     use crate::vterm::VTerm;
     use crossterm::event::KeyModifiers;
+    use std::collections::HashMap;
 
     fn leaf(id: usize, agent: &str) -> Pane {
         Pane {
             agent_name: agent.into(),
             instance_id: crate::types::InstanceId::default(),
+            instance_ref: None,
             vterm: VTerm::new(10, 10),
             rx: crossbeam_channel::bounded(1).1,
             id,
             backend: None,
             working_dir: None,
             display_name: None,
+            restart_error: None,
             scroll_offset: 0,
             has_notification: false,
             fleet_instance_name: None,
@@ -985,6 +1015,32 @@ mod tests {
         assert_eq!(plain.tab_bar_label(false), " x ", "no notif → no badge");
     }
 
+    #[test]
+    fn authoritative_team_label_is_shared_by_render_and_hit_test() {
+        let mut lead = leaf(1, "lead");
+        lead.fleet_instance_name = Some("lead".into());
+        let mut member = leaf(2, "member");
+        member.fleet_instance_name = Some("member".into());
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("operator-renamed".into(), lead));
+        layout.tabs[0].split_focused(SplitDir::Vertical, member);
+        let config: crate::fleet::FleetConfig = serde_yaml_ng::from_str(
+            "teams:\n  ops:\n    members: [lead, member]\n    orchestrator: lead\n",
+        )
+        .unwrap();
+        let view = crate::team_view::TeamView::from_fleet(config, Some(HashMap::new()));
+        assert_eq!(
+            layout.tabs[0].tab_bar_label_with_team(true, Some(&view)),
+            " ops [LEAD?] ",
+            "tab identity must come from the authoritative member set"
+        );
+        assert_eq!(
+            tab_bar_hit_test_with_team(&layout, 0, Some(&view)),
+            Some(TabBarClick::Tab(0)),
+            "hit-test must use the same authoritative label width"
+        );
+    }
+
     /// #777 regression: render and `tab_bar_hit_test` must agree on per-tab widths so a
     /// click never lands on the wrong tab. The old `[respawning]`/`[crashed]` badge
     /// widened a tab in render ONLY — the hit-test didn't count it, shifting every later
@@ -1055,6 +1111,7 @@ mod tests {
             &mut state,
             fleet_path,
             &empty_registry(),
+            None,
             &mut out,
         );
 
@@ -1223,6 +1280,7 @@ mod tests {
             &mut state,
             fleet_path,
             &empty_registry(),
+            None,
         );
 
         assert_eq!(
@@ -1263,6 +1321,7 @@ mod tests {
             &mut state,
             fleet_path,
             &empty_registry(),
+            None,
         );
 
         assert_eq!(
@@ -1276,6 +1335,82 @@ mod tests {
             "handle_selection MUST cache selecting_pane on Down so drag \
              continues against the same pane"
         );
+    }
+
+    /// #3657 immutable RED: a title drag released over a mouse-forwarding
+    /// target must still complete through the real top-level `handle()` path.
+    /// The source title Down is local; the target-body Drag and Up must remain
+    /// local continuation events for the active pane drag.
+    #[test]
+    #[serial]
+    fn title_drag_through_forwarded_target_body_swaps_and_clears_3657() {
+        let _home = ScopedHome::new("title-drag-forwarded-target");
+
+        let mut layout = two_pane_layout("opencode");
+        layout.tabs[0].focus_id = 2;
+        enable_opencode_mouse(layout.tabs[0].root_mut().find_pane_mut(2).unwrap());
+
+        let source_down = down_left_at(2, 1);
+        assert_eq!(
+            layout.tabs[0].title_bar_at(2, 1),
+            Some(1),
+            "test precondition: source Down must hit pane 1 title text"
+        );
+
+        let mut state = MouseState::default();
+        let fleet_path = std::path::Path::new("/nonexistent/fleet.yaml");
+        let down_out = super::handle(
+            source_down,
+            &mut layout,
+            &mut state,
+            fleet_path,
+            &empty_registry(),
+            None,
+        );
+        assert!(!down_out.needs_resize);
+        assert_eq!(layout.tabs[0].dragging_pane, Some(1));
+
+        let target_drag = drag_left_at(15, 5);
+        assert_eq!(
+            super::pane_for_mouse_forward(&layout, &target_drag).map(|(pane_id, _, _)| pane_id),
+            Some(2),
+            "test precondition: target body must be a real mouse-forward target"
+        );
+        super::handle(
+            target_drag,
+            &mut layout,
+            &mut state,
+            fleet_path,
+            &empty_registry(),
+            None,
+        );
+        assert_eq!(
+            layout.tabs[0].drag_target,
+            Some(2),
+            "active local pane drag must record the target under the cursor"
+        );
+
+        let up_out = super::handle(
+            up_left_at(15, 5),
+            &mut layout,
+            &mut state,
+            fleet_path,
+            &empty_registry(),
+            None,
+        );
+        assert!(
+            up_out.needs_resize,
+            "completed pane swap must request resize"
+        );
+        assert_eq!(
+            layout.tabs[0].root().pane_ids(),
+            vec![2, 1],
+            "target pane must move into the source's visual slot"
+        );
+        assert_eq!(layout.tabs[0].focus_id, 1);
+        assert_eq!(layout.tabs[0].dragging_pane, None);
+        assert_eq!(layout.tabs[0].drag_target, None);
+        assert_eq!(layout.tabs[0].drag_target_tab, None);
     }
 
     // ----- #92758-3: a left-click dismisses a stale selection anywhere -----
@@ -1311,6 +1446,7 @@ mod tests {
             &mut state,
             std::path::Path::new("/nonexistent/fleet.yaml"),
             &empty_registry(),
+            None,
         );
 
         assert!(
@@ -1345,6 +1481,7 @@ mod tests {
             &mut state,
             std::path::Path::new("/nonexistent/fleet.yaml"),
             &empty_registry(),
+            None,
         );
 
         assert!(
@@ -1379,6 +1516,7 @@ mod tests {
             &mut state,
             std::path::Path::new("/nonexistent/fleet.yaml"),
             &empty_registry(),
+            None,
         );
 
         let pane = layout.tabs[0].root_mut().find_pane_mut(2).unwrap();
@@ -1471,6 +1609,115 @@ mod tests {
                 .selection
                 .is_none(),
             "a pure click must not leave a zero-width selection"
+        );
+    }
+
+    /// #3500: REMOTE pane (blank VTerm, offthread None) must see wants_mouse
+    /// true after processing the first TAG_DATA dump that now carries TermMode,
+    /// for both offthread ON and OFF. This pins the dump fix for the
+    /// AGEND_OFFTHREAD_PARSE=0 (thin-client) and =1 paths.
+    #[test]
+    fn remote_pane_wants_mouse_after_dump_offthread_off() {
+        // Simulate daemon's VTerm that has already seen opencode's
+        // startup: 1000h + 1006h (wants_mouse + SGR).
+        let mut daemon_vt = VTerm::new(80, 24);
+        daemon_vt.process(b"\x1b[?1000h\x1b[?1006h");
+        assert!(daemon_vt.wants_mouse() && daemon_vt.mouse_sgr());
+        let dump = daemon_vt.dump_screen();
+        // Simulate TUI's REMOTE pane: blank VTerm, offthread None (thin-client default).
+        let mut remote_pane = leaf(1, "opencode-remote");
+        assert!(
+            !remote_pane.wants_mouse(),
+            "remote blank VTerm must start without mouse"
+        );
+        // First TAG_DATA (dump) arrives before any mouse event.
+        remote_pane.vterm.process(&dump);
+        assert!(
+            remote_pane.wants_mouse() && remote_pane.mouse_sgr(),
+            "remote pane after dump must have wants_mouse+mouse_sgr true (offthread OFF)"
+        );
+        // Also verify the SGR forwarding gate would route.
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("single".to_string(), remote_pane));
+        layout.active = 0;
+        layout.tabs[0].focus_id = 1;
+        layout.tabs[0].pane_rects.insert(1, (0, 0, 80, 24));
+        let mouse = scroll_up_at(10, 5);
+        assert!(
+            super::pane_for_mouse_forward(&layout, &mouse).is_some(),
+            "remote pane after dump must route wheel for SGR forwarding"
+        );
+    }
+
+    #[test]
+    fn remote_pane_wants_mouse_after_dump_offthread_on() {
+        // Same as above but via the offthread snapshot path.
+        let mut daemon_vt = VTerm::new(80, 24);
+        daemon_vt.process(b"\x1b[?1000h\x1b[?1006h");
+        let dump = daemon_vt.dump_screen();
+        // Build an offthread parser that will process the dump and publish a snapshot.
+        let (data_tx, data_rx) = crossbeam_channel::unbounded::<Vec<u8>>();
+        let (wake_tx, wake_rx) = crossbeam_channel::unbounded::<usize>();
+        let parser_vt = VTerm::new(80, 24);
+        let handle = crate::render::offthread::spawn_offthread_parser(
+            2,
+            "opencode-remote-offthread".to_string(),
+            data_rx,
+            parser_vt,
+            wake_tx,
+        )
+        .expect("parser spawns");
+        // Send the dump as the first chunk (exactly how tui_bridge's first TAG_DATA arrives).
+        data_tx.send(dump).expect("send dump");
+        wake_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("offthread must publish snapshot after dump");
+        let mut remote_pane = leaf(2, "opencode-remote-offthread");
+        remote_pane.offthread = Some(handle);
+        // Main VTerm is idle, but snapshot must have the mode.
+        assert!(
+            !remote_pane.vterm.wants_mouse(),
+            "offthread main VTerm is idle"
+        );
+        assert!(
+            remote_pane.wants_mouse() && remote_pane.mouse_sgr(),
+            "remote pane via snapshot must have wants_mouse+mouse_sgr true (offthread ON)"
+        );
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::new("single".to_string(), remote_pane));
+        layout.active = 0;
+        layout.tabs[0].focus_id = 2;
+        layout.tabs[0].pane_rects.insert(2, (0, 0, 80, 24));
+        let mouse = scroll_up_at(10, 5);
+        assert!(
+            super::pane_for_mouse_forward(&layout, &mouse).is_some(),
+            "offthread remote pane must route wheel"
+        );
+    }
+
+    /// #3500: alt-screen (1049h) must also be carried by the dump so a REMOTE
+    /// attach to an alt-screen opencode does not get a local scroll that should be SGR-forwarded.
+    #[test]
+    fn remote_pane_alt_screen_after_dump_has_no_local_scroll() {
+        let mut daemon_vt = VTerm::new(80, 24);
+        daemon_vt.process(b"\x1b[?1049h\x1b[?1000h\x1b[?1006h");
+        let dump = daemon_vt.dump_screen();
+        let mut remote_pane = leaf(3, "opencode-alt");
+        remote_pane.vterm.process(&dump);
+        assert!(
+            remote_pane.wants_mouse() && remote_pane.mouse_sgr(),
+            "alt-screen remote must still have mouse"
+        );
+        // In alt-screen, max_scroll is 0, so local scroll path is disabled.
+        assert_eq!(
+            remote_pane.vterm.max_scroll(),
+            0,
+            "alt-screen must have max_scroll 0"
+        );
+        assert_eq!(
+            remote_pane.scroll_max(),
+            0,
+            "alt-screen remote pane scroll_max must be 0 (no local scroll)"
         );
     }
 }

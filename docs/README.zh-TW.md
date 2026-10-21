@@ -2,12 +2,17 @@
 
 # AgEnD Terminal — 文件總覽
 
+> **Status：** 目前文件索引
+> **Audience：** Operator、agent、reviewer 與 contributor
+> **Authority：** 本索引與各連結主題的 owner
+> **Last verified：** 2026-09-22，`main@62b28f36`
+
 [專案 README](../README.zh-TW.md)以外的所有文件，依主題分類。每一份 repository
 自有的 Markdown 都以英文／繁體中文成對維護；任一語言都不能在不知不覺中少掉
 section、table、code block 或 link target。
 
-> 第一次接觸？先看[快速開始](FEATURE-quickstart.zh-TW.md)，再讀
-> [Fleet 設定](FEATURE-fleet.zh-TW.md)。
+> **從這裡開始：** 先用[目標路由](START-HERE.zh-TW.md)選擇 Operator、Agent、Reviewer
+> 或 Incident。第一次操作的 operator 再開[快速開始](FEATURE-quickstart.zh-TW.md)。
 
 ## 擺放與維護政策
 
@@ -46,6 +51,7 @@ artifact 內提到的 issue/PR，或執行 `git log -- <former-path>`。歷史�
 
 | 文件 | EN | 中文 | 內容 |
 |---|---|---|---|
+| 從這裡開始 | [EN](START-HERE.md) | [中文](START-HERE.zh-TW.md) | Operator、agent、reviewer 與 incident 的目標路由 |
 | 快速開始 | [EN](FEATURE-quickstart.md) | [中文](FEATURE-quickstart.zh-TW.md) | 從安裝到第一個 live fleet |
 | Fleet 設定 | [EN](FEATURE-fleet.md) | [中文](FEATURE-fleet.zh-TW.md) | `fleet.yaml`、backend、role、team 與 workspace |
 | 使用指南 | [EN](USAGE.md) | [中文](USAGE.zh-TW.md) | 日常操作與常見流程 |
@@ -93,6 +99,8 @@ artifact 內提到的 issue/PR，或執行 `git log -- <former-path>`。歷史�
 | Architecture-14 台帳 | [EN](ARCHITECTURE-14-LEDGER.md) | [中文](ARCHITECTURE-14-LEDGER.zh-TW.md) | 現行 convergence outcome 與 evidence |
 | Daemon Lock Ordering | [EN](DAEMON-LOCK-ORDERING.md) | [中文](DAEMON-LOCK-ORDERING.zh-TW.md) | Lock hierarchy 與 deadlock prevention |
 | Hung-State 契約 | [EN](HUNG-STATE-TRANSITIONS.md) | [中文](HUNG-STATE-TRANSITIONS.zh-TW.md) | Detection transition 與 productive-output gate |
+| 偵測規則 Spike | [EN](DETECTION-RULES-SPIKE-3647.md) | [中文](DETECTION-RULES-SPIKE-3647.zh-TW.md) | Issue #3647 的畫面偵測規則資料化設計 |
+| 側欄 Spike | [EN](SIDEBAR-SPIKE-3645.md) | [中文](SIDEBAR-SPIKE-3645.zh-TW.md) | Issue #3645 的常駐 spaces/agents 側欄與 attention queue |
 | Recovery Stages | [EN](RECOVERY-STAGES.md) | [中文](RECOVERY-STAGES.zh-TW.md) | 分階段 automatic recovery |
 | Backend Matrix | [EN](BACKEND-CAPABILITY-MATRIX.md) | [中文](BACKEND-CAPABILITY-MATRIX.zh-TW.md) | Backend signal、provider、resume 與 MCP |
 | MCP Tools | [EN](MCP-TOOLS.md) | [中文](MCP-TOOLS.zh-TW.md) | Tool registry 與 bridge/proxy 契約 |

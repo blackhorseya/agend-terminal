@@ -75,6 +75,22 @@ pub struct BackendProfile {
     /// only over the bottom status rows — NOT the error tail window — because
     /// agents routinely DISCUSS context% in conversation text (prose-FP).
     pub context_pattern: Option<&'static str>,
+    /// t-…-82348-36: what the scraped `context_pattern` figure MEANS, so a
+    /// consumer cannot mistake it for remaining session budget. `None` exactly
+    /// when `context_pattern` is `None` (nothing is scraped, nothing to
+    /// explain). Surfaced verbatim on LIST as `context_meaning` and used by the
+    /// daemon's alert/handoff wording. Values today:
+    /// - `"window_fill"` (ClaudeCode) — ccstatusline's `context-percentage` is
+    ///   the fill of an auto-compacted CONTEXT WINDOW: auto-compaction fires
+    ///   near 95% and the figure then drops, so it CYCLES during normal work
+    ///   and is NOT a session-budget countdown (2026-09-02 evidence: a live
+    ///   pane read 95.0%, auto-compaction fired, it then read 7.0%). Under the
+    ///   fleet policy — fresh-restart at a natural boundary INSTEAD of letting
+    ///   compaction happen — it is the fresh-restart trigger.
+    /// - `"context_gauge"` (KiroCli) — kiro's own ◔ context gauge. Its relation
+    ///   to auto-compaction is NOT established by fleet evidence; also not
+    ///   session budget.
+    pub context_meaning: Option<&'static str>,
     /// #1947: prompt markers identifying the backend's INPUT line (and echoed /
     /// submitted user-message lines). An error pattern matched on a line whose
     /// trimmed start is one of these is operator-typed / quoted text, not CLI
@@ -95,6 +111,86 @@ pub const CLAUDE_CONTEXT_PATTERN: &str = r"(?i)\bctx\s+used:\s*(\d+(?:\.\d+)?)\s
 /// (`Kiro · auto · ◔ 10%`). The ◔ glyph is kiro's context gauge and never
 /// appears in prose.
 pub const KIRO_CONTEXT_PATTERN: &str = r"◔\s*(\d+(?:\.\d+)?)\s*%";
+
+/// t-…-82348-29 r2: the codex 0.150.x startup update menu, recognized
+/// STRUCTURALLY and anchored to the TAIL of the rendered screen.
+///
+/// It matches the whole menu block and nothing else: the `Update available!`
+/// title line, then (within at most 4 intervening lines — the release-notes
+/// line and its blank spacers) the cursor option `› 1. Update now`, then the
+/// two consecutive options `2. Skip` and `3. Skip until next version`, and
+/// after option 3 NOTHING but blank lines and the optional
+/// `Press enter to continue` hint before end-of-text (`\z`).
+///
+/// WHY TAIL-ANCHORED — this is the whole FP argument, do not weaken it to a
+/// phrase. The live modal REPLACES codex's UI: while it owns the terminal
+/// nothing is painted below it — no `›` composer, no `esc to interrupt`
+/// status line, no transcript. A menu that appears in ordinary output
+/// (a transcript, an issue body, this repo's own tests, a resume repaint) is
+/// by construction NOT the last thing on the screen: codex's composer and
+/// status chrome render underneath it. So "the complete menu block sits at
+/// the very end of the rendered screen" is the property that separates live
+/// from quoted; the bare phrase `Skip until next version` — an unanchored
+/// whole-visible-text match, with no position guard and no heartbeat override
+/// (`StatePatterns::detect_with_match` is `re.find(whole screen)`, and
+/// PermissionPrompt is not a HIGH_FP state so neither `apply_anchor_gate` nor
+/// `apply_position_gate` applies) — separates nothing at all.
+///
+/// The screen text this is matched against is
+/// [`crate::vterm::VTerm::tail_lines_dewrapped`] / `tail_lines`, which trims
+/// trailing blank rows, so a live frame ends immediately after the hint; the
+/// trailing `(?:\n[ \t]*…)*` run keeps the anchor tolerant of a capture or
+/// fixture that does carry trailing newlines.
+///
+/// Used in BOTH places that act on this modal, deliberately from ONE
+/// definition: the codex `PermissionPrompt` classification (see
+/// [`codex_profile`]) and the codex update `DismissPattern.label` (see
+/// `Backend::Codex`'s preset in `crate::backend`). Because the dismiss scan
+/// matches the same anchored regex, quoted text cannot fire the `2\r`
+/// keystroke under ANY [`crate::agent::dismiss::DismissScanScope`] — Startup
+/// included — not merely under the post-latch re-arm.
+///
+/// F3 (disclosed, NOT fixed here): while this menu is up the pane classifies
+/// `PermissionPrompt`, so `supervisor/reactions.rs`'s edge-triggered notice
+/// would be suppressed for a genuine approval prompt arriving in the same
+/// window. Bounds, measured rather than assumed:
+///
+/// * codex's modal is EXCLUSIVE — no other prompt can render while it owns the
+///   screen — so there is no genuine approval prompt to miss while it is up.
+/// * `detect` releases the instant anything is painted below the menu (that is
+///   what the tail anchor buys). The tracked STATE lags by the hysteresis
+///   min-hold for a priority-DOWN transition, 2s from `PermissionPrompt`
+///   (`StateTracker::transition`), with `INTERACTIVE_EXPIRY` (120s) as the
+///   backstop for the case where the screen then goes hash-stable and
+///   detection stops re-evaluating.
+///
+/// So the exposure is the live-menu window plus ~2s, once per spawn. Mitigation
+/// is follow-up task t-20260902123656981395-82348-52; do not implement it here.
+///
+/// The cursor glyph (`›`) is OPTIONAL on each option line: it may sit on any
+/// of the three (a stray Down keypress mid-repaint, or a build that restores
+/// the previous selection, can leave it off option 1). The dismiss sequence
+/// selects Skip BY NUMBER (`2\r`), so cursor position is irrelevant to the
+/// keystroke that gets typed — the classifier must be equally indifferent to
+/// it. It is the tail anchor (`\z`), not the cursor, that separates this live
+/// menu from a quoted one: a repaint under it (composer, status line) breaks
+/// the match regardless of where `›` sits.
+pub const CODEX_UPDATE_MENU_LIVE: &str = concat!(
+    r"Update available![^\n]*\n",
+    r"(?:[^\n]*\n){0,4}?",
+    r"[ \t]*(?:›[ \t]*)?1\. Update now[^\n]*\n",
+    r"[ \t]*(?:›[ \t]*)?2\. Skip[ \t]*\n",
+    r"[ \t]*(?:›[ \t]*)?3\. Skip until next version[ \t]*",
+    r"(?:\n[ \t]*(?:Press enter to continue)?[ \t]*)*\z",
+);
+
+/// The plain literal every [`CODEX_UPDATE_MENU_LIVE`] match necessarily
+/// contains. Two consumers need it: the dismiss scan's cheap `screen.contains`
+/// prefilter (a structural label has no `DISMISS_REGEX_*_PREFIX` to strip, so
+/// the generic literal-hint recovery would hand `contains` an entire regex),
+/// and `REARM_PRE_IDLE_BACKEND_STARTUP_HINTS`, whose membership stays keyed on
+/// this literal. See `crate::agent::dismiss`.
+pub const CODEX_UPDATE_MENU_LITERAL: &str = "Update available!";
 
 /// The single dispatch: `Backend → &'static BackendProfile`, lazy-cached
 /// (compile-once, mirroring `StatePatterns::for_backend`'s `OnceLock`). This
@@ -177,6 +273,7 @@ fn grok_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Generic),
         },
         context_pattern: None,
+        context_meaning: None,
         input_line_markers: &["❯"],
         initial_state: AgentState::Starting,
     }
@@ -265,6 +362,7 @@ fn agy_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Agy),
         },
         context_pattern: None,
+        context_meaning: None,
         input_line_markers: &[],
         initial_state: AgentState::Starting,
     }
@@ -329,6 +427,7 @@ fn kirocli_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Kiro),
         },
         context_pattern: Some(KIRO_CONTEXT_PATTERN),
+        context_meaning: Some("context_gauge"),
         input_line_markers: &[">"],
         initial_state: AgentState::Starting,
     }
@@ -412,6 +511,7 @@ fn opencode_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::OpenCode),
         },
         context_pattern: None,
+        context_meaning: None,
         input_line_markers: &[],
         initial_state: AgentState::Starting,
     }
@@ -452,6 +552,23 @@ fn codex_profile() -> BackendProfile {
                 AgentState::PermissionPrompt,
                 r"Would you like to run the following command\?|Press enter to confirm or esc to cancel|No, and tell Codex what to do differently",
             ),
+            // t-…-82348-29: the codex startup update menu (0.150.x shows it
+            // even with `-c check_for_update_on_startup=false` on the argv).
+            // Without a prompt token this frame fell through to Active ("esc to
+            // interrupt" in the repainted transcript) or Idle (the menu's own
+            // `›` cursor), so the post-latch dismiss scan never armed and the
+            // agent stranded until a human keypress. Priority order puts this
+            // above both, matching how the other prompt tokens already win.
+            //
+            // r2 (review F2): a SEPARATE entry carrying the structural,
+            // tail-anchored [`CODEX_UPDATE_MENU_LIVE`] rather than a bare
+            // `Skip until next version` token folded into the alternation
+            // above. Same classification (first-match priority is by state, and
+            // both entries are PermissionPrompt), but the recognizer now
+            // distinguishes the LIVE modal from a transcript quoting it —
+            // a bare phrase could not, and any prose carrying it kept the pane
+            // prompt_blocked and re-armed the dismiss scan.
+            (AgentState::PermissionPrompt, CODEX_UPDATE_MENU_LIVE),
             (
                 AgentState::GitConflict,
                 r"Automatic merge failed; fix conflicts|CONFLICT \(content\)|Resolve all conflicts manually|Failed to merge submodule|Failed to merge in",
@@ -471,6 +588,7 @@ fn codex_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Codex),
         },
         context_pattern: None,
+        context_meaning: None,
         input_line_markers: &["›"],
         initial_state: AgentState::Starting,
     }
@@ -510,8 +628,21 @@ fn claudecode_profile() -> BackendProfile {
                 r"API Error: Request rejected \(429\)|rate_limit_error|hit a rate limit",
             ),
             (
+                // The model-tier wall names whatever model is active, and that
+                // name drifts on every rename: the live 2026-09-05 banner read
+                // "your Fable limit" while this arm still pinned "Fable 5", so
+                // nothing latched and the agent idled 82 minutes undetected.
+                // Key on the banner SHAPE — box-draw chrome (the prose-FP guard,
+                // see `claude_model_tier_limit_prose_without_banner_chrome_is_not_usage_limit`)
+                // plus the `/usage-credits` remedy — and leave the model name
+                // free — LAZY and `.`-tolerant, because a point release
+                // ("Fable 5.1", the live statusline value) puts a dot inside
+                // the model name; the mandatory " limit. Run /usage-credits"
+                // tail is what keeps the bounded run from wandering. The
+                // trailing "to continue or switch models…" clause is dropped
+                // for the same drift reason.
                 AgentState::UsageLimit,
-                r"⎿[ \t]+You've reached your Fable 5 limit\. Run /usage-credits to continue or switch models with /model\.|You've hit your session limit|You've hit your weekly limit|You've hit your Opus limit|Credit balance is too low|credit_balance_too_low",
+                r"⎿[ \t]+You've reached your [^\n]{0,32}? limit\.[ \t]+Run /usage-credits|You've hit your session limit|You've hit your weekly limit|You've hit your Opus limit|Credit balance is too low|credit_balance_too_low",
             ),
             (
                 // #2090 P2: the broad `context.*(full|limit)` arm is replaced by a
@@ -558,6 +689,8 @@ fn claudecode_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Claude),
         },
         context_pattern: Some(CLAUDE_CONTEXT_PATTERN),
+        // Window-fill semantics — see the field doc; the wording was the bug.
+        context_meaning: Some("window_fill"),
         input_line_markers: &["❯", ">"],
         initial_state: AgentState::Starting,
     }
@@ -576,6 +709,7 @@ fn empty_profile() -> BackendProfile {
             cache_id: Some(MarkerCacheId::Generic),
         },
         context_pattern: None,
+        context_meaning: None,
         input_line_markers: &[],
         initial_state: AgentState::Idle,
     }
@@ -620,6 +754,43 @@ mod context_pattern_tests {
             .captures("Kiro · auto · ◔ 10%        ~/.agend-terminal/workspace/kiro")
             .expect("kiro live render matches");
         assert_eq!(&caps[1], "10");
+    }
+
+    /// t-…-82348-36: `context_meaning` exists exactly when a figure is
+    /// scraped — a reading with no stated meaning is what let two
+    /// orchestrators read Claude's window fill as remaining session budget —
+    /// and the two live values are pinned.
+    #[test]
+    fn context_meaning_present_exactly_when_pattern_is() {
+        for b in [
+            Backend::ClaudeCode,
+            Backend::KiroCli,
+            Backend::Codex,
+            Backend::OpenCode,
+            Backend::Agy,
+            Backend::Grok,
+            Backend::Shell,
+            Backend::Raw("x".into()),
+        ] {
+            let p = profile(&b);
+            assert_eq!(
+                p.context_meaning.is_some(),
+                p.context_pattern.is_some(),
+                "{b:?}: a scraped figure must state its meaning, and a backend that \
+                 scrapes nothing must state none"
+            );
+        }
+        assert_eq!(
+            profile(&Backend::ClaudeCode).context_meaning,
+            Some("window_fill"),
+            "Claude's statusline figure is context-WINDOW fill of an auto-compacted \
+             window, not session budget"
+        );
+        assert_eq!(
+            profile(&Backend::KiroCli).context_meaning,
+            Some("context_gauge"),
+            "kiro reports its own ◔ context gauge"
+        );
     }
 }
 

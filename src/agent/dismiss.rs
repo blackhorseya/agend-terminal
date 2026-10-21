@@ -1,4 +1,90 @@
 use super::*;
+use crate::agent::dev_modal::{DevModalGate, GateOutcome, LogicalMs};
+
+// #3314 test seam: perform the dismiss write INLINE instead of on a detached
+// thread with the production 300ms pacing. Every new race/one-shot assertion
+// needs to observe bytes without sleeping — a wall-clock wait is exactly the
+// dependence that let the first draft of the one-shot regression pass against
+// unfixed code. Production is untouched; other backends keep their #468 pacing.
+#[cfg(test)]
+thread_local! {
+    /// THREAD-local, deliberately: the test binary runs cases in parallel, and a
+    /// process-global flag lets one case's teardown disarm another case
+    /// mid-run — which is exactly how the first draft of this seam produced
+    /// three spurious failures.
+    static INLINE_DISMISS_WRITE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_inline_dismiss_write_for_test(on: bool) {
+    INLINE_DISMISS_WRITE.with(|f| f.set(on));
+}
+
+#[cfg(test)]
+thread_local! {
+    /// #3314 rendezvous: runs at the LAST instant before the startup-modal
+    /// keystroke syscall, so a test can deterministically deliver a
+    /// cancellation or a competing write exactly there and assert zero bytes.
+    /// It also makes W3 honest rather than rhetorical — the same hook placed
+    /// after the write shows a byte already gone cannot be recalled.
+    static PRE_WRITE_RENDEZVOUS: std::cell::RefCell<Option<Box<dyn Fn()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_pre_write_rendezvous_for_test(hook: Option<Box<dyn Fn()>>) {
+    PRE_WRITE_RENDEZVOUS.with(|h| *h.borrow_mut() = hook);
+}
+
+/// The PTY read loop's post-dismiss cooldown: once a dismiss has fired, the
+/// loop refuses to scan the next frames until this has elapsed.
+///
+/// RATE LIMITING ONLY — it is NOT a bound on how many times a startup modal
+/// can be answered, and no comment here or in `crate::backend` may claim it
+/// is. `StateTracker::feed_with_lazy_fg` reports `state_changed` on ANY
+/// screen-hash change, so a pre-Idle repaint that still shows the modal
+/// re-arms the scan the instant this window lapses, and `DISMISS_IN_FLIGHT`
+/// only bounds CONCURRENT dismisses. The real bound is the per-spawn one-shot
+/// threaded through [`try_prepared_dismiss_dialog_once_per_spawn`]
+/// (t-…-82348-29 r2, review F1).
+const DISMISS_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
+#[cfg(test)]
+thread_local! {
+    /// Test seam: compress the read loop's cooldown so a loop-level test can
+    /// deliver repaints AFTER it has lapsed without sleeping 10s per repaint —
+    /// a wall-clock wait is exactly the dependence that lets a one-shot
+    /// regression pass against unfixed code (the #3314 lesson). THREAD-local
+    /// for the same reason as `INLINE_DISMISS_WRITE`: cases run in parallel and
+    /// a process-global lets one case retune another. The loop-level test
+    /// drives `pty_read_loop` on its own thread, so the loop reads this value.
+    static DISMISS_COOLDOWN_OVERRIDE: std::cell::Cell<Option<std::time::Duration>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_dismiss_cooldown_for_test(cooldown: Option<std::time::Duration>) {
+    DISMISS_COOLDOWN_OVERRIDE.with(|c| c.set(cooldown));
+}
+
+/// The cooldown the PTY read loop applies after a dismiss fires. Production
+/// always returns [`DISMISS_COOLDOWN`]; the single accessor exists so the test
+/// seam above has one place to intercept.
+pub(crate) fn dismiss_cooldown() -> std::time::Duration {
+    #[cfg(test)]
+    if let Some(cooldown) = DISMISS_COOLDOWN_OVERRIDE.with(std::cell::Cell::get) {
+        return cooldown;
+    }
+    DISMISS_COOLDOWN
+}
+
+#[cfg(test)]
+fn run_pre_write_rendezvous() {
+    let hook = PRE_WRITE_RENDEZVOUS.with(|h| h.borrow_mut().take());
+    if let Some(hook) = hook {
+        hook();
+    }
+}
 
 /// Try to auto-dismiss dialogs using backend-configurable patterns. Returns true if dismissed.
 /// `screen` is the VTerm-rendered view the user sees — not raw PTY bytes —
@@ -20,12 +106,9 @@ use super::*;
 static DISMISS_REGEX_CACHE: std::sync::LazyLock<
     parking_lot::Mutex<std::collections::HashMap<String, Option<std::sync::Arc<regex::Regex>>>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
-
-/// H2: agents with a dismiss thread currently in flight — gates rapid dialog
-/// re-detection to one thread per agent. Hoisted to module scope (#1886
-/// follow-up) so the RAII [`InFlightGuard`] can clear it on drop.
+/// H2: per-agent/class flights dedupe without stranding the next startup modal (#1886).
 static DISMISS_IN_FLIGHT: std::sync::LazyLock<
-    parking_lot::Mutex<std::collections::HashSet<String>>,
+    parking_lot::Mutex<std::collections::HashSet<(String, bool)>>,
 > = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
 
 #[cfg(test)]
@@ -41,6 +124,11 @@ pub(crate) fn dismiss_scan_count_for_test() -> usize {
     DISMISS_SCAN_COUNT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
+#[cfg(test)]
+pub(crate) fn dismiss_in_flight_for_test(name: &str) -> bool {
+    DISMISS_IN_FLIGHT.lock().iter().any(|key| key.0 == name)
+}
+
 #[derive(Clone)]
 pub struct PreparedDismissPattern {
     pattern: String,
@@ -53,6 +141,22 @@ pub struct PreparedDismissPattern {
     /// `Yes, proceed`) is false so it never auto-acts a real mid-session
     /// permission modal. Derived from [`REARM_PAST_LATCH_TRUST_HINTS`].
     rearm_past_latch: bool,
+    /// #3314: may this pattern fire on a post-latch re-arm while the agent has
+    /// NEVER reached Idle — i.e. the startup sequence is demonstrably still
+    /// running? True for daemon-CAUSED startup modals
+    /// ([`REARM_PRE_IDLE_STARTUP_HINTS`]) and for backend-caused startup modals
+    /// with a fixed safe answer ([`REARM_PRE_IDLE_BACKEND_STARTUP_HINTS`],
+    /// t-…-82348-29); see [`DismissScanScope`].
+    rearm_pre_idle: bool,
+    /// #3314: does this pattern route through the dev-modal generation gate
+    /// ([`DevModalGate`])? That gate binds recognition to facts the daemon OWNS
+    /// (the dev-channel argv it passed, frame-epoch, a per-generation one-shot)
+    /// and its fingerprint is the dev-channel modal's static lines — so it is
+    /// TRUE only for [`REARM_PRE_IDLE_STARTUP_HINTS`]. A backend-caused startup
+    /// modal (codex update prompt) carries no daemon-owned fact to bind and its
+    /// frame never satisfies the dev fingerprint, so routing it through the gate
+    /// would refuse it unconditionally (t-…-82348-29 preflight).
+    dev_gated: bool,
 }
 
 /// #1886 follow-up: RAII guard that removes an agent from `DISMISS_IN_FLIGHT` on
@@ -60,7 +164,7 @@ pub struct PreparedDismissPattern {
 /// the removal was a trailing statement, so a panic before it left a stale entry
 /// that silently no-op'd every future dismiss for that agent until daemon
 /// restart. Arm it at thread entry; the in-flight slot is freed on any exit.
-struct InFlightGuard(String);
+struct InFlightGuard((String, bool));
 
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
@@ -117,7 +221,28 @@ fn dismiss_regex_cache_contains(pattern: &str) -> bool {
 const DISMISS_REGEX_PREFIX: &str = r"(?m)^[^A-Za-z\n]{0,8}";
 const DISMISS_REGEX_WIDE_PREFIX: &str = r"(?m)^[^A-Za-z\n]*";
 
+/// t-…-82348-29 r2 (review F2): dismiss labels that are STRUCTURAL rather than
+/// `DISMISS_REGEX_*_PREFIX` + literal, mapped to the plain literal that every
+/// match necessarily contains.
+///
+/// Two consumers need that literal and neither can recover it by stripping a
+/// prefix: the cheap `screen.contains` prefilter in
+/// [`try_prepared_dismiss_dialog_once_per_spawn`] (handing it a whole regex
+/// would make the pattern permanently unfireable — the trap
+/// [`dismiss_literal_hint`]'s doc warns about), and the hint lists below, whose
+/// membership stays keyed on the human-readable literal so the audit point
+/// still reads as one.
+const STRUCTURAL_DISMISS_HINTS: &[(&str, &str)] = &[(
+    crate::backend_profile::CODEX_UPDATE_MENU_LIVE,
+    crate::backend_profile::CODEX_UPDATE_MENU_LITERAL,
+)];
+
 fn dismiss_literal_hint(pattern: &str) -> &str {
+    for (label, hint) in STRUCTURAL_DISMISS_HINTS {
+        if *label == pattern {
+            return hint;
+        }
+    }
     pattern
         .strip_prefix(DISMISS_REGEX_PREFIX)
         .or_else(|| pattern.strip_prefix(DISMISS_REGEX_WIDE_PREFIX))
@@ -138,12 +263,147 @@ fn dismiss_literal_hint(pattern: &str) -> &str {
 /// one place.
 const REARM_PAST_LATCH_TRUST_HINTS: &[&str] = &[
     "Yes, I trust",
+    // t-…-65: the SAME trust modal with the cursor on `No, exit` — listed so a
+    // post-latch re-arm keeps it eligible instead of falling through to the
+    // `Yes, I trust` entry, whose bare Enter confirms the exit on that shape.
+    // Marker-qualified: the bare literal `No, exit` is kiro's hint too.
+    "❯ No, exit",
     "Run Grok Build in a project directory",
     "Do you trust the contents of this directory",
 ];
 
 fn is_rearm_past_latch_hint(literal_hint: &str) -> bool {
     REARM_PAST_LATCH_TRUST_HINTS.contains(&literal_hint)
+}
+
+/// #3314: literal hints of DAEMON-CAUSED STARTUP modals — prompts the daemon
+/// itself provokes by how it launches the backend, whose answer is fixed and is
+/// never the operator's to make. They may fire on a post-latch re-arm, but ONLY
+/// while the agent has never reached Idle ([`DismissScanScope::RearmPreIdle`]).
+///
+/// The dev-channel modal is here because the daemon passes
+/// `--dangerously-load-development-channels`; on a FRESH spawn the workspace-
+/// trust dialog renders first and settles the (monotonic) startup latch before
+/// this modal ever appears, so the startup window alone never sees it and the
+/// agent hangs at `awaiting operator`.
+///
+/// Why NOT [`REARM_PAST_LATCH_TRUST_HINTS`]: that list carries no time bound, and
+/// this literal circulates as ordinary transcript text (issue bodies, PR text,
+/// this file). Listed there, a quoted marker line above a LIVE approval modal
+/// would auto-answer it — the #2474 (r6) footgun. The pre-Idle bound closes that:
+/// a live modal needs a running session, which needs the composer, which is Idle.
+const REARM_PRE_IDLE_STARTUP_HINTS: &[&str] = &["WARNING: Loading development channels"];
+
+fn is_rearm_pre_idle_hint(literal_hint: &str) -> bool {
+    REARM_PRE_IDLE_STARTUP_HINTS.contains(&literal_hint)
+}
+
+/// t-…-82348-29: literal hints of BACKEND-caused startup modals — prompts the
+/// backend itself raises during its startup sequence, whose answer is fixed and
+/// is never the operator's to make. Like [`REARM_PRE_IDLE_STARTUP_HINTS`] they
+/// may fire on a post-latch re-arm ONLY while the agent has never reached Idle,
+/// but they do NOT route through the dev-modal generation gate: there is no
+/// daemon-owned fact (argv flag) to bind, and the gate's fingerprint is the
+/// dev-channel modal's static lines, so the gate would refuse them outright.
+///
+/// The codex "Update available!" entry is here because codex 0.150.x shows the
+/// update menu even when the child argv carries
+/// `-c check_for_update_on_startup=false` (#1626 — verified on the live
+/// stranded pid), and the modal frame previously classified Idle/Active, so the
+/// #1069 fallback was structurally dead: the agent stranded for ~11h until a
+/// human pressed a key. The pre-Idle bound keeps the #2474 exposure to the
+/// startup window: post-Idle the phrase is transcript and the settled re-arm
+/// refuses it.
+///
+/// r2 (review F1 + F2) — the round-1 residual note that stood here ("one
+/// possible stray 2\r, 10s-cooldown-limited") was wrong on BOTH halves. It is
+/// replaced by two real bounds, and no comment in this repo may restate the old
+/// claim:
+///
+/// * RECOGNITION (F2): the label is no longer a phrase. It is
+///   [`crate::backend_profile::CODEX_UPDATE_MENU_LIVE`] — the complete menu
+///   block anchored to the TAIL of the rendered screen — so a transcript that
+///   quotes the modal cannot match it in ANY scope, Startup included, not
+///   merely on the post-latch re-arm. The same const is the classifier's
+///   PermissionPrompt pattern, so quoted text never even reaches
+///   `prompt_blocked`.
+/// * COUNT (F1): membership in THIS list makes a pattern a PER-SPAWN ONE-SHOT.
+///   The flag is owned by the PTY read loop and threaded through
+///   [`try_prepared_dismiss_dialog_once_per_spawn`], which spends it at the
+///   first DISPATCH. The loop's 10s cooldown is rate limiting, NOT the bound:
+///   `StateTracker::feed_with_lazy_fg` reports `state_changed` on any
+///   screen-hash change, so without the flag every pre-Idle repaint still
+///   showing the menu enqueued another "2\r" once the window lapsed, and
+///   `DISMISS_IN_FLIGHT` bounds only CONCURRENT dismisses.
+///
+/// Consequence, stated plainly: exactly one "2\r" per spawn. If that single
+/// write fails, the auto-skip is FORFEIT for the spawn — the pane stays
+/// prompt-blocked and visible to the stuck watchdog, which is the honest
+/// degradation; `restart_instance` gets a fresh one-shot because the read loop,
+/// and with it the flag, restarts.
+const REARM_PRE_IDLE_BACKEND_STARTUP_HINTS: &[&str] =
+    &[crate::backend_profile::CODEX_UPDATE_MENU_LITERAL];
+
+fn is_rearm_pre_idle_backend_startup_hint(literal_hint: &str) -> bool {
+    REARM_PRE_IDLE_BACKEND_STARTUP_HINTS.contains(&literal_hint)
+}
+
+/// #3314: which dismiss patterns may a single rendered frame's scan consider?
+/// Selected by [`dismiss_scan_scope`] from the startup latch plus whether the
+/// agent has ever been Idle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DismissScanScope {
+    /// Startup latch still open: every configured pattern (unchanged behavior).
+    Startup,
+    /// Post-latch re-arm, agent has never reached Idle — the startup sequence is
+    /// still running: workspace-trust patterns plus daemon-caused startup modals.
+    RearmPreIdle,
+    /// Post-latch re-arm after the agent has settled at least once: workspace-
+    /// trust only, so a runtime-approval modal is never auto-acted (#2473/#2474).
+    RearmSettled,
+}
+
+/// #3314: the scan scope for this frame. `scan_enabled` is the startup latch;
+/// `ever_idle` records that the agent has reached Idle at least once, which is
+/// the point after which a startup modal can no longer legitimately appear.
+pub(crate) fn dismiss_scan_scope(scan_enabled: bool, ever_idle: bool) -> DismissScanScope {
+    match (scan_enabled, ever_idle) {
+        (true, _) => DismissScanScope::Startup,
+        (false, false) => DismissScanScope::RearmPreIdle,
+        (false, true) => DismissScanScope::RearmSettled,
+    }
+}
+
+impl PreparedDismissPattern {
+    /// #3314: may this pattern be considered under `scope`?
+    fn eligible(&self, scope: DismissScanScope) -> bool {
+        match scope {
+            DismissScanScope::Startup => true,
+            DismissScanScope::RearmPreIdle => self.rearm_past_latch || self.rearm_pre_idle,
+            // t-20260912171012286674-51827-9: the daemon-caused dev-channel modal
+            // stays eligible past Idle. Its safety never came from the scope —
+            // it comes from the generation gate's daemon-owned facts
+            // (argv flag, epoch, one-shot, 120s window, stability) — and 2.1.269
+            // provokes a transient Idle before the modal paints, which would
+            // otherwise strand the pane (gate never consulted again). Only the
+            // gate-routed (`dev_gated`) class is admitted here, never the
+            // backend-caused startup hints; the gate itself answers a settled
+            // frame on the complete fingerprint only, and refuses beside a live
+            // competitor (`SettledCompetitor`).
+            DismissScanScope::RearmSettled => self.rearm_past_latch || self.dev_gated,
+        }
+    }
+
+    /// t-…-82348-29 r2: is this a BACKEND-caused startup-modal hint
+    /// ([`REARM_PRE_IDLE_BACKEND_STARTUP_HINTS`]) — the class the per-spawn
+    /// one-shot governs? DERIVED from the two flags that define the class, not
+    /// stored, so it cannot drift from them: pre-Idle re-arm eligible AND not
+    /// routed through the dev-modal generation gate (the daemon-caused class
+    /// carries its own per-generation one-shot inside that gate, so applying
+    /// this flag to it would double-count and is deliberately excluded).
+    fn is_backend_startup_hint(&self) -> bool {
+        self.rearm_pre_idle && !self.dev_gated
+    }
 }
 
 pub fn prepare_dismiss_patterns(
@@ -157,6 +417,9 @@ pub fn prepare_dismiss_patterns(
             Some(PreparedDismissPattern {
                 pattern: pattern.clone(),
                 rearm_past_latch: is_rearm_past_latch_hint(&literal_hint),
+                rearm_pre_idle: is_rearm_pre_idle_hint(&literal_hint)
+                    || is_rearm_pre_idle_backend_startup_hint(&literal_hint),
+                dev_gated: is_rearm_pre_idle_hint(&literal_hint),
                 literal_hint,
                 regex,
                 key_seq: key_seq.clone(),
@@ -174,21 +437,110 @@ pub fn try_dismiss_dialog(
 ) -> bool {
     let prepared = prepare_dismiss_patterns(dismiss_patterns);
     // Default callers (tests + the `try_dismiss_dialog` seam) get the full
-    // startup-window scan (`trust_class_only = false`).
-    try_prepared_dismiss_dialog(name, screen, pty_writer, &prepared, false)
+    // startup-window scan.
+    // Default callers (tests + the `try_dismiss_dialog` seam) get the full
+    // startup-window scan with a permanently-armed, never-spent gate, and the
+    // stability window PRE-SATISFIED by observing this same frame once at t=0,
+    // so a single call keeps its historical meaning for the backends that use
+    // this seam. It is therefore NOT a model of production timing: the read
+    // loop supplies a real monotonic clock and a real per-generation gate, and
+    // there a candidate must genuinely persist unmodified across the window.
+    let mut gate = DevModalGate::new(true);
+    let _ = gate.observe(screen, LogicalMs(0));
+    try_prepared_dismiss_dialog(
+        name,
+        screen,
+        pty_writer,
+        &prepared,
+        DismissScanScope::Startup,
+        &mut gate,
+        LogicalMs(crate::agent::dev_modal::MIN_STABLE_MS),
+    )
 }
 
-/// `trust_class_only` (#2473): when true, only WORKSPACE-TRUST-class patterns
-/// (`rearm_past_latch`) are considered — used on a POST-latch re-arm so a
-/// runtime-approval pattern (claude `Yes, proceed`) can never auto-act a real
-/// mid-session permission modal. The startup-window scan passes false (full
-/// list, unchanged behavior). See [`REARM_PAST_LATCH_TRUST_HINTS`].
+/// `scope` (#2473, narrowed by #3314): which patterns this frame's scan may
+/// consider. A POST-latch re-arm never reaches runtime-approval patterns (claude
+/// `Yes, proceed`), so it can never auto-act a real mid-session permission modal;
+/// a re-arm before the agent has ever been Idle additionally reaches daemon-caused
+/// startup modals. The startup-window scan passes [`DismissScanScope::Startup`]
+/// (full list, unchanged behavior). See [`REARM_PAST_LATCH_TRUST_HINTS`],
+/// [`REARM_PRE_IDLE_STARTUP_HINTS`] and [`dismiss_scan_scope`].
 pub fn try_prepared_dismiss_dialog(
     name: &str,
     screen: &str,
     pty_writer: &PtyWriter,
     dismiss_patterns: &[PreparedDismissPattern],
-    trust_class_only: bool,
+    scope: DismissScanScope,
+    dev_gate: &mut DevModalGate,
+    now: LogicalMs,
+) -> bool {
+    // A caller with no spawn-scoped flag gets a FRESH one-shot for this single
+    // frame — the historical meaning of this seam, and the right default for a
+    // one-frame verdict. The PTY read loop must NOT use it: its flag has to
+    // live for the whole spawn (see `pty_read_loop`).
+    let mut backend_startup_hint_spent = false;
+    try_prepared_dismiss_dialog_once_per_spawn(
+        name,
+        screen,
+        pty_writer,
+        dismiss_patterns,
+        scope,
+        dev_gate,
+        now,
+        &mut backend_startup_hint_spent,
+    )
+}
+
+/// As [`try_prepared_dismiss_dialog`], plus the t-…-82348-29 r2 (review F1)
+/// per-spawn ONE-SHOT for backend-caused startup-modal hints.
+///
+/// `backend_startup_hint_spent` is owned by the PTY read loop, created once per
+/// `pty_read_loop` invocation (i.e. per spawn) and NEVER reset within it. A
+/// pattern in [`REARM_PRE_IDLE_BACKEND_STARTUP_HINTS`] is eligible in EVERY
+/// scope — Startup as well as RearmPreIdle — only while the flag is false, and
+/// the flag is set at DISPATCH: after the in-flight slot is claimed and before
+/// the inline write or the detached worker runs. So exactly one keystroke per
+/// spawn reaches the PTY, and a failed write forfeits the auto-skip for that
+/// spawn rather than opening a retry loop (see the hint list's doc comment).
+///
+/// Everything else is untouched: `DISMISS_IN_FLIGHT` concurrency, the #3314
+/// dev-modal gate (`enqueue_receipt` / Spent / write barrier / `still_valid`),
+/// and the #3314 RearmSettled / #2474 settled-scope behaviour.
+#[allow(clippy::too_many_arguments)]
+pub fn try_prepared_dismiss_dialog_once_per_spawn(
+    name: &str,
+    screen: &str,
+    pty_writer: &PtyWriter,
+    dismiss_patterns: &[PreparedDismissPattern],
+    scope: DismissScanScope,
+    dev_gate: &mut DevModalGate,
+    now: LogicalMs,
+    backend_startup_hint_spent: &mut bool,
+) -> bool {
+    try_prepared_dismiss_dialog_with_cooldown(
+        name,
+        screen,
+        pty_writer,
+        dismiss_patterns,
+        scope,
+        dev_gate,
+        now,
+        backend_startup_hint_spent,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn try_prepared_dismiss_dialog_with_cooldown(
+    name: &str,
+    screen: &str,
+    pty_writer: &PtyWriter,
+    dismiss_patterns: &[PreparedDismissPattern],
+    scope: DismissScanScope,
+    dev_gate: &mut DevModalGate,
+    now: LogicalMs,
+    backend_startup_hint_spent: &mut bool,
+    cooldown_until: Option<std::time::Instant>,
 ) -> bool {
     #[cfg(test)]
     DISMISS_SCAN_COUNT.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -198,9 +550,24 @@ pub fn try_prepared_dismiss_dialog(
     }
 
     for pattern in dismiss_patterns {
-        // #2473: on a post-latch re-arm, skip everything but workspace-trust
-        // patterns — never fire runtime-approval (`Yes, proceed`) off the latch.
-        if trust_class_only && !pattern.rearm_past_latch {
+        // When retrying specifically across cooldown, only dev-gated patterns
+        // (with their generation write barriers) are eligible.
+        if cooldown_until.is_some() && !pattern.dev_gated {
+            continue;
+        }
+        // #2473/#3314: on a post-latch re-arm, skip everything the scope does
+        // not admit — never fire runtime-approval (`Yes, proceed`) off the latch,
+        // and admit a daemon-caused startup modal only before the agent settles.
+        if !pattern.eligible(scope) {
+            continue;
+        }
+        // t-…-82348-29 r2 (review F1): a backend-caused startup modal is
+        // answered AT MOST ONCE per spawn, in EVERY scope. Scope-independent
+        // deliberately: the codex update menu holds the pane in
+        // PermissionPrompt, so the startup latch never closes and the scope
+        // stays `Startup` for as long as the modal is up — a RearmPreIdle-only
+        // guard would bound nothing in exactly the situation it exists for.
+        if pattern.is_backend_startup_hint() && *backend_startup_hint_spent {
             continue;
         }
         if !pattern.literal_hint.is_empty() && !screen.contains(&pattern.literal_hint) {
@@ -211,32 +578,181 @@ pub fn try_prepared_dismiss_dialog(
         // whenever the phrase appeared anywhere on screen — including in agent
         // output and scrollback — sending input the user never authorized.
         if pattern.regex.is_match(screen) {
-            tracing::info!(agent = name, pattern = %pattern.pattern, "auto-dismissing dialog");
             // Delayed write: TUI escape-sequence parsers need time to distinguish
             // \x1b (ESC key) from \x1b[ (CSI start).  Writing immediately causes
             // Ink-based TUIs (kiro-cli) to interpret \x1b as "ESC to cancel".
             // H2: bounded dismiss — skip if one already in-flight for this agent.
             // Prevents thread accumulation from rapid dialog re-detection.
+            // #3314: a daemon-caused STARTUP modal is gated on facts the daemon
+            // OWNS — this generation's argv, the untouched-frame epoch, and a
+            // per-generation one-shot — never on the frame alone. Recognition is
+            // precision, not safety: a replayed or quoted modal satisfies the
+            // fingerprint just as well as a live one (measured, see the fixtures).
+            // Every other pattern keeps its existing path and pacing untouched.
+            #[cfg(test)]
+            let mut scheduled_from_first_sighting = false;
+            if pattern.dev_gated {
+                // #3561 R1 B1 remedy (b): is anything ELSE on this frame
+                // answerable? Computed here, where the prepared pattern set is
+                // already in hand, and pushed in as a fact — the gate itself
+                // still looks at nothing but the screen and what it was told.
+                dev_gate.set_other_prompt_on_screen(
+                    dismiss_patterns
+                        .iter()
+                        .any(|other| !other.dev_gated && other.regex.is_match(screen)),
+                );
+                match dev_gate.observe(screen, now) {
+                    GateOutcome::Enqueue => {}
+                    GateOutcome::Schedule => {
+                        #[cfg(test)]
+                        {
+                            scheduled_from_first_sighting = true;
+                        }
+                    }
+                    GateOutcome::Hold => return false,
+                    GateOutcome::Refuse(reason) => {
+                        // #3547 P0-near Task2: the FIRST Refuse of a generation
+                        // surfaces at info with its reason (NotArmed /
+                        // NoCompleteModal / WindowExpired / Spent) so a
+                        // dismiss-miss leaves a grep-able trace; later refuses
+                        // stay at debug to avoid log flooding. Observability
+                        // only — the verdict and the early return are unchanged.
+                        if dev_gate.claim_first_refuse_log() {
+                            tracing::info!(
+                                agent = name,
+                                ?reason,
+                                "startup-modal dismiss refused by the generation gate (first of generation)"
+                            );
+                        } else {
+                            tracing::debug!(
+                                agent = name,
+                                ?reason,
+                                "startup-modal dismiss refused by the generation gate"
+                            );
+                        }
+                        return false;
+                    }
+                }
+            }
+            let flight_key = (name.to_string(), pattern.rearm_pre_idle);
             {
                 let mut inflight = DISMISS_IN_FLIGHT.lock();
-                if inflight.contains(name) {
+                if inflight.contains(&flight_key) {
                     return true; // dismiss already pending
                 }
-                inflight.insert(name.to_string());
+                inflight.insert(flight_key.clone());
+            }
+            // t-…-82348-29 r2 (review F1): spend the per-spawn one-shot HERE —
+            // at dispatch, after the in-flight slot is claimed (a collision
+            // returned above without dispatching, so it must not spend) and
+            // before either write path runs. Never reset within this spawn.
+            //
+            // Deliberately NOT the dev-modal gate's spend-only-on-success rule:
+            // that gate may safely retry because its recognition is bound to
+            // facts the daemon OWNS (this generation's argv, the frame epoch).
+            // This one is bound only to what is on the screen, so a retry after
+            // a failed write is a retry on evidence that may already be stale —
+            // forfeiting the auto-skip leaves the pane blocked and VISIBLE to
+            // the watchdog, which is the safer failure.
+            if pattern.is_backend_startup_hint() {
+                *backend_startup_hint_spent = true;
             }
             let writer = Arc::clone(pty_writer);
             let keys = pattern.key_seq.clone();
             let agent = name.to_string();
-            // fire-and-forget: dialog-dismiss keystroke writer is short-lived
-            // (sleep 300ms then write). H2: in-flight slot freed by InFlightGuard
-            // on any exit (incl. panic), armed at thread entry below.
+            let pattern_text = pattern.pattern.clone();
+            // #3314: the barrier is scoped to the startup-modal class ONLY.
+            // Other backends send multi-chunk sequences (agy's up-up-Enter), and
+            // each chunk's own write bumps the epoch — applying the barrier
+            // there would cancel a pattern midway through its own keystrokes.
+            //
+            // P2-D: snapshot the barrier here, but spend the one-shot only AFTER
+            // the write is successfully submitted. A failed thread spawn or a
+            // rejected enqueue must leave the generation able to try again;
+            // spending early strands it as Refused(Spent) with the modal
+            // unanswered, which is the exact failure the rule exists to prevent.
+            let barrier = pattern.dev_gated.then(|| dev_gate.write_barrier());
+            let enqueue_receipt = pattern.dev_gated.then(|| dev_gate.enqueue_receipt());
+            #[cfg(test)]
+            if INLINE_DISMISS_WRITE.with(std::cell::Cell::get) {
+                if scheduled_from_first_sighting {
+                    DISMISS_IN_FLIGHT.lock().remove(&flight_key);
+                    return false;
+                }
+                let _guard = InFlightGuard(flight_key.clone());
+                run_pre_write_rendezvous();
+                let result = if barrier
+                    .as_ref()
+                    .is_none_or(crate::agent::dev_modal::WriteBarrier::still_valid)
+                {
+                    write_with_timeout(&writer, &keys)
+                } else {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::Interrupted,
+                        "PTY write cancelled by stale-frame barrier",
+                    ))
+                };
+                if result.is_ok() {
+                    if let Some(receipt) = enqueue_receipt.as_ref() {
+                        receipt.mark_enqueued();
+                    }
+                }
+                if result.is_ok() {
+                    tracing::info!(agent = name, pattern = %pattern.pattern, "dialog dismiss submitted");
+                }
+                return true;
+            }
+            let worker_flight_key = flight_key.clone();
+            let remaining_cooldown = cooldown_until
+                .and_then(|until| until.checked_duration_since(std::time::Instant::now()));
+            // fire-and-forget: dialog-dismiss keystroke writer is bounded by the
+            // startup eligibility window. It normally waits 300ms; complete
+            // repaints restart that stability wait inside this SAME worker. H2:
+            // in-flight slot freed by InFlightGuard on any exit (incl. panic),
+            // armed at thread entry below.
             if std::thread::Builder::new()
                 .name("dismiss-dialog".into())
                 .spawn(move || {
                     // #1886 follow-up: arm the in-flight removal as a Drop guard at
                     // thread entry so a panic / early-return still frees the slot.
-                    let _guard = InFlightGuard(agent.clone());
-                    std::thread::sleep(std::time::Duration::from_millis(300));
+                    let _guard = InFlightGuard(worker_flight_key);
+                    let stable_for = std::time::Duration::from_millis(
+                        crate::agent::dev_modal::MIN_STABLE_MS,
+                    );
+                    let wait_time = if let Some(remaining) = remaining_cooldown {
+                        stable_for.max(remaining)
+                    } else {
+                        stable_for
+                    };
+                    if let Some(barrier) = barrier.as_ref() {
+                        if !barrier.wait_until_stable(
+                            wait_time,
+                            std::time::Duration::from_millis(
+                                crate::agent::dev_modal::ELIGIBILITY_EXPIRY_MS
+                                    .saturating_sub(now.0),
+                            ),
+                        ) {
+                            tracing::debug!(
+                                agent = %agent,
+                                "#3314: startup-modal stability wait cancelled"
+                            );
+                            return;
+                        }
+                    } else {
+                        std::thread::sleep(wait_time);
+                    }
+                    // #3314 W3: re-check as late as we can. This closes the wide
+                    // decide-then-sleep-then-write window, but a check and a
+                    // syscall cannot be atomic with respect to another process's
+                    // output, so the last instant before `write` remains
+                    // irreducible. Bounded by exactly one CR and no retry.
+                    if barrier.as_ref().is_some_and(|b| !b.still_valid()) {
+                        tracing::debug!(
+                            agent = %agent,
+                            "#3314: startup-modal keystroke cancelled before write"
+                        );
+                        return;
+                    }
                     // Send keys in chunks split on \r/\n boundaries with delay between,
                     // so TUI frameworks process navigation before confirmation.
                     // H13: route each chunk through `write_with_timeout` (bounded
@@ -246,29 +762,55 @@ pub fn try_prepared_dismiss_dialog(
                     // state that triggers a dismiss — would otherwise pin the writer
                     // lock forever, wedging every future inject to that agent until
                     // daemon restart. `write_with_timeout` flushes internally.
-                    let mut start = 0;
-                    for (i, &b) in keys.iter().enumerate() {
-                        if b == b'\r' || b == b'\n' {
-                            // Send everything up to (not including) this Enter
-                            if start < i {
-                                let _ = write_with_timeout(&writer, &keys[start..i]);
-                                std::thread::sleep(std::time::Duration::from_millis(200));
+                    let result = (|| -> std::io::Result<()> {
+                        let mut start = 0;
+                        for (i, &b) in keys.iter().enumerate() {
+                            if b == b'\r' || b == b'\n' {
+                                // Send everything up to (not including) this Enter
+                                if start < i {
+                                    write_with_timeout_guarded(
+                                        &writer,
+                                        &keys[start..i],
+                                        barrier.clone(),
+                                    )?;
+                                    std::thread::sleep(std::time::Duration::from_millis(200));
+                                }
+                                // Send the Enter
+                                write_with_timeout_guarded(
+                                    &writer,
+                                    &keys[i..=i],
+                                    barrier.clone(),
+                                )?;
+                                start = i + 1;
                             }
-                            // Send the Enter
-                            let _ = write_with_timeout(&writer, &keys[i..=i]);
-                            start = i + 1;
+                        }
+                        if start < keys.len() {
+                            write_with_timeout_guarded(
+                                &writer,
+                                &keys[start..],
+                                barrier.clone(),
+                            )?;
+                        }
+                        Ok(())
+                    })();
+                    match result {
+                        Ok(()) => {
+                            if let Some(receipt) = enqueue_receipt {
+                                receipt.mark_enqueued();
+                            }
+                            tracing::info!(agent = %agent, pattern = %pattern_text, "dialog dismiss submitted");
+                            tracing::debug!(agent = %agent, "dismiss keystrokes sent");
+                        }
+                        Err(error) => {
+                            tracing::debug!(agent = %agent, %error, "dialog dismiss write failed");
                         }
                     }
-                    if start < keys.len() {
-                        let _ = write_with_timeout(&writer, &keys[start..]);
-                    }
-                    tracing::debug!(agent = %agent, "dismiss keystrokes sent");
                     // H2: in-flight slot freed by `_guard` on scope exit.
                 })
                 .is_err()
             {
                 tracing::warn!(agent = name, "failed to spawn dismiss-dialog thread");
-                DISMISS_IN_FLIGHT.lock().remove(name);
+                DISMISS_IN_FLIGHT.lock().remove(&flight_key);
             }
             return true;
         }
@@ -324,806 +866,19 @@ pub(crate) fn is_dismissible_prompt_state(state: crate::state::AgentState) -> bo
 /// latch. This is false-positive-safe: ordinary conversation that quotes the
 /// phrase does not put the agent into PermissionPrompt/InteractivePrompt, and the
 /// keystroke only fires when the anchored backend regex ALSO matches the frame.
+///
+/// t-20260913064200432164-24626-4: dev-gated consult does not depend on
+/// `state_changed` — WARNING hint visibility (`dev_modal_visible`) arms the gate
+/// directly. Precision, stability, and replay safety are upheld by the generation
+/// gate (daemon-owned argv flag, epoch, 300ms stability window, one-shot receipt).
 pub(crate) fn dismiss_scan_armed(
     scan_enabled: bool,
     prompt_blocked: bool,
     state_changed: bool,
+    dev_modal_visible: bool,
 ) -> bool {
-    state_changed && (scan_enabled || prompt_blocked)
+    dev_modal_visible || (state_changed && (scan_enabled || prompt_blocked))
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn test_writer() -> PtyWriter {
-        Arc::new(Mutex::new(Box::new(Vec::<u8>::new())))
-    }
-
-    #[derive(Clone)]
-    struct RecordingWriter {
-        bytes: Arc<Mutex<Vec<u8>>>,
-    }
-
-    impl std::io::Write for RecordingWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.bytes.lock().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// #3294: the dev-channel startup modal IS classified as `PermissionPrompt`,
-    /// honestly, like any other matching frame (`state::prompt_latch` changes only
-    /// when that latch releases, never the classification). This test pins the two
-    /// facts that make the auto-dismiss independent of that classification either
-    /// way, so a future change to prompt state cannot silently break dismissal:
-    /// the scan is armed by the state-INDEPENDENT startup latch, and this pattern
-    /// is not in the post-latch re-arm class, so `prompt_blocked` is not its
-    /// delivery path.
-    #[test]
-    fn dev_channel_modal_dismissal_does_not_depend_on_prompt_state_3294() {
-        assert!(
-            dismiss_scan_armed(true, false, true),
-            "#3294: a new frame inside the startup latch must arm the scan with no dismissible state"
-        );
-        let hint = crate::backend::Backend::ClaudeCode
-            .preset()
-            .dismiss_patterns
-            .iter()
-            .map(|pattern| dismiss_literal_hint(pattern.label))
-            .find(|hint| hint.starts_with("WARNING: Loading development channels"))
-            .expect("claude ships the dev-channel dismiss pattern");
-        assert!(
-            !is_rearm_past_latch_hint(hint),
-            "#3294: the dev-channel pattern is startup-window-only, so its dismissal does not ride the PermissionPrompt classification"
-        );
-    }
-
-    #[test]
-    fn claude_development_channel_modal_matches_and_sends_one_enter() {
-        let patterns: Vec<(String, Vec<u8>)> = crate::backend::Backend::ClaudeCode
-            .preset()
-            .dismiss_patterns
-            .iter()
-            .map(|pattern| (pattern.label.to_string(), pattern.sequence.to_vec()))
-            .collect();
-        // Exact text captured from Claude Code v2.1.224 after starting with
-        // --dangerously-load-development-channels server:agend-claude-channel.
-        let screen = "\
-────────────────────────────────────────────────────────────────────────────────
-  WARNING: Loading development channels
-
-  --dangerously-load-development-channels is for local channel development
-  only. Do not use this option to run channels you have downloaded off the
-  internet.
-
-  Please use --channels to run a list of approved channels.
-
-  Channels:   server:agend-claude-channel
-
-  ❯ 1. I am using this for local development
-    2. Exit
-
-  Enter to confirm · Esc to cancel
-";
-        let written = Arc::new(Mutex::new(Vec::new()));
-        let writer: PtyWriter = Arc::new(Mutex::new(Box::new(RecordingWriter {
-            bytes: Arc::clone(&written),
-        })));
-
-        assert!(try_dismiss_dialog(
-            "claude-development-channel-modal",
-            screen,
-            &writer,
-            &patterns
-        ));
-
-        for _ in 0..20 {
-            if written.lock().as_slice() == b"\r" {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
-        assert_eq!(written.lock().as_slice(), b"\r");
-    }
-
-    /// A PTY writer whose `write` BLOCKS — simulates a backend that stopped
-    /// draining its input (the exact #2160/H13 wedge). Bounded at 60s (>> the 5s
-    /// `PTY_WRITE_TIMEOUT`) so the timeout fires first while the helper thread +
-    /// in-progress guard still self-clean instead of leaking for the whole run.
-    struct ParkWriter;
-    impl std::io::Write for ParkWriter {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            std::thread::sleep(std::time::Duration::from_secs(60));
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    /// CR-2026-06-14 t-25 (RUNTIME behavioral hardening of #2160/H13): the
-    /// static-grep repro (`writer.lock()` absent in dismiss.rs) is bypassable by
-    /// aliasing / an API rename. This test proves the actual property the fix
-    /// exists for — the dismiss write path is BOUNDED: a parked PTY writer must
-    /// make `write_with_timeout` (the primitive every dismiss keystroke routes
-    /// through) RETURN `Err(TimedOut)` within its bound, never hang the caller and
-    /// pin the writer lock forever.
-    #[test]
-    fn write_with_timeout_returns_on_parked_writer_h13_2160() {
-        let writer: PtyWriter = Arc::new(Mutex::new(Box::new(ParkWriter)));
-        let start = std::time::Instant::now();
-        let res = write_with_timeout(&writer, b"dismiss-keystrokes");
-        let elapsed = start.elapsed();
-        let err = res.expect_err("a parked PTY write must time out, not report success");
-        assert_eq!(
-            err.kind(),
-            std::io::ErrorKind::TimedOut,
-            "a parked write must surface TimedOut"
-        );
-        assert!(
-            elapsed < std::time::Duration::from_secs(8),
-            "write_with_timeout must return within its ~5s bound even when the writer \
-             parks (H13/#2160 — no unbounded lock-pinning hang); took {elapsed:?}"
-        );
-    }
-
-    #[test]
-    fn inflight_guard_clears_entry_on_panic_1886() {
-        // #1886 follow-up §3.9: a dismiss thread that panics before its normal
-        // exit must STILL free the in-flight slot (via InFlightGuard's Drop),
-        // else the stale entry permanently no-op's future dismiss for that agent.
-        // Inject a panic after the guard is armed and assert the slot is cleared.
-        DISMISS_IN_FLIGHT
-            .lock()
-            .insert("panic-agent-1886".to_string());
-        let h = std::thread::Builder::new()
-            .name("dismiss-panic-test".into())
-            .spawn(|| {
-                let _guard = InFlightGuard("panic-agent-1886".to_string());
-                panic!("injected panic before normal in-flight removal");
-            })
-            .expect("spawn");
-        // Join the panicking thread (the panic is contained to it).
-        assert!(h.join().is_err(), "the injected panic must propagate");
-        assert!(
-            !DISMISS_IN_FLIGHT.lock().contains("panic-agent-1886"),
-            "InFlightGuard must clear the in-flight slot even when the thread panics"
-        );
-    }
-
-    #[test]
-    fn dismiss_fires_when_pattern_in_screen() {
-        let patterns = vec![("Do you trust".to_string(), b"\n".to_vec())];
-        let hit = try_dismiss_dialog(
-            "t",
-            "Do you trust the contents of this directory?",
-            &test_writer(),
-            &patterns,
-        );
-        assert!(hit);
-    }
-
-    #[test]
-    fn dismiss_skips_when_pattern_absent() {
-        let patterns = vec![("Do you trust".to_string(), b"\n".to_vec())];
-        let hit = try_dismiss_dialog("t", "unrelated screen content", &test_writer(), &patterns);
-        assert!(!hit);
-    }
-
-    #[test]
-    fn dismiss_skips_when_no_patterns() {
-        assert!(!try_dismiss_dialog("t", "anything", &test_writer(), &[]));
-    }
-
-    #[test]
-    fn dismiss_matches_ink_style_cursor_painted_prompt() {
-        // Regression for macOS: Ink-based TUIs (codex) paint text by
-        // positioning the cursor before each segment. VTerm resolves this
-        // into a clean screen; the old raw-byte strip_ansi path was fragile
-        // on such streams. Drive VTerm with BSU + cursor positioning and
-        // confirm the rendered screen still contains the pattern literally.
-        let mut vt = crate::vterm::VTerm::new(80, 24);
-        vt.process(b"\x1b[?2026h"); // begin synchronized update
-        vt.process(b"\x1b[5;2HDo you trust"); // row 5 col 2
-        vt.process(b"\x1b[5;15H the contents of this directory?");
-        vt.process(b"\x1b[?2026l"); // end synchronized update
-        let screen = vt.tail_lines(24);
-        let patterns = vec![("Do you trust".to_string(), b"\n".to_vec())];
-        assert!(try_dismiss_dialog("t", &screen, &test_writer(), &patterns));
-    }
-
-    #[test]
-    fn grok_02114_directory_trust_matches_real_modal() {
-        let patterns: Vec<(String, Vec<u8>)> = crate::backend::Backend::Grok
-            .preset()
-            .dismiss_patterns
-            .iter()
-            .map(|p| (p.label.to_string(), p.sequence.to_vec()))
-            .collect();
-        let screen = "\
-                  Do you trust the contents of this directory?
-/private/tmp/agend-s1/workspace/s1-grok
-
-                         Yes, proceed                 y
-                         No, quit                     n
-
-                                                      Grok Build  0.2.114 Beta";
-        assert!(try_dismiss_dialog(
-            "grok-02114-trust",
-            screen,
-            &test_writer(),
-            &patterns
-        ));
-    }
-
-    #[test]
-    fn grok_02114_directory_trust_does_not_match_runtime_approval() {
-        let patterns: Vec<(String, Vec<u8>)> = crate::backend::Backend::Grok
-            .preset()
-            .dismiss_patterns
-            .iter()
-            .map(|p| (p.label.to_string(), p.sequence.to_vec()))
-            .collect();
-        let screen = "\
-Requesting permission for: rm -rf build
-Yes, proceed                 y
-No, cancel                   n";
-        assert!(!try_dismiss_dialog(
-            "grok-02114-runtime",
-            screen,
-            &test_writer(),
-            &patterns
-        ));
-    }
-
-    // ── Issue #468: dismiss precision regression tests ─────────────────
-    //
-    // Hotfix #468 replaces `screen.contains(pattern)` substring match with
-    // an anchored regex (`(?m)^[│║|>\s]*<text>`) so user input and
-    // scrollback content containing the dialog phrase mid-paragraph cannot
-    // trigger an unauthorized auto-dismiss.
-    //
-    // Production-realistic patterns: these tests use the EXACT regex strings
-    // from `BackendPreset::dismiss_patterns` so a future refactor that diverges
-    // the test pattern from prod would still trigger these assertions on the
-    // prod string.
-    //
-    // Regression-proof: revert `try_dismiss_dialog` to use
-    // `screen.contains(pattern.as_str())` (bare substring match) and the
-    // false-positive tests below FAIL. Restore the regex match → PASS.
-
-    /// Production dismiss regex for kiro-cli's "Trust All Tools" prompt
-    /// (Issue #468 follow-up — radio-button cursor `)` was unmatched).
-    const KIRO_TRUST_REGEX: &str = r"(?m)^[^A-Za-z\n]{0,8}No, exit";
-    /// Production dismiss regex for Claude's workspace-trust prompt (#996
-    /// Phase 1). Modern Claude (v2.1.145+) defaults cursor to "Yes, I trust",
-    /// so the keystroke shipped is single Enter `\r` — see
-    /// `Backend::ClaudeCode.preset().dismiss_patterns`.
-    const CLAUDE_TRUST_REGEX: &str = r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust";
-
-    /// `(regex, keystrokes)` pair for `try_dismiss_dialog` — `Down` then
-    /// `Enter` to dismiss kiro-cli's "Trust All Tools" prompt.
-    fn kiro_trust_patterns() -> Vec<(String, Vec<u8>)> {
-        vec![(KIRO_TRUST_REGEX.to_string(), b"\x1b[B\r".to_vec())]
-    }
-
-    /// #996 Phase 1: true Claude workspace-trust prompt — vterm-rendered —
-    /// MUST still match the anchored regex so the dismiss fires. The fix
-    /// changes the keystroke (config-pinned in backend.rs tests) but the
-    /// regex is unchanged. Anti-regression for the dismiss path itself.
-    #[test]
-    fn claude_trust_dismiss_matches_real_modal() {
-        let mut vt = crate::vterm::VTerm::new(120, 30);
-        vt.process(b"\x1b[2J\x1b[H");
-        vt.process(" Accessing workspace:\r\n\r\n /private/tmp/claude-test\r\n\r\n".as_bytes());
-        vt.process(
-            " Quick safety check: Is this a project you created or one you trust?\r\n\r\n"
-                .as_bytes(),
-        );
-        vt.process(" ❯ 1. Yes, I trust this folder\r\n".as_bytes()); // marker on row 1 (default)
-        vt.process("   2. No, exit\r\n".as_bytes());
-        vt.process(" Enter to confirm · Esc to cancel\r\n".as_bytes());
-        let screen = vt.tail_lines(30);
-        // Production keystroke after #996 Phase 1: single Enter.
-        let patterns = vec![(CLAUDE_TRUST_REGEX.to_string(), b"\r".to_vec())];
-        assert!(
-            try_dismiss_dialog("t", &screen, &test_writer(), &patterns),
-            "real Claude trust modal (default-Yes cursor) must still match anchored regex. Screen:\n{screen}"
-        );
-    }
-
-    /// #996 Phase 1: operator-quoted content matching the anchored regex —
-    /// reproduces the exact false-positive class observed today on the
-    /// fixup-lead pane (37 events between 19:46:55-19:53:04 +08). The match
-    /// STILL fires (we don't change the regex), but the production keystroke
-    /// is now `\r` (non-destructive single Enter, pinned in backend.rs
-    /// tests) instead of the historical up+up+Enter (history-resubmit blast).
-    #[test]
-    fn claude_trust_false_positive_quoted_content_still_matches_regex() {
-        // Operator pastes (or daemon-routed message includes) the Agy
-        // trust-prompt example verbatim from issue #995. The leading `>` + ` `
-        // satisfies the `[^A-Za-z\n]{0,8}` anchor → regex matches even
-        // though this is normal conversation content, not a real modal.
-        let screen = "\
-[user] Filing #995 — agy bug. The trust prompt shows:
-> Yes, I trust this folder
-  No, exit
-Should we add a dismiss_pattern?
-[claude] checking the existing patterns now
-";
-        let patterns = vec![(CLAUDE_TRUST_REGEX.to_string(), b"\r".to_vec())];
-        assert!(
-            try_dismiss_dialog("t", screen, &test_writer(), &patterns),
-            "regex anchor (?m)^[^A-Za-z\\n]{{0,8}} matches `> Yes, I trust` mid-conversation — \
-             this is the surface that produced today's 37 false-positives on fixup-lead. \
-             The fix is the keystroke (`\\r`, non-destructive), pinned in backend tests."
-        );
-    }
-
-    // ── #2473: dismiss-scan re-arm on prompt-blocked states ──────────────
-    //
-    // Root cause: the read loop's startup latch (`dismiss_scan_enabled`) is
-    // cleared once the agent settles (`Idle || has_productive_output()`), and
-    // `has_productive_output()` is MONOTONIC. agy paints an "Antigravity CLI"
-    // banner that trips the latch BEFORE its "Do you trust this folder?" modal
-    // renders, so the matcher never scanned the modal — every fresh agy spawn
-    // hung at `prev_state=permission`. Fix: a `prompt_blocked` frame re-arms the
-    // scan past the latch. Two orthogonal defenses must BOTH hold (the DUAL
-    // reviewers' #996 boundary): the anchored regex gates "content looks like a
-    // modal", the state-gate (`dismiss_scan_armed`) gates "the timing is a real
-    // modal". The tests below cover BOTH directions of BOTH layers.
-
-    /// #2473 POSITIVE: the real agy trust modal. The startup latch is already
-    /// OFF (the banner settled the agent), but the agent is in PermissionPrompt,
-    /// so the scan RE-ARMS and the anchored regex matches the live grid → Enter
-    /// fires. This is the exact production path that was dead.
-    #[test]
-    fn agy_trust_modal_rearms_and_fires_when_prompt_blocked_2473() {
-        use crate::state::AgentState;
-        // Real agy modal rendered through VTerm (cursor `>` marker, col 0).
-        let mut vt = crate::vterm::VTerm::new(120, 30);
-        vt.process(b"\x1b[2J\x1b[H");
-        vt.process(" Do you trust the contents of this folder?\r\n\r\n".as_bytes());
-        vt.process(" > Yes, I trust this folder\r\n".as_bytes());
-        vt.process("   No, exit\r\n".as_bytes());
-        let screen = vt.tail_lines(30);
-        // agy preset dismiss regex == claude's (backend.rs:642).
-        let patterns = vec![(CLAUDE_TRUST_REGEX.to_string(), b"\r".to_vec())];
-        // Latch OFF (startup banner already tripped it) but state is PermissionPrompt.
-        let armed = dismiss_scan_armed(
-            /* scan_enabled */ false,
-            is_dismissible_prompt_state(AgentState::PermissionPrompt),
-            /* state_changed */ true,
-        );
-        assert!(
-            armed,
-            "#2473: a PermissionPrompt frame must re-arm dismiss even past the startup latch"
-        );
-        // Fire through the ACTUAL post-latch re-arm path (`trust_class_only=true`):
-        // agy `Yes, I trust` IS workspace-trust-class, so it still fires.
-        let prepared = prepare_dismiss_patterns(&patterns);
-        assert!(
-            armed && try_prepared_dismiss_dialog("agy", &screen, &test_writer(), &prepared, true),
-            "#2473: the re-armed (trust-class-only) scan must match the real agy trust modal \
-             and fire Enter. Screen:\n{screen}"
-        );
-    }
-
-    /// #2473 NEGATIVE (r6 blocking finding on PR #2474): a POST-latch re-arm must
-    /// NOT fire claude's RUNTIME-APPROVAL pattern `Yes, proceed` (↑↑Enter) — that
-    /// would auto-act a real mid-session permission modal (also classified
-    /// PermissionPrompt) and steal the operator's decision. Only workspace-trust
-    /// (`Yes, I trust`) may re-arm. Uses the REAL claude preset so a future preset
-    /// edit that re-introduces the footgun trips this test.
-    #[test]
-    fn claude_yes_proceed_not_rearmed_past_latch_2473_r6() {
-        let claude_patterns: Vec<(String, Vec<u8>)> = crate::backend::Backend::ClaudeCode
-            .preset()
-            .dismiss_patterns
-            .iter()
-            .map(|p| (p.label.to_string(), p.sequence.to_vec()))
-            .collect();
-        let prepared = prepare_dismiss_patterns(&claude_patterns);
-
-        // A real claude runtime tool-approval modal (the operator's call).
-        let mut vt = crate::vterm::VTerm::new(120, 30);
-        vt.process(b"\x1b[2J\x1b[H");
-        vt.process(" Bash command\r\n   rm -rf build/\r\n\r\n".as_bytes());
-        vt.process(" > Yes, proceed\r\n".as_bytes());
-        vt.process("   No, and tell Claude what to do differently\r\n".as_bytes());
-        vt.process(" Esc to cancel · Enter to confirm\r\n".as_bytes());
-        let screen = vt.tail_lines(30);
-
-        // Post-latch re-arm (trust_class_only=true): `Yes, proceed` is NOT
-        // trust-class → skipped → returns false. A false return is authoritative
-        // "did not fire": the keystroke write happens ONLY inside the matched-fire
-        // block, which a false return never enters — so no `\x1b[A\x1b[A\r`.
-        assert!(
-            !try_prepared_dismiss_dialog("claude", &screen, &test_writer(), &prepared, true),
-            "#2473 r6: `Yes, proceed` (runtime approval) must NOT re-arm past the latch. \
-             Screen:\n{screen}"
-        );
-
-        // Sanity: in the STARTUP window (trust_class_only=false) the SAME pattern
-        // DOES match — proving it is the re-arm GATE that blocks it, not the regex.
-        assert!(
-            try_prepared_dismiss_dialog("claude", &screen, &test_writer(), &prepared, false),
-            "sanity: in the startup window `Yes, proceed` still matches (gate, not regex, blocks re-arm)"
-        );
-    }
-
-    /// #2473 (r6): pin the trust-class classification on the REAL presets — agy +
-    /// claude `Yes, I trust` re-arm; claude `Yes, proceed` does not; claude has
-    /// exactly one re-arm-eligible pattern.
-    #[test]
-    fn rearm_past_latch_classification_2473() {
-        let agy = prepare_dismiss_patterns(&[(
-            r"(?m)^[^A-Za-z\n]{0,8}Yes, I trust".to_string(),
-            b"\r".to_vec(),
-        )]);
-        assert!(agy[0].rearm_past_latch, "agy `Yes, I trust` is trust-class");
-
-        let proceed = prepare_dismiss_patterns(&[(
-            r"(?m)^[^A-Za-z\n]{0,8}Yes, proceed".to_string(),
-            b"\x1b[A\x1b[A\r".to_vec(),
-        )]);
-        assert!(
-            !proceed[0].rearm_past_latch,
-            "`Yes, proceed` (runtime approval) is NOT trust-class"
-        );
-
-        let claude: Vec<(String, Vec<u8>)> = crate::backend::Backend::ClaudeCode
-            .preset()
-            .dismiss_patterns
-            .iter()
-            .map(|p| (p.label.to_string(), p.sequence.to_vec()))
-            .collect();
-        let trust_count = prepare_dismiss_patterns(&claude)
-            .iter()
-            .filter(|p| p.rearm_past_latch)
-            .count();
-        assert_eq!(
-            trust_count, 1,
-            "claude must have exactly ONE re-arm-eligible (workspace-trust) dismiss pattern"
-        );
-
-        let grok: Vec<(String, Vec<u8>)> = crate::backend::Backend::Grok
-            .preset()
-            .dismiss_patterns
-            .iter()
-            .map(|p| (p.label.to_string(), p.sequence.to_vec()))
-            .collect();
-        assert_eq!(
-            prepare_dismiss_patterns(&grok)
-                .iter()
-                .filter(|p| p.rearm_past_latch)
-                .count(),
-            2,
-            "both Grok workspace-trust variants must re-arm past startup"
-        );
-    }
-
-    /// #2473 NEGATIVE (#996 regression): the SAME `> Yes, I trust` phrase, but as
-    /// conversation content — the agent is Idle/Active (NOT a prompt modal) and
-    /// the latch is off. The anchored regex (content layer) WOULD match, but the
-    /// state-gate (timing layer) refuses to arm → the matcher is never called,
-    /// so no Enter. This is precisely the false-positive case the DUAL reviewers
-    /// construct; both layers must hold.
-    #[test]
-    fn quoted_trust_phrase_in_non_prompt_state_does_not_rearm_996() {
-        use crate::state::AgentState;
-        let screen = "\
-[user] Filing #995 — the agy trust prompt shows:
-> Yes, I trust this folder
-  No, exit
-[claude] checking the dismiss_pattern now
-";
-        let patterns = vec![(CLAUDE_TRUST_REGEX.to_string(), b"\r".to_vec())];
-        // Content layer: the anchored regex DOES match the quoted phrase ...
-        assert!(
-            try_dismiss_dialog("t", screen, &test_writer(), &patterns),
-            "precondition: the anchored regex matches the quoted phrase (content-layer FP surface)"
-        );
-        // ... but the timing layer refuses to arm: latch off + non-prompt state.
-        for s in [AgentState::Idle, AgentState::Active] {
-            assert!(
-                !dismiss_scan_armed(false, is_dismissible_prompt_state(s), true),
-                "#996: {s:?} + latched-off must NOT re-arm — no scan, no Enter, \
-                 despite the matching phrase on screen"
-            );
-        }
-    }
-
-    /// #2473: the arming-decision matrix + the state classification, both
-    /// directions. Pins which states re-arm (exactly those a `dismiss_pattern`
-    /// targets) and the frame/latch gating.
-    #[test]
-    fn dismiss_scan_arming_matrix_2473() {
-        use crate::state::AgentState::*;
-        // Startup window: latch ON + a new frame → armed.
-        assert!(dismiss_scan_armed(true, false, true));
-        // No new frame (dedup hit) → never armed, even if prompt-blocked — a
-        // cursor-blink redraw that doesn't change the dewrapped tail must not rescan.
-        assert!(!dismiss_scan_armed(true, true, false));
-        assert!(!dismiss_scan_armed(false, true, false));
-        // Steady-state after startup: latch off + non-prompt → off.
-        assert!(!dismiss_scan_armed(false, false, true));
-        // Latch off + prompt-blocked → RE-ARMED (#2473 core).
-        assert!(dismiss_scan_armed(false, true, true));
-        // Exactly the states a dismiss_pattern targets re-arm; nothing else does.
-        for s in [PermissionPrompt, InteractivePrompt, AwaitingOperator] {
-            assert!(is_dismissible_prompt_state(s), "{s:?} must re-arm dismiss");
-        }
-        for s in [
-            Idle,
-            Active,
-            Starting,
-            Hang,
-            RateLimit,
-            ServerRateLimit,
-            UsageLimit,
-            Crashed,
-        ] {
-            assert!(
-                !is_dismissible_prompt_state(s),
-                "{s:?} must NOT re-arm dismiss (would reopen the #996 false-positive surface)"
-            );
-        }
-    }
-
-    #[test]
-    #[tracing_test::traced_test]
-    fn invalid_regex_cached_no_relog() {
-        // r1 fix (PR #469 reviewer): a typo in a backend dismiss pattern must
-        // not re-compile + re-log on every screen-update tick. Negative-cache
-        // failed compiles so the warn fires once per unique bad pattern.
-
-        // Use a pattern that the `regex` crate rejects. Unclosed group is
-        // syntactically invalid in every regex flavor.
-        let bad = "(?P<unclosed";
-        // Pre-condition: not yet cached.
-        assert!(
-            !super::dismiss_regex_cache_contains(bad),
-            "test invariant: cache must not pre-contain '{bad}'"
-        );
-
-        let r1 = super::compile_dismiss_regex(bad);
-        assert!(
-            r1.is_none(),
-            "first call on invalid pattern must return None"
-        );
-        assert!(
-            super::dismiss_regex_cache_contains(bad),
-            "first call must populate the negative cache"
-        );
-
-        let r2 = super::compile_dismiss_regex(bad);
-        assert!(
-            r2.is_none(),
-            "second call must also return None (from cache)"
-        );
-
-        // tracing-test capture: the warn must have fired (at least once).
-        // Asserting "exactly once" is brittle across test-runner concurrency,
-        // but the cache assertion above proves the second call did not
-        // re-attempt compile — so the warn cannot have fired again from the
-        // second invocation.
-        assert!(
-            logs_contain("dismiss regex compile failed"),
-            "compile failure must be logged at warn level"
-        );
-    }
-
-    #[test]
-    fn issue_468_logs_substring_near_miss_for_operator_visibility() {
-        // Step 4 (Issue #468): when the literal hint would have triggered
-        // the old substring path but the new regex declined, emit a debug
-        // log so the operator can see realistic false positives.
-        // Test asserts behavior: try_dismiss_dialog returns false (no
-        // injection) but the regex compile + literal extraction path is
-        // exercised. The log itself is observed indirectly via the no-op
-        // outcome (the actual log line is captured by tracing-test in
-        // dedicated integration suites elsewhere; keeping this test free
-        // of subscriber setup avoids per-test global-state collisions).
-        let screen = "user said: Yes, I trust this repo, right?";
-        let patterns = vec![(CLAUDE_TRUST_REGEX.to_string(), b"\r".to_vec())];
-        let fired = try_dismiss_dialog("t", screen, &test_writer(), &patterns);
-        assert!(
-            !fired,
-            "Step 4: literal-hint near-miss must NOT inject keystrokes"
-        );
-        // dismiss_literal_hint should recover the bare phrase from the prod regex.
-        assert_eq!(
-            super::dismiss_literal_hint(CLAUDE_TRUST_REGEX),
-            "Yes, I trust",
-            "literal hint must strip the standard line-anchor prefix"
-        );
-    }
-
-    // ── Issue #468 follow-up: bounded-permissive prefix variants ─────
-
-    /// Kiro startup hang (the bug that prompted this PR): the radio-button
-    /// `)` cursor was outside the original `[│║|>\s]` class, so dismiss
-    /// silently no-op'd and kiro hung on the trust-all-tools confirmation.
-    #[test]
-    fn kiro_trust_dismiss_matches_paren_cursor() {
-        // Reproduces the operator's screenshot of kiro startup: the selected
-        // option is rendered as `) No, exit`, alternatives as ` Yes, ...`.
-        let screen = "\
-Allow Trust All Tools mode?
-
-) No, exit
-  Yes, I accept
-  Yes, and don't ask again
-";
-        let patterns = kiro_trust_patterns();
-        assert!(
-            try_dismiss_dialog("t", screen, &test_writer(), &patterns),
-            "kiro `) No, exit` (radio-button cursor) must match the bounded class"
-        );
-    }
-
-    /// Sanity: the bounded class still accepts the prefixes the original
-    /// `[│║|>\s]` class supported. Box-drawing + `>` cursor + plain space.
-    #[test]
-    fn dismiss_matches_classical_prefixes() {
-        let cases = [
-            "│ No, exit",   // Ink box-drawing
-            "║ No, exit",   // double box-drawing
-            "| No, exit",   // ASCII pipe
-            "> No, exit",   // chevron cursor
-            "  No, exit",   // bare indent
-            ") No, exit",   // radio cursor (the new case)
-            "[3] No, exit", // digit-bracket choice rows
-        ];
-        for screen in cases {
-            let patterns = kiro_trust_patterns();
-            assert!(
-                try_dismiss_dialog("t", screen, &test_writer(), &patterns),
-                "prefix variant must match: {screen:?}"
-            );
-        }
-    }
-
-    /// Length cap proof: a long indent (more than 8 non-alpha chars)
-    /// before the phrase must NOT match. Defends against pathological
-    /// scrollback that happens to start with many non-alpha chars.
-    #[test]
-    fn dismiss_rejects_when_prefix_exceeds_length_cap() {
-        // 9 non-alpha chars ahead of the phrase — exceeds {0,8}.
-        let screen = "         No, exit"; // 9 spaces
-        let patterns = kiro_trust_patterns();
-        assert!(
-            !try_dismiss_dialog("t", screen, &test_writer(), &patterns),
-            "9-char non-alpha prefix must exceed length cap and not match"
-        );
-    }
-
-    /// False-positive regression: alpha char anywhere in the prefix area
-    /// (typical of scrollback/user text) must still be rejected.
-    #[test]
-    fn dismiss_rejects_alpha_char_in_prefix_zone() {
-        // Even though `Pre` is short, an alpha char in the [^A-Za-z\n]{0,8}
-        // window breaks the match — proving mid-paragraph text is safe.
-        let screen = "Pre: No, exit";
-        let patterns = kiro_trust_patterns();
-        assert!(
-            !try_dismiss_dialog("t", screen, &test_writer(), &patterns),
-            "alpha char in prefix zone must invalidate match (regression-safe)"
-        );
-    }
-
-    /// Production smoke: spawn a real kiro-cli process and observe its
-    /// startup screen via VTerm. Asserts that the rendered screen contains
-    /// the kiro trust prompt and that try_dismiss_dialog matches against
-    /// the production regex. Skipped when kiro-cli isn't on PATH so the
-    /// test is safe on CI without forcing a kiro-cli install matrix.
-    ///
-    /// Run locally with:  cargo test -- --ignored kiro_real_spawn
-    ///
-    /// Reader runs on a dedicated thread piping into an mpsc channel —
-    /// portable_pty's `try_clone_reader()` returns a blocking reader, so
-    /// polling for `WouldBlock` would hang forever waiting on a kiro that
-    /// has nothing more to write. The channel + `recv_timeout` pattern is
-    /// the only robust way to bound the wait without a runtime dependency.
-    #[test]
-    #[ignore = "spawns real kiro-cli process; run locally only"]
-    #[cfg(unix)]
-    fn issue_468_kiro_real_spawn_dismiss_smoke() {
-        use portable_pty::{native_pty_system, CommandBuilder, PtySize};
-        use std::sync::mpsc;
-
-        if which::which("kiro-cli").is_err() {
-            eprintln!("SKIP: kiro-cli not on PATH");
-            return;
-        }
-
-        let pty = native_pty_system();
-        let pair = pty
-            .openpty(PtySize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("openpty");
-
-        let mut cmd = CommandBuilder::new("kiro-cli");
-        cmd.args(["chat", "--trust-all-tools"]);
-        cmd.env("AGEND_GIT_BYPASS", "1");
-        let mut child = pair.slave.spawn_command(cmd).expect("spawn kiro-cli");
-        drop(pair.slave);
-
-        // Reader thread → mpsc channel; main thread polls with timeout.
-        let mut reader = pair.master.try_clone_reader().expect("reader");
-        let (tx, rx) = mpsc::channel::<Vec<u8>>();
-        // fire-and-forget: thread exits when reader hits EOF after child kill.
-        std::thread::spawn(move || {
-            use std::io::Read;
-            let mut buf = [0u8; 4096];
-            while let Ok(n) = reader.read(&mut buf) {
-                if n == 0 || tx.send(buf[..n].to_vec()).is_err() {
-                    break;
-                }
-            }
-        });
-
-        let mut vt = crate::vterm::VTerm::new(80, 24);
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
-        loop {
-            let now = std::time::Instant::now();
-            if now >= deadline {
-                break;
-            }
-            match rx.recv_timeout(deadline - now) {
-                Ok(chunk) => vt.process(&chunk),
-                Err(_) => break, // timeout or sender disconnected
-            }
-            if vt.tail_lines(24).contains("No, exit") {
-                break;
-            }
-        }
-        let _ = child.kill();
-        let _ = child.wait();
-
-        let screen = vt.tail_lines(24);
-        let patterns = kiro_trust_patterns();
-
-        // Two valid outcomes prove kiro startup is no longer hung on the
-        // confirmation screen — the actual user-visible bug being fixed.
-        //
-        // (a) "No, exit" rendered → must match regex (real-spawn dismiss).
-        // (b) Already past confirmation (kiro saved trust from a prior run,
-        //     or `--trust-all-tools` bypassed it) → reaching the ready
-        //     prompt within deadline proves no hang.
-        //
-        // Failure mode: neither marker present within the deadline → kiro
-        // really did hang somewhere unexpected.
-        let saw_prompt = screen.contains("No, exit");
-        let saw_ready = screen.contains("Trust All Tools active")
-            || screen.contains("ask a question or describe a task");
-
-        if saw_prompt {
-            assert!(
-                try_dismiss_dialog("t", &screen, &test_writer(), &patterns),
-                "production regex must match real kiro-cli trust prompt. Screen:\n{screen}"
-            );
-        } else {
-            assert!(
-                saw_ready,
-                "kiro neither rendered the trust prompt nor reached ready state within 5s. \
-                 Screen:\n{screen}"
-            );
-            eprintln!(
-                "SMOKE NOTE: kiro skipped the trust prompt (saved acceptance or --trust-all-tools \
-                 bypass). Synthetic-screen unit tests cover the regex correctness for the \
-                 reported operator screenshot."
-            );
-        }
-    }
-}
+mod tests;
