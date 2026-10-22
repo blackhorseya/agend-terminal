@@ -962,24 +962,16 @@ impl CiProvider for GitHubCiProvider {
         // runtime"). Bounded by a timeout so a wedged `gh` can't stall the poll.
         let repo_log = repo.to_string(); // for diagnostic warns (repo is moved into the closure)
         let repo = repo.to_string();
+        // #178: via the ScmProvider exit so the repo's gh identity applies.
         let run = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("gh")
-                .args([
-                    "run",
-                    "view",
-                    &run_id.to_string(),
-                    "--log-failed",
-                    "-R",
-                    &repo,
-                ])
-                .output()
+            crate::scm::make_scm_provider(&repo, None).run_failed_log(&repo, run_id)
         });
         // #1537 follow-up: log WHY a fetch yields no tail instead of swallowing
         // it (every failure mode used to collapse to a silent `None`, so a
         // tail-less notification was undiagnosable — e.g. the #1542 windows
         // case). Still always returns None on any failure (notification degrades
         // to the no-tail checklist); the warn is observability only.
-        let out = match tokio::time::timeout(std::time::Duration::from_secs(20), run).await {
+        let raw = match tokio::time::timeout(std::time::Duration::from_secs(20), run).await {
             Err(_) => {
                 tracing::warn!(repo = %repo_log, run_id, "#1537: failed-log tail fetch timed out (20s) — notification omits tail");
                 return None;
@@ -988,22 +980,12 @@ impl CiProvider for GitHubCiProvider {
                 tracing::warn!(repo = %repo_log, run_id, error = %join_err, "#1537: failed-log tail fetch task join error");
                 return None;
             }
-            Ok(Ok(Err(exec_err))) => {
-                tracing::warn!(repo = %repo_log, run_id, error = %exec_err, "#1537: failed-log tail fetch could not exec `gh`");
+            Ok(Ok(Err(e))) => {
+                tracing::warn!(repo = %repo_log, run_id, error = %e, "#1537: `gh run view --log-failed` failed (run may be incomplete) — notification omits tail");
                 return None;
             }
-            Ok(Ok(Ok(out))) => out,
+            Ok(Ok(Ok(raw))) => raw,
         };
-        if !out.status.success() {
-            let stderr: String = String::from_utf8_lossy(&out.stderr)
-                .trim()
-                .chars()
-                .take(300)
-                .collect();
-            tracing::warn!(repo = %repo_log, run_id, code = ?out.status.code(), stderr = %stderr, "#1537: `gh run view --log-failed` non-zero (run may be incomplete) — notification omits tail");
-            return None;
-        }
-        let raw = String::from_utf8_lossy(&out.stdout);
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             tracing::warn!(repo = %repo_log, run_id, "#1537: `gh run view --log-failed` empty stdout — notification omits tail");

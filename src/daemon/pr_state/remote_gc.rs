@@ -21,7 +21,6 @@
 
 use super::gh_poll::{GhPrMetadata, GhPrState};
 use std::collections::HashSet;
-use std::process::Command;
 use std::time::Duration;
 
 /// #1750-B4: minimum age since `merged_at` before a remote orphan is GC'd.
@@ -136,83 +135,46 @@ pub(crate) fn gc_remote_orphans(repo: &str, prs: &[GhPrMetadata]) {
 }
 
 /// `gh api repos/{repo}/branches --paginate` → ({existing names}, {protected names}).
+/// #178: via the ScmProvider exit so the repo's gh identity applies.
 fn list_remote_branches(repo: &str) -> Option<(HashSet<String>, HashSet<String>)> {
-    let out = Command::new("gh")
-        .args([
-            "api",
-            "--paginate",
-            &format!("repos/{repo}/branches"),
-            "--jq",
-            r#".[] | [.name, (.protected|tostring)] | @tsv"#,
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        tracing::warn!(repo = %repo, "#1750-B4: gh branches list failed — skipping remote GC this tick");
-        return None;
-    }
+    let branches = match crate::scm::make_scm_provider(repo, None).list_branches(repo) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(repo = %repo, error = %e, "#1750-B4: gh branches list failed — skipping remote GC this tick");
+            return None;
+        }
+    };
     let mut existing = HashSet::new();
     let mut protected = HashSet::new();
-    for line in String::from_utf8_lossy(&out.stdout).lines() {
-        let mut parts = line.split('\t');
-        let Some(name) = parts.next() else { continue };
-        if name.is_empty() {
-            continue;
+    for b in branches {
+        if b.protected {
+            protected.insert(b.name.clone());
         }
-        existing.insert(name.to_string());
-        if parts.next() == Some("true") {
-            protected.insert(name.to_string());
-        }
+        existing.insert(b.name);
     }
     Some((existing, protected))
 }
 
 /// Resolve the repo's default branch via `gh`.
 fn default_branch(repo: &str) -> Option<String> {
-    let out = Command::new("gh")
-        .args([
-            "repo",
-            "view",
-            repo,
-            "--json",
-            "defaultBranchRef",
-            "--jq",
-            ".defaultBranchRef.name",
-        ])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    let s = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    (!s.is_empty()).then_some(s)
+    crate::scm::make_scm_provider(repo, None)
+        .default_branch(repo)
+        .ok()
 }
 
 /// `gh api -X DELETE repos/{repo}/git/refs/heads/{branch}`. Returns true on a
 /// successful delete; a 404/422 (already gone) or any error logs and returns
 /// false (no retry — the next tick re-evaluates).
 fn delete_remote_ref(repo: &str, branch: &str) -> bool {
-    let out = Command::new("gh")
-        .args([
-            "api",
-            "-X",
-            "DELETE",
-            &format!("repos/{repo}/git/refs/heads/{branch}"),
-        ])
-        .output();
-    match out {
-        Ok(o) if o.status.success() => true,
-        Ok(o) => {
+    match crate::scm::make_scm_provider(repo, None).delete_branch(repo, branch) {
+        Ok(()) => true,
+        Err(e) => {
             tracing::warn!(
                 repo = %repo,
                 branch = %branch,
-                stderr = %String::from_utf8_lossy(&o.stderr).trim(),
+                error = %e,
                 "#1750-B4: remote ref delete failed (left for next tick)"
             );
-            false
-        }
-        Err(e) => {
-            tracing::warn!(repo = %repo, branch = %branch, error = %e, "#1750-B4: gh delete spawn failed");
             false
         }
     }

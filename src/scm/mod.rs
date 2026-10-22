@@ -124,6 +124,13 @@ pub(crate) struct CompareResult {
     pub files: Vec<String>,
 }
 
+/// #178: one remote branch from `gh api repos/{repo}/branches` (remote-orphan GC).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteBranch {
+    pub name: String,
+    pub protected: bool,
+}
+
 /// Returned by non-GitHub providers so callers fail LOUD instead of an
 /// auto-merge silently no-opping (§3.7 cross-backend stance). Hand-rolled
 /// (no `thiserror` dependency) — it composes into `anyhow::Error` via the
@@ -179,6 +186,30 @@ pub(crate) trait ScmProvider: Send + Sync {
     /// commit-ancestry (`behind_by` + changed `files`) for the merge-freshness
     /// gate, independent of the laggy `mergeStateStatus`.
     fn compare(&self, repo: &str, base: &str, head: &str) -> anyhow::Result<CompareResult>;
+
+    // #178: the remaining direct `gh` spawns (remote-orphan GC, ci_watch
+    // failed-log tail) routed through this exit so per-repo identity applies
+    // to every gh call. Defaulted so non-GitHub providers and test doubles
+    // fail loud without boilerplate.
+
+    /// `gh api --paginate repos/{repo}/branches` → every remote branch.
+    fn list_branches(&self, _repo: &str) -> anyhow::Result<Vec<RemoteBranch>> {
+        anyhow::bail!("list_branches: not supported by this SCM provider")
+    }
+    /// `gh repo view {repo} --json defaultBranchRef` → the default branch name.
+    fn default_branch(&self, _repo: &str) -> anyhow::Result<String> {
+        anyhow::bail!("default_branch: not supported by this SCM provider")
+    }
+    /// `gh api -X DELETE repos/{repo}/git/refs/heads/{branch}`. `Err` carries
+    /// gh's stderr (404/422 = already gone).
+    fn delete_branch(&self, _repo: &str, _branch: &str) -> anyhow::Result<()> {
+        anyhow::bail!("delete_branch: not supported by this SCM provider")
+    }
+    /// `gh run view <run_id> --log-failed -R {repo}` → raw stdout. `Err` carries
+    /// the exit code + stderr.
+    fn run_failed_log(&self, _repo: &str, _run_id: u64) -> anyhow::Result<String> {
+        anyhow::bail!("run_failed_log: not supported by this SCM provider")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -296,6 +327,65 @@ fn compare_args(repo: &str, base: &str, head: &str) -> Vec<String> {
         "api".into(),
         format!("repos/{repo}/compare/{base}...{head}"),
     ]
+}
+
+// #178: argv moved verbatim from remote_gc.rs / ci_watch/provider.rs.
+
+fn list_branches_args(repo: &str) -> Vec<String> {
+    vec![
+        "api".into(),
+        "--paginate".into(),
+        format!("repos/{repo}/branches"),
+        "--jq".into(),
+        r#".[] | [.name, (.protected|tostring)] | @tsv"#.into(),
+    ]
+}
+
+fn default_branch_args(repo: &str) -> Vec<String> {
+    vec![
+        "repo".into(),
+        "view".into(),
+        repo.into(),
+        "--json".into(),
+        "defaultBranchRef".into(),
+        "--jq".into(),
+        ".defaultBranchRef.name".into(),
+    ]
+}
+
+fn delete_branch_args(repo: &str, branch: &str) -> Vec<String> {
+    vec![
+        "api".into(),
+        "-X".into(),
+        "DELETE".into(),
+        format!("repos/{repo}/git/refs/heads/{branch}"),
+    ]
+}
+
+fn run_failed_log_args(repo: &str, run_id: u64) -> Vec<String> {
+    vec![
+        "run".into(),
+        "view".into(),
+        run_id.to_string(),
+        "--log-failed".into(),
+        "-R".into(),
+        repo.into(),
+    ]
+}
+
+/// Parse the `name<TAB>protected` lines emitted by [`list_branches_args`]'s `--jq`.
+fn parse_branches_tsv(stdout: &str) -> Vec<RemoteBranch> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let name = parts.next().filter(|n| !n.is_empty())?;
+            Some(RemoteBranch {
+                name: name.to_string(),
+                protected: parts.next() == Some("true"),
+            })
+        })
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -510,6 +600,52 @@ impl ScmProvider for GitHubScmProvider {
         let v: Value = serde_json::from_slice(&out.stdout)?;
         Ok(parse_compare(&v))
     }
+
+    fn list_branches(&self, repo: &str) -> anyhow::Result<Vec<RemoteBranch>> {
+        let out = Self::run(&list_branches_args(repo), None)?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "gh api branches ({repo}) exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(parse_branches_tsv(&String::from_utf8_lossy(&out.stdout)))
+    }
+
+    fn default_branch(&self, repo: &str) -> anyhow::Result<String> {
+        let out = Self::run(&default_branch_args(repo), None)?;
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || name.is_empty() {
+            anyhow::bail!(
+                "gh repo view ({repo}) exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(name)
+    }
+
+    fn delete_branch(&self, repo: &str, branch: &str) -> anyhow::Result<()> {
+        let out = Self::run(&delete_branch_args(repo, branch), None)?;
+        if !out.status.success() {
+            anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
+
+    fn run_failed_log(&self, repo: &str, run_id: u64) -> anyhow::Result<String> {
+        let out = Self::run(&run_failed_log_args(repo, run_id), None)?;
+        if !out.status.success() {
+            let stderr: String = String::from_utf8_lossy(&out.stderr)
+                .trim()
+                .chars()
+                .take(300)
+                .collect();
+            anyhow::bail!("code={:?} stderr={stderr}", out.status.code());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -666,6 +802,18 @@ impl ScmProvider for TestScmHandle {
     }
     fn compare(&self, r: &str, b: &str, h: &str) -> anyhow::Result<CompareResult> {
         self.0.compare(r, b, h)
+    }
+    fn list_branches(&self, r: &str) -> anyhow::Result<Vec<RemoteBranch>> {
+        self.0.list_branches(r)
+    }
+    fn default_branch(&self, r: &str) -> anyhow::Result<String> {
+        self.0.default_branch(r)
+    }
+    fn delete_branch(&self, r: &str, b: &str) -> anyhow::Result<()> {
+        self.0.delete_branch(r, b)
+    }
+    fn run_failed_log(&self, r: &str, id: u64) -> anyhow::Result<String> {
+        self.0.run_failed_log(r, id)
     }
 }
 
@@ -1284,6 +1432,64 @@ mod tests {
         // (it would attempt a gh call) — assert it's a different provider by
         // confirming it is constructed (smoke: trait object dispatch works).
         let _ = gh;
+    }
+
+    // ---- #178: argv moved verbatim from remote_gc.rs / ci_watch/provider.rs ----
+
+    #[test]
+    fn remote_gc_and_failed_log_argv_byte_identical_178() {
+        assert_eq!(
+            list_branches_args("o/r"),
+            [
+                "api",
+                "--paginate",
+                "repos/o/r/branches",
+                "--jq",
+                r#".[] | [.name, (.protected|tostring)] | @tsv"#,
+            ]
+        );
+        assert_eq!(
+            default_branch_args("o/r"),
+            [
+                "repo",
+                "view",
+                "o/r",
+                "--json",
+                "defaultBranchRef",
+                "--jq",
+                ".defaultBranchRef.name",
+            ]
+        );
+        assert_eq!(
+            delete_branch_args("o/r", "feat/x"),
+            ["api", "-X", "DELETE", "repos/o/r/git/refs/heads/feat/x"]
+        );
+        assert_eq!(
+            run_failed_log_args("o/r", 42),
+            ["run", "view", "42", "--log-failed", "-R", "o/r"]
+        );
+    }
+
+    #[test]
+    fn parse_branches_tsv_reads_name_and_protected_178() {
+        let got = parse_branches_tsv("main\ttrue\nfeat/x\tfalse\n\t\nbare\n");
+        assert_eq!(
+            got,
+            vec![
+                RemoteBranch {
+                    name: "main".into(),
+                    protected: true
+                },
+                RemoteBranch {
+                    name: "feat/x".into(),
+                    protected: false
+                },
+                RemoteBranch {
+                    name: "bare".into(),
+                    protected: false
+                },
+            ]
+        );
     }
 
     #[test]
