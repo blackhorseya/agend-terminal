@@ -2185,6 +2185,10 @@ fn resolve_binding_notify_recipient(home: &Path, repo: &str, branch: &str) -> Op
 /// single-agent deployment) the author self-notifies, since they merge their
 /// own PR; `fixup-lead` remains only as the last-ditch when the author is
 /// unknown.
+///
+/// Test-only since -209(a): every production emit goes through
+/// [`resolve_merge_authority_checked`], which adds the repo-identity gate.
+#[cfg(test)]
 pub fn resolve_merge_authority(home: &Path, state: &PrState) -> String {
     let mut candidates: Vec<&str> = Vec::new();
     match &state.verdict_state {
