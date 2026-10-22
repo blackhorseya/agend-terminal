@@ -338,21 +338,26 @@ fn merge_ready_with_fresh_tuple_still_emits_pr_ready() {
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
 
+    // -209(a): the latch is only set when a notice is actually queued, so
+    // the fixture needs a merge authority eligible for this repo.
+    write_team_fleet(&home, "lead", "dev");
     let head = "abcdef0";
-    let mut s = merge_ready_state("o/r", "b", head, 78);
+    let mut s = merge_ready_state("owner/repo", "b", head, 78);
+    s.pr_author = "dev".into();
     stamp_fresh_tuple(&mut s, head, "beef0001", 0);
     save(&home, &s).unwrap();
 
     let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta(78, "b")])]);
     scan_and_emit_with(&home, &empty_registry(), &poller);
 
-    let reloaded = load(&home, "o/r", "b").expect("state persists");
+    let reloaded = load(&home, "owner/repo", "b").expect("state persists");
     assert_eq!(
         reloaded.ready_emitted_for_sha,
         Some(head.to_string()),
         "#2749 no-regression: a MergeReady PR with a valid FRESH tuple \
              (behind_by=0) must STILL emit [pr-ready-for-merge]"
     );
+    assert_eq!(kind_count(&home, "pr-ready-for-merge"), 1);
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -2322,4 +2327,243 @@ fn b4_scanner_self_heal_persists_then_redrive_recomputes_bidirectional() {
              (bidirectional — not a one-way latch)"
     );
     std::fs::remove_dir_all(&home).ok();
+}
+
+// -209(a): the merge-authority half of every repo-bearing notice is
+// fail-closed on repo identity — `[pr-ready-for-merge]`,
+// `[review-dispatch-required]` (and `[review-class-unresolved]`, pinned in
+// `pr_state::tests`). A candidate from another team's repo must not route
+// this repo's notice to THAT team's orchestrator.
+
+fn write_foreign_fleet(home: &std::path::Path) {
+    std::fs::create_dir_all(home.join("inbox")).ok();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(home),
+        "instances:\n  foreign-dev:\n    backend: claude\n  foreign-lead:\n    backend: claude\n\
+         teams:\n  foreign:\n    orchestrator: foreign-lead\n    source_repo: owner/other\n    \
+         members:\n      - foreign-dev\n",
+    )
+    .unwrap();
+}
+
+fn kind_count(home: &std::path::Path, kind: &str) -> usize {
+    crate::daemon::pr_state::tests::all_inbox_kinds(home)
+        .into_iter()
+        .filter(|(_, k)| k == kind)
+        .count()
+}
+
+#[test]
+fn pr_ready_not_sent_to_foreign_team_authority_209a() {
+    let home = tmp_home(line!());
+    write_foreign_fleet(&home);
+    let mut s = merge_ready_state("owner/repo", "feat/x", BEHIND_HEAD, 77);
+    s.pr_author = "foreign-dev".into();
+    stamp_fresh_tuple(&mut s, BEHIND_HEAD, BEHIND_BASE, 0);
+    save(&home, &s).unwrap();
+
+    scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+
+    assert_eq!(
+        kind_count(&home, "pr-ready-for-merge"),
+        0,
+        "foreign-team orchestrator must not get this repo's pr-ready"
+    );
+    // Nothing was sent, so nothing is latched: a later tick on the same head
+    // must still be able to deliver once the fleet identity is repaired.
+    let reloaded = load(&home, "owner/repo", "feat/x").unwrap();
+    assert_eq!(reloaded.ready_emitted_for_sha, None);
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// -209(a) liveness: fail-closed must not silence the head forever. No
+/// eligible authority → nothing sent, nothing latched; repair the fleet
+/// identity → the next scan on the SAME head delivers exactly once, and a
+/// further scan does not re-send.
+#[test]
+fn pr_ready_recovers_after_fleet_identity_repair_209a() {
+    let home = tmp_home(line!());
+    write_foreign_fleet(&home);
+    let mut s = merge_ready_state("owner/repo", "feat/x", BEHIND_HEAD, 77);
+    s.pr_author = "dev".into();
+    stamp_fresh_tuple(&mut s, BEHIND_HEAD, BEHIND_BASE, 0);
+    save(&home, &s).unwrap();
+
+    scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+    assert_eq!(
+        kind_count(&home, "pr-ready-for-merge"),
+        0,
+        "no eligible authority yet"
+    );
+
+    write_team_fleet(&home, "lead", "dev");
+    scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+    scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+
+    let to_lead = crate::inbox::drain(&home, "lead");
+    let ready: Vec<_> = to_lead
+        .iter()
+        .filter(|m| m.kind.as_deref() == Some("pr-ready-for-merge"))
+        .collect();
+    assert_eq!(
+        ready.len(),
+        1,
+        "same head delivers exactly once after repair"
+    );
+    let reloaded = load(&home, "owner/repo", "feat/x").unwrap();
+    assert_eq!(reloaded.ready_emitted_for_sha.as_deref(), Some(BEHIND_HEAD));
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// Positive control for the test above: same state, but the author's team
+/// owns the repo ⇒ its orchestrator gets exactly one pr-ready.
+#[test]
+fn pr_ready_reaches_eligible_authority_209a() {
+    let home = tmp_home(line!());
+    write_team_fleet(&home, "lead", "dev");
+    let mut s = merge_ready_state("owner/repo", "feat/x", BEHIND_HEAD, 77);
+    s.pr_author = "dev".into();
+    stamp_fresh_tuple(&mut s, BEHIND_HEAD, BEHIND_BASE, 0);
+    save(&home, &s).unwrap();
+
+    scan_and_emit_with(&home, &empty_registry(), &behind_poller(77));
+
+    assert_eq!(
+        kind_count(&home, "pr-ready-for-merge"),
+        1,
+        "exactly one notice"
+    );
+    let to_lead = crate::inbox::drain(&home, "lead");
+    assert_eq!(to_lead.len(), 1, "and it went to this repo's orchestrator");
+    assert_eq!(to_lead[0].kind.as_deref(), Some("pr-ready-for-merge"));
+    let _ = std::fs::remove_dir_all(home);
+}
+
+#[test]
+fn review_dispatch_not_sent_to_foreign_team_authority_209a() {
+    let home = tmp_home(line!());
+    write_foreign_fleet(&home);
+    let head = "abcdef0123456789abcdef0123456789abcdef01";
+    let base = "1234567890abcdef1234567890abcdef12345678";
+    super::super::record_ci_result(
+        &home,
+        "owner/repo",
+        "feat/review-dispatch",
+        head,
+        super::super::CiConclusion::Green,
+        vec!["foreign-dev".into()],
+        ReviewClass::Single,
+    );
+    let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(
+        3182,
+        "feat/review-dispatch",
+        head,
+        base,
+    )])]);
+    scan_and_emit_with(&home, &empty_registry(), &poller);
+
+    assert_eq!(
+        kind_count(&home, "review-dispatch-required"),
+        0,
+        "foreign-team orchestrator must not get this repo's review-dispatch"
+    );
+    let state = load(&home, "owner/repo", "feat/review-dispatch").unwrap();
+    assert_eq!(state.merge_state, MergeState::NotReady);
+    assert_eq!(
+        state.review_dispatch_emitted_for_sha, None,
+        "nothing sent ⇒ nothing latched for this head"
+    );
+
+    // Liveness: repair the fleet identity (the subscriber's team now owns
+    // the repo) → the same head delivers exactly once, then stays quiet.
+    write_team_fleet(&home, "lead", "foreign-dev");
+    for _ in 0..2 {
+        let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(
+            3182,
+            "feat/review-dispatch",
+            head,
+            base,
+        )])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+    }
+    let to_lead = crate::inbox::drain(&home, "lead");
+    let dispatch: Vec<_> = to_lead
+        .iter()
+        .filter(|m| m.kind.as_deref() == Some("review-dispatch-required"))
+        .collect();
+    assert_eq!(
+        dispatch.len(),
+        1,
+        "same head delivers exactly once after repair"
+    );
+    let state = load(&home, "owner/repo", "feat/review-dispatch").unwrap();
+    assert_eq!(state.review_dispatch_emitted_for_sha.as_deref(), Some(head));
+    let _ = std::fs::remove_dir_all(home);
+}
+
+/// -209(a) liveness for `[review-dispatch-unavailable]`, which has its own
+/// `ReviewDispatchStatus` arm, `authority_unknown` handling and latch
+/// (`review_dispatch_unavailable_emitted_for_sha`): a corrupt assignment
+/// record makes the authority Unreadable; with no eligible merge authority
+/// nothing is sent or latched, and once the fleet identity is repaired the
+/// same head delivers exactly once.
+#[test]
+fn review_dispatch_unavailable_recovers_after_fleet_identity_repair_209a() {
+    let home = tmp_home(line!());
+    write_foreign_fleet(&home);
+    let head = "abcdef0123456789abcdef0123456789abcdef02";
+    let base = "1234567890abcdef1234567890abcdef12345678";
+    let branch = "feat/review-unavailable";
+    super::super::record_ci_result(
+        &home,
+        "owner/repo",
+        branch,
+        head,
+        super::super::CiConclusion::Green,
+        vec!["foreign-dev".into()],
+        ReviewClass::Single,
+    );
+    let dir = crate::daemon::assignment_authority::branch_dir(&home, "owner/repo", branch);
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("corrupt.json"), b"{ not json").unwrap();
+    assert!(matches!(
+        crate::daemon::assignment_authority::probe_branch_authority(&home, "owner/repo", branch),
+        crate::daemon::assignment_authority::BranchAuthority::Unreadable
+    ));
+    let scan = || {
+        let poller = MockGhPoller::new(vec![Ok(vec![open_pr_meta_oids(3183, branch, head, base)])]);
+        scan_and_emit_with(&home, &empty_registry(), &poller);
+    };
+
+    scan();
+    assert_eq!(
+        kind_count(&home, "review-dispatch-unavailable"),
+        0,
+        "foreign-team orchestrator must not get this repo's notice"
+    );
+    let state = load(&home, "owner/repo", branch).unwrap();
+    assert!(state.authority_unknown, "Unreadable authority is surfaced");
+    assert_eq!(
+        state.review_dispatch_unavailable_emitted_for_sha, None,
+        "nothing sent ⇒ nothing latched for this head"
+    );
+
+    write_team_fleet(&home, "lead", "foreign-dev");
+    scan();
+    scan();
+    let unavailable: Vec<_> = crate::inbox::drain(&home, "lead")
+        .into_iter()
+        .filter(|m| m.kind.as_deref() == Some("review-dispatch-unavailable"))
+        .collect();
+    assert_eq!(
+        unavailable.len(),
+        1,
+        "same head delivers exactly once after repair"
+    );
+    let state = load(&home, "owner/repo", branch).unwrap();
+    assert_eq!(
+        state.review_dispatch_unavailable_emitted_for_sha.as_deref(),
+        Some(head)
+    );
+    let _ = std::fs::remove_dir_all(home);
 }
