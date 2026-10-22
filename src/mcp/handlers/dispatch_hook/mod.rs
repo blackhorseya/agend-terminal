@@ -9,6 +9,7 @@ mod branch_start_point;
 mod cleanup_trunk;
 mod exact_head;
 mod from_ref;
+mod github_ssh_alias;
 mod lifecycle_permit;
 mod live_binding;
 // #3675: shared external-PR-head availability helper (dispatch + checkout sides).
@@ -18,8 +19,10 @@ mod rebase_dispatch;
 mod source_repo_resolution;
 mod stale_dir;
 mod types;
+
 pub(crate) use branch_start_point::BranchProvision;
 pub(crate) use from_ref::resolve_from_ref_remote; // CR-2026-06-14 extraction
+pub(crate) use github_ssh_alias::strip_github_ssh_alias;
 pub(crate) use provider_neutral_slug::derive_repo_slug_any_forge_pub;
 pub(crate) use rebase_dispatch::dispatch_auto_bind_lease_with_source_and_chain_preheld;
 // t-…-17: the lockstep source→slug normalizer shared by the reviewer-assignment
@@ -1021,26 +1024,6 @@ pub(crate) fn canonicalize_repo_slug(s: &str) -> Option<String> {
         owner.to_ascii_lowercase(),
         name.to_ascii_lowercase()
     ))
-}
-
-/// Strip an ssh-config GitHub host alias — `git@github-<x>:` or
-/// `ssh://git@github-<x>/` (also `github.com-<x>`), the usual multi-account
-/// convention — returning the `owner/repo(.git)` remainder. Only
-/// `github-`/`github.com-` prefixed aliases qualify: an arbitrary SCP host
-/// may be GitLab/Bitbucket/self-hosted, which must not be passed to `gh`
-/// as a GitHub slug. Look-alikes such as `github.com.evil.com` don't match.
-pub(crate) fn strip_github_ssh_alias(s: &str) -> Option<&str> {
-    let (host, rest) = match s.strip_prefix("ssh://git@") {
-        Some(r) => r.split_once('/')?,
-        None => s.strip_prefix("git@")?.split_once(':')?,
-    };
-    let alias = host
-        .strip_prefix("github.com-")
-        .or_else(|| host.strip_prefix("github-"))?;
-    if alias.is_empty() || alias.contains(['/', ':', '@']) {
-        return None;
-    }
-    Some(rest)
 }
 
 /// Returns `None` for non-GitHub remotes. This GitHub-only derivation is the
