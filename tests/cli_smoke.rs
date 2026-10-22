@@ -818,11 +818,19 @@ fn residue_diagnostics(home: &std::path::Path, pids: &[u32]) -> String {
     )
 }
 
-/// Processes planted as if a test runner had died and left them behind:
-/// `sleep` invoked through a symlink at `…/target/debug/deps/agend_terminal-<hash>`
-/// (the #3539 residue shape — `ps` reports argv[0] as invoked, and a symlink
-/// keeps the real `/bin/sleep`, which macOS would SIGKILL if copied out of its
-/// signed location) and a plain one elsewhere (the control).
+/// Processes planted as if a test runner had died and left them behind: a
+/// long-lived `/bin/sh` loop invoked through a symlink at
+/// `…/target/debug/deps/agend_terminal-<hash>` (the #3539 residue shape — `ps`
+/// reports argv[0] as invoked, and a symlink keeps the real binary, which macOS
+/// would SIGKILL if copied out of its signed location) and a plain one
+/// elsewhere (the control).
+///
+/// Why `sh` and not `sleep`: on uutils coreutils (Ubuntu ≥ 25.10, the
+/// `ubuntu-latest` runner) every utility is a multi-call binary that refuses to
+/// run when argv[0] does not name it ("Requested utility … does not match
+/// executable name"), so a renamed `sleep` exits at once. `sh` (dash / macOS
+/// sh) does not care about argv[0]; its transient `sleep 1` children share its
+/// process group, which `Drop` kills as a whole.
 ///
 /// The V1 scope is `ppid == 1`, same uid, `sid != 1`, and not a session leader.
 /// Start the throw-away shell with `setsid()` so the sleep inherits a fresh
@@ -843,8 +851,8 @@ impl PlantedResidue {
         std::fs::create_dir_all(&plain).expect("mkdir ctl");
         let hinted = deps.join("agend_terminal-deadbeef3539");
         let control = plain.join("plain-sleeper");
-        std::os::unix::fs::symlink("/bin/sleep", &hinted).expect("link sleep as test-binary shape");
-        std::os::unix::fs::symlink("/bin/sleep", &control).expect("link sleep as control");
+        std::os::unix::fs::symlink("/bin/sh", &hinted).expect("link sh as test-binary shape");
+        std::os::unix::fs::symlink("/bin/sh", &control).expect("link sh as control");
         Self {
             hinted_pid: Self::spawn_reparented(&hinted, home),
             control_pid: Self::spawn_reparented(&control, home),
@@ -855,7 +863,7 @@ impl PlantedResidue {
         use std::os::unix::process::CommandExt;
         let mut sh = std::process::Command::new("sh");
         sh.arg("-c")
-            .arg("\"$0\" 300 >/dev/null 2>&1 & echo $!")
+            .arg("\"$0\" -c 'while :; do sleep 1; done' >/dev/null 2>&1 & echo $!")
             .arg(exe)
             .current_dir(cwd);
         // SAFETY: `setsid` is async-signal-safe and touches only the child's
@@ -901,9 +909,19 @@ impl PlantedResidue {
 impl Drop for PlantedResidue {
     fn drop(&mut self) {
         for pid in [self.hinted_pid, self.control_pid] {
-            // SAFETY: exact positive pid this fixture spawned; test-only.
+            // The planted loop's process group is the throw-away `setsid` shell's,
+            // so it holds only this fixture's loop and its transient `sleep 1`
+            // child. Kill the group so no child outlives the loop with its cwd
+            // still inside the fixture home; fall back to the exact pid.
+            // SAFETY: getpgid only reads; kill targets this fixture's own group
+            // (never ours, never init's) or its exact positive pid; test-only.
             unsafe {
-                libc::kill(pid as i32, libc::SIGKILL);
+                let pgid = libc::getpgid(pid as i32);
+                if pgid > 1 && pgid != libc::getpgrp() {
+                    libc::kill(-pgid, libc::SIGKILL);
+                } else {
+                    libc::kill(pid as i32, libc::SIGKILL);
+                }
             }
             let started = std::time::Instant::now();
             while pid_alive(pid) && started.elapsed() < std::time::Duration::from_secs(5) {

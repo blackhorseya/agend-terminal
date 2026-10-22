@@ -324,6 +324,22 @@ fn handle_mcp_tool_inner(
 /// Counter-parameterized admission + dispatch. Production always passes
 /// `&OUTSTANDING`; the cap test passes its own isolated counter so lingering
 /// workers from other tests cannot pollute it.
+/// Reserve one worker slot unless `MAX_MCP_WORKERS` are already outstanding.
+///
+/// Spelled out as the CAS loop `AtomicUsize::fetch_update` performs: that
+/// method is deprecated on current stable (renamed `try_update`), while the
+/// replacement is newer than the crate's MSRV.
+fn try_reserve_worker(counter: &AtomicUsize) -> bool {
+    let mut cur = counter.load(Ordering::Relaxed);
+    while cur < MAX_MCP_WORKERS {
+        match counter.compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return true,
+            Err(actual) => cur = actual,
+        }
+    }
+    false
+}
+
 fn handle_mcp_tool_counted(
     counter: &'static AtomicUsize,
     tool: &str,
@@ -333,16 +349,7 @@ fn handle_mcp_tool_counted(
     action: Option<String>,
     exec: impl FnOnce(&str, &Value, &str) -> Value + Send + 'static,
 ) -> Value {
-    if counter
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |cur| {
-            if cur >= MAX_MCP_WORKERS {
-                None
-            } else {
-                Some(cur + 1)
-            }
-        })
-        .is_err()
-    {
+    if !try_reserve_worker(counter) {
         return json!({
             "ok": false,
             "error": format!(
