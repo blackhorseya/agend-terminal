@@ -170,9 +170,12 @@ pub fn run_stop(home: &Path, opts: StopOptions) -> anyhow::Result<StopOutcome> {
     }
 }
 
-/// Liveness for the exit wait.
+/// Liveness for the exit wait: a zombie has exited even though `kill(pid, 0)`
+/// still succeeds. Its parent may never reap it promptly — in app mode the TUI
+/// spawns the daemon and drops the `Child` — so without this `stop` waited out
+/// its whole bound and reported an exited daemon as still running.
 fn pid_running(pid: u32) -> bool {
-    crate::process::is_pid_alive(pid)
+    crate::process::is_pid_alive(pid) && !crate::process::is_zombie(pid)
 }
 
 /// `run/<pid>/.daemon` is `pid:boot_unix:start_token` (token optional on
