@@ -91,7 +91,8 @@ pub(crate) fn resolve_in(
 
     // A — override table: exact `owner/repo` first, then `owner`. Keys that
     // collide case-insensitively (`KicksCrew` + `kickscrew`) would pick a dir
-    // by HashMap order → fail closed instead.
+    // by HashMap order → fail closed, but ONLY when the colliding key is the
+    // one consulted for this repo; every other entry keeps resolving.
     let mut by_key: HashMap<String, Vec<(&String, &String)>> = HashMap::new();
     for (k, v) in &cfg.gh_identities {
         by_key
@@ -99,33 +100,25 @@ pub(crate) fn resolve_in(
             .or_default()
             .push((k, v));
     }
-    let mut collisions: Vec<String> = by_key
-        .values()
-        .filter(|e| e.len() > 1)
-        .map(|e| {
-            let mut keys: Vec<&str> = e.iter().map(|(k, _)| k.as_str()).collect();
-            keys.sort_unstable();
-            keys.join(" / ")
-        })
-        .collect();
-    if !collisions.is_empty() {
-        collisions.sort();
-        anyhow::bail!(
-            "{ERR_PREFIX} gh_identities keys collide case-insensitively ({}); keep one",
-            collisions.join("; ")
-        );
-    }
-    let overrides: HashMap<String, &String> = by_key
-        .into_iter()
-        .filter_map(|(k, e)| e.first().map(|(_, v)| (k, *v)))
-        .collect();
     for key in [slug.as_str(), owner] {
-        if let Some(dir) = overrides.get(key) {
-            return existing_dir(
-                expand_tilde(dir, env),
-                &format!("gh_identities[{key}] for {slug}"),
-                env,
-            );
+        match by_key.get(key).map(Vec::as_slice) {
+            None | Some([]) => {}
+            Some([(_, dir)]) => {
+                return existing_dir(
+                    expand_tilde(dir, env),
+                    &format!("gh_identities[{key}] for {slug}"),
+                    env,
+                );
+            }
+            Some(entries) => {
+                let mut keys: Vec<&str> = entries.iter().map(|(k, _)| k.as_str()).collect();
+                keys.sort_unstable();
+                anyhow::bail!(
+                    "{ERR_PREFIX} gh_identities keys collide case-insensitively ({}) for {slug}; \
+                     keep one",
+                    keys.join(" / ")
+                );
+            }
         }
     }
 
