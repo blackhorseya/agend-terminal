@@ -457,8 +457,11 @@ impl RepoOverride {
 
     /// Every configured repo, in order.
     pub fn iter(&self) -> impl Iterator<Item = &str> {
-        // RED stub (t-…-24985-1): only the primary entry — pre-list behaviour.
-        self.primary().into_iter()
+        let all: &[String] = match self {
+            Self::One(s) => std::slice::from_ref(s),
+            Self::Many(v) => v,
+        };
+        all.iter().map(String::as_str)
     }
 }
 
