@@ -493,9 +493,19 @@ impl GitHubCiProvider {
         repo: &str,
         resolved: anyhow::Result<crate::gh_identity::GhIdentity>,
     ) -> anyhow::Result<Self> {
-        // RED stub (#178): resolution ignored — global account.
-        let _ = (repo, resolved);
-        Self::with_base_url(base_url)
+        let identity = resolved?;
+        if let crate::gh_identity::GhIdentity::ConfigDir(dir) = &identity {
+            if host_receives_credentials(&base_url)
+                && crate::github_token::cached_token_for(&identity).is_none()
+            {
+                anyhow::bail!(
+                    "{} no REST token for {repo} under GH_CONFIG_DIR {}",
+                    crate::gh_identity::ERR_PREFIX,
+                    dir.display()
+                );
+            }
+        }
+        Self::with_identity(base_url, identity)
     }
 
     fn with_identity(

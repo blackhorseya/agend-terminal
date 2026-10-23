@@ -15,9 +15,10 @@
 //! lives in one place: agent-visible MCP responses, ci_watch's polling
 //! path, and the operator setup hint all draw from `SETUP_WARNING`.
 
-use std::path::Path;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Operator-actionable guidance shown in MCP responses + agent-visible
 /// surfaces when no token is available. Source-of-truth wording lives
@@ -75,14 +76,15 @@ impl TokenCache {
         // `falls_back_to_gh_when_env_unset`, and `empty_env_falls_through_to_gh`
         // all immediately fail with the signature captured in PR #r0.
         if let Some(t) = env.read("GITHUB_TOKEN") {
+            if let Some(dir) = config_dir {
+                crate::gh_identity::warn_if_env_token_overrides(dir);
+            }
             return Self {
                 token: Some(t),
                 source: TokenSource::Env,
             };
         }
-        // RED stub (#178): config_dir ignored — global account.
-        let _ = config_dir;
-        if let Some(t) = gh.fetch_token() {
+        if let Some(t) = gh.fetch_token_for(config_dir) {
             return Self {
                 token: Some(t),
                 source: TokenSource::GhCli,
@@ -148,9 +150,34 @@ pub fn cached_token() -> Option<String> {
 ///
 /// [`GhIdentity::Global`]: crate::gh_identity::GhIdentity::Global
 pub(crate) fn cached_token_for(identity: &crate::gh_identity::GhIdentity) -> Option<String> {
-    // RED stub (#178): every identity gets the global token.
-    let _ = identity;
-    cached_token()
+    let crate::gh_identity::GhIdentity::ConfigDir(dir) = identity else {
+        return cached_token();
+    };
+    static PER_DIR: OnceLock<Mutex<HashMap<PathBuf, TokenCache>>> = OnceLock::new();
+    let cell = PER_DIR.get_or_init(|| Mutex::new(HashMap::new()));
+    let cached = cell
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(dir)
+        .cloned();
+    let cache = match cached {
+        Some(c) => c,
+        None => {
+            let c = TokenCache::discover_for(&DefaultEnvReader, &DefaultGhRunner, Some(dir));
+            if c.token.is_some() {
+                cell.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(dir.clone(), c.clone());
+            }
+            c
+        }
+    };
+    let token = cache.token().map(String::from)?;
+    if let Err(msg) = validate_token_format(&token) {
+        tracing::warn!("GitHub token format invalid: {msg}");
+        return None;
+    }
+    Some(token)
 }
 
 /// Validate GitHub token format.
@@ -201,7 +228,6 @@ impl EnvReader for DefaultEnvReader {
 pub(crate) trait GhRunner {
     fn fetch_token(&self) -> Option<String>;
     /// #178: fetch under `GH_CONFIG_DIR = config_dir` (`None` = global).
-    #[allow(dead_code)] // RED (#178): called by discovery in GREEN
     fn fetch_token_for(&self, config_dir: Option<&Path>) -> Option<String> {
         let _ = config_dir;
         self.fetch_token()
@@ -211,6 +237,18 @@ pub(crate) trait GhRunner {
 struct DefaultGhRunner;
 impl GhRunner for DefaultGhRunner {
     fn fetch_token(&self) -> Option<String> {
+        self.fetch_token_for(None)
+    }
+
+    fn fetch_token_for(&self, config_dir: Option<&Path>) -> Option<String> {
+        let gh = |args: [&str; 2]| {
+            let mut cmd = Command::new("gh");
+            cmd.args(args);
+            if let Some(dir) = config_dir {
+                cmd.env("GH_CONFIG_DIR", dir);
+            }
+            cmd.output()
+        };
         // P0-4 r1 portability fix (reviewer m-43): the prior `which gh`
         // precheck was not portable to Windows (no `which` builtin) and
         // was redundant — `Command::new("gh").output()` on a missing
@@ -221,12 +259,12 @@ impl GhRunner for DefaultGhRunner {
         //
         // 1. authed? `gh auth status` exits non-zero when gh is missing
         // OR when no auth is configured for any host.
-        let status = Command::new("gh").args(["auth", "status"]).output().ok()?;
+        let status = gh(["auth", "status"]).ok()?;
         if !status.status.success() {
             return None;
         }
         // 2. fetch token. Output is plain text (no JSON wrapping).
-        let token_out = Command::new("gh").args(["auth", "token"]).output().ok()?;
+        let token_out = gh(["auth", "token"]).ok()?;
         if !token_out.status.success() {
             return None;
         }

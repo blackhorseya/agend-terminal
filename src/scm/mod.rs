@@ -522,8 +522,10 @@ impl GitHubScmProvider {
 /// #178: point gh at the resolved identity's config dir. Global leaves the
 /// env untouched (pre-#178 behaviour).
 fn apply_identity(cmd: &mut Command, identity: &crate::gh_identity::GhIdentity) {
-    // RED stub (#178): identity not applied — global account.
-    let _ = (cmd, identity);
+    if let crate::gh_identity::GhIdentity::ConfigDir(dir) = identity {
+        crate::gh_identity::warn_if_env_token_overrides(dir);
+        cmd.env("GH_CONFIG_DIR", dir);
+    }
 }
 
 impl ScmProvider for GitHubScmProvider {
