@@ -36,6 +36,16 @@ pub fn is_pid_alive(pid: u32) -> bool {
     }
 }
 
+/// True when `pid` has exited but its parent has not reaped it yet. Such a
+/// zombie still answers `kill(pid, 0)`, so [`is_pid_alive`] keeps reporting it
+/// alive; callers that need "is it still RUNNING" (e.g. `stop` waiting for the
+/// daemon to exit) must also rule this out.
+#[allow(dead_code)] // RED: stub, wired in GREEN
+pub fn is_zombie(pid: u32) -> bool {
+    let _ = pid;
+    false
+}
+
 /// Cross-platform process start-time token: an identifier that is stable for
 /// the lifetime of a single process but (almost certainly) differs from any
 /// later process that the OS happens to recycle the same PID onto. Used to
@@ -244,6 +254,32 @@ mod tests {
         assert!(
             is_pid_alive(std::process::id()),
             "self pid must report alive"
+        );
+    }
+
+    #[test]
+    fn is_zombie_reports_an_exited_unreaped_child() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn sh");
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !is_zombie(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            is_zombie(pid),
+            "an exited-but-unreaped child must read as a zombie"
+        );
+        assert!(
+            is_pid_alive(pid),
+            "kill(pid, 0) still succeeds for a zombie — the gap is_zombie closes"
+        );
+        child.wait().expect("reap");
+        assert!(
+            !is_zombie(std::process::id()),
+            "a running process is not a zombie"
         );
     }
 
