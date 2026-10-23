@@ -434,6 +434,34 @@ fn default_discord_bot_token_env() -> String {
     "AGEND_DISCORD_BOT_TOKEN".to_string()
 }
 
+/// Instance `repo:` override: one GitHub `owner/name`, or a list of them
+/// (t-20261023055258928031-24985-1). The single-string form is unchanged and
+/// serializes back as a string; a list lets one instance own the pr-state
+/// notices of several repos. Dispatch-time defaults that need ONE repo use
+/// [`RepoOverride::primary`] (the first entry).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RepoOverride {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl RepoOverride {
+    /// The repo used where exactly one is needed (first list entry).
+    pub fn primary(&self) -> Option<&str> {
+        match self {
+            Self::One(s) => Some(s.as_str()),
+            Self::Many(v) => v.first().map(String::as_str),
+        }
+    }
+
+    /// Every configured repo, in order.
+    pub fn iter(&self) -> impl Iterator<Item = &str> {
+        // RED stub (t-…-24985-1): only the primary entry — pre-list behaviour.
+        self.primary().into_iter()
+    }
+}
+
 /// A fleet environment value is either stored literally or read from the
 /// daemon's environment when an instance is resolved.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -573,8 +601,11 @@ pub struct InstanceConfig {
     /// or fork/upstream disambiguation. When present, takes precedence over
     /// derivation from `source_repo`'s origin. When absent, daemon falls
     /// back to `derive_repo_from_remote(source_repo)` per existing behavior.
+    ///
+    /// May be a list (see [`RepoOverride`]): pr-state author eligibility
+    /// matches ANY entry; single-repo consumers use the first.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub repo: Option<String>,
+    pub repo: Option<RepoOverride>,
     pub ready_pattern: Option<String>,
     #[serde(default)]
     pub env: HashMap<String, FleetEnvValue>,
