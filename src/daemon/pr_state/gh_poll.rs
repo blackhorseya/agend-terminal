@@ -664,7 +664,7 @@ fn eligible_for(cfg: &crate::fleet::FleetConfig, repo: &str) -> Vec<AuthorCandid
 
 /// `source_repo` → canonical GitHub slug: a bare slug / URL directly,
 /// otherwise the local checkout's `origin` remote (a git subprocess).
-fn slug_for_source(src: &std::path::Path) -> Option<String> {
+pub(crate) fn slug_for_source(src: &std::path::Path) -> Option<String> {
     src.to_str()
         .and_then(crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug)
         .or_else(|| {

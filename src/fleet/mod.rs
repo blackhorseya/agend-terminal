@@ -190,6 +190,12 @@ pub struct FleetConfig {
     pub instances: HashMap<String, InstanceConfig>,
     #[serde(default)]
     pub teams: HashMap<String, TeamConfig>,
+    /// #178: per-repo gh identity override for the daemon's own GitHub calls.
+    /// Key = `owner` or `owner/repo` (case-insensitive; `owner/repo` wins),
+    /// value = the `GH_CONFIG_DIR` to run gh / fetch the REST token with
+    /// (`~` expanded). Checked before team derivation — see `crate::gh_identity`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub gh_identities: HashMap<String, String>,
     /// #1440: fleet-wide env keys to pass through to every agent backend when
     /// `AGEND_ENV_ISOLATION` is on (additive with per-instance
     /// `passthrough_env`). Still gated by `is_sensitive_env_key`, so listing

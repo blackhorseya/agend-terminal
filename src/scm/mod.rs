@@ -23,7 +23,7 @@
 
 use serde_json::Value;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 // ---------------------------------------------------------------------------
 // Provider-neutral types (superset of what the 10 gh sites read).
@@ -492,12 +492,18 @@ impl GitHubScmProvider {
     /// Run `gh` with the given args. `cwd`: when `Some`, set the process
     /// working directory (site 10 runs gh inside the repo dir so gh
     /// auto-detects the repo, no `--repo`).
-    fn run(args: &[String], cwd: Option<&Path>) -> anyhow::Result<std::process::Output> {
+    ///
+    /// #178: `repo` (or, when it is not a slug, `cwd`'s origin) picks the gh
+    /// identity. A fail-closed resolution returns `Err` WITHOUT spawning gh —
+    /// never a silent run as the global account.
+    fn run(args: &[String], cwd: Option<&Path>, repo: &str) -> anyhow::Result<Output> {
+        let identity = crate::gh_identity::resolve(&crate::home_dir(), repo, cwd)?;
         let mut cmd = Command::new("gh");
         cmd.args(args);
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
+        apply_identity(&mut cmd, &identity);
         // CR-2026-06-14 #5: bound the `gh` subprocess via the shared
         // process-group-killing spawner (same machinery as the local git
         // helpers) — a bare `.output()` is UNBOUNDED and a wedged gh hangs the
@@ -513,9 +519,16 @@ impl GitHubScmProvider {
     }
 }
 
+/// #178: point gh at the resolved identity's config dir. Global leaves the
+/// env untouched (pre-#178 behaviour).
+fn apply_identity(cmd: &mut Command, identity: &crate::gh_identity::GhIdentity) {
+    // RED stub (#178): identity not applied — global account.
+    let _ = (cmd, identity);
+}
+
 impl ScmProvider for GitHubScmProvider {
     fn pr_view(&self, repo: &str, pr: u64, fields: &[&str]) -> anyhow::Result<PrSummary> {
-        let out = Self::run(&pr_view_args(repo, pr, fields), None)?;
+        let out = Self::run(&pr_view_args(repo, pr, fields), None, repo)?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh pr view #{pr} ({repo}) exited {}: {}",
@@ -528,7 +541,7 @@ impl ScmProvider for GitHubScmProvider {
     }
 
     fn pr_checks(&self, repo: &str, pr: u64) -> anyhow::Result<Vec<CheckState>> {
-        let out = Self::run(&pr_checks_args(repo, pr), None)?;
+        let out = Self::run(&pr_checks_args(repo, pr), None, repo)?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh pr checks #{pr} ({repo}) exited {}: {}",
@@ -547,7 +560,7 @@ impl ScmProvider for GitHubScmProvider {
         fields: &[&str],
         cwd: Option<&Path>,
     ) -> anyhow::Result<Vec<PrSummary>> {
-        let out = Self::run(&pr_list_args(repo, filter, fields, cwd), cwd)?;
+        let out = Self::run(&pr_list_args(repo, filter, fields, cwd), cwd, repo)?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh pr list ({repo}) exited {}: {}",
@@ -562,7 +575,7 @@ impl ScmProvider for GitHubScmProvider {
     }
 
     fn pr_merge(&self, repo: &str, pr: u64, opts: &MergeOpts) -> anyhow::Result<MergeOutcome> {
-        let out = Self::run(&pr_merge_args(repo, pr, opts), None)?;
+        let out = Self::run(&pr_merge_args(repo, pr, opts), None, repo)?;
         if out.status.success() {
             Ok(MergeOutcome::Submitted)
         } else {
@@ -576,7 +589,7 @@ impl ScmProvider for GitHubScmProvider {
     }
 
     fn issue_view(&self, repo: &str, number: u64, fields: &[&str]) -> anyhow::Result<IssueSummary> {
-        let out = Self::run(&issue_view_args(repo, number, fields), None)?;
+        let out = Self::run(&issue_view_args(repo, number, fields), None, repo)?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh issue view #{number} ({repo}) exited {}: {}",
@@ -589,7 +602,7 @@ impl ScmProvider for GitHubScmProvider {
     }
 
     fn compare(&self, repo: &str, base: &str, head: &str) -> anyhow::Result<CompareResult> {
-        let out = Self::run(&compare_args(repo, base, head), None)?;
+        let out = Self::run(&compare_args(repo, base, head), None, repo)?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh api compare {base}...{head} ({repo}) exited {}: {}",
@@ -602,7 +615,7 @@ impl ScmProvider for GitHubScmProvider {
     }
 
     fn list_branches(&self, repo: &str) -> anyhow::Result<Vec<RemoteBranch>> {
-        let out = Self::run(&list_branches_args(repo), None)?;
+        let out = Self::run(&list_branches_args(repo), None, repo)?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh api branches ({repo}) exited {}: {}",
@@ -614,7 +627,7 @@ impl ScmProvider for GitHubScmProvider {
     }
 
     fn default_branch(&self, repo: &str) -> anyhow::Result<String> {
-        let out = Self::run(&default_branch_args(repo), None)?;
+        let out = Self::run(&default_branch_args(repo), None, repo)?;
         let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
         if !out.status.success() || name.is_empty() {
             anyhow::bail!(
@@ -627,7 +640,7 @@ impl ScmProvider for GitHubScmProvider {
     }
 
     fn delete_branch(&self, repo: &str, branch: &str) -> anyhow::Result<()> {
-        let out = Self::run(&delete_branch_args(repo, branch), None)?;
+        let out = Self::run(&delete_branch_args(repo, branch), None, repo)?;
         if !out.status.success() {
             anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
         }
@@ -635,7 +648,7 @@ impl ScmProvider for GitHubScmProvider {
     }
 
     fn run_failed_log(&self, repo: &str, run_id: u64) -> anyhow::Result<String> {
-        let out = Self::run(&run_failed_log_args(repo, run_id), None)?;
+        let out = Self::run(&run_failed_log_args(repo, run_id), None, repo)?;
         if !out.status.success() {
             let stderr: String = String::from_utf8_lossy(&out.stderr)
                 .trim()
@@ -1498,5 +1511,29 @@ mod tests {
             NotSupported("gitlab").to_string(),
             "SCM provider 'gitlab' does not support PR operations (GitHub-only)"
         );
+    }
+
+    fn gh_config_dir_env(cmd: &Command) -> Option<Option<std::ffi::OsString>> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == "GH_CONFIG_DIR")
+            .map(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+    }
+
+    #[test]
+    fn apply_identity_sets_gh_config_dir_for_config_dir_178() {
+        let mut cmd = Command::new("gh");
+        let dir = std::path::PathBuf::from("/h/.agend/gh/kickscrew");
+        apply_identity(&mut cmd, &crate::gh_identity::GhIdentity::ConfigDir(dir));
+        assert_eq!(
+            gh_config_dir_env(&cmd),
+            Some(Some("/h/.agend/gh/kickscrew".into()))
+        );
+    }
+
+    #[test]
+    fn apply_identity_global_leaves_env_untouched_178() {
+        let mut cmd = Command::new("gh");
+        apply_identity(&mut cmd, &crate::gh_identity::GhIdentity::Global);
+        assert_eq!(gh_config_dir_env(&cmd), None);
     }
 }

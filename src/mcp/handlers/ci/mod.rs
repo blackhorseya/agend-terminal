@@ -202,7 +202,8 @@ fn build_default_provider(repo: &str) -> Option<Box<dyn crate::daemon::ci_watch:
                 .ok()
                 .map(|p| Box::new(p) as Box<dyn CiProvider>)
         }
-        _ => GitHubCiProvider::with_base_url("https://api.github.com".to_string())
+        _ => GitHubCiProvider::with_base_url_for_repo("https://api.github.com".to_string(), repo)
+            .inspect_err(|e| tracing::warn!(repo, error = %e, "watch_ci: no GitHub provider"))
             .ok()
             .map(|p| Box::new(p) as Box<dyn CiProvider>),
     }

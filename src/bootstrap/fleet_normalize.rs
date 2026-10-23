@@ -128,6 +128,7 @@ mod tests {
             role_model_tiers: Default::default(),
             instances: Default::default(),
             teams: Default::default(),
+            gh_identities: Default::default(),
             passthrough_env: Vec::new(),
             channel: Some(ChannelConfig::Telegram {
                 bot_token_env: "TG_TOKEN".into(),

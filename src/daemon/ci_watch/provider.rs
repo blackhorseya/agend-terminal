@@ -475,6 +475,33 @@ impl GitHubCiProvider {
     }
 
     pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
+        Self::with_identity(base_url, crate::gh_identity::GhIdentity::Global)
+    }
+
+    /// #178: REST client authenticated as `repo`'s gh identity. Fails closed
+    /// (`Err` → the caller skips this poll) when the identity does not
+    /// resolve, or resolves to a config dir that yields no token — never an
+    /// anonymous request in place of the mapped account.
+    pub fn with_base_url_for_repo(base_url: String, repo: &str) -> anyhow::Result<Self> {
+        let resolved = crate::gh_identity::resolve(&crate::home_dir(), repo, None);
+        Self::for_resolved(base_url, repo, resolved)
+    }
+
+    /// [`Self::with_base_url_for_repo`] after resolution (test seam).
+    pub(crate) fn for_resolved(
+        base_url: String,
+        repo: &str,
+        resolved: anyhow::Result<crate::gh_identity::GhIdentity>,
+    ) -> anyhow::Result<Self> {
+        // RED stub (#178): resolution ignored — global account.
+        let _ = (repo, resolved);
+        Self::with_base_url(base_url)
+    }
+
+    fn with_identity(
+        base_url: String,
+        identity: crate::gh_identity::GhIdentity,
+    ) -> anyhow::Result<Self> {
         let auth_url = base_url.clone();
         Ok(Self {
             http: CiHttpClient::with_accept(
@@ -490,7 +517,7 @@ impl GitHubCiProvider {
                     if !host_receives_credentials(&auth_url) {
                         return None;
                     }
-                    crate::github_token::cached_token().map(CiAuth::Bearer)
+                    crate::github_token::cached_token_for(&identity).map(CiAuth::Bearer)
                 },
             )?,
         })
@@ -1589,5 +1616,41 @@ mod audit2_001_credential_gate_tests {
         // unparseable / empty → fail closed.
         assert!(!host_receives_credentials("not a url"));
         assert!(!host_receives_credentials(""));
+    }
+}
+
+#[cfg(test)]
+mod gh_identity_rest_178_tests {
+    use super::GitHubCiProvider;
+    use crate::gh_identity::GhIdentity;
+
+    // #178 Q3: a fail-closed identity yields NO provider, so the watcher
+    // skips the poll — there is no client left that could send an anonymous
+    // request in place of the mapped account.
+    #[test]
+    fn fail_closed_identity_builds_no_provider_178() {
+        let resolved = Err(anyhow::anyhow!(
+            "{} teams disagree",
+            crate::gh_identity::ERR_PREFIX
+        ));
+        let built =
+            GitHubCiProvider::for_resolved("http://127.0.0.1:9".into(), "kickscrew/x", resolved);
+        let err = built
+            .err()
+            .expect("fail-closed resolution must not build a provider");
+        assert!(
+            err.to_string().starts_with(crate::gh_identity::ERR_PREFIX),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn global_identity_builds_provider_178() {
+        let built = GitHubCiProvider::for_resolved(
+            "http://127.0.0.1:9".into(),
+            "8am-tech/site",
+            Ok(GhIdentity::Global),
+        );
+        assert!(built.is_ok());
     }
 }

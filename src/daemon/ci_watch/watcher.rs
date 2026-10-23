@@ -61,7 +61,15 @@ pub fn check_ci_watches(home: &Path, registry: &AgentRegistry) {
             }
             _ => {
                 let url = url_or_default(url, "https://api.github.com");
-                Some(Box::new(GitHubCiProvider::with_base_url(url).ok()?) as Box<dyn CiProvider>)
+                // #178: per-repo gh identity; a fail-closed resolution skips
+                // this poll (warned) instead of polling anonymously.
+                match GitHubCiProvider::with_base_url_for_repo(url, repo) {
+                    Ok(p) => Some(Box::new(p) as Box<dyn CiProvider>),
+                    Err(e) => {
+                        tracing::warn!(repo, error = %e, "ci_watch: skipping poll");
+                        None
+                    }
+                }
             }
         }
     });
