@@ -21,7 +21,8 @@
 //!
 //! Fail closed (`Err`, message prefixed `gh identity:`) when the chosen dir
 //! does not exist, a `from_env` source is unset, or B is ambiguous — never a
-//! silent fallback to Global. `GH_TOKEN` / `GITHUB_TOKEN` in the daemon env
+//! silent fallback to Global; `gh_identities` keys that collide
+//! case-insensitively fail closed too. `GH_TOKEN` / `GITHUB_TOKEN` in the daemon env
 //! still win over the config dir (gh's own precedence); that is warned, not
 //! blocked ([`warn_if_env_token_overrides`]).
 
@@ -88,11 +89,35 @@ pub(crate) fn resolve_in(
     };
     let owner = slug.split('/').next().unwrap_or_default();
 
-    // A — override table: exact `owner/repo` first, then `owner`.
-    let overrides: HashMap<String, &String> = cfg
-        .gh_identities
-        .iter()
-        .map(|(k, v)| (k.trim().to_ascii_lowercase(), v))
+    // A — override table: exact `owner/repo` first, then `owner`. Keys that
+    // collide case-insensitively (`KicksCrew` + `kickscrew`) would pick a dir
+    // by HashMap order → fail closed instead.
+    let mut by_key: HashMap<String, Vec<(&String, &String)>> = HashMap::new();
+    for (k, v) in &cfg.gh_identities {
+        by_key
+            .entry(k.trim().to_ascii_lowercase())
+            .or_default()
+            .push((k, v));
+    }
+    let mut collisions: Vec<String> = by_key
+        .values()
+        .filter(|e| e.len() > 1)
+        .map(|e| {
+            let mut keys: Vec<&str> = e.iter().map(|(k, _)| k.as_str()).collect();
+            keys.sort_unstable();
+            keys.join(" / ")
+        })
+        .collect();
+    if !collisions.is_empty() {
+        collisions.sort();
+        anyhow::bail!(
+            "{ERR_PREFIX} gh_identities keys collide case-insensitively ({}); keep one",
+            collisions.join("; ")
+        );
+    }
+    let overrides: HashMap<String, &String> = by_key
+        .into_iter()
+        .filter_map(|(k, e)| e.first().map(|(_, v)| (k, *v)))
         .collect();
     for key in [slug.as_str(), owner] {
         if let Some(dir) = overrides.get(key) {

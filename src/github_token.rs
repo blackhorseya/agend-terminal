@@ -1,7 +1,8 @@
 //! Centralized GitHub token discovery for the daemon (Sprint 54 P0-4).
 //!
 //! Resolution chain (top wins):
-//! 1. `GITHUB_TOKEN` env (verbatim — operator-controlled override)
+//! 1. `GH_TOKEN`, then `GITHUB_TOKEN` env (verbatim — operator-controlled
+//!    override; same order as gh itself, #178)
 //! 2. `gh auth token` if `gh` is on PATH and authed
 //! 3. None — caller falls back to unauthenticated 60/hr cap
 //!
@@ -37,7 +38,7 @@ pub struct TokenCache {
 /// `gh` discovery without re-running the chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenSource {
-    /// Read directly from `GITHUB_TOKEN`.
+    /// Read directly from `GH_TOKEN` or `GITHUB_TOKEN`.
     Env,
     /// Obtained via `gh auth token` after `gh auth status` reported authed.
     GhCli,
@@ -62,7 +63,7 @@ impl TokenCache {
 
     /// #178: discovery for one gh identity. `config_dir` = `Some` runs
     /// `gh auth token` under that `GH_CONFIG_DIR`; `None` = the global account
-    /// (byte-identical to the pre-#178 chain). `GITHUB_TOKEN` still wins (Q4),
+    /// (the pre-#178 chain, plus `GH_TOKEN`). An env token still wins (Q4),
     /// warned when it shadows a per-repo config dir.
     pub(crate) fn discover_for(
         env: &dyn EnvReader,
@@ -75,7 +76,9 @@ impl TokenCache {
         // chain. `env_token_wins_when_set_no_gh_call`,
         // `falls_back_to_gh_when_env_unset`, and `empty_env_falls_through_to_gh`
         // all immediately fail with the signature captured in PR #r0.
-        if let Some(t) = env.read("GITHUB_TOKEN") {
+        // #178 review r1: same precedence as gh itself (GH_TOKEN, then
+        // GITHUB_TOKEN) so the CLI and REST paths never pick different tokens.
+        if let Some(t) = env.read("GH_TOKEN").or_else(|| env.read("GITHUB_TOKEN")) {
             if let Some(dir) = config_dir {
                 crate::gh_identity::warn_if_env_token_overrides(dir);
             }
