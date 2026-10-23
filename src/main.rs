@@ -54,6 +54,7 @@ mod error;
 mod event_log;
 mod fleet;
 mod framing;
+mod gh_identity;
 mod git_helpers;
 mod git_worktree;
 mod github_token;

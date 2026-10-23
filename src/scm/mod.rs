@@ -23,7 +23,7 @@
 
 use serde_json::Value;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Output};
 
 // ---------------------------------------------------------------------------
 // Provider-neutral types (superset of what the 10 gh sites read).
@@ -124,6 +124,13 @@ pub(crate) struct CompareResult {
     pub files: Vec<String>,
 }
 
+/// #178: one remote branch from `gh api repos/{repo}/branches` (remote-orphan GC).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RemoteBranch {
+    pub name: String,
+    pub protected: bool,
+}
+
 /// Returned by non-GitHub providers so callers fail LOUD instead of an
 /// auto-merge silently no-opping (§3.7 cross-backend stance). Hand-rolled
 /// (no `thiserror` dependency) — it composes into `anyhow::Error` via the
@@ -179,6 +186,30 @@ pub(crate) trait ScmProvider: Send + Sync {
     /// commit-ancestry (`behind_by` + changed `files`) for the merge-freshness
     /// gate, independent of the laggy `mergeStateStatus`.
     fn compare(&self, repo: &str, base: &str, head: &str) -> anyhow::Result<CompareResult>;
+
+    // #178: the remaining direct `gh` spawns (remote-orphan GC, ci_watch
+    // failed-log tail) routed through this exit so per-repo identity applies
+    // to every gh call. Defaulted so non-GitHub providers and test doubles
+    // fail loud without boilerplate.
+
+    /// `gh api --paginate repos/{repo}/branches` → every remote branch.
+    fn list_branches(&self, _repo: &str) -> anyhow::Result<Vec<RemoteBranch>> {
+        anyhow::bail!("list_branches: not supported by this SCM provider")
+    }
+    /// `gh repo view {repo} --json defaultBranchRef` → the default branch name.
+    fn default_branch(&self, _repo: &str) -> anyhow::Result<String> {
+        anyhow::bail!("default_branch: not supported by this SCM provider")
+    }
+    /// `gh api -X DELETE repos/{repo}/git/refs/heads/{branch}`. `Err` carries
+    /// gh's stderr (404/422 = already gone).
+    fn delete_branch(&self, _repo: &str, _branch: &str) -> anyhow::Result<()> {
+        anyhow::bail!("delete_branch: not supported by this SCM provider")
+    }
+    /// `gh run view <run_id> --log-failed -R {repo}` → raw stdout. `Err` carries
+    /// the exit code + stderr.
+    fn run_failed_log(&self, _repo: &str, _run_id: u64) -> anyhow::Result<String> {
+        anyhow::bail!("run_failed_log: not supported by this SCM provider")
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +329,65 @@ fn compare_args(repo: &str, base: &str, head: &str) -> Vec<String> {
     ]
 }
 
+// #178: argv moved verbatim from remote_gc.rs / ci_watch/provider.rs.
+
+fn list_branches_args(repo: &str) -> Vec<String> {
+    vec![
+        "api".into(),
+        "--paginate".into(),
+        format!("repos/{repo}/branches"),
+        "--jq".into(),
+        r#".[] | [.name, (.protected|tostring)] | @tsv"#.into(),
+    ]
+}
+
+fn default_branch_args(repo: &str) -> Vec<String> {
+    vec![
+        "repo".into(),
+        "view".into(),
+        repo.into(),
+        "--json".into(),
+        "defaultBranchRef".into(),
+        "--jq".into(),
+        ".defaultBranchRef.name".into(),
+    ]
+}
+
+fn delete_branch_args(repo: &str, branch: &str) -> Vec<String> {
+    vec![
+        "api".into(),
+        "-X".into(),
+        "DELETE".into(),
+        format!("repos/{repo}/git/refs/heads/{branch}"),
+    ]
+}
+
+fn run_failed_log_args(repo: &str, run_id: u64) -> Vec<String> {
+    vec![
+        "run".into(),
+        "view".into(),
+        run_id.to_string(),
+        "--log-failed".into(),
+        "-R".into(),
+        repo.into(),
+    ]
+}
+
+/// Parse the `name<TAB>protected` lines emitted by [`list_branches_args`]'s `--jq`.
+fn parse_branches_tsv(stdout: &str) -> Vec<RemoteBranch> {
+    stdout
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\t');
+            let name = parts.next().filter(|n| !n.is_empty())?;
+            Some(RemoteBranch {
+                name: name.to_string(),
+                protected: parts.next() == Some("true"),
+            })
+        })
+        .collect()
+}
+
 // ---------------------------------------------------------------------------
 // parsers — pure + unit-tested. All gh-schema knowledge lives here, never
 // in the call sites.
@@ -402,12 +492,18 @@ impl GitHubScmProvider {
     /// Run `gh` with the given args. `cwd`: when `Some`, set the process
     /// working directory (site 10 runs gh inside the repo dir so gh
     /// auto-detects the repo, no `--repo`).
-    fn run(args: &[String], cwd: Option<&Path>) -> anyhow::Result<std::process::Output> {
+    ///
+    /// #178: `repo` (or, when it is not a slug, `cwd`'s origin) picks the gh
+    /// identity. A fail-closed resolution returns `Err` WITHOUT spawning gh —
+    /// never a silent run as the global account.
+    fn run(args: &[String], cwd: Option<&Path>, repo: &str) -> anyhow::Result<Output> {
+        let identity = crate::gh_identity::resolve(&crate::home_dir(), repo, cwd)?;
         let mut cmd = Command::new("gh");
         cmd.args(args);
         if let Some(dir) = cwd {
             cmd.current_dir(dir);
         }
+        apply_identity(&mut cmd, &identity);
         // CR-2026-06-14 #5: bound the `gh` subprocess via the shared
         // process-group-killing spawner (same machinery as the local git
         // helpers) — a bare `.output()` is UNBOUNDED and a wedged gh hangs the
@@ -423,9 +519,18 @@ impl GitHubScmProvider {
     }
 }
 
+/// #178: point gh at the resolved identity's config dir. Global leaves the
+/// env untouched (pre-#178 behaviour).
+fn apply_identity(cmd: &mut Command, identity: &crate::gh_identity::GhIdentity) {
+    if let crate::gh_identity::GhIdentity::ConfigDir(dir) = identity {
+        crate::gh_identity::warn_if_env_token_overrides(dir);
+        cmd.env("GH_CONFIG_DIR", dir);
+    }
+}
+
 impl ScmProvider for GitHubScmProvider {
     fn pr_view(&self, repo: &str, pr: u64, fields: &[&str]) -> anyhow::Result<PrSummary> {
-        let out = Self::run(&pr_view_args(repo, pr, fields), None)?;
+        let out = Self::run(&pr_view_args(repo, pr, fields), None, repo)?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh pr view #{pr} ({repo}) exited {}: {}",
@@ -438,7 +543,7 @@ impl ScmProvider for GitHubScmProvider {
     }
 
     fn pr_checks(&self, repo: &str, pr: u64) -> anyhow::Result<Vec<CheckState>> {
-        let out = Self::run(&pr_checks_args(repo, pr), None)?;
+        let out = Self::run(&pr_checks_args(repo, pr), None, repo)?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh pr checks #{pr} ({repo}) exited {}: {}",
@@ -457,7 +562,7 @@ impl ScmProvider for GitHubScmProvider {
         fields: &[&str],
         cwd: Option<&Path>,
     ) -> anyhow::Result<Vec<PrSummary>> {
-        let out = Self::run(&pr_list_args(repo, filter, fields, cwd), cwd)?;
+        let out = Self::run(&pr_list_args(repo, filter, fields, cwd), cwd, repo)?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh pr list ({repo}) exited {}: {}",
@@ -472,7 +577,7 @@ impl ScmProvider for GitHubScmProvider {
     }
 
     fn pr_merge(&self, repo: &str, pr: u64, opts: &MergeOpts) -> anyhow::Result<MergeOutcome> {
-        let out = Self::run(&pr_merge_args(repo, pr, opts), None)?;
+        let out = Self::run(&pr_merge_args(repo, pr, opts), None, repo)?;
         if out.status.success() {
             Ok(MergeOutcome::Submitted)
         } else {
@@ -486,7 +591,7 @@ impl ScmProvider for GitHubScmProvider {
     }
 
     fn issue_view(&self, repo: &str, number: u64, fields: &[&str]) -> anyhow::Result<IssueSummary> {
-        let out = Self::run(&issue_view_args(repo, number, fields), None)?;
+        let out = Self::run(&issue_view_args(repo, number, fields), None, repo)?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh issue view #{number} ({repo}) exited {}: {}",
@@ -499,7 +604,7 @@ impl ScmProvider for GitHubScmProvider {
     }
 
     fn compare(&self, repo: &str, base: &str, head: &str) -> anyhow::Result<CompareResult> {
-        let out = Self::run(&compare_args(repo, base, head), None)?;
+        let out = Self::run(&compare_args(repo, base, head), None, repo)?;
         if !out.status.success() {
             anyhow::bail!(
                 "gh api compare {base}...{head} ({repo}) exited {}: {}",
@@ -509,6 +614,52 @@ impl ScmProvider for GitHubScmProvider {
         }
         let v: Value = serde_json::from_slice(&out.stdout)?;
         Ok(parse_compare(&v))
+    }
+
+    fn list_branches(&self, repo: &str) -> anyhow::Result<Vec<RemoteBranch>> {
+        let out = Self::run(&list_branches_args(repo), None, repo)?;
+        if !out.status.success() {
+            anyhow::bail!(
+                "gh api branches ({repo}) exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(parse_branches_tsv(&String::from_utf8_lossy(&out.stdout)))
+    }
+
+    fn default_branch(&self, repo: &str) -> anyhow::Result<String> {
+        let out = Self::run(&default_branch_args(repo), None, repo)?;
+        let name = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        if !out.status.success() || name.is_empty() {
+            anyhow::bail!(
+                "gh repo view ({repo}) exited {}: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
+        }
+        Ok(name)
+    }
+
+    fn delete_branch(&self, repo: &str, branch: &str) -> anyhow::Result<()> {
+        let out = Self::run(&delete_branch_args(repo, branch), None, repo)?;
+        if !out.status.success() {
+            anyhow::bail!("{}", String::from_utf8_lossy(&out.stderr).trim());
+        }
+        Ok(())
+    }
+
+    fn run_failed_log(&self, repo: &str, run_id: u64) -> anyhow::Result<String> {
+        let out = Self::run(&run_failed_log_args(repo, run_id), None, repo)?;
+        if !out.status.success() {
+            let stderr: String = String::from_utf8_lossy(&out.stderr)
+                .trim()
+                .chars()
+                .take(300)
+                .collect();
+            anyhow::bail!("code={:?} stderr={stderr}", out.status.code());
+        }
+        Ok(String::from_utf8_lossy(&out.stdout).into_owned())
     }
 }
 
@@ -666,6 +817,18 @@ impl ScmProvider for TestScmHandle {
     }
     fn compare(&self, r: &str, b: &str, h: &str) -> anyhow::Result<CompareResult> {
         self.0.compare(r, b, h)
+    }
+    fn list_branches(&self, r: &str) -> anyhow::Result<Vec<RemoteBranch>> {
+        self.0.list_branches(r)
+    }
+    fn default_branch(&self, r: &str) -> anyhow::Result<String> {
+        self.0.default_branch(r)
+    }
+    fn delete_branch(&self, r: &str, b: &str) -> anyhow::Result<()> {
+        self.0.delete_branch(r, b)
+    }
+    fn run_failed_log(&self, r: &str, id: u64) -> anyhow::Result<String> {
+        self.0.run_failed_log(r, id)
     }
 }
 
@@ -1286,11 +1449,93 @@ mod tests {
         let _ = gh;
     }
 
+    // ---- #178: argv moved verbatim from remote_gc.rs / ci_watch/provider.rs ----
+
+    #[test]
+    fn remote_gc_and_failed_log_argv_byte_identical_178() {
+        assert_eq!(
+            list_branches_args("o/r"),
+            [
+                "api",
+                "--paginate",
+                "repos/o/r/branches",
+                "--jq",
+                r#".[] | [.name, (.protected|tostring)] | @tsv"#,
+            ]
+        );
+        assert_eq!(
+            default_branch_args("o/r"),
+            [
+                "repo",
+                "view",
+                "o/r",
+                "--json",
+                "defaultBranchRef",
+                "--jq",
+                ".defaultBranchRef.name",
+            ]
+        );
+        assert_eq!(
+            delete_branch_args("o/r", "feat/x"),
+            ["api", "-X", "DELETE", "repos/o/r/git/refs/heads/feat/x"]
+        );
+        assert_eq!(
+            run_failed_log_args("o/r", 42),
+            ["run", "view", "42", "--log-failed", "-R", "o/r"]
+        );
+    }
+
+    #[test]
+    fn parse_branches_tsv_reads_name_and_protected_178() {
+        let got = parse_branches_tsv("main\ttrue\nfeat/x\tfalse\n\t\nbare\n");
+        assert_eq!(
+            got,
+            vec![
+                RemoteBranch {
+                    name: "main".into(),
+                    protected: true
+                },
+                RemoteBranch {
+                    name: "feat/x".into(),
+                    protected: false
+                },
+                RemoteBranch {
+                    name: "bare".into(),
+                    protected: false
+                },
+            ]
+        );
+    }
+
     #[test]
     fn not_supported_display_names_the_provider() {
         assert_eq!(
             NotSupported("gitlab").to_string(),
             "SCM provider 'gitlab' does not support PR operations (GitHub-only)"
         );
+    }
+
+    fn gh_config_dir_env(cmd: &Command) -> Option<Option<std::ffi::OsString>> {
+        cmd.get_envs()
+            .find(|(k, _)| *k == "GH_CONFIG_DIR")
+            .map(|(_, v)| v.map(std::ffi::OsStr::to_os_string))
+    }
+
+    #[test]
+    fn apply_identity_sets_gh_config_dir_for_config_dir_178() {
+        let mut cmd = Command::new("gh");
+        let dir = std::path::PathBuf::from("/h/.agend/gh/kickscrew");
+        apply_identity(&mut cmd, &crate::gh_identity::GhIdentity::ConfigDir(dir));
+        assert_eq!(
+            gh_config_dir_env(&cmd),
+            Some(Some("/h/.agend/gh/kickscrew".into()))
+        );
+    }
+
+    #[test]
+    fn apply_identity_global_leaves_env_untouched_178() {
+        let mut cmd = Command::new("gh");
+        apply_identity(&mut cmd, &crate::gh_identity::GhIdentity::Global);
+        assert_eq!(gh_config_dir_env(&cmd), None);
     }
 }

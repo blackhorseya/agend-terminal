@@ -475,6 +475,43 @@ impl GitHubCiProvider {
     }
 
     pub fn with_base_url(base_url: String) -> anyhow::Result<Self> {
+        Self::with_identity(base_url, crate::gh_identity::GhIdentity::Global)
+    }
+
+    /// #178: REST client authenticated as `repo`'s gh identity. Fails closed
+    /// (`Err` → the caller skips this poll) when the identity does not
+    /// resolve, or resolves to a config dir that yields no token — never an
+    /// anonymous request in place of the mapped account.
+    pub fn with_base_url_for_repo(base_url: String, repo: &str) -> anyhow::Result<Self> {
+        let resolved = crate::gh_identity::resolve(&crate::home_dir(), repo, None);
+        Self::for_resolved(base_url, repo, resolved)
+    }
+
+    /// [`Self::with_base_url_for_repo`] after resolution (test seam).
+    pub(crate) fn for_resolved(
+        base_url: String,
+        repo: &str,
+        resolved: anyhow::Result<crate::gh_identity::GhIdentity>,
+    ) -> anyhow::Result<Self> {
+        let identity = resolved?;
+        if let crate::gh_identity::GhIdentity::ConfigDir(dir) = &identity {
+            if host_receives_credentials(&base_url)
+                && crate::github_token::cached_token_for(&identity).is_none()
+            {
+                anyhow::bail!(
+                    "{} no REST token for {repo} under GH_CONFIG_DIR {}",
+                    crate::gh_identity::ERR_PREFIX,
+                    dir.display()
+                );
+            }
+        }
+        Self::with_identity(base_url, identity)
+    }
+
+    fn with_identity(
+        base_url: String,
+        identity: crate::gh_identity::GhIdentity,
+    ) -> anyhow::Result<Self> {
         let auth_url = base_url.clone();
         Ok(Self {
             http: CiHttpClient::with_accept(
@@ -490,7 +527,7 @@ impl GitHubCiProvider {
                     if !host_receives_credentials(&auth_url) {
                         return None;
                     }
-                    crate::github_token::cached_token().map(CiAuth::Bearer)
+                    crate::github_token::cached_token_for(&identity).map(CiAuth::Bearer)
                 },
             )?,
         })
@@ -962,24 +999,16 @@ impl CiProvider for GitHubCiProvider {
         // runtime"). Bounded by a timeout so a wedged `gh` can't stall the poll.
         let repo_log = repo.to_string(); // for diagnostic warns (repo is moved into the closure)
         let repo = repo.to_string();
+        // #178: via the ScmProvider exit so the repo's gh identity applies.
         let run = tokio::task::spawn_blocking(move || {
-            std::process::Command::new("gh")
-                .args([
-                    "run",
-                    "view",
-                    &run_id.to_string(),
-                    "--log-failed",
-                    "-R",
-                    &repo,
-                ])
-                .output()
+            crate::scm::make_scm_provider(&repo, None).run_failed_log(&repo, run_id)
         });
         // #1537 follow-up: log WHY a fetch yields no tail instead of swallowing
         // it (every failure mode used to collapse to a silent `None`, so a
         // tail-less notification was undiagnosable — e.g. the #1542 windows
         // case). Still always returns None on any failure (notification degrades
         // to the no-tail checklist); the warn is observability only.
-        let out = match tokio::time::timeout(std::time::Duration::from_secs(20), run).await {
+        let raw = match tokio::time::timeout(std::time::Duration::from_secs(20), run).await {
             Err(_) => {
                 tracing::warn!(repo = %repo_log, run_id, "#1537: failed-log tail fetch timed out (20s) — notification omits tail");
                 return None;
@@ -988,22 +1017,12 @@ impl CiProvider for GitHubCiProvider {
                 tracing::warn!(repo = %repo_log, run_id, error = %join_err, "#1537: failed-log tail fetch task join error");
                 return None;
             }
-            Ok(Ok(Err(exec_err))) => {
-                tracing::warn!(repo = %repo_log, run_id, error = %exec_err, "#1537: failed-log tail fetch could not exec `gh`");
+            Ok(Ok(Err(e))) => {
+                tracing::warn!(repo = %repo_log, run_id, error = %e, "#1537: `gh run view --log-failed` failed (run may be incomplete) — notification omits tail");
                 return None;
             }
-            Ok(Ok(Ok(out))) => out,
+            Ok(Ok(Ok(raw))) => raw,
         };
-        if !out.status.success() {
-            let stderr: String = String::from_utf8_lossy(&out.stderr)
-                .trim()
-                .chars()
-                .take(300)
-                .collect();
-            tracing::warn!(repo = %repo_log, run_id, code = ?out.status.code(), stderr = %stderr, "#1537: `gh run view --log-failed` non-zero (run may be incomplete) — notification omits tail");
-            return None;
-        }
-        let raw = String::from_utf8_lossy(&out.stdout);
         let trimmed = raw.trim();
         if trimmed.is_empty() {
             tracing::warn!(repo = %repo_log, run_id, "#1537: `gh run view --log-failed` empty stdout — notification omits tail");
@@ -1607,5 +1626,41 @@ mod audit2_001_credential_gate_tests {
         // unparseable / empty → fail closed.
         assert!(!host_receives_credentials("not a url"));
         assert!(!host_receives_credentials(""));
+    }
+}
+
+#[cfg(test)]
+mod gh_identity_rest_178_tests {
+    use super::GitHubCiProvider;
+    use crate::gh_identity::GhIdentity;
+
+    // #178 Q3: a fail-closed identity yields NO provider, so the watcher
+    // skips the poll — there is no client left that could send an anonymous
+    // request in place of the mapped account.
+    #[test]
+    fn fail_closed_identity_builds_no_provider_178() {
+        let resolved = Err(anyhow::anyhow!(
+            "{} teams disagree",
+            crate::gh_identity::ERR_PREFIX
+        ));
+        let built =
+            GitHubCiProvider::for_resolved("http://127.0.0.1:9".into(), "kickscrew/x", resolved);
+        let err = built
+            .err()
+            .expect("fail-closed resolution must not build a provider");
+        assert!(
+            err.to_string().starts_with(crate::gh_identity::ERR_PREFIX),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn global_identity_builds_provider_178() {
+        let built = GitHubCiProvider::for_resolved(
+            "http://127.0.0.1:9".into(),
+            "8am-tech/site",
+            Ok(GhIdentity::Global),
+        );
+        assert!(built.is_ok());
     }
 }

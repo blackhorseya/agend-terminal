@@ -1,7 +1,8 @@
 //! Centralized GitHub token discovery for the daemon (Sprint 54 P0-4).
 //!
 //! Resolution chain (top wins):
-//! 1. `GITHUB_TOKEN` env (verbatim — operator-controlled override)
+//! 1. `GH_TOKEN`, then `GITHUB_TOKEN` env (verbatim — operator-controlled
+//!    override; same order as gh itself, #178)
 //! 2. `gh auth token` if `gh` is on PATH and authed
 //! 3. None — caller falls back to unauthenticated 60/hr cap
 //!
@@ -15,8 +16,10 @@
 //! lives in one place: agent-visible MCP responses, ci_watch's polling
 //! path, and the operator setup hint all draw from `SETUP_WARNING`.
 
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 /// Operator-actionable guidance shown in MCP responses + agent-visible
 /// surfaces when no token is available. Source-of-truth wording lives
@@ -35,7 +38,7 @@ pub struct TokenCache {
 /// `gh` discovery without re-running the chain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenSource {
-    /// Read directly from `GITHUB_TOKEN`.
+    /// Read directly from `GH_TOKEN` or `GITHUB_TOKEN`.
     Env,
     /// Obtained via `gh auth token` after `gh auth status` reported authed.
     GhCli,
@@ -55,19 +58,36 @@ impl TokenCache {
     /// Production code paths construct the defaults; tests pass stubs
     /// so we don't have to serialize over `std::env` mutations.
     pub(crate) fn discover_with(env: &dyn EnvReader, gh: &dyn GhRunner) -> Self {
+        Self::discover_for(env, gh, None)
+    }
+
+    /// #178: discovery for one gh identity. `config_dir` = `Some` runs
+    /// `gh auth token` under that `GH_CONFIG_DIR`; `None` = the global account
+    /// (the pre-#178 chain, plus `GH_TOKEN`). An env token still wins (Q4),
+    /// warned when it shadows a per-repo config dir.
+    pub(crate) fn discover_for(
+        env: &dyn EnvReader,
+        gh: &dyn GhRunner,
+        config_dir: Option<&Path>,
+    ) -> Self {
         // EMPIRICAL REGRESSION-PROOF FLIP (Sprint 54 P0-4): replace the
         // body below with `let _ = (env, gh); return Self { token: None,
         // source: TokenSource::None };` to simulate a broken discovery
         // chain. `env_token_wins_when_set_no_gh_call`,
         // `falls_back_to_gh_when_env_unset`, and `empty_env_falls_through_to_gh`
         // all immediately fail with the signature captured in PR #r0.
-        if let Some(t) = env.read("GITHUB_TOKEN") {
+        // #178 review r1: same precedence as gh itself (GH_TOKEN, then
+        // GITHUB_TOKEN) so the CLI and REST paths never pick different tokens.
+        if let Some(t) = env.read("GH_TOKEN").or_else(|| env.read("GITHUB_TOKEN")) {
+            if let Some(dir) = config_dir {
+                crate::gh_identity::warn_if_env_token_overrides(dir);
+            }
             return Self {
                 token: Some(t),
                 source: TokenSource::Env,
             };
         }
-        if let Some(t) = gh.fetch_token() {
+        if let Some(t) = gh.fetch_token_for(config_dir) {
             return Self {
                 token: Some(t),
                 source: TokenSource::GhCli,
@@ -125,6 +145,44 @@ pub fn cached_token() -> Option<String> {
     Some(token)
 }
 
+/// #178: token for one gh identity. [`GhIdentity::Global`] is exactly
+/// [`cached_token`]; a config dir gets its own discovery, cached per dir.
+/// Only a discovered token is cached — a failed `gh auth token` under a
+/// config dir is retried on the next call instead of pinning `None` for the
+/// process lifetime.
+///
+/// [`GhIdentity::Global`]: crate::gh_identity::GhIdentity::Global
+pub(crate) fn cached_token_for(identity: &crate::gh_identity::GhIdentity) -> Option<String> {
+    let crate::gh_identity::GhIdentity::ConfigDir(dir) = identity else {
+        return cached_token();
+    };
+    static PER_DIR: OnceLock<Mutex<HashMap<PathBuf, TokenCache>>> = OnceLock::new();
+    let cell = PER_DIR.get_or_init(|| Mutex::new(HashMap::new()));
+    let cached = cell
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get(dir)
+        .cloned();
+    let cache = match cached {
+        Some(c) => c,
+        None => {
+            let c = TokenCache::discover_for(&DefaultEnvReader, &DefaultGhRunner, Some(dir));
+            if c.token.is_some() {
+                cell.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(dir.clone(), c.clone());
+            }
+            c
+        }
+    };
+    let token = cache.token().map(String::from)?;
+    if let Err(msg) = validate_token_format(&token) {
+        tracing::warn!("GitHub token format invalid: {msg}");
+        return None;
+    }
+    Some(token)
+}
+
 /// Validate GitHub token format.
 /// Accepts: `ghp_` (PAT), `gho_` (OAuth), `ghs_` (app), `github_pat_` (fine-grained).
 /// Minimum length: 20 chars.
@@ -172,11 +230,28 @@ impl EnvReader for DefaultEnvReader {
 
 pub(crate) trait GhRunner {
     fn fetch_token(&self) -> Option<String>;
+    /// #178: fetch under `GH_CONFIG_DIR = config_dir` (`None` = global).
+    fn fetch_token_for(&self, config_dir: Option<&Path>) -> Option<String> {
+        let _ = config_dir;
+        self.fetch_token()
+    }
 }
 
 struct DefaultGhRunner;
 impl GhRunner for DefaultGhRunner {
     fn fetch_token(&self) -> Option<String> {
+        self.fetch_token_for(None)
+    }
+
+    fn fetch_token_for(&self, config_dir: Option<&Path>) -> Option<String> {
+        let gh = |args: [&str; 2]| {
+            let mut cmd = Command::new("gh");
+            cmd.args(args);
+            if let Some(dir) = config_dir {
+                cmd.env("GH_CONFIG_DIR", dir);
+            }
+            cmd.output()
+        };
         // P0-4 r1 portability fix (reviewer m-43): the prior `which gh`
         // precheck was not portable to Windows (no `which` builtin) and
         // was redundant — `Command::new("gh").output()` on a missing
@@ -187,12 +262,12 @@ impl GhRunner for DefaultGhRunner {
         //
         // 1. authed? `gh auth status` exits non-zero when gh is missing
         // OR when no auth is configured for any host.
-        let status = Command::new("gh").args(["auth", "status"]).output().ok()?;
+        let status = gh(["auth", "status"]).ok()?;
         if !status.status.success() {
             return None;
         }
         // 2. fetch token. Output is plain text (no JSON wrapping).
-        let token_out = Command::new("gh").args(["auth", "token"]).output().ok()?;
+        let token_out = gh(["auth", "token"]).ok()?;
         if !token_out.status.success() {
             return None;
         }
@@ -210,6 +285,7 @@ impl GhRunner for DefaultGhRunner {
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
 
     /// Stub env reader: returns the same value for any key (sufficient
     /// for unit tests; real reader is keyed but we only ever look up
@@ -227,6 +303,107 @@ mod tests {
         fn fetch_token(&self) -> Option<String> {
             self.0.clone()
         }
+    }
+
+    /// #178: records the config dir `fetch_token_for` was asked for. Its
+    /// plain `fetch_token` returns a different token, so a discovery that
+    /// ignores the dir is caught by the token value too.
+    struct RecordingGh(std::cell::RefCell<Vec<Option<PathBuf>>>);
+    impl GhRunner for RecordingGh {
+        fn fetch_token(&self) -> Option<String> {
+            Some("global-token".to_string())
+        }
+        fn fetch_token_for(&self, config_dir: Option<&Path>) -> Option<String> {
+            self.0.borrow_mut().push(config_dir.map(Path::to_path_buf));
+            Some(match config_dir {
+                Some(_) => "dir-token".to_string(),
+                None => "global-token".to_string(),
+            })
+        }
+    }
+
+    #[test]
+    fn discover_for_config_dir_fetches_under_that_dir_178() {
+        let gh = RecordingGh(Default::default());
+        let dir = Path::new("/h/.agend/gh/kickscrew");
+        let cache = TokenCache::discover_for(&StubEnv(None), &gh, Some(dir));
+        assert_eq!(cache.token(), Some("dir-token"));
+        assert_eq!(*gh.0.borrow(), vec![Some(dir.to_path_buf())]);
+    }
+
+    #[test]
+    fn discover_with_stays_global_178() {
+        // Control: the pre-#178 entry point never passes a config dir.
+        let gh = RecordingGh(Default::default());
+        let cache = TokenCache::discover_with(&StubEnv(None), &gh);
+        assert_eq!(cache.token(), Some("global-token"));
+        assert!(gh.0.borrow().iter().all(Option::is_none));
+    }
+
+    #[test]
+    fn env_token_still_wins_over_config_dir_178() {
+        // Q4: GITHUB_TOKEN keeps precedence (warned, not blocked).
+        struct PanicGh;
+        impl GhRunner for PanicGh {
+            fn fetch_token(&self) -> Option<String> {
+                panic!("gh must not run when GITHUB_TOKEN is set");
+            }
+        }
+        let cache = TokenCache::discover_for(
+            &StubEnv(Some("env-token-xyz".to_string())),
+            &PanicGh,
+            Some(Path::new("/h/.agend/gh/kickscrew")),
+        );
+        assert_eq!(cache.source(), TokenSource::Env);
+    }
+
+    /// Keyed env stub (the plain [`StubEnv`] answers every key alike).
+    struct KeyedEnv(Vec<(&'static str, &'static str)>);
+    impl EnvReader for KeyedEnv {
+        fn read(&self, key: &str) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    struct NoGh;
+    impl GhRunner for NoGh {
+        fn fetch_token(&self) -> Option<String> {
+            panic!("gh must not run when an env token is set");
+        }
+    }
+
+    #[test]
+    fn gh_token_wins_over_github_token_like_gh_178() {
+        // Review r1: gh itself prefers GH_TOKEN; REST must pick the same token
+        // or CLI and REST run as different accounts for one repo.
+        let env = KeyedEnv(vec![
+            ("GH_TOKEN", "gh-token"),
+            ("GITHUB_TOKEN", "github-token"),
+        ]);
+        for dir in [None, Some(Path::new("/h/.agend/gh/kickscrew"))] {
+            let cache = TokenCache::discover_for(&env, &NoGh, dir);
+            assert_eq!(cache.token(), Some("gh-token"));
+            assert_eq!(cache.source(), TokenSource::Env);
+        }
+    }
+
+    #[test]
+    fn gh_token_alone_is_an_env_token_178() {
+        let env = KeyedEnv(vec![("GH_TOKEN", "gh-token")]);
+        let cache = TokenCache::discover_for(&env, &NoGh, Some(Path::new("/d")));
+        assert_eq!(cache.token(), Some("gh-token"));
+        assert_eq!(cache.source(), TokenSource::Env);
+    }
+
+    #[test]
+    fn github_token_alone_still_wins_178() {
+        // Control: pre-#178 behaviour for GITHUB_TOKEN only.
+        let env = KeyedEnv(vec![("GITHUB_TOKEN", "github-token")]);
+        let cache = TokenCache::discover_for(&env, &NoGh, None);
+        assert_eq!(cache.token(), Some("github-token"));
     }
 
     #[test]
