@@ -144,7 +144,12 @@ fn override_missing_dir_fails_closed_178() {
     let cfg = fleet("gh_identities:\n  kickscrew: ~/.agend/gh/nope\n");
     let err = resolve_in(&cfg, "kickscrew/kxcw-goapi-v2", &StubEnv::new()).unwrap_err();
     assert!(err.to_string().starts_with(ERR_PREFIX), "{err}");
-    assert!(err.to_string().contains("/h/.agend/gh/nope"), "{err}");
+    // Built with the same `join` as `expand_tilde` so Windows' `\` separator matches.
+    let expected = Path::new("/h").join(".agend/gh/nope");
+    assert!(
+        err.to_string().contains(&expected.display().to_string()),
+        "{err}"
+    );
 }
 
 #[test]
