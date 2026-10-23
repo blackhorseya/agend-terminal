@@ -284,3 +284,29 @@ teams:
     let got = resolve_in(&cfg, "blackhorseya/x-infra", &StubEnv::new()).unwrap();
     assert_eq!(got, GhIdentity::Global);
 }
+
+// --- review r1 (third-hq-1) ------------------------------------------------
+
+#[test]
+fn override_keys_colliding_case_insensitively_fail_closed_178() {
+    // `KicksCrew` and `kickscrew` normalise to the same key; which dir wins
+    // would depend on HashMap order → ambiguous config, fail closed.
+    let cfg = fleet("gh_identities:\n  KicksCrew: /abs/gh\n  kickscrew: ~/.agend/gh/kickscrew\n");
+    let err = resolve_in(&cfg, "kickscrew/kxcw-goapi-v2", &StubEnv::new()).unwrap_err();
+    let msg = err.to_string();
+    assert!(msg.starts_with(ERR_PREFIX), "{msg}");
+    assert!(
+        msg.contains("KicksCrew") && msg.contains("kickscrew"),
+        "{msg}"
+    );
+}
+
+#[test]
+fn override_distinct_keys_do_not_collide_178() {
+    // Control: an owner key and an owner/repo key are distinct, not a collision.
+    let cfg = fleet("gh_identities:\n  KicksCrew: /abs/gh\n  kickscrew/x: ~/.agend/gh/kickscrew\n");
+    assert_eq!(
+        resolve_in(&cfg, "kickscrew/other", &StubEnv::new()).unwrap(),
+        dir("/abs/gh")
+    );
+}

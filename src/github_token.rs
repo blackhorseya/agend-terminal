@@ -354,6 +354,55 @@ mod tests {
         assert_eq!(cache.source(), TokenSource::Env);
     }
 
+    /// Keyed env stub (the plain [`StubEnv`] answers every key alike).
+    struct KeyedEnv(Vec<(&'static str, &'static str)>);
+    impl EnvReader for KeyedEnv {
+        fn read(&self, key: &str) -> Option<String> {
+            self.0
+                .iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| v.to_string())
+        }
+    }
+
+    struct NoGh;
+    impl GhRunner for NoGh {
+        fn fetch_token(&self) -> Option<String> {
+            panic!("gh must not run when an env token is set");
+        }
+    }
+
+    #[test]
+    fn gh_token_wins_over_github_token_like_gh_178() {
+        // Review r1: gh itself prefers GH_TOKEN; REST must pick the same token
+        // or CLI and REST run as different accounts for one repo.
+        let env = KeyedEnv(vec![
+            ("GH_TOKEN", "gh-token"),
+            ("GITHUB_TOKEN", "github-token"),
+        ]);
+        for dir in [None, Some(Path::new("/h/.agend/gh/kickscrew"))] {
+            let cache = TokenCache::discover_for(&env, &NoGh, dir);
+            assert_eq!(cache.token(), Some("gh-token"));
+            assert_eq!(cache.source(), TokenSource::Env);
+        }
+    }
+
+    #[test]
+    fn gh_token_alone_is_an_env_token_178() {
+        let env = KeyedEnv(vec![("GH_TOKEN", "gh-token")]);
+        let cache = TokenCache::discover_for(&env, &NoGh, Some(Path::new("/d")));
+        assert_eq!(cache.token(), Some("gh-token"));
+        assert_eq!(cache.source(), TokenSource::Env);
+    }
+
+    #[test]
+    fn github_token_alone_still_wins_178() {
+        // Control: pre-#178 behaviour for GITHUB_TOKEN only.
+        let env = KeyedEnv(vec![("GITHUB_TOKEN", "github-token")]);
+        let cache = TokenCache::discover_for(&env, &NoGh, None);
+        assert_eq!(cache.token(), Some("github-token"));
+    }
+
     #[test]
     fn env_token_wins_when_set_no_gh_call() {
         // Spec test gate 1: GITHUB_TOKEN env present → use env token,
