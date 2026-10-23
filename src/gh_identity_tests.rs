@@ -310,3 +310,39 @@ fn override_distinct_keys_do_not_collide_178() {
         dir("/abs/gh")
     );
 }
+
+#[test]
+fn colliding_keys_only_block_their_own_owner_178() {
+    // Review r2 scope: a collision fails closed ONLY for the owner/repo it
+    // covers; other entries keep resolving (no fleet-wide outage, no silent
+    // downgrade of other repos to Global).
+    let cfg = fleet(
+        "gh_identities:\n  KicksCrew: /abs/gh\n  kickscrew: ~/.agend/gh/kickscrew\n  8am-tech: ~/.agend/gh/blackhorseya\n",
+    );
+    let env = StubEnv::new();
+    assert!(resolve_in(&cfg, "kickscrew/kxcw-goapi-v2", &env).is_err());
+    assert_eq!(
+        resolve_in(&cfg, "8am-tech/site", &env).unwrap(),
+        dir("/h/.agend/gh/blackhorseya")
+    );
+    // A repo with no entry at all stays Global, untouched by the collision.
+    assert_eq!(
+        resolve_in(&cfg, "blackhorseya/x-brain", &env).unwrap(),
+        GhIdentity::Global
+    );
+}
+
+#[test]
+fn exact_repo_key_wins_over_a_colliding_owner_key_178() {
+    // owner/repo is consulted before owner, so an exact, non-colliding repo
+    // entry still resolves even when its owner key collides.
+    let cfg = fleet(
+        "gh_identities:\n  KicksCrew: /abs/gh\n  kickscrew: ~/.agend/gh/kickscrew\n  kickscrew/infra: ~/.agend/gh/blackhorseya\n",
+    );
+    let env = StubEnv::new();
+    assert_eq!(
+        resolve_in(&cfg, "KicksCrew/infra", &env).unwrap(),
+        dir("/h/.agend/gh/blackhorseya")
+    );
+    assert!(resolve_in(&cfg, "kickscrew/other", &env).is_err());
+}
