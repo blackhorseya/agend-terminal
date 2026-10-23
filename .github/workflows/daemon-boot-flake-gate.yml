@@ -46,16 +46,25 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # The 20 repeats are split across 4 parallel runners (5 each): every loop is
+  # ~75s of mostly-serial wall time, so 20 in one job was ~28 min after a ~5 min
+  # compile. Same total repeat count, same fail-on-ANY semantics — a flake in
+  # any slot fails its job, and therefore the check.
   flake-gate:
-    name: Daemon-boot flake gate (20x)
+    name: Daemon-boot flake gate (20x, slot ${{ matrix.slot }}/4)
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        slot: [1, 2, 3, 4]
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
+          save-if: ${{ matrix.slot == 1 }}
       - name: Install Linux tray deps
         run: |
           grep -rlZ 'packages\.microsoft\.com' /etc/apt/sources.list.d | xargs -0r sudo rm -f
@@ -65,7 +74,7 @@ jobs:
         uses: taiki-e/install-action@v2
         with:
           tool: nextest
-      - name: Repeat daemon-boot tests 20x (catch boot-race flakes pre-merge)
+      - name: Repeat daemon-boot tests 5x (slot ${{ matrix.slot }}/4 of 20x — catch boot-race flakes pre-merge)
         timeout-minutes: 35
         env:
           AGEND_LOCK_AUDIT: "1"
@@ -75,14 +84,16 @@ jobs:
           FILTER=$(grep -vE '^\s*#|^\s*$' tests/daemon_boot_gate_filter.txt \
             | sed 's/.*/binary(&)/' | paste -sd '+' -)
           echo "daemon-boot filter: $FILTER"
-          # Build once so the 20 runs only pay test wall-time, not compile.
+          # Build once so the 5 runs only pay test wall-time, not compile.
           cargo nextest run --features tray --profile ci -E "$FILTER" --no-run
-          for i in $(seq 1 20); do
-            echo "::group::daemon-boot run $i/20"
+          SLOT=${{ matrix.slot }}
+          for i in $(seq 1 5); do
+            n=$(( (SLOT - 1) * 5 + i ))
+            echo "::group::daemon-boot run $n/20 (slot $SLOT)"
             if ! cargo nextest run --features tray --profile ci -E "$FILTER"; then
-              echo "::error::daemon-boot flake gate FAILED on run $i/20 — a daemon-boot test is non-deterministic"
+              echo "::error::daemon-boot flake gate FAILED on run $n/20 (slot $SLOT) — a daemon-boot test is non-deterministic"
               exit 1
             fi
             echo "::endgroup::"
           done
-          echo "daemon-boot flake gate: 20/20 clean"
+          echo "daemon-boot flake gate slot $SLOT: runs $(( (SLOT - 1) * 5 + 1 ))-$(( SLOT * 5 ))/20 clean"
