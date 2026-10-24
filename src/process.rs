@@ -36,6 +36,64 @@ pub fn is_pid_alive(pid: u32) -> bool {
     }
 }
 
+/// True when `pid` has exited but its parent has not reaped it yet. Such a
+/// zombie still answers `kill(pid, 0)`, so [`is_pid_alive`] keeps reporting it
+/// alive; callers that need "is it still RUNNING" (e.g. `stop` waiting for the
+/// daemon to exit) must also rule this out.
+pub fn is_zombie(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // `pid (comm) state ...` — state is the first field after the last ')'.
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|stat| {
+                let tail = &stat[stat.rfind(')')? + 1..];
+                tail.split_whitespace().next().map(|state| state == "Z")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(target_os = "macos")]
+    {
+        // `proc_pidinfo` returns nothing for a zombie, so read `p_stat` via
+        // `sysctl(KERN_PROC_PID)` — what `ps` uses. libc has no `kinfo_proc`
+        // for Apple; its LP64 layout (arm64 and x86_64) is 648 bytes with the
+        // one-byte `kp_proc.p_stat` at offset 36. Any other returned length
+        // (pid gone → 0) is read as "not a zombie".
+        const KINFO_PROC_SIZE: usize = 648;
+        const P_STAT_OFFSET: usize = 36;
+        let mut mib = [
+            libc::CTL_KERN,
+            libc::KERN_PROC,
+            libc::KERN_PROC_PID,
+            pid as libc::c_int,
+        ];
+        let mut buf = [0u8; KINFO_PROC_SIZE];
+        let mut len = KINFO_PROC_SIZE;
+        // SAFETY: `buf` is `len` bytes and sysctl writes at most `len`.
+        let rc = unsafe {
+            libc::sysctl(
+                mib.as_mut_ptr(),
+                mib.len() as libc::c_uint,
+                buf.as_mut_ptr() as *mut libc::c_void,
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        rc == 0 && len == KINFO_PROC_SIZE && u32::from(buf[P_STAT_OFFSET]) == libc::SZOMB
+    }
+    // Windows has no zombie state: an exited process stays openable only
+    // while a handle is held, and `Child` drop closes it.
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 /// Cross-platform process start-time token: an identifier that is stable for
 /// the lifetime of a single process but (almost certainly) differs from any
 /// later process that the OS happens to recycle the same PID onto. Used to
@@ -244,6 +302,32 @@ mod tests {
         assert!(
             is_pid_alive(std::process::id()),
             "self pid must report alive"
+        );
+    }
+
+    #[test]
+    fn is_zombie_reports_an_exited_unreaped_child() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "exit 0"])
+            .spawn()
+            .expect("spawn sh");
+        let pid = child.id();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !is_zombie(pid) && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        assert!(
+            is_zombie(pid),
+            "an exited-but-unreaped child must read as a zombie"
+        );
+        assert!(
+            is_pid_alive(pid),
+            "kill(pid, 0) still succeeds for a zombie — the gap is_zombie closes"
+        );
+        child.wait().expect("reap");
+        assert!(
+            !is_zombie(std::process::id()),
+            "a running process is not a zombie"
         );
     }
 

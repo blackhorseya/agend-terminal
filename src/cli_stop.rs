@@ -131,14 +131,7 @@ pub fn run_stop(home: &Path, opts: StopOptions) -> anyhow::Result<StopOutcome> {
         return Ok(StopOutcome::Initiated);
     };
 
-    let probe = || {
-        daemon_liveness(
-            pid,
-            token,
-            crate::process::is_pid_alive,
-            crate::process::process_start_token,
-        )
-    };
+    let probe = || daemon_liveness(pid, token, pid_running, crate::process::process_start_token);
     match wait_for_exit(probe, opts.timeout, POLL) {
         WaitOutcome::Exited(elapsed) => {
             println!(
@@ -175,6 +168,14 @@ pub fn run_stop(home: &Path, opts: StopOptions) -> anyhow::Result<StopOutcome> {
             Ok(StopOutcome::TimedOut)
         }
     }
+}
+
+/// Liveness for the exit wait: a zombie has exited even though `kill(pid, 0)`
+/// still succeeds. Its parent may never reap it promptly — in app mode the TUI
+/// spawns the daemon and drops the `Child` — so without this `stop` waited out
+/// its whole bound and reported an exited daemon as still running.
+fn pid_running(pid: u32) -> bool {
+    crate::process::is_pid_alive(pid) && !crate::process::is_zombie(pid)
 }
 
 /// `run/<pid>/.daemon` is `pid:boot_unix:start_token` (token optional on
@@ -274,6 +275,28 @@ fn now_epoch_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A daemon whose parent never reaps it (app mode: the TUI spawns it and
+    /// drops the `Child`) lingers as a zombie after exiting. The exit wait must
+    /// read that as Exited — not burn the whole timeout and report it running.
+    #[test]
+    #[cfg(unix)]
+    fn exit_wait_treats_an_unreaped_daemon_as_exited() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sleep 0.2"])
+            .spawn()
+            .expect("spawn sh");
+        let pid = child.id();
+        let token = crate::process::process_start_token(pid);
+        std::thread::sleep(Duration::from_millis(800));
+        let seen = daemon_liveness(pid, token, pid_running, crate::process::process_start_token);
+        child.wait().expect("reap");
+        assert_eq!(
+            seen,
+            Liveness::Exited,
+            "an unreaped (zombie) daemon has exited"
+        );
+    }
 
     #[test]
     fn wait_for_exit_returns_as_soon_as_the_process_is_gone_3539() {
