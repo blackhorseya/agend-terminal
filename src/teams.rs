@@ -2370,4 +2370,36 @@ mod tests {
         );
         std::fs::remove_dir_all(home).ok();
     }
+
+    /// -18577-7: a team's extra pr-state `repos` live only in fleet.yaml;
+    /// both rewrite paths (team update, instance-delete member removal)
+    /// rebuild the whole team mapping and must carry the list through.
+    #[test]
+    fn team_rewrites_preserve_extra_repos_18577_7() {
+        let home = tmp_home("preserve_repos");
+        std::fs::write(
+            crate::fleet::fleet_yaml_path(&home),
+            "teams:\n  game:\n    orchestrator: lead\n    members: [lead, rev, dev]\n    \
+             source_repo: acme/game-goapi\n    repos: [acme/game-frontend]\n",
+        )
+        .unwrap();
+        let yaml = || std::fs::read_to_string(crate::fleet::fleet_yaml_path(&home)).unwrap();
+        let result = update(
+            &home,
+            &serde_json::json!({"name": "game", "description": "game team"}),
+        );
+        assert_eq!(result["status"], "updated", "{result}");
+        assert!(
+            yaml().contains("acme/game-frontend"),
+            "team update dropped `repos`:\n{}",
+            yaml()
+        );
+        remove_member_from_all(&home, "dev");
+        assert!(
+            yaml().contains("acme/game-frontend"),
+            "member removal dropped `repos`:\n{}",
+            yaml()
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
 }
