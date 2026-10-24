@@ -2357,3 +2357,8 @@ mod cold_pr_tests;
 #[allow(clippy::unwrap_used)]
 #[path = "watch_settlement_tests.rs"]
 mod watch_settlement_tests;
+
+#[cfg(test)]
+#[allow(clippy::unwrap_used)]
+#[path = "recipient_routing_tests.rs"]
+mod recipient_routing_tests;

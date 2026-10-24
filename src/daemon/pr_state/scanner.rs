@@ -1619,3 +1619,6 @@ mod tests;
 
 #[cfg(test)]
 mod review_repro_daemon_ci_pr;
+
+#[cfg(test)]
+mod author_log_once_tests;
