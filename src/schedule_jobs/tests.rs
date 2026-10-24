@@ -177,6 +177,135 @@ fn advance_to_running(h: &Path, rt: &Fake, clock: i64) {
     assert_eq!(read(h).unwrap().runs[0].phase, Phase::Running);
 }
 
+/// Scripted worker for the two ways a Dispatching run can sit through a burst
+/// of ticks without committing: the worker is still Starting, or the
+/// dispatching tick loses the driver re-acquire to a sibling.
+struct Scripted {
+    driver_lock: std::path::PathBuf,
+    starting: std::sync::atomic::AtomicBool,
+    hold_driver_on_dispatch: std::sync::atomic::AtomicBool,
+    held: Mutex<Option<crate::store::FileFlockGuard>>,
+    sends: Mutex<u32>,
+}
+impl Scripted {
+    fn new(h: &Path) -> Self {
+        Self {
+            driver_lock: h.join("schedule-jobs-driver.lock"),
+            starting: Default::default(),
+            hold_driver_on_dispatch: Default::default(),
+            held: Mutex::new(None),
+            sends: Mutex::new(0),
+        }
+    }
+}
+impl JobRuntime for Scripted {
+    fn start(&self, _: &Run, a: &Attempt) -> anyhow::Result<String> {
+        Ok(format!("uuid-{}", a.number))
+    }
+    fn observe(&self, _: &Attempt) -> anyhow::Result<Observation> {
+        Ok(if self.starting.load(std::sync::atomic::Ordering::SeqCst) {
+            Observation::Starting
+        } else {
+            Observation::Running
+        })
+    }
+    fn stop(&self, _: &Run, _: &Attempt) -> anyhow::Result<bool> {
+        Ok(true)
+    }
+    fn dispatch(&self, _: &Run, _: &Attempt) -> anyhow::Result<()> {
+        *self.sends.lock().unwrap() += 1;
+        if self
+            .hold_driver_on_dispatch
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            // Stand in for a sibling tick that grabbed the driver while this
+            // dispatch ran outside it.
+            *self.held.lock().unwrap() = crate::store::try_acquire_file_lock(&self.driver_lock)?;
+        }
+        Ok(())
+    }
+}
+
+fn advance_to_dispatching(h: &Path, rt: &impl JobRuntime, clock: i64) -> Run {
+    tick(h, rt, clock).unwrap();
+    let r = read(h).unwrap().runs[0].clone();
+    assert_eq!(r.phase, Phase::Starting, "{:?}", r.error);
+    crate::fleet::add_instance_to_yaml(
+        h,
+        &r.attempt.as_ref().unwrap().name,
+        &crate::fleet::InstanceYamlEntry {
+            backend: Some("codex".into()),
+            created_by: Some("system:schedule_job".into()),
+            ..Default::default()
+        },
+    )
+    .unwrap();
+    tick(h, rt, clock).unwrap();
+    let r = read(h).unwrap().runs[0].clone();
+    assert_eq!(r.phase, Phase::Dispatching, "{:?}", r.error);
+    r
+}
+
+#[test]
+fn issue3698_dispatching_run_waits_while_worker_is_still_starting() {
+    let h = TempHome::new();
+    admit_due(h.path(), &schedule(h.path()), now()).unwrap();
+    let rt = Scripted::new(h.path());
+    let clock = now().timestamp();
+    advance_to_dispatching(h.path(), &rt, clock);
+
+    rt.starting.store(true, std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..8 {
+        tick(h.path(), &rt, clock).unwrap();
+    }
+    assert_eq!(read(h.path()).unwrap().runs[0].phase, Phase::Dispatching);
+    assert_eq!(
+        *rt.sends.lock().unwrap(),
+        0,
+        "no dispatch before the worker runs"
+    );
+
+    rt.starting
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    tick(h.path(), &rt, clock).unwrap();
+    assert_eq!(read(h.path()).unwrap().runs[0].phase, Phase::Running);
+    assert_eq!(*rt.sends.lock().unwrap(), 1);
+}
+
+#[test]
+fn issue3698_lost_driver_reacquire_is_committed_by_the_next_tick() {
+    let h = TempHome::new();
+    admit_due(h.path(), &schedule(h.path()), now()).unwrap();
+    let rt = Scripted::new(h.path());
+    let clock = now().timestamp();
+    advance_to_dispatching(h.path(), &rt, clock);
+
+    rt.hold_driver_on_dispatch
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    tick(h.path(), &rt, clock).unwrap();
+    let parked = read(h.path()).unwrap().runs[0].clone();
+    assert_eq!(
+        parked.phase,
+        Phase::Dispatching,
+        "commit skipped without the driver"
+    );
+    assert!(
+        parked.dispatch_intent.is_some(),
+        "the durable claim survives"
+    );
+
+    rt.hold_driver_on_dispatch
+        .store(false, std::sync::atomic::Ordering::SeqCst);
+    drop(rt.held.lock().unwrap().take());
+    tick(h.path(), &rt, clock).unwrap();
+    let committed = read(h.path()).unwrap().runs[0].clone();
+    assert_eq!(committed.phase, Phase::Running);
+    assert!(committed.dispatch_intent.is_none());
+    // Production dispatch is enqueue_once per run+attempt, so the replay is
+    // delivered once; this fake just counts calls.
+    assert_eq!(*rt.sends.lock().unwrap(), 2);
+}
+
 #[cfg(unix)]
 #[test]
 fn issue3698_real_managed_dispatch_is_not_called_under_driver_flock() {
@@ -214,12 +343,38 @@ fn issue3698_real_managed_dispatch_is_not_called_under_driver_flock() {
 
     tick(&h, &runtime, now().timestamp()).unwrap();
     tick(&h, &runtime, now().timestamp()).unwrap();
-    assert_eq!(read(&h).unwrap().runs[0].phase, Phase::Dispatching);
+    let dispatching = read(&h).unwrap().runs[0].clone();
+    assert_eq!(dispatching.phase, Phase::Dispatching);
+    // The burst has to race on the dispatch path itself. While the `sh` worker
+    // is still Starting every tick returns early, which on a slow runner
+    // (Coverage) left the run Dispatching.
+    let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let worker_ready = loop {
+        if matches!(
+            runtime.observe(dispatching.attempt.as_ref().unwrap()),
+            Ok(Observation::Running)
+        ) {
+            break true;
+        }
+        if std::time::Instant::now() >= ready_deadline {
+            break false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
     std::thread::scope(|scope| {
         for _ in 0..8 {
             scope.spawn(|| tick(&h, &runtime, now().timestamp()).unwrap());
         }
     });
+    // A dispatcher that loses the driver re-acquire to a sibling leaves its
+    // claim for the next tick, and nothing ticks after the burst: settle
+    // serially, bounded.
+    let settle_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while read(&h).unwrap().runs[0].phase == Phase::Dispatching
+        && std::time::Instant::now() < settle_deadline
+    {
+        tick(&h, &runtime, now().timestamp()).unwrap();
+    }
 
     let observed = read(&h).unwrap().runs[0].clone();
     let attempt = observed.attempt.as_ref().unwrap();
@@ -239,6 +394,7 @@ fn issue3698_real_managed_dispatch_is_not_called_under_driver_flock() {
     )
     .unwrap();
 
+    assert!(worker_ready, "sh worker never left Starting within 30s");
     assert_eq!(
         observed.phase,
         Phase::Running,

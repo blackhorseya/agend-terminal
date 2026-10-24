@@ -890,6 +890,57 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// The interleaving that made `concurrent_recovery_archives_once_and_clears_once`
+    /// flaky, pinned without threads: the second caller arrives after the first
+    /// finished and is answered from the receipt.
+    #[test]
+    fn recovery_after_completion_returns_the_same_archive() {
+        let home = temp_home("late-caller");
+        let instance = format!("recovery-late-{}", std::process::id());
+        let branch = "review/late".to_string();
+        let source_repo = home.join("source-repo");
+        std::fs::create_dir_all(&source_repo).expect("create source repository fixture");
+        let worktree = crate::worktree_pool::daemon_managed_worktree_root(&home)
+            .join(&instance)
+            .join("review-late");
+        std::fs::create_dir_all(&worktree).expect("create worktree fixture");
+        std::fs::write(worktree.join("leftover.txt"), b"late-caller")
+            .expect("write residual worktree fixture");
+        crate::binding::bind_full(
+            &home,
+            &instance,
+            "",
+            &branch,
+            &worktree,
+            &source_repo,
+            false,
+        )
+        .expect("bind recovery fixture");
+
+        let recover = |actor: &str| {
+            recover_markerless_bound_worktree(
+                &home,
+                actor,
+                "late caller",
+                &instance,
+                &branch,
+                &worktree,
+                &source_repo,
+            )
+        };
+        let first = recover("operator-a").expect("first recovery");
+        let second = recover("operator-b").expect("late recovery is answered from the receipt");
+        assert_eq!(second.archive, first.archive);
+        let prefix = format!("{instance}-recovery-");
+        let archived = std::fs::read_dir(home.join(".trash").join("worktrees"))
+            .expect("read recovery archive root")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .count();
+        assert_eq!(archived, 1);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[test]
     fn concurrent_recovery_archives_once_and_clears_once() {
         let home = temp_home("race");
@@ -950,7 +1001,25 @@ mod tests {
             first.join().expect("join first recovery attempt"),
             second.join().expect("join second recovery attempt"),
         ];
-        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        // A caller that reads the #3697 receipt after the winner finished gets
+        // the same archive back as Ok, so "exactly one Ok" depends on timing.
+        // The invariant is one archive, shared by every Ok.
+        let archives: Vec<_> = results
+            .iter()
+            .filter_map(|result| result.as_ref().ok().map(|report| report.archive.clone()))
+            .collect();
+        assert!(!archives.is_empty(), "{results:?}");
+        assert!(
+            archives.iter().all(|archive| archive == &archives[0]),
+            "{results:?}"
+        );
+        let prefix = format!("{instance}-recovery-");
+        let archived = std::fs::read_dir(home.join(".trash").join("worktrees"))
+            .expect("read recovery archive root")
+            .filter_map(|entry| entry.ok())
+            .filter(|entry| entry.file_name().to_string_lossy().starts_with(&prefix))
+            .count();
+        assert_eq!(archived, 1, "the worktree must be archived exactly once");
         assert!(crate::binding::read(&home, &instance).is_none());
         assert!(!worktree.exists());
         let _ = std::fs::remove_dir_all(&home);
