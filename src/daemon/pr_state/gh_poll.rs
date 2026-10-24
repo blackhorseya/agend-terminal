@@ -461,8 +461,9 @@ pub(crate) fn resolve_author_with_index(
 
 /// Fleet instances eligible to be the author of a PR in one `repo`, i.e.
 /// whose repo identity matches it. Identity precedence per instance:
-///   1. explicit `repo` override (Sprint 55 EC4) — invalid slug (e.g. the
-///      `repo: none` opt-out sentinel) → no match, no fall-through;
+///   1. explicit `repo` override (Sprint 55 EC4; a list matches on ANY
+///      entry) — invalid slug (e.g. the `repo: none` opt-out sentinel) → no
+///      match, no fall-through;
 ///   2. instance `source_repo` (bare slug / URL / local origin remote);
 ///   3. `source_repo` of the team(s) listing the instance in `members` or
 ///      naming it `orchestrator`;
@@ -624,12 +625,15 @@ fn eligible_for(cfg: &crate::fleet::FleetConfig, repo: &str) -> Vec<AuthorCandid
     let matches_repo = |slug: Option<String>| slug.is_some_and(|s| s.eq_ignore_ascii_case(repo));
     let mut eligible: Vec<AuthorCandidate> = Vec::new();
     for (name, inst) in &cfg.instances {
-        let matches = if let Some(explicit) = inst.repo.as_deref() {
-            // Invalid slug (e.g. the `repo: none` opt-out) → not eligible,
-            // never falls through to source_repo / team.
-            matches_repo(crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(
-                explicit,
-            ))
+        let matches = if let Some(explicit) = inst.repo.as_ref() {
+            // Any listed repo matches (t-…-24985-1). Invalid slugs (e.g. the
+            // `repo: none` opt-out) never match and never fall through to
+            // source_repo / team.
+            explicit.iter().any(|r| {
+                matches_repo(crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(
+                    r,
+                ))
+            })
         } else if let Some(sr) = inst.source_repo.as_deref() {
             matches_repo(resolve(sr))
         } else {
@@ -1137,6 +1141,47 @@ pub(crate) mod tests {
             "instances:\n  \
              opted-out:\n    backend: claude\n    github_login: shared-bot\n    repo: none\n  \
              shared-bot:\n    backend: claude\n    repo: none\n",
+        );
+        let mut state = fresh_state("br");
+        state.subscribers = vec!["opted-out".to_string()];
+        assert_eq!(resolve(&home, Some("shared-bot"), &state), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// t-…-24985-1: a `repo:` LIST makes the instance eligible for every
+    /// listed repo — personal owns both x-brain and agend-terminal notices.
+    #[test]
+    fn repo_list_matches_every_listed_repo_24985() {
+        let home = home_with_fleet(
+            "auth-repo-list",
+            "instances:\n  \
+             personal:\n    backend: claude\n    github_login: shared-bot\n    \
+             repo: [blackhorseya/x-brain, blackhorseya/agend-terminal]\n",
+        );
+        for repo in ["blackhorseya/x-brain", "blackhorseya/agend-terminal"] {
+            let mut state = fresh_state("br");
+            state.repo = repo.to_string();
+            assert_eq!(
+                resolve(&home, Some("shared-bot"), &state).as_deref(),
+                Some("personal"),
+                "listed repo {repo} must route to personal"
+            );
+        }
+        // Control: an unlisted repo still fails closed.
+        let mut state = fresh_state("br");
+        state.repo = "blackhorseya/other".to_string();
+        assert_eq!(resolve(&home, Some("shared-bot"), &state), None);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
+    /// Control: a list holding only the `none` sentinel opts out exactly like
+    /// the scalar form, and invalid entries never make a list match.
+    #[test]
+    fn repo_list_with_none_sentinel_never_matches_24985() {
+        let home = home_with_fleet(
+            "auth-repo-list-none",
+            "instances:\n  \
+             opted-out:\n    backend: claude\n    github_login: shared-bot\n    repo: [none]\n",
         );
         let mut state = fresh_state("br");
         state.subscribers = vec!["opted-out".to_string()];

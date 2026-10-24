@@ -2623,3 +2623,40 @@ instances:
     fs::remove_dir_all(&dir).ok();
     fs::remove_dir_all(&dir2).ok();
 }
+
+// ── t-20261023055258928031-24985-1: `repo:` accepts a list ─────────
+
+#[test]
+fn instance_repo_scalar_round_trips_as_a_string_24985() {
+    let cfg: FleetConfig =
+        serde_yaml_ng::from_str("instances:\n  a:\n    backend: claude\n    repo: owner/one\n")
+            .unwrap();
+    let repo = cfg.instances["a"].repo.as_ref().unwrap();
+    assert_eq!(repo.primary(), Some("owner/one"));
+    assert_eq!(repo.iter().collect::<Vec<_>>(), vec!["owner/one"]);
+    let out = serde_yaml_ng::to_string(&cfg).unwrap();
+    assert!(
+        out.contains("repo: owner/one"),
+        "scalar stays scalar: {out}"
+    );
+}
+
+#[test]
+fn instance_repo_list_parses_and_lists_every_entry_24985() {
+    let cfg: FleetConfig = serde_yaml_ng::from_str(
+        "instances:\n  a:\n    backend: claude\n    repo: [owner/one, owner/two]\n",
+    )
+    .unwrap();
+    let repo = cfg.instances["a"].repo.as_ref().unwrap();
+    assert_eq!(repo.primary(), Some("owner/one"), "primary = first entry");
+    assert_eq!(
+        repo.iter().collect::<Vec<_>>(),
+        vec!["owner/one", "owner/two"]
+    );
+    let back: FleetConfig =
+        serde_yaml_ng::from_str(&serde_yaml_ng::to_string(&cfg).unwrap()).unwrap();
+    assert_eq!(
+        back.instances["a"].repo, cfg.instances["a"].repo,
+        "list round-trips"
+    );
+}

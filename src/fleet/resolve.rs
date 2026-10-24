@@ -196,7 +196,11 @@ pub(super) fn resolve_instance(
             .clone()
             .or_else(|| defaults.instructions.clone()),
         source_repo: inst.source_repo.as_ref().map(|d| expand_tilde_path(d)),
-        repo: inst.repo.clone(),
+        repo: inst
+            .repo
+            .as_ref()
+            .and_then(|r| r.primary())
+            .map(String::from),
     }))
 }
 

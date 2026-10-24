@@ -718,7 +718,7 @@ templates:
         "deployed instance must carry the template's github_login (D002 false-fire root cause)"
     );
     assert_eq!(
-        inst.repo.as_deref(),
+        inst.repo.as_ref().and_then(|r| r.primary()),
         Some("cheerc/talented-payroll"),
         "deployed instance must carry the template's explicit repo owner/name override"
     );
