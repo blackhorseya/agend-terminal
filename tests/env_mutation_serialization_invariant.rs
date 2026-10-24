@@ -157,6 +157,11 @@ const SERIALIZED_PAIRS: &[(&str, &str, &str)] = &[
         "the test holds worktree_cleanup::tests::ENV_LOCK",
     ),
     (
+        "src/worktree_cleanup/bind_race_tests.rs",
+        "AGEND_WORKTREE_AUTO_CLEANUP",
+        "both tests hold worktree_cleanup::tests::ENV_LOCK around run_sweep",
+    ),
+    (
         "src/worktree_cleanup/windows_cleanup_diagnostics_tests.rs",
         "AGEND_WORKTREE_AUTO_CLEANUP",
         "the test holds worktree_cleanup::tests::ENV_LOCK",
