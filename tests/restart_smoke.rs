@@ -60,14 +60,28 @@ fn api_serves_within(home: &Path, budget: Duration) -> bool {
     false
 }
 
-/// Graceful shutdown via the API (the supervisor restart path).
-fn stop(home: &Path) {
-    let _ = Command::new(bin())
+/// Graceful shutdown via the API (the supervisor restart path), reaping the
+/// daemon while `stop` waits. `stop` polls the pid with `kill(pid, 0)`, which
+/// still succeeds for an exited-but-unreaped child, so waiting on `stop` before
+/// `wait()` left the daemon a zombie and burned stop's full 30s timeout on
+/// every call. `kill` after the budget is belt-and-suspenders so a stop that
+/// never terminates the daemon can't hang the test.
+fn stop(home: &Path, daemon: &mut Child) {
+    let stopper = Command::new(bin())
         .env("AGEND_HOME", home)
         .arg("stop")
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status();
+        .spawn();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while matches!(daemon.try_wait(), Ok(None)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = daemon.kill();
+    let _ = daemon.wait();
+    if let Ok(mut stopper) = stopper {
+        let _ = stopper.wait();
+    }
 }
 
 #[test]
@@ -80,18 +94,12 @@ fn daemon_api_responds_within_5s_after_restart() {
     let first_up = api_serves_within(&home, Duration::from_secs(30));
 
     // Graceful stop → restart (the exact lifecycle the morning crashes wedged on).
-    // `kill` after `stop` is belt-and-suspenders: harmless once stop reaped it,
-    // but guarantees `wait` can't hang the test if stop ever fails to terminate.
-    stop(&home);
-    let _ = d1.kill();
-    let _ = d1.wait();
+    stop(&home, &mut d1);
     let mut d2 = boot(&home);
     let after_restart = api_serves_within(&home, Duration::from_secs(5));
 
     // Tear down before asserting so a failure never leaks the process or dir.
-    stop(&home);
-    let _ = d2.kill();
-    let _ = d2.wait();
+    stop(&home, &mut d2);
     std::fs::remove_dir_all(&home).ok();
 
     assert!(first_up, "daemon API must serve on first boot");
