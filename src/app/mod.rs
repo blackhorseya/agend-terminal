@@ -544,7 +544,8 @@ fn setup_app_bootstrap(home: &Path, fleet_path: &Path) -> Result<PathBuf> {
         return Ok(run_dir);
     }
 
-    let spawn_error = crate::bootstrap::daemon_spawn::spawn_detached(home, Some(fleet_path)).err();
+    let spawn_error =
+        crate::bootstrap::daemon_spawn::spawn_detached_reaped(home, Some(fleet_path)).err();
     if let Some(run_dir) = wait_for_ready_daemon(home, std::time::Duration::from_secs(5)) {
         return Ok(run_dir);
     }
