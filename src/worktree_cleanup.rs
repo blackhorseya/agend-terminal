@@ -1373,6 +1373,9 @@ mod lifecycle_r1_tests;
 #[cfg(test)]
 mod protected_sweep_tests;
 
+#[cfg(all(test, unix))]
+mod bind_race_tests;
+
 #[cfg(test)]
 mod windows_cleanup_diagnostics_tests;
 
