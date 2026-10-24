@@ -33,9 +33,33 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 ///
 /// On Windows the child gets `CREATE_NEW_PROCESS_GROUP` + `DETACHED_PROCESS`
 /// for the equivalent behavior.
+///
+/// The `Child` is dropped unwaited, which is right for `agend-terminal start`:
+/// the launcher exits immediately and the daemon is reparented. A launcher
+/// that outlives the daemon must use [`spawn_detached_reaped`] instead.
 pub fn spawn_detached(home: &Path, fleet_path: Option<&Path>) -> Result<DaemonHandle> {
     let exe = std::env::current_exe().context("resolve current_exe for detach spawn")?;
+    spawn_detached_with(&exe, home, fleet_path)
+}
 
+/// [`spawn_detached`] for a long-lived launcher (the app/TUI thin client).
+/// The launcher stays the daemon's parent for its whole lifetime, so when the
+/// daemon exits (`stop`, crash, restart handoff) the launcher must wait on it
+/// or the daemon lingers as its zombie until the launcher itself exits.
+pub fn spawn_detached_reaped(home: &Path, fleet_path: Option<&Path>) -> Result<DaemonHandle> {
+    let exe = std::env::current_exe().context("resolve current_exe for detach spawn")?;
+    spawn_detached_reaped_with(&exe, home, fleet_path)
+}
+
+fn spawn_detached_reaped_with(
+    exe: &Path,
+    home: &Path,
+    fleet_path: Option<&Path>,
+) -> Result<DaemonHandle> {
+    spawn_detached_with(exe, home, fleet_path)
+}
+
+fn spawn_detached_with(exe: &Path, home: &Path, fleet_path: Option<&Path>) -> Result<DaemonHandle> {
     std::fs::create_dir_all(home).with_context(|| format!("create home {}", home.display()))?;
     if let Some(run_dir) = crate::daemon::find_active_run_dir(home) {
         let pid = crate::daemon::read_daemon_pid(&run_dir).unwrap_or(0);
@@ -55,7 +79,7 @@ pub fn spawn_detached(home: &Path, fleet_path: Option<&Path>) -> Result<DaemonHa
     // into the rotated log files.
     let log_path = home.join("daemon.log");
 
-    let mut cmd = Command::new(&exe);
+    let mut cmd = Command::new(exe);
     cmd.arg("start");
     // P0 hotfix 2026-05-18: child MUST run with --foreground or it re-enters
     // main.rs Start arm's default-detach branch (`force_foreground = false`
@@ -243,4 +267,59 @@ pub fn spawn_successor_handoff(
         run_dir: crate::daemon::run_dir_for_pid(home, pid),
         child,
     })
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    /// A stand-in daemon: publishes `{home}/run/<pid>/.daemon` the way the real
+    /// daemon does, so the launcher's readiness poll succeeds, then exits.
+    fn fake_daemon(home: &Path) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let script = home.join("fake-daemon.sh");
+        std::fs::write(
+            &script,
+            format!(
+                "#!/bin/sh\nd='{}/run/'$$\nmkdir -p \"$d\"\necho \"$$:0\" > \"$d/.daemon\"\nsleep 1\n",
+                home.display()
+            ),
+        )
+        .unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        script
+    }
+
+    fn scratch_home(tag: &str) -> PathBuf {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let home =
+            std::env::temp_dir().join(format!("agend-spawn-{tag}-{}-{nanos}", std::process::id()));
+        std::fs::create_dir_all(&home).unwrap();
+        home
+    }
+
+    /// The test process plays the long-lived launcher. Once the daemon exits,
+    /// its pid must be fully gone — not a zombie still parented to us.
+    #[test]
+    fn reaped_spawn_leaves_no_zombie_after_the_daemon_exits() {
+        let home = scratch_home("reaped");
+        let exe = fake_daemon(&home);
+        let handle = spawn_detached_reaped_with(&exe, &home, None).expect("fake daemon publishes");
+
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while crate::process::is_pid_alive(handle.pid) && Instant::now() < deadline {
+            std::thread::sleep(POLL_INTERVAL);
+        }
+        let zombie = crate::process::is_zombie(handle.pid);
+        let alive = crate::process::is_pid_alive(handle.pid);
+        std::fs::remove_dir_all(&home).ok();
+        assert!(
+            !zombie && !alive,
+            "daemon pid {} must be reaped by its launcher after it exits (zombie={zombie}, alive={alive})",
+            handle.pid
+        );
+    }
 }
