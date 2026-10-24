@@ -683,11 +683,17 @@ pub fn sweep_from_registry(
             // (daemon_managed=true, pinned=false) → byte-identical to the prior
             // `is_in_use`-only skip. (The tick-level `list_worktrees Err → continue`
             // above is the `None`/unresolvable arm of the same L0 fail-direction.)
-            if crate::worktree::disposition::l0_protected(
-                true,
-                false,
-                Some(is_in_use(wt_path, &active_dirs)),
-            ) {
+            //
+            // `active_dirs` was read once at the start of the round, and the
+            // per-repo `fetch --prune` calls stretch a round to minutes — a
+            // worktree bound since then is absent from it. Re-read binding.json
+            // here: the permit above excludes an in-flight bind for this owner,
+            // so any bind that has completed is visible. Unreadable bindings are
+            // the `None`/unresolvable arm (protected), as at the top of the round.
+            let in_use = bound_worktree_paths_or_ambiguous(home)
+                .ok()
+                .map(|live| is_in_use(wt_path, &active_dirs) || is_in_use(wt_path, &live));
+            if crate::worktree::disposition::l0_protected(true, false, in_use) {
                 tracing::debug!(branch = %entry.branch, path = %entry.path, "skipping worktree (in use by agent — L0 protected)");
                 continue;
             }
