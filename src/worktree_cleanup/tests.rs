@@ -62,7 +62,7 @@ fn make_old_dated_branch(repo: &Path, branch: &str, tip_date: &str) {
 
 /// #2605: fake daemon `home` for `bound_source_repos` — repo discovery now
 /// reads live `binding.json` state instead of the old configs-tuple field.
-fn tmp_home(tag: &str) -> PathBuf {
+pub(super) fn tmp_home(tag: &str) -> PathBuf {
     use std::sync::atomic::{AtomicU32, Ordering};
     static C: AtomicU32 = AtomicU32::new(0);
     let dir = std::env::temp_dir().join(format!(
@@ -77,7 +77,7 @@ fn tmp_home(tag: &str) -> PathBuf {
 
 /// Seed `home/runtime/<agent>/binding.json` so `binding::bound_source_repos`
 /// reports `source_repo` as a live-bound repo.
-fn write_source_repo_binding(home: &Path, agent: &str, source_repo: &Path) {
+pub(super) fn write_source_repo_binding(home: &Path, agent: &str, source_repo: &Path) {
     let dir = crate::paths::runtime_dir(home).join(agent);
     std::fs::create_dir_all(&dir).unwrap();
     std::fs::write(
@@ -90,7 +90,7 @@ fn write_source_repo_binding(home: &Path, agent: &str, source_repo: &Path) {
     .unwrap();
 }
 
-fn write_managed_marker(worktree: &Path, agent: &str, branch: &str) {
+pub(super) fn write_managed_marker(worktree: &Path, agent: &str, branch: &str) {
     let common_dir = Command::new("git")
         .args(["rev-parse", "--git-common-dir"])
         .current_dir(worktree)
