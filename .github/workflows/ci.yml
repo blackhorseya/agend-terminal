@@ -27,6 +27,15 @@ jobs:
     name: Check (${{ matrix.os }}${{ matrix.shards > 1 && format(', {0}/{1}', matrix.shard, matrix.shards) || '' }})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    # Link time dominates the dev/test builds here (167 test binaries, each
+    # linked separately). Line tables keep file:line in panic backtraces but
+    # drop the variable/type debuginfo that bloats every binary; the test
+    # profile inherits it from dev. Windows also swaps MSVC link.exe for the
+    # toolchain's bundled lld, which links large debug binaries much faster.
+    # The linker var is target-scoped, so it is inert on Linux/macOS.
+    env:
+      CARGO_PROFILE_DEV_DEBUG: line-tables-only
+      CARGO_TARGET_X86_64_PC_WINDOWS_MSVC_LINKER: rust-lld.exe
     strategy:
       fail-fast: false
       matrix:
