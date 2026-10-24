@@ -251,6 +251,7 @@ pub fn create(home: &Path, args: &Value) -> Value {
         description,
         created_at: Some(chrono::Utc::now().to_rfc3339()),
         source_repo,
+        repos: None,
         project_id,
         accept_from,
     };
@@ -652,6 +653,7 @@ pub fn update_authorized(home: &Path, args: &Value, caller: TeamUpdateCaller<'_>
         description: current.description.clone(),
         created_at: current.created_at.clone(),
         source_repo: new_source_repo,
+        repos: current.repos.clone(),
         project_id: new_project_id,
         accept_from: new_accept_from,
     };
@@ -730,6 +732,7 @@ pub fn remove_member_from_all(home: &Path, instance_name: &str) {
             description: cfg.description.clone(),
             created_at: cfg.created_at.clone(),
             source_repo: cfg.source_repo.clone(),
+            repos: cfg.repos.clone(),
             project_id: cfg.project_id.clone(),
             accept_from: cfg.accept_from.clone(),
         };

@@ -60,6 +60,7 @@ Broadcast to a team with the `team` selector:
 | `created_at` | Creation timestamp |
 | `source_repo` | The team's source repository path |
 | `project_id` | Optional explicit project-board id override |
+| `repos` | Optional extra GitHub `owner/repo` slugs (one or a list) the team also owns beyond `source_repo`, e.g. a frontend next to the API checkout. Additive; only makes the team's instances eligible for that repo's pr-state notices (author / merge-ready / rebase). Worktree, dispatch and board identity still come from `source_repo`. Set by editing `fleet.yaml`; team rewrites preserve it. |
 | `accept_from` | External agent names allowed to message the orchestrator directly; empty denies cross-team direct sends |
 | `stale_members` | View-only; members not found in the live registry |
 
@@ -91,6 +92,7 @@ Broadcast to a team with the `team` selector:
 - `add` enforces one-agent-one-team (cannot add a member who belongs to another team).
 - `repository_path` is preserved if not explicitly changed.
 - `project_id` and `accept_from` are also preserved unless explicitly supplied.
+- `repos` (fleet.yaml-only) is always preserved.
 - Writes back to `fleet.yaml` on success.
 
 ## 7. `team action=delete`

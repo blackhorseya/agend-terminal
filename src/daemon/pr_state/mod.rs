@@ -2090,7 +2090,7 @@ pub(crate) fn resolve_author_checked(
              (pre-fix match-any value?) — ignoring it"
         );
     }
-    gh_poll::resolve_author_with_index(index, None, state)
+    gh_poll::resolve_author_logged_once(index, None, state)
 }
 
 /// t-verdict-to-author-routing-design (#2): resolve the AGENT to notify for an
@@ -2236,6 +2236,29 @@ pub(crate) fn resolve_merge_authority_checked(
     state: &PrState,
     index: &gh_poll::AuthorIndex,
 ) -> Option<String> {
+    let authority = merge_authority_quiet(home, state, index);
+    // -18577-7 (c): runs every scanner tick — warn once per PR, not per tick.
+    if gh_poll::unresolved_first_time(
+        gh_poll::UnresolvedKind::MergeAuthority,
+        state,
+        authority.is_none(),
+    ) {
+        tracing::warn!(
+            repo = %state.repo,
+            branch = %state.branch,
+            pr_author = %state.pr_author,
+            "pr_state: no merge authority eligible for this repo — failing closed \
+             (authority half of the notice not sent)"
+        );
+    }
+    authority
+}
+
+fn merge_authority_quiet(
+    home: &Path,
+    state: &PrState,
+    index: &gh_poll::AuthorIndex,
+) -> Option<String> {
     let mut candidates: Vec<&str> = Vec::new();
     match &state.verdict_state {
         VerdictState::Verified { reviewers } => {
@@ -2265,13 +2288,6 @@ pub(crate) fn resolve_merge_authority_checked(
             return Some(fallback.to_string());
         }
     }
-    tracing::warn!(
-        repo = %state.repo,
-        branch = %state.branch,
-        pr_author = %state.pr_author,
-        "pr_state: no merge authority eligible for this repo — failing closed \
-         (authority half of the notice not sent)"
-    );
     None
 }
 

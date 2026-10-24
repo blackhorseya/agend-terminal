@@ -58,6 +58,7 @@ Team 將 agent 組成具名單位，以進行結構化協作。每個 team 都�
 | `created_at` | 建立時間戳 |
 | `source_repo` | Team 的 source repository path |
 | `project_id` | Optional 的 explicit project-board id override |
+| `repos` | Optional，team 在 `source_repo` 之外也負責的 GitHub `owner/repo`（單一或 list），例如 API checkout 旁的 frontend。屬於附加設定，只讓 team 的 instance 有資格收該 repo 的 pr-state 通知（作者／可合併／需 rebase）；worktree、dispatch 與 board 身分仍取自 `source_repo`。直接編輯 `fleet.yaml` 設定，team 改寫時會保留。 |
 | `accept_from` | 可直接傳訊給 orchestrator 的外部 agent name；空值會拒絕 cross-team direct send |
 | `stale_members` | 僅供 view；在 live registry 找不到的 member |
 
@@ -89,6 +90,7 @@ Team 將 agent 組成具名單位，以進行結構化協作。每個 team 都�
 - `add` 強制執行 one-agent-one-team（不能加入已屬於另一 team 的 member）。
 - 未明確變更時，保留 `repository_path`。
 - 未明確提供時，也保留 `project_id` 與 `accept_from`。
+- `repos`（只存在 fleet.yaml）一律保留。
 - 成功時寫回 `fleet.yaml`。
 
 ## 7. `team action=delete`

@@ -426,8 +426,38 @@ pub(crate) fn resolve_author_with_gh(
 
 /// [`resolve_author_with_gh`] against a precomputed [`AuthorIndex`]
 /// (built for `state.repo`). Pure — no fleet.yaml load, no subprocess —
-/// so it is safe to call under the pr-state flock.
+/// so it is safe to call under the pr-state flock. Warns on EVERY failure;
+/// the per-tick scanner paths use [`resolve_author_logged_once`] instead.
+#[cfg(test)]
 pub(crate) fn resolve_author_with_index(
+    index: &AuthorIndex,
+    gh_author: Option<&str>,
+    state: &super::PrState,
+) -> Option<String> {
+    let author = resolve_author_quiet(index, gh_author, state);
+    if author.is_none() {
+        warn_no_eligible_author(gh_author, state);
+    }
+    author
+}
+
+/// -18577-7 (c): [`resolve_author_with_index`] for paths that run every
+/// poll/tick — the fail-closed warn fires once per PR (repo, branch, number)
+/// until the author resolves, instead of once per poll.
+pub(crate) fn resolve_author_logged_once(
+    index: &AuthorIndex,
+    gh_author: Option<&str>,
+    state: &super::PrState,
+) -> Option<String> {
+    let author = resolve_author_quiet(index, gh_author, state);
+    if unresolved_first_time(UnresolvedKind::Author, state, author.is_none()) {
+        warn_no_eligible_author(gh_author, state);
+    }
+    author
+}
+
+/// The 4-tier chain without logging.
+fn resolve_author_quiet(
     index: &AuthorIndex,
     gh_author: Option<&str>,
     state: &super::PrState,
@@ -440,12 +470,64 @@ pub(crate) fn resolve_author_with_index(
             return Some(name);
         }
     }
-    if let Some(sub) = state.subscribers.iter().find(|s| index.is_eligible(s)) {
+    // -18577-7 (b): a subscriber is only a GUESS at the author. A reviewer is
+    // subscribed because it reviews the PR, so never infer it as the author
+    // (merged/closed would go to the reviewer, rebase to lead + reviewer). An
+    // explicit tier-1/2 identity match above still wins.
+    if let Some(sub) = state
+        .subscribers
+        .iter()
+        .find(|s| index.is_eligible(s) && !index.is_reviewer(s))
+    {
         return Some(sub.clone());
     }
     if index.is_eligible("fixup-lead") {
         return Some("fixup-lead".to_string());
     }
+    None
+}
+
+/// Which unresolvable-recipient warn a once-per-PR key belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum UnresolvedKind {
+    Author,
+    MergeAuthority,
+}
+
+/// -18577-7 (c): `true` the first time `state`'s PR is unresolved for
+/// `kind`; `false` on every repeat. A later successful resolution forgets
+/// the key, so a regression after a fix is logged again. Process-local: a
+/// daemon restart logs each still-unresolved PR once more. Bounded by the
+/// number of PRs observed while unresolved.
+pub(crate) fn unresolved_first_time(
+    kind: UnresolvedKind,
+    state: &super::PrState,
+    unresolved: bool,
+) -> bool {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+    /// (kind, lowercased repo, branch, PR number).
+    type Key = (UnresolvedKind, String, String, u64);
+    static SEEN: OnceLock<Mutex<HashSet<Key>>> = OnceLock::new();
+    let key = (
+        kind,
+        state.repo.to_ascii_lowercase(),
+        state.branch.clone(),
+        state.pr_number,
+    );
+    let mut seen = SEEN
+        .get_or_init(|| Mutex::new(HashSet::new()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if unresolved {
+        seen.insert(key)
+    } else {
+        seen.remove(&key);
+        false
+    }
+}
+
+fn warn_no_eligible_author(gh_author: Option<&str>, state: &super::PrState) {
     // Reviewer MANDATORY: warn-log so the operator sees the chain fail closed.
     tracing::warn!(
         repo = %state.repo,
@@ -454,9 +536,8 @@ pub(crate) fn resolve_author_with_index(
         subscribers = ?state.subscribers,
         "#986 author resolution: no instance eligible for this repo — failing closed \
          (no author notice). Give the author a `repo`/`source_repo` or put it in a team \
-         whose `source_repo` is this repo"
+         whose `source_repo` or `repos` names this repo"
     );
-    None
 }
 
 /// Fleet instances eligible to be the author of a PR in one `repo`, i.e.
@@ -465,8 +546,8 @@ pub(crate) fn resolve_author_with_index(
 ///      entry) — invalid slug (e.g. the `repo: none` opt-out sentinel) → no
 ///      match, no fall-through;
 ///   2. instance `source_repo` (bare slug / URL / local origin remote);
-///   3. `source_repo` of the team(s) listing the instance in `members` or
-///      naming it `orchestrator`;
+///   3. `source_repo` (or any `repos` entry, -18577-7) of the team(s)
+///      listing the instance in `members` or naming it `orchestrator`;
 ///   4. none of the above → NOT eligible (fail-closed).
 ///
 /// Step 4 replaces the former match-any compat, under which every
@@ -494,6 +575,8 @@ struct AuthorCandidate {
     name: String,
     github_login: Option<String>,
     is_orchestrator: bool,
+    /// `role_kind: reviewer` — never a tier-3 (subscriber) author guess.
+    is_reviewer: bool,
 }
 
 impl AuthorIndex {
@@ -579,6 +662,13 @@ impl AuthorIndex {
         self.eligible.iter().any(|c| c.name == name)
     }
 
+    /// Is `name` an eligible instance with `role_kind: reviewer`?
+    pub(crate) fn is_reviewer(&self, name: &str) -> bool {
+        self.eligible
+            .iter()
+            .any(|c| c.name == name && c.is_reviewer)
+    }
+
     /// Tier 2: eligible instance literally named `gh_login`.
     fn match_instance_name(&self, gh_login: &str) -> Option<String> {
         self.eligible
@@ -643,8 +733,20 @@ fn eligible_for(cfg: &crate::fleet::FleetConfig, repo: &str) -> Vec<AuthorCandid
                     t.members.iter().any(|m| m == name)
                         || t.orchestrator.as_deref() == Some(name.as_str())
                 })
-                .filter_map(|t| t.source_repo.as_deref().and_then(|p| p.to_str()))
-                .any(|src| matches_repo(resolve(src)))
+                .any(|t| {
+                    t.source_repo
+                        .as_deref()
+                        .and_then(|p| p.to_str())
+                        .is_some_and(|src| matches_repo(resolve(src)))
+                        // -18577-7 (a): extra repos the team owns, additive.
+                        || t.repos.as_ref().is_some_and(|rs| {
+                            rs.iter().any(|r| {
+                                matches_repo(
+                                    crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(r),
+                                )
+                            })
+                        })
+                })
         };
         if matches {
             let is_orchestrator = cfg
@@ -655,6 +757,7 @@ fn eligible_for(cfg: &crate::fleet::FleetConfig, repo: &str) -> Vec<AuthorCandid
                 name: name.clone(),
                 github_login: inst.github_login.clone(),
                 is_orchestrator,
+                is_reviewer: inst.role_kind == Some(crate::fleet::RoleKind::Reviewer),
             });
         }
     }

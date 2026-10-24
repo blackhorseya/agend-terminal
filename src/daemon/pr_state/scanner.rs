@@ -1440,18 +1440,23 @@ fn apply_gh_observations(
         // No pre-lock index (the snapshot already had pr_author but the locked
         // state is fresh — delete→recreate race): leave it empty rather than
         // build one here (git under the flock, #1617); the next poll resolves.
+        // -18577-7 (c): while the author is unresolvable this block re-runs on
+        // every poll; the resolver warns once per PR and the populate line is
+        // logged only when an author actually lands.
         state.pr_author = author_index
             .and_then(|index| {
-                gh_poll::resolve_author_with_index(index, Some(&meta.author_login), state)
+                gh_poll::resolve_author_logged_once(index, Some(&meta.author_login), state)
             })
             .unwrap_or_default();
-        tracing::info!(
-            repo = %state.repo,
-            branch = %state.branch,
-            pr_number = state.pr_number,
-            pr_author = %state.pr_author,
-            "#986 pr_state: first-observation populated PR identity"
-        );
+        if !state.pr_author.is_empty() {
+            tracing::info!(
+                repo = %state.repo,
+                branch = %state.branch,
+                pr_number = state.pr_number,
+                pr_author = %state.pr_author,
+                "#986 pr_state: first-observation populated PR identity"
+            );
+        }
     }
 
     // Draft transition.
