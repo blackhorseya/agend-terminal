@@ -168,10 +168,19 @@ jobs:
         timeout-minutes: 15
         run: cargo clippy -p agend-terminal --no-deps --lib --bin agend-terminal --bin agend-git --bin agend-mcp-bridge --bin agentic-git --tests --examples --features tray -- -D warnings
 
+      # The release binary is only consumed by the CLI smoke and the artifact
+      # upload below (release.yml rebuilds its own), and on Windows it was
+      # ~5.5 min of shard 1. PRs smoke a debug build of the same default-feature
+      # binary instead; pushes to main keep the release build and upload.
       - name: Build
-        if: matrix.shard == 1
+        if: matrix.shard == 1 && github.event_name != 'pull_request'
         timeout-minutes: 20
         run: cargo build --release
+
+      - name: Build (debug, PR smoke)
+        if: matrix.shard == 1 && github.event_name == 'pull_request'
+        timeout-minutes: 20
+        run: cargo build --locked --bin agend-terminal
 
       # #3661: the attached TUI must survive its daemon disappearing and
       # reconnect to a successor without lifecycle respawn or log/CPU churn.
@@ -288,13 +297,14 @@ jobs:
         shell: bash
         env:
           AGEND_HOME: ${{ runner.temp }}/agend-smoke
+          BIN_PROFILE: ${{ github.event_name == 'pull_request' && 'debug' || 'release' }}
         run: |
           set -eu
           if [ "$RUNNER_OS" = "Windows" ]; then
-            BIN="./target/release/agend-terminal.exe"
+            BIN="./target/$BIN_PROFILE/agend-terminal.exe"
             SHELL_CMD="cmd.exe"
           else
-            BIN="./target/release/agend-terminal"
+            BIN="./target/$BIN_PROFILE/agend-terminal"
             SHELL_CMD="/bin/bash"
           fi
 
@@ -369,7 +379,7 @@ jobs:
 
       - name: Upload binary (Unix)
         timeout-minutes: 5
-        if: runner.os != 'Windows' && matrix.shard == 1
+        if: runner.os != 'Windows' && matrix.shard == 1 && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v5
         with:
           name: agend-terminal-${{ runner.os }}-${{ runner.arch }}
@@ -378,7 +388,7 @@ jobs:
 
       - name: Upload binary (Windows)
         timeout-minutes: 5
-        if: runner.os == 'Windows' && matrix.shard == 1
+        if: runner.os == 'Windows' && matrix.shard == 1 && github.event_name != 'pull_request'
         uses: actions/upload-artifact@v5
         with:
           name: agend-terminal-${{ runner.os }}-${{ runner.arch }}
