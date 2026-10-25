@@ -465,6 +465,8 @@ pub(crate) enum AuthorOutcome {
     Conflict(AuthorSource, Vec<String>),
     /// r4/r7: an assignment or reviewer-retirement record cannot be read.
     Unreadable,
+    /// r8: a candidate is shown reviewing this PR by the records.
+    ReviewerExcluded(AuthorSource, Vec<String>),
 }
 
 /// The chain without logging (d-20261025004632404221-3, option A):
@@ -489,21 +491,34 @@ fn resolve_author_outcome(
                 return AuthorOutcome::Conflict(source, names)
             }
             Authoritative::Unreadable => return AuthorOutcome::Unreadable,
+            Authoritative::ReviewerExcluded(source, names) => {
+                return AuthorOutcome::ReviewerExcluded(source, names)
+            }
             Authoritative::None => {}
         }
     }
-    let reviews_this_pr = |name: &str| evidence.is_some_and(|e| e.is_reviewer(index, state, name));
+    let reviews_this_pr = |name: &str| evidence.is_some_and(|e| e.reviews_this_pr(state, name));
     if let Some(login) = gh_author {
         let hits: Vec<&AuthorCandidate> = index
             .eligible
             .iter()
-            .filter(|c| !c.is_reviewer && !reviews_this_pr(&c.name))
+            .filter(|c| !c.is_reviewer)
             .filter(|c| {
                 c.github_login
                     .as_deref()
                     .is_some_and(|gl| gl.eq_ignore_ascii_case(login))
             })
             .collect();
+        // r8: a login match the records show reviewing this PR may be the
+        // author; another member of the login must not take its place.
+        let excluded: Vec<String> = hits
+            .iter()
+            .filter(|c| reviews_this_pr(&c.name))
+            .map(|c| c.name.clone())
+            .collect();
+        if !excluded.is_empty() {
+            return AuthorOutcome::ReviewerExcluded(AuthorSource::GhLogin, excluded);
+        }
         if !hits.is_empty() {
             let domains = distinct_domains(&hits);
             if domains.len() > 1 {
@@ -512,10 +527,10 @@ fn resolve_author_outcome(
             index.warn_on_rank_tie(login, &hits);
             return AuthorOutcome::Resolved(hits[0].name.clone(), AuthorSource::GhLogin);
         }
-        if let Some(name) = index
-            .match_instance_name(login)
-            .filter(|name| !reviews_this_pr(name))
-        {
+        if let Some(name) = index.match_instance_name(login) {
+            if reviews_this_pr(&name) {
+                return AuthorOutcome::ReviewerExcluded(AuthorSource::GhLogin, vec![name]);
+            }
             return AuthorOutcome::Resolved(name, AuthorSource::GhLogin);
         }
     }
@@ -617,6 +632,18 @@ fn warn_unresolved_author(
                 ?names,
                 "pr_state author resolution: the authoritative records name more than one \
                  author — failing closed (no author notice)"
+            );
+            return;
+        }
+        AuthorOutcome::ReviewerExcluded(source, names) => {
+            tracing::warn!(
+                repo = %state.repo,
+                branch = %state.branch,
+                gh_author = ?gh_author,
+                ?source,
+                ?names,
+                "pr_state author resolution: the records show a candidate reviewing this PR — \
+                 failing closed (no author notice)"
             );
             return;
         }

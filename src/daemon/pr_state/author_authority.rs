@@ -76,6 +76,10 @@ pub(crate) enum Authoritative {
     Conflict(AuthorSource, Vec<String>),
     /// No tier named anyone.
     None,
+    /// r8: a tier named someone the records show reviewing this PR. That name
+    /// may be the real author (an unknown-generation row names whoever closed
+    /// a task), so no peer and no lower tier may answer: fail closed.
+    ReviewerExcluded(AuthorSource, Vec<String>),
     /// r4/r7: an assignment or reviewer-retirement record could not be read:
     /// who authored or reviewed this PR is unknown.
     Unreadable,
@@ -149,14 +153,20 @@ impl AuthorEvidence {
     /// `name` reviews this PR (assignment target, retired or active) or is a
     /// reviewer instance: never the author.
     pub(crate) fn is_reviewer(&self, index: &AuthorIndex, state: &PrState, name: &str) -> bool {
-        index.is_reviewer(name)
-            || self.reviewer_targets.iter().any(|(t, pr)| {
-                // A state without a PR number cannot tell generations apart:
-                // keep excluding (the safe direction).
-                // `pr == 0`: a pre-r6 retirement of unknown generation.
-                t == name && (state.pr_number == 0 || *pr == 0 || *pr == state.pr_number)
-            })
-            || verdict_reviewers(state).any(|r| r == name)
+        index.is_reviewer(name) || self.reviews_this_pr(state, name)
+    }
+
+    /// r8: the records (assignment targets, retirement rows, verdicts) show
+    /// `name` reviewing this PR. Unlike `role_kind: reviewer` — static config,
+    /// simply filtered — this exclusion is evidence that can be wrong about
+    /// who the author is, so a tier that hits it fails closed.
+    pub(crate) fn reviews_this_pr(&self, state: &PrState, name: &str) -> bool {
+        self.reviewer_targets.iter().any(|(t, pr)| {
+            // A state without a PR number cannot tell generations apart:
+            // keep excluding (the safe direction).
+            // `pr == 0`: a pre-r6 retirement of unknown generation.
+            t == name && (state.pr_number == 0 || *pr == 0 || *pr == state.pr_number)
+        }) || verdict_reviewers(state).any(|r| r == name)
     }
 
     /// Run the three authoritative tiers against the fleet eligibility `index`.
@@ -187,11 +197,19 @@ impl AuthorEvidence {
             // their names must be eligible for this repo.
             let require_eligible = !matches!(source, AuthorSource::ReviewAssignment);
             let mut candidates: Vec<String> = Vec::new();
+            let mut excluded: Vec<String> = Vec::new();
             for n in names {
-                if (!require_eligible || index.is_eligible(n)) && !self.is_reviewer(index, state, n)
-                {
+                if (require_eligible && !index.is_eligible(n)) || index.is_reviewer(n) {
+                    continue;
+                }
+                if self.reviews_this_pr(state, n) {
+                    push_unique(&mut excluded, n);
+                } else {
                     push_unique(&mut candidates, n);
                 }
+            }
+            if !excluded.is_empty() {
+                return Authoritative::ReviewerExcluded(source, excluded);
             }
             match candidates.len() {
                 0 => continue,
@@ -256,9 +274,9 @@ pub(crate) fn trusted_stored_author(
     }
     if let (Some(e), Some(stored)) = (evidence, state.pr_author_source) {
         let live_rank = match e.resolve(index, state) {
-            Authoritative::Resolved(_, source) | Authoritative::Conflict(source, _) => {
-                Some(tier_rank(source))
-            }
+            Authoritative::Resolved(_, source)
+            | Authoritative::Conflict(source, _)
+            | Authoritative::ReviewerExcluded(source, _) => Some(tier_rank(source)),
             Authoritative::Unreadable => Some(tier_rank(AuthorSource::ReviewAssignment)),
             Authoritative::None => None,
         };
