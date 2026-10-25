@@ -53,6 +53,7 @@ pub(super) fn new_state(head: &str, class: ReviewClass) -> PrState {
         pr_author: "dev".to_string(),
         // -18577-7 r3: `new_state` models an ALREADY-RESOLVED author.
         pr_author_source: Some(super::author_authority::AuthorSource::GhLogin),
+        pr_author_pr_number: 100,
         subscribers: vec!["dev".to_string()],
         ci_state: CiState::Pending,
         verdict_state: VerdictState::None,
@@ -3304,6 +3305,7 @@ fn review_verdict_no_matching_binding_falls_back_to_author_2920() {
     state.pr_number = 2920;
     state.pr_author = "resolved-author-2919".into();
     state.pr_author_source = Some(super::author_authority::AuthorSource::GhLogin);
+    state.pr_author_pr_number = state.pr_number;
     save(&home, &state).unwrap();
     let receipt = seed_route_assignment(&home, "owner/repo-c", branch, &head);
 

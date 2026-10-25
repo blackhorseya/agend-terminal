@@ -1466,6 +1466,7 @@ fn apply_gh_observations(
     // author, or delete→recreate race): leave it; the next poll resolves.
     // While unresolvable this block re-runs on every poll; the resolver warns
     // once per PR and the populate line is logged only when an author lands.
+    super::author_authority::forget_author_for_new_pr(state, meta.number);
     let trusted = author_index.and_then(|index| {
         super::author_authority::trusted_stored_author(state, index, author_evidence)
     });

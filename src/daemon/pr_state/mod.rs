@@ -80,6 +80,11 @@ pub struct PrState {
     /// pre-r3 resolvers) ⇒ the value is display-only and never routes a notice.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pr_author_source: Option<author_authority::AuthorSource>,
+    /// -18577-7 r6: the PR number `pr_author_source` was resolved for. A
+    /// branch can be reused by a later PR; attribution for another number is
+    /// never trusted. `0` on legacy state.
+    #[serde(default)]
+    pub pr_author_pr_number: u64,
     /// ci_watch's subscriber list at the time of first observation.
     /// Used only as fallback for [`pr_author`] resolution.
     #[serde(default)]
@@ -1462,6 +1467,7 @@ pub fn new_for_branch(
         head_sha: head_sha.to_string(),
         pr_author: String::new(),
         pr_author_source: None,
+        pr_author_pr_number: 0,
         subscribers: Vec::new(),
         ci_state: CiState::Pending,
         verdict_state: VerdictState::None,

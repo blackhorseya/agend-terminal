@@ -57,8 +57,9 @@ pub(crate) struct AuthorEvidence {
     /// r4: an assignment record exists but cannot be read. A higher tier that
     /// cannot be read is not absent: the chain fails closed.
     assignments_unreadable: bool,
-    /// Assignment targets (active + terminal-retired): reviewers of this PR.
-    reviewer_targets: Vec<String>,
+    /// Assignment targets (active + terminal-retired) with the PR number they
+    /// review: reviewers of THAT generation only (r6 P2).
+    reviewer_targets: Vec<(String, u64)>,
     /// Agents bound to the branch (repo-matched first, legacy branch-only after).
     bound_agents: Vec<String>,
     /// Owners of live tasks that carry the branch (any board; done, cancelled
@@ -95,7 +96,9 @@ impl AuthorEvidence {
         let mut assignment_authors: Vec<(String, u64)> = Vec::new();
         let mut reviewer_targets = Vec::new();
         for a in &assignments {
-            push_unique(&mut reviewer_targets, &a.target);
+            if !reviewer_targets.contains(&(a.target.clone(), a.pr_number)) {
+                reviewer_targets.push((a.target.clone(), a.pr_number));
+            }
             if let crate::mcp::handlers::comms_gates::ReviewAuthor::Agent(name) = &a.review_author {
                 if !name.is_empty()
                     && !assignment_authors
@@ -107,9 +110,11 @@ impl AuthorEvidence {
             }
         }
         for retired in
-            crate::daemon::assignment_authority::terminal_retirement_instances(home, repo, branch)
+            crate::daemon::assignment_authority::retired_review_targets(home, repo, branch)
         {
-            push_unique(&mut reviewer_targets, &retired);
+            if !reviewer_targets.contains(&retired) {
+                reviewer_targets.push(retired);
+            }
         }
         let bound_agents = bound_agents_on_branch(home, repo, branch);
         let task_assignees = task_assignees_on_branch(home, branch);
@@ -134,7 +139,11 @@ impl AuthorEvidence {
     /// reviewer instance: never the author.
     pub(crate) fn is_reviewer(&self, index: &AuthorIndex, state: &PrState, name: &str) -> bool {
         index.is_reviewer(name)
-            || self.reviewer_targets.iter().any(|t| t == name)
+            || self.reviewer_targets.iter().any(|(t, pr)| {
+                // A state without a PR number cannot tell generations apart:
+                // keep excluding (the safe direction).
+                t == name && (state.pr_number == 0 || *pr == state.pr_number)
+            })
             || verdict_reviewers(state).any(|r| r == name)
     }
 
@@ -182,10 +191,16 @@ impl AuthorEvidence {
     }
 }
 
-/// The poller must (re)resolve this state's author: nothing stored, or a
-/// stored value without provenance (pre-r3 resolvers).
+/// The poller must (re)resolve this state's author: nothing stored, a stored
+/// value without provenance (pre-r3 resolvers), or one attributed for another
+/// PR generation (r6).
 pub(crate) fn needs_author(state: &PrState) -> bool {
-    state.pr_author.is_empty() || state.pr_author_source.is_none()
+    state.pr_author.is_empty() || state.pr_author_source.is_none() || !stored_for_current_pr(state)
+}
+
+/// r6 P1: the stored attribution was made for the PR this state now tracks.
+fn stored_for_current_pr(state: &PrState) -> bool {
+    state.pr_number != 0 && state.pr_author_pr_number == state.pr_number
 }
 
 /// The persisted `pr_author`, if it was written by an r3 resolver (has a
@@ -203,6 +218,11 @@ pub(crate) fn trusted_stored_author(
     evidence: Option<&AuthorEvidence>,
 ) -> Option<String> {
     if state.pr_author.is_empty() || state.pr_author_source.is_none() {
+        return None;
+    }
+    // r6 P1: attribution from an earlier PR on a reused branch is not this
+    // PR's author (this check also covers the merge-authority candidates).
+    if !stored_for_current_pr(state) {
         return None;
     }
     let name = state.pr_author.as_str();
@@ -250,12 +270,26 @@ fn tier_rank(source: AuthorSource) -> u8 {
 /// Persist `name`/`source` as the PR author. Returns true when the state
 /// changed (callers mark it dirty).
 pub(crate) fn remember_author(state: &mut PrState, name: &str, source: AuthorSource) -> bool {
-    if state.pr_author == name && state.pr_author_source == Some(source) {
+    if state.pr_author == name
+        && state.pr_author_source == Some(source)
+        && state.pr_author_pr_number == state.pr_number
+    {
         return false;
     }
     state.pr_author = name.to_string();
     state.pr_author_source = Some(source);
+    state.pr_author_pr_number = state.pr_number;
     true
+}
+
+/// r6 P1: the poller observed a different PR number on this branch (the
+/// branch was reused). The stored attribution belongs to the old PR and
+/// becomes display-only until it is re-resolved for the new one.
+pub(crate) fn forget_author_for_new_pr(state: &mut PrState, observed_pr: u64) {
+    if observed_pr != 0 && state.pr_number != 0 && observed_pr != state.pr_number {
+        state.pr_author_source = None;
+        state.pr_author_pr_number = 0;
+    }
 }
 
 fn verdict_reviewers(state: &PrState) -> impl Iterator<Item = &str> {

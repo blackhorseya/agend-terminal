@@ -1061,6 +1061,7 @@ pub(crate) mod tests {
             head_sha: "sha-A".to_string(),
             pr_author: String::new(),
             pr_author_source: None,
+            pr_author_pr_number: 0,
             subscribers: vec!["dev".to_string()],
             ci_state: super::super::CiState::Pending,
             verdict_state: super::super::VerdictState::None,

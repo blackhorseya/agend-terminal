@@ -280,7 +280,7 @@ fn terminal_retirements_file(home: &Path, repo: &str, branch: &str) -> PathBuf {
 fn is_metadata_json(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|name| name.to_str()),
-        Some("markers.json" | "terminal_retirements.json")
+        Some("markers.json" | "terminal_retirements.json" | "retired_review_targets.json")
     )
 }
 
@@ -392,20 +392,54 @@ fn read_terminal_retirements(
     }
 }
 
-/// -18577-7 r3: the instances whose assignment on `repo`/`branch` was retired
-/// by a terminal task event — the PR's reviewers after their verdict landed.
+/// -18577-7 r6: a reviewer whose assignment on this branch was retired by a
+/// terminal task event, with the PR generation it reviewed. The idempotency
+/// ledger (`terminal_retirements.json`) carries no PR number, so the author
+/// exclusion keeps its own record (d-20261025030819687590-11).
+#[derive(Clone, Debug, serde::Deserialize, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
+struct RetiredReviewTarget {
+    target: String,
+    pr_number: u64,
+}
+
+fn retired_review_targets_file(home: &Path, repo: &str, branch: &str) -> PathBuf {
+    branch_dir(home, repo, branch).join("retired_review_targets.json")
+}
+
+fn read_retired_review_targets(path: &Path) -> std::collections::BTreeSet<RetiredReviewTarget> {
+    std::fs::read(path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+
+/// Record that `record`'s target reviewed `record.pr_number`. Caller holds
+/// the branch lock. Lossy on a corrupt file: it feeds author EXCLUSION only.
+pub(crate) fn note_retired_review_target(
+    home: &Path,
+    record: &ActiveAssignment,
+) -> std::io::Result<()> {
+    let path = retired_review_targets_file(home, &record.repo, &record.branch);
+    let mut set = read_retired_review_targets(&path);
+    if set.insert(RetiredReviewTarget {
+        target: record.target.clone(),
+        pr_number: record.pr_number,
+    }) {
+        atomic_write_json(&path, &set)?;
+    }
+    Ok(())
+}
+
+/// -18577-7 r6: `(reviewer, pr_number)` for every assignment on
+/// `repo`/`branch` retired by a terminal task event — a PR's reviewers after
+/// their verdict landed, tagged with the PR generation they reviewed.
 /// Lossy (a corrupt ledger reads as empty): this feeds author EXCLUSION, not
 /// the merge gate.
-pub(crate) fn terminal_retirement_instances(home: &Path, repo: &str, branch: &str) -> Vec<String> {
-    let mut out: Vec<String> =
-        read_terminal_retirements(&terminal_retirements_file(home, repo, branch))
-            .unwrap_or_default()
-            .into_iter()
-            .map(|k| k.instance)
-            .collect();
-    out.sort();
-    out.dedup();
-    out
+pub(crate) fn retired_review_targets(home: &Path, repo: &str, branch: &str) -> Vec<(String, u64)> {
+    read_retired_review_targets(&retired_review_targets_file(home, repo, branch))
+        .into_iter()
+        .map(|t| (t.target, t.pr_number))
+        .collect()
 }
 
 /// Read one authority record. Three-state (B4): `Ok(None)` = genuinely ABSENT
@@ -1351,6 +1385,7 @@ pub(crate) fn retire_for_terminal_event(
             .filter(|record| record.task_id == task_id)
             .collect::<Vec<_>>();
         for record in records {
+            note_retired_review_target(home, &record)?;
             retired += usize::from(retire_under_lock(
                 home,
                 &repo,
@@ -1450,6 +1485,7 @@ fn retire_operator_settlement_after_preflight(
                 }
                 for record in list_active_checked(home, &repo, &branch)? {
                     if record.task_id == task_id {
+                        note_retired_review_target(home, &record)?;
                         // The task is already terminal under its writer lock. Do not
                         // call cancellation, which would re-enter that same lock.
                         retired += usize::from(retire_delivery_under_lock(home, &record, now)?);

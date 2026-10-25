@@ -171,6 +171,7 @@ fn persisted_reviewer_author_is_not_used() {
     let mut state = state_for("acme/game-goapi", "feat/old", &["rev"]);
     state.pr_author = "rev".to_string();
     state.pr_author_source = Some(AuthorSource::GhLogin);
+    state.pr_author_pr_number = state.pr_number;
     assert_eq!(resolve_author_checked(&mut state, &idx, None).0, None);
     // r3: a persisted non-reviewer is used only WITH provenance …
     state.pr_author = "lead".to_string();

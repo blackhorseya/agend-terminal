@@ -484,6 +484,7 @@ fn stored_gh_login_author_is_rechecked_after_a_second_team_joins() {
     let branch = "feat/login-drift-review";
     let mut state = merged_state(branch, &[], "personal");
     state.pr_author_source = Some(super::author_authority::AuthorSource::GhLogin);
+    state.pr_author_pr_number = state.pr_number;
     save(&home, &state).unwrap();
     std::fs::write(crate::fleet::fleet_yaml_path(&home), TWO_TEAM_FLEET).unwrap();
     scan(&home, vec![]);
@@ -635,6 +636,7 @@ fn attack_current_typed_assignment_overrides_stored_binding_author() {
     );
     let mut state = merged_state(branch, &["personal", "third"], "personal");
     state.pr_author_source = Some(super::author_authority::AuthorSource::Binding);
+    state.pr_author_pr_number = state.pr_number;
     save(&home, &state).unwrap();
     scan(&home, vec![]);
     let personal = kinds(&home, "personal");
@@ -666,6 +668,7 @@ fn attack_corrupt_assignment_cannot_reuse_stored_binding_author() {
     std::fs::write(path, b"{").unwrap();
     let mut state = merged_state(branch, &["personal", "third"], "personal");
     state.pr_author_source = Some(super::author_authority::AuthorSource::Binding);
+    state.pr_author_pr_number = state.pr_number;
     save(&home, &state).unwrap();
     scan(&home, vec![]);
     assert!(
@@ -730,6 +733,7 @@ fn r5_control_stored_assignment_author_outranks_a_later_binding() {
     crate::binding::bind(&home, "third", "t-later-binding", branch);
     let mut state = merged_state(branch, &["personal", "third"], "personal");
     state.pr_author_source = Some(super::author_authority::AuthorSource::ReviewAssignment);
+    state.pr_author_pr_number = state.pr_number;
     save(&home, &state).unwrap();
     scan(&home, vec![]);
     assert_eq!(kinds(&home, "personal"), vec!["pr-merged"]);
@@ -797,6 +801,7 @@ fn attack_same_tier_binding_conflict_over_stored_binding_fails_closed() {
     crate::binding::bind(&home, "third", "t-current-binding", branch);
     let mut state = merged_state(branch, &["personal", "third"], "personal");
     state.pr_author_source = Some(super::author_authority::AuthorSource::Binding);
+    state.pr_author_pr_number = state.pr_number;
     save(&home, &state).unwrap();
     scan(&home, vec![]);
     assert!(kinds(&home, "personal").is_empty());
@@ -842,6 +847,7 @@ fn attack_same_tier_assignment_conflict_over_stored_author_fails_closed() {
     );
     let mut state = merged_state(branch, &["personal", "third"], "personal");
     state.pr_author_source = Some(super::author_authority::AuthorSource::ReviewAssignment);
+    state.pr_author_pr_number = state.pr_number;
     save(&home, &state).unwrap();
     scan(&home, vec![]);
     assert!(kinds(&home, "personal").is_empty());
@@ -868,6 +874,78 @@ fn attack_prior_pr_retired_reviewer_cannot_exclude_current_author() {
         br#"[{"board":"old","task_id":"t-pr14","instance":"third","seq":1}]"#,
     )
     .unwrap();
+    crate::binding::bind(&home, "third", "t-pr15", branch);
+    save(&home, &merged_state(branch, &[], "")).unwrap();
+    scan(&home, vec![]);
+    assert_eq!(kinds(&home, "third"), vec!["pr-merged"]);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ---------------------------------------------------------------------------
+// -18577-7 r6 controls (d-20261025030819687590-11): each pairs with an
+// existing test so that "this PR" and "an earlier PR on the same branch" are
+// told apart. `r5_control_stored_assignment_author_outranks_a_later_binding`
+// now records PR #15 as the attribution's generation; the cross-PR twin below
+// records PR #14 and must not keep the stored author.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn r6_control_stored_assignment_author_from_an_earlier_pr_yields_to_the_binding() {
+    let home = home_with_fleet("stored-assignment-earlier-pr", TWO_TEAM_FLEET);
+    let branch = "feat/stored-assignment-earlier-pr";
+    crate::binding::bind(&home, "third", "t-current-pr", branch);
+    let mut state = merged_state(branch, &["personal", "third"], "personal");
+    state.pr_author_source = Some(super::author_authority::AuthorSource::ReviewAssignment);
+    state.pr_author_pr_number = 14; // attributed for the previous PR
+    save(&home, &state).unwrap();
+    scan(&home, vec![]);
+    assert!(kinds(&home, "personal").is_empty());
+    assert_eq!(kinds(&home, "third"), vec!["pr-merged"]);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+fn retired_review(home: &std::path::Path, branch: &str, target: &str, pr_number: u64) {
+    let record = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        REPO,
+        branch,
+        target,
+        crate::types::InstanceId::new(),
+        pr_number,
+        "a".repeat(40),
+        crate::review_receipt::ReviewSlot::Primary,
+        "third",
+        format!("t-review-{pr_number}"),
+        ReviewClass::Single,
+        ReviewAuthor::Agent("someone".into()),
+        "review",
+        None,
+        None,
+        "2026-10-25T00:00:00Z",
+    );
+    let dir = crate::daemon::assignment_authority::record_path_for_test(home, REPO, branch, target);
+    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    crate::daemon::assignment_authority::note_retired_review_target(home, &record).unwrap();
+}
+
+/// The reviewer retired on THIS PR is still excluded from authorship.
+#[test]
+fn r6_control_reviewer_retired_on_this_pr_is_still_not_the_author() {
+    let home = home_with_fleet("retired-reviewer-this-pr", TWO_TEAM_FLEET);
+    let branch = "feat/retired-reviewer-this-pr";
+    retired_review(&home, branch, "third", 15);
+    crate::binding::bind(&home, "third", "t-review-worktree", branch);
+    save(&home, &merged_state(branch, &[], "")).unwrap();
+    scan(&home, vec![]);
+    assert!(kinds(&home, "third").is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// The same record for an EARLIER PR does not exclude the current author.
+#[test]
+fn r6_control_reviewer_retired_on_an_earlier_pr_can_author_this_one() {
+    let home = home_with_fleet("retired-reviewer-earlier-pr", TWO_TEAM_FLEET);
+    let branch = "feat/retired-reviewer-earlier-pr";
+    retired_review(&home, branch, "third", 14);
     crate::binding::bind(&home, "third", "t-pr15", branch);
     save(&home, &merged_state(branch, &[], "")).unwrap();
     scan(&home, vec![]);
