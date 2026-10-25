@@ -736,3 +736,141 @@ fn r5_control_stored_assignment_author_outranks_a_later_binding() {
     assert!(kinds(&home, "third").is_empty());
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// Reviewer attack: when a branch is reused by PR #15, provenance saved for
+/// PR #14 must not be carried forward as an author for the new generation.
+#[test]
+fn attack_stored_assignment_author_cleared_when_pr_number_changes() {
+    let home = home_with_fleet("stored-generation-drift", TWO_TEAM_FLEET);
+    let branch = "feat/stored-generation-drift";
+    let mut state = new_for_branch(REPO, branch, &"a".repeat(40), ReviewClass::Single);
+    state.pr_number = 14;
+    state.pr_author = "personal".into();
+    state.pr_author_source = Some(super::author_authority::AuthorSource::ReviewAssignment);
+    let mut old_meta = open_meta(branch);
+    old_meta.number = 14;
+    state.last_gh_state = Some(old_meta);
+    save(&home, &state).unwrap();
+    let mut new_meta = open_meta(branch);
+    new_meta.head_ref_oid = Some("c".repeat(40));
+    scan(&home, vec![new_meta]); // new PR #15, same branch and a different head
+    let updated = load(&home, REPO, branch).unwrap();
+    assert_eq!(
+        updated.pr_number, 15,
+        "the poll must observe the new PR generation"
+    );
+    assert_eq!(updated.head_sha, "c".repeat(40));
+    assert!(
+        updated.pr_author.is_empty() || updated.pr_author_source.is_none(),
+        "PR #14's stored assignment author survived on PR #15: {:?}",
+        updated.pr_author_source
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Reviewer attack: if the prior generation's stored author survives, a
+/// current PR binding cannot identify the new author because rank 0 wins.
+#[test]
+fn attack_prior_pr_stored_assignment_routes_current_merged_notice() {
+    let home = home_with_fleet("stale-stored-generation-notice", TWO_TEAM_FLEET);
+    let branch = "feat/stale-stored-generation-notice";
+    crate::binding::bind(&home, "third", "t-current-pr", branch);
+    let mut state = merged_state(branch, &["personal", "third"], "personal");
+    state.pr_author_source = Some(super::author_authority::AuthorSource::ReviewAssignment); // saved for PR #14
+    save(&home, &state).unwrap();
+    scan(&home, vec![]);
+    let personal = kinds(&home, "personal");
+    let third = kinds(&home, "third");
+    assert!(
+        personal.is_empty(),
+        "prior PR author got {personal:?}; current bound author got {third:?}"
+    );
+    assert_eq!(third, vec!["pr-merged"]);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn attack_same_tier_binding_conflict_over_stored_binding_fails_closed() {
+    let home = home_with_fleet("stored-binding-conflict", TWO_TEAM_FLEET);
+    let branch = "feat/stored-binding-conflict";
+    crate::binding::bind(&home, "personal", "t-prior-binding", branch);
+    crate::binding::bind(&home, "third", "t-current-binding", branch);
+    let mut state = merged_state(branch, &["personal", "third"], "personal");
+    state.pr_author_source = Some(super::author_authority::AuthorSource::Binding);
+    save(&home, &state).unwrap();
+    scan(&home, vec![]);
+    assert!(kinds(&home, "personal").is_empty());
+    assert!(kinds(&home, "third").is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn attack_stale_stored_author_misroutes_review_dispatch_authority() {
+    let home = home_with_fleet("stale-merge-authority", TWO_TEAM_FLEET);
+    let branch = "feat/stale-merge-authority";
+    crate::binding::bind(&home, "third", "t-current-pr", branch);
+    let mut state = new_for_branch(REPO, branch, &"a".repeat(40), ReviewClass::Single);
+    state.pr_number = 15;
+    state.pr_author = "personal".into();
+    state.pr_author_source = Some(super::author_authority::AuthorSource::ReviewAssignment); // PR #14
+    state.last_gh_state = Some(open_meta(branch));
+    save(&home, &state).unwrap();
+    scan(&home, vec![]);
+    let personal = kinds(&home, "personal");
+    assert!(
+        personal.is_empty(),
+        "current PR diagnostics routed to prior PR's team: {personal:?}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn attack_same_tier_assignment_conflict_over_stored_author_fails_closed() {
+    let home = home_with_fleet("stored-assignment-conflict", TWO_TEAM_FLEET);
+    let branch = "feat/stored-assignment-conflict";
+    assign_review(
+        &home,
+        branch,
+        "third-rev",
+        ReviewAuthor::Agent("personal".into()),
+    );
+    assign_review(
+        &home,
+        branch,
+        "other-rev",
+        ReviewAuthor::Agent("third".into()),
+    );
+    let mut state = merged_state(branch, &["personal", "third"], "personal");
+    state.pr_author_source = Some(super::author_authority::AuthorSource::ReviewAssignment);
+    save(&home, &state).unwrap();
+    scan(&home, vec![]);
+    assert!(kinds(&home, "personal").is_empty());
+    assert!(kinds(&home, "third").is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// A reviewer exclusion retired on PR #14 cannot exclude the same agent when
+/// that agent authors PR #15 on the reused branch.
+#[test]
+fn attack_prior_pr_retired_reviewer_cannot_exclude_current_author() {
+    let home = home_with_fleet("retired-reviewer-generation", TWO_TEAM_FLEET);
+    let branch = "feat/retired-reviewer-generation";
+    let record_path = crate::daemon::assignment_authority::record_path_for_test(
+        &home,
+        REPO,
+        branch,
+        "old-reviewer",
+    );
+    let dir = record_path.parent().unwrap();
+    std::fs::create_dir_all(dir).unwrap();
+    std::fs::write(
+        dir.join("terminal_retirements.json"),
+        br#"[{"board":"old","task_id":"t-pr14","instance":"third","seq":1}]"#,
+    )
+    .unwrap();
+    crate::binding::bind(&home, "third", "t-pr15", branch);
+    save(&home, &merged_state(branch, &[], "")).unwrap();
+    scan(&home, vec![]);
+    assert_eq!(kinds(&home, "third"), vec!["pr-merged"]);
+    let _ = std::fs::remove_dir_all(&home);
+}
