@@ -1433,7 +1433,10 @@ fn apply_gh_observations(
     }
 
     // First observation — populate identity fields.
-    if state.pr_author.is_empty() {
+    // -18577-7 r2 P1-1: a reviewer stored by the pre-fix tier-3 guess is
+    // re-resolved from the live gh login, like an empty author.
+    let stored_reviewer = author_index.is_some_and(|index| index.is_reviewer(&state.pr_author));
+    if state.pr_author.is_empty() || stored_reviewer {
         state.pr_number = meta.number;
         // `None` (fail-closed) leaves pr_author empty, so a later poll retries
         // once the fleet config gives the author a repo identity.

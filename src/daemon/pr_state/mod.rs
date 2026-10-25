@@ -1216,6 +1216,7 @@ pub fn ensure_from_scm(
 /// terminal state (Merged / ClosedUnmerged) is observed and the
 /// `[pr-merged]` / `[pr-closed-unmerged]` events have been emitted.
 pub fn remove(home: &Path, repo: &str, branch: &str) -> std::io::Result<()> {
+    gh_poll::forget_unresolved(repo, branch);
     let dir = pr_state_dir(home);
     let filename = pr_state_filename(repo, branch);
     let path = dir.join(&filename);
@@ -2079,7 +2080,9 @@ pub(crate) fn resolve_author_checked(
     index: &gh_poll::AuthorIndex,
 ) -> Option<String> {
     if !state.pr_author.is_empty() {
-        if index.is_eligible(&state.pr_author) {
+        // -18577-7 r2 P1-1: a reviewer stored by the pre-fix tier-3 guess is
+        // never used; the next gh poll re-resolves it (scanner).
+        if index.is_eligible(&state.pr_author) && !index.is_reviewer(&state.pr_author) {
             return Some(state.pr_author.clone());
         }
         tracing::warn!(
@@ -2284,7 +2287,7 @@ fn merge_authority_quiet(
         }
     }
     for fallback in [state.pr_author.as_str(), "fixup-lead"] {
-        if !fallback.is_empty() && index.is_eligible(fallback) {
+        if !fallback.is_empty() && index.is_eligible(fallback) && !index.is_reviewer(fallback) {
             return Some(fallback.to_string());
         }
     }
