@@ -417,3 +417,199 @@ fn single_team_login_still_identifies_the_author_without_other_sources() {
     assert_eq!(load(&home, REPO, branch).unwrap().pr_author, "lead");
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ---------------------------------------------------------------------------
+// -18577-7 r4 — third-hq-1 REJECTED r3 (a24adfe9) on four P1s, each reproduced
+// through the production scanner (receipt review-receipt:m-20261025015044219575-164).
+// The attack tests below are the reviewer's (scratch-161/pr15-r3-adversarial-
+// tests.patch, pr15-r3-stale-task.patch), taken as the RED set; the `r4_control_*`
+// tests are the reviewer's controls that already pass on r3.
+// ---------------------------------------------------------------------------
+
+/// r4 P1-1: an UNREADABLE assignment record is not "no assignment". The author
+/// chain must fail closed instead of falling to the binding tier.
+#[test]
+fn corrupt_assignment_does_not_downgrade_author_to_a_different_binding() {
+    let home = home_with_fleet("corrupt-assignment-review", TWO_TEAM_FLEET);
+    let branch = "feat/corrupt-assignment-review";
+    assign_review(
+        &home,
+        branch,
+        "third-rev",
+        ReviewAuthor::Agent("personal".into()),
+    );
+    let path =
+        crate::daemon::assignment_authority::record_path_for_test(&home, REPO, branch, "third-rev");
+    std::fs::write(path, b"{").unwrap();
+    crate::binding::bind(&home, "third", "t-new-binding", branch);
+    save(&home, &merged_state(branch, &["third"], "")).unwrap();
+    scan(&home, vec![]);
+    assert!(
+        kinds(&home, "third").is_empty(),
+        "an unreadable higher-priority author record must not route to another binding"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// r4 P1-2: a reviewer whose `repo` override makes it ineligible for this repo
+/// is bound to the branch (borrowed review). It is outside the `AuthorIndex`,
+/// so the reviewer predicate cannot see it; the binding tier must require
+/// repo eligibility like every other tier.
+#[test]
+fn repo_ineligible_reviewer_binding_does_not_become_author() {
+    let home = home_with_fleet(
+        "borrowed-reviewer-review",
+        "instances:\n  rev:\n    backend: codex\n    role_kind: reviewer\n    repo: acme/other\n",
+    );
+    let branch = "feat/borrowed-reviewer-review";
+    crate::binding::bind(&home, "rev", "t-review", branch);
+    save(&home, &merged_state(branch, &[], "")).unwrap();
+    scan(&home, vec![]);
+    assert!(
+        kinds(&home, "rev").is_empty(),
+        "a reviewer borrowed into this branch must not be treated as the PR author"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// r4 P1-4: a stored `gh_login` author was valid while the login mapped to one
+/// team (d-20261025014213077350-7). Once a second eligible team shares the
+/// login the stored value must be re-validated and fail closed.
+#[test]
+fn stored_gh_login_author_is_rechecked_after_a_second_team_joins() {
+    let home = home_with_fleet(
+        "login-drift-review",
+        "instances:\n  personal:\n    backend: claude\n    role_kind: orchestrator\n    github_login: shared-bot\nteams:\n  personal-hq:\n    orchestrator: personal\n    members: [personal]\n    source_repo: acme/tool\n",
+    );
+    let branch = "feat/login-drift-review";
+    let mut state = merged_state(branch, &[], "personal");
+    state.pr_author_source = Some(super::author_authority::AuthorSource::GhLogin);
+    save(&home, &state).unwrap();
+    std::fs::write(crate::fleet::fleet_yaml_path(&home), TWO_TEAM_FLEET).unwrap();
+    scan(&home, vec![]);
+    assert!(
+        kinds(&home, "personal").is_empty(),
+        "a saved GH-login inference must fail closed once two teams match that login"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// r4 P1-3a: a typed assignment of PR #14 survives on a reused branch. It must
+/// not name the author of PR #15.
+#[test]
+fn stale_assignment_for_prior_pr_number_cannot_name_new_pr_author() {
+    let home = home_with_fleet("stale-assignment-review", TWO_TEAM_FLEET);
+    let branch = "feat/reused-branch-review";
+    let record = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        REPO,
+        branch,
+        "third-rev",
+        crate::types::InstanceId::new(),
+        14,
+        "b".repeat(40),
+        crate::review_receipt::ReviewSlot::Primary,
+        "third",
+        "t-pr-14-review",
+        ReviewClass::Single,
+        ReviewAuthor::Agent("personal".into()),
+        "review",
+        None,
+        None,
+        "2026-10-25T00:00:00Z",
+    );
+    crate::daemon::assignment_authority::persist(&home, &record).unwrap();
+    save(&home, &merged_state(branch, &[], "")).unwrap();
+    scan(&home, vec![]);
+    assert!(
+        kinds(&home, "personal").is_empty(),
+        "an assignment for PR #14 must not name the author of PR #15 on the reused branch"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// r4 P1-3b: a Done task of PR #14 on a reused branch must not name the author
+/// of PR #15.
+#[test]
+fn done_task_for_prior_pr_cannot_name_new_pr_author_on_reused_branch() {
+    use crate::task_events::{DoneSource, InstanceName, TaskEvent, TaskId};
+
+    let home = home_with_fleet("stale-done-task-review", TWO_TEAM_FLEET);
+    let branch = "feat/reused-task-branch-review";
+    task_on_branch(&home, "t-pr-14-author", "personal", branch);
+    crate::task_events::append(
+        &home,
+        &InstanceName::from("test:seed"),
+        TaskEvent::Done {
+            task_id: TaskId("t-pr-14-author".into()),
+            by: InstanceName::from("personal"),
+            source: DoneSource::OperatorManual {
+                authored_at: "2026-10-25T00:00:00Z".into(),
+                result: Some("PR #14 complete".into()),
+            },
+        },
+    )
+    .unwrap();
+    save(&home, &merged_state(branch, &[], "")).unwrap();
+    scan(&home, vec![]);
+    assert!(
+        kinds(&home, "personal").is_empty(),
+        "a completed task from PR #14 must not name PR #15's author"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Control (passes on r3): legacy JSON without provenance deserializes.
+#[test]
+fn r4_control_legacy_json_without_author_source_deserializes() {
+    let state = new_for_branch(REPO, "feat/legacy-json", "sha", ReviewClass::Single);
+    let mut json = serde_json::to_value(&state).unwrap();
+    json.as_object_mut().unwrap().remove("pr_author_source");
+    let loaded: PrState = serde_json::from_value(json).unwrap();
+    assert_eq!(loaded.pr_author_source, None);
+}
+
+/// Control (passes on r3): a legacy stored lead is repaired from the typed
+/// assignment by the real poller and the provenance is written.
+#[test]
+fn r4_control_legacy_lead_is_repaired_from_assignment_by_real_poller() {
+    let home = home_with_fleet("legacy-lead-replay", TWO_TEAM_FLEET);
+    let branch = "feat/legacy-lead-replay";
+    assign_review(
+        &home,
+        branch,
+        "third-rev",
+        ReviewAuthor::Agent("personal".into()),
+    );
+    let mut state = new_for_branch(REPO, branch, &"a".repeat(40), ReviewClass::Single);
+    state.pr_number = 15;
+    state.pr_author = "third".into();
+    save(&home, &state).unwrap();
+    scan(&home, vec![open_meta(branch)]);
+    let loaded = load(&home, REPO, branch).unwrap();
+    assert_eq!(loaded.pr_author, "personal");
+    assert_eq!(
+        loaded.pr_author_source,
+        Some(super::author_authority::AuthorSource::ReviewAssignment)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Control (passes on r3): the typed assignment precedes a different live
+/// binding; the bound non-author gets nothing.
+#[test]
+fn r4_control_assignment_precedes_different_live_binding() {
+    let home = home_with_fleet("cross-tier-order", TWO_TEAM_FLEET);
+    let branch = "feat/cross-tier-order";
+    assign_review(
+        &home,
+        branch,
+        "third-rev",
+        ReviewAuthor::Agent("personal".into()),
+    );
+    crate::binding::bind(&home, "third", "t-transfer", branch);
+    save(&home, &merged_state(branch, &["personal", "third"], "")).unwrap();
+    scan(&home, vec![]);
+    assert_eq!(kinds(&home, "personal"), vec!["pr-merged"]);
+    assert!(kinds(&home, "third").is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
