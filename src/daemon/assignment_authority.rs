@@ -392,6 +392,22 @@ fn read_terminal_retirements(
     }
 }
 
+/// -18577-7 r3: the instances whose assignment on `repo`/`branch` was retired
+/// by a terminal task event — the PR's reviewers after their verdict landed.
+/// Lossy (a corrupt ledger reads as empty): this feeds author EXCLUSION, not
+/// the merge gate.
+pub(crate) fn terminal_retirement_instances(home: &Path, repo: &str, branch: &str) -> Vec<String> {
+    let mut out: Vec<String> =
+        read_terminal_retirements(&terminal_retirements_file(home, repo, branch))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|k| k.instance)
+            .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Read one authority record. Three-state (B4): `Ok(None)` = genuinely ABSENT
 /// (NotFound), `Ok(Some)` = present + parsed, `Err` = the file EXISTS but is
 /// unreadable/corrupt. A corrupt record is NEVER conflated with absent — merge-gate

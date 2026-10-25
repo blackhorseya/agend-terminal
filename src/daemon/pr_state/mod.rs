@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) mod author_authority;
 pub mod auto_arm;
 mod freshness_populator;
 pub mod gh_poll;
@@ -74,6 +75,11 @@ pub struct PrState {
     /// from subscriber order alone — subscribers mutate during long
     /// PR lifecycles.
     pub pr_author: String,
+    /// -18577-7 r3: where `pr_author` came from. `None` on legacy state (an
+    /// alphabetical pick, a subscriber guess or the raw gh login written by the
+    /// pre-r3 resolvers) ⇒ the value is display-only and never routes a notice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pr_author_source: Option<author_authority::AuthorSource>,
     /// ci_watch's subscriber list at the time of first observation.
     /// Used only as fallback for [`pr_author`] resolution.
     #[serde(default)]
@@ -1455,6 +1461,7 @@ pub fn new_for_branch(
         branch: branch.to_string(),
         head_sha: head_sha.to_string(),
         pr_author: String::new(),
+        pr_author_source: None,
         subscribers: Vec::new(),
         ci_state: CiState::Pending,
         verdict_state: VerdictState::None,
@@ -1808,9 +1815,12 @@ pub(crate) fn record_validated_receipt(
     report_delivery: Option<(&str, &crate::inbox::InboxMessage)>,
 ) -> bool {
     let summary = receipt.summary();
-    // Resolve binding identity before taking either the assignment or pr-state
-    // lock: local source_repo paths may require a git-origin subprocess.
-    let binding_recipient = resolve_binding_notify_recipient(home, &summary.repo, &summary.branch);
+    // -18577-7 r3: the author's eligibility index and authoritative records are
+    // gathered before either lock (a binding's local source_repo may need a
+    // git-origin subprocess).
+    let author_index = gh_poll::AuthorIndex::build(home, &summary.repo);
+    let author_evidence =
+        author_authority::AuthorEvidence::gather(home, &summary.repo, &summary.branch, None);
     // Keep the same assignment-OUTER / pr_state-INNER lock order used by the
     // CI drain. Authorization at the API sink precedes inbox delivery; a revoke
     // may race after that check. Re-acquire the exact subject's assignment lock
@@ -1845,7 +1855,14 @@ pub(crate) fn record_validated_receipt(
             crate::review_receipt::ReviewVerdict::Rejected => "REJECTED",
             crate::review_receipt::ReviewVerdict::Unverified => "UNVERIFIED",
         };
-        let recipient = resolve_notify_recipient_precomputed(state, binding_recipient.as_deref());
+        // -18577-7 r3 P1-4: the fan-out goes to the AUTHORITATIVE author or to
+        // nobody — never to a stored reviewer or a subscriber guess.
+        let Some(recipient) =
+            resolve_author_checked(state, &author_index, Some(&author_evidence)).0
+        else {
+            applied = true;
+            return;
+        };
         if let Some((report_recipient, report_message)) = report_delivery {
             // #3177: `route_and_deliver` already wrote the complete report to
             // `report_recipient`. A same-recipient verdict row is duplicate noise;
@@ -1984,9 +2001,9 @@ pub(crate) fn record_verdict(
         let repo = state.repo.clone();
         let branch = state.branch.clone();
         let label = verdict_label(&kind);
-        // Resolve binding identity before entering with_pr_state: local
-        // source_repo paths may require a git-origin subprocess.
-        let binding_recipient = resolve_binding_notify_recipient(home, &repo, &branch);
+        // -18577-7 r3: index + authoritative records before the flock.
+        let author_index = gh_poll::AuthorIndex::build(home, &repo);
+        let author_evidence = author_authority::AuthorEvidence::gather(home, &repo, &branch, None);
         // #2 (t-verdict-to-author-routing): capture the verdict notification under
         // the flock, enqueue it AFTER `with_pr_state` returns (self-IPC safety —
         // mirrors the scanner's #1629 deferred-emit pattern).
@@ -2003,8 +2020,11 @@ pub(crate) fn record_verdict(
             // The legacy display projection cannot make the PR merge-ready, so
             // surface it as an ordinary author notification.
             if !is_merge_ready(s) {
-                let recipient =
-                    resolve_notify_recipient_precomputed(s, binding_recipient.as_deref());
+                let Some(recipient) =
+                    resolve_author_checked(s, &author_index, Some(&author_evidence)).0
+                else {
+                    return;
+                };
                 let body = format_verdict_body(s, reviewer, label);
                 let msg = crate::inbox::InboxMessage::new_system(
                     "system:pr-state",
@@ -2044,128 +2064,33 @@ pub(crate) fn record_verdict(
     }
 }
 
-/// Author resolution chain (reviewer cross-audit PRIMARY):
-/// 1. Stored `pr_author` field if non-empty (gh-poll already populated
-///    it via the 4-tier chain in [`gh_poll::resolve_author_with_gh`])
-/// 2. `subscribers[0]` from ci_watch (pre-gh-poll fallback)
-/// 3. `"fixup-lead"` last-resort fallback (with `tracing::warn`)
-pub fn resolve_author(state: &PrState) -> String {
-    if !state.pr_author.is_empty() {
-        return state.pr_author.clone();
-    }
-    if let Some(first) = state.subscribers.first() {
-        return first.clone();
-    }
-    tracing::warn!(
-        repo = %state.repo,
-        branch = %state.branch,
-        "#986 resolve_author: no pr_author + no subscribers → \
-         fixup-lead fallback (gh-poll may not have run yet)"
-    );
-    "fixup-lead".to_string()
-}
-
-/// Emit-time author for the repo/branch-bearing author notices
-/// (`[pr-merged]`, `[pr-closed-unmerged]`, `[pr-needs-rebase]`).
+/// Emit-time author for every author-facing notice (`[pr-merged]`,
+/// `[pr-closed-unmerged]`, `[pr-needs-rebase]`, `[review-verdict]` and the
+/// validated-review fan-out).
 ///
-/// The stored `pr_author` is RE-VALIDATED against the current fleet rules
-/// (`index`, built for `state.repo`) rather than trusted: a value written by
-/// the pre-fix match-any resolver may name an instance unrelated to the repo.
-/// Ineligible → `tracing::warn` and fall back to the remaining eligible tiers
-/// (subscribers, then `fixup-lead`); nothing eligible → `None` and the caller
-/// sends nothing (fail-closed). The gh login is not persisted, so tiers 1-2
-/// cannot be re-run here; a later first-observation (empty `pr_author`) does.
+/// -18577-7 r3 (d-20261025004632404221-3): the stored `pr_author` is used only
+/// when it carries provenance and is still an eligible non-reviewer. Otherwise
+/// the branch's authoritative records (`evidence`: typed assignment author,
+/// live binding, task assignee — gathered OUTSIDE the flock) are consulted and
+/// a hit is persisted with its source (the returned flag says the state
+/// changed). Nothing identifies the author → `None`, the caller sends nothing
+/// and one WARN per PR is logged. The gh login is not available here; the
+/// poller ([`scanner`]) applies it on the next observation.
 pub(crate) fn resolve_author_checked(
-    state: &PrState,
+    state: &mut PrState,
     index: &gh_poll::AuthorIndex,
-) -> Option<String> {
-    if !state.pr_author.is_empty() {
-        // -18577-7 r2 P1-1: a reviewer stored by the pre-fix tier-3 guess is
-        // never used; the next gh poll re-resolves it (scanner).
-        if index.is_eligible(&state.pr_author) && !index.is_reviewer(&state.pr_author) {
-            return Some(state.pr_author.clone());
-        }
-        tracing::warn!(
-            repo = %state.repo,
-            branch = %state.branch,
-            pr_author = %state.pr_author,
-            "pr_state: stored pr_author is not eligible for this repo under current rules \
-             (pre-fix match-any value?) — ignoring it"
-        );
+    evidence: Option<&author_authority::AuthorEvidence>,
+) -> (Option<String>, bool) {
+    if let Some(author) = author_authority::trusted_stored_author(state, index, evidence) {
+        return (Some(author), false);
     }
-    gh_poll::resolve_author_logged_once(index, None, state)
-}
-
-/// t-verdict-to-author-routing-design (#2): resolve the AGENT to notify for an
-/// author-facing pr-state signal (`[review-verdict]`, `[pr-ready-for-merge]`).
-///
-/// BINDING-first (shared-account-proof, reusing PR-3 #1799): the fleet shares one
-/// GitHub account, so `resolve_author`'s gh-login chain can mis-route (and its
-/// last resort is a hard-coded `"fixup-lead"`). The agent BOUND to the branch is
-/// the dispatchee/author who is waiting; resolve that first, then fall back to the
-/// existing `resolve_author` chain (`pr_author` → `subscribers[0]` → `fixup-lead`)
-/// unchanged. Production callers precompute the binding recipient before
-/// entering a `with_pr_state` closure so local source_repo origin lookup cannot
-/// run under a state lock.
-#[cfg(test)]
-pub fn resolve_notify_recipient(home: &Path, state: &PrState) -> String {
-    let binding_recipient = resolve_binding_notify_recipient(home, &state.repo, &state.branch);
-    resolve_notify_recipient_precomputed(state, binding_recipient.as_deref())
-}
-
-fn resolve_notify_recipient_precomputed(
-    state: &PrState,
-    binding_recipient: Option<&str>,
-) -> String {
-    binding_recipient
-        .map(str::to_owned)
-        .unwrap_or_else(|| resolve_author(state))
-}
-
-/// Resolve a verdict recipient from all branch bindings without changing the
-/// generic lease scanner. Known repo matches win over legacy branch-only
-/// bindings regardless of directory enumeration order; a non-empty binding
-/// repo that cannot be resolved is never treated as legacy.
-fn resolve_binding_notify_recipient(home: &Path, repo: &str, branch: &str) -> Option<String> {
-    if repo.is_empty() || branch.is_empty() {
-        return None;
+    match gh_poll::resolve_author_logged_once(index, evidence, None, state) {
+        Some((name, source)) => {
+            let changed = author_authority::remember_author(state, &name, source);
+            (Some(name), changed)
+        }
+        None => (None, false),
     }
-    let canonical_repo =
-        crate::mcp::handlers::dispatch_hook::canonical_repo_slug_for_source(Path::new(repo))?;
-    let mut legacy_recipient = None;
-    for (agent, binding) in crate::binding::binding_scan_all(home) {
-        if binding["branch"].as_str() != Some(branch) {
-            continue;
-        }
-        let Some(source_value) = binding.get("source_repo") else {
-            if legacy_recipient.is_none() {
-                legacy_recipient = Some(agent);
-            }
-            continue;
-        };
-        if source_value.is_null() {
-            if legacy_recipient.is_none() {
-                legacy_recipient = Some(agent);
-            }
-            continue;
-        }
-        let Some(source_repo) = source_value.as_str().map(str::trim) else {
-            continue;
-        };
-        if source_repo.is_empty() {
-            if legacy_recipient.is_none() {
-                legacy_recipient = Some(agent);
-            }
-            continue;
-        }
-        let source_slug = crate::mcp::handlers::dispatch_hook::canonical_repo_slug_for_source(
-            Path::new(source_repo),
-        );
-        if source_slug.as_deref() == Some(canonical_repo.as_str()) {
-            return Some(agent);
-        }
-    }
-    legacy_recipient
 }
 
 /// #2059-#3: resolve the MERGE AUTHORITY for `[pr-ready-for-merge]` — a
@@ -2204,8 +2129,13 @@ pub fn resolve_merge_authority(home: &Path, state: &PrState) -> String {
         VerdictState::None | VerdictState::Pending => {}
     }
     candidates.extend(state.subscribers.iter().map(String::as_str));
-    if !state.pr_author.is_empty() {
-        candidates.push(state.pr_author.as_str());
+    let trusted_author = state
+        .pr_author_source
+        .is_some()
+        .then_some(state.pr_author.as_str())
+        .filter(|a| !a.is_empty());
+    if let Some(author) = trusted_author {
+        candidates.push(author);
     }
     for member in candidates {
         if let Some(orch) = crate::teams::find_team_for(home, member)
@@ -2222,8 +2152,8 @@ pub fn resolve_merge_authority(home: &Path, state: &PrState) -> String {
     // instance — the #2058 dead-zone recurring on someone else's machine
     // (de-hardcode follow-up to #2063). "fixup-lead" stays only as the
     // last-ditch when even the author is unknown.
-    if !state.pr_author.is_empty() {
-        return state.pr_author.clone();
+    if let Some(author) = trusted_author {
+        return author.to_string();
     }
     "fixup-lead".to_string()
 }
@@ -2273,8 +2203,11 @@ fn merge_authority_quiet(
         VerdictState::None | VerdictState::Pending => {}
     }
     candidates.extend(state.subscribers.iter().map(String::as_str));
-    if !state.pr_author.is_empty() {
-        candidates.push(state.pr_author.as_str());
+    // -18577-7 r3: only an author WITH provenance counts. A legacy value may be
+    // a reviewer (whose team lead would then be picked) or another team's lead.
+    let trusted_author = author_authority::trusted_stored_author(state, index, None);
+    if let Some(author) = trusted_author.as_deref() {
+        candidates.push(author);
     }
     for member in candidates {
         if let Some(orch) = crate::teams::find_team_for(home, member)
@@ -2286,7 +2219,7 @@ fn merge_authority_quiet(
             }
         }
     }
-    for fallback in [state.pr_author.as_str(), "fixup-lead"] {
+    for fallback in [trusted_author.as_deref().unwrap_or(""), "fixup-lead"] {
         if !fallback.is_empty() && index.is_eligible(fallback) && !index.is_reviewer(fallback) {
             return Some(fallback.to_string());
         }

@@ -1,0 +1,283 @@
+//! -18577-7 r3 — WHO is the PR author (d-20261025004632404221-3, option A).
+//!
+//! The fleet shares GitHub logins, so the gh `author_login` alone cannot name
+//! the agent that opened a PR, and the CI subscribers only say who wants to
+//! hear about it. The author is identified from the daemon's own
+//! AUTHORITATIVE records, in this order:
+//!
+//! 1. the typed review assignment's `review_author = Agent(name)` — set by the
+//!    orchestrator at dispatch, immutable;
+//! 2. the live binding on the branch (the agent working in its worktree);
+//! 3. the assignee of a task carrying the branch.
+//!
+//! Within a tier exactly one eligible non-reviewer must remain; several →
+//! the tier is in conflict and the chain stops (fail closed — a weaker tier
+//! must not "break the tie"); none → the next tier. Reviewers never author:
+//! the assignment targets, the terminal-retirement instances and every
+//! `role_kind: reviewer` instance are excluded from every tier.
+//!
+//! Only when no record exists does the gh login decide, and only if it maps
+//! to exactly one team (see [`super::gh_poll::resolve_author_outcome`]).
+//!
+//! The resolved name is persisted on the PR state together with its
+//! [`AuthorSource`]; a stored author WITHOUT a source (written by the pre-r3
+//! resolvers: alphabetical pick, subscriber guess, raw login) is never used
+//! for routing. Records are transient — the assignment is retired when the
+//! verdict lands, the binding when the worktree is released — so the stored
+//! provenance is what carries the author to the merged/closed notice.
+//!
+//! All reads here are filesystem / catalog reads done OUTSIDE the pr-state
+//! flock; [`AuthorEvidence`] is handed into the locked section.
+
+use std::path::Path;
+
+use super::gh_poll::AuthorIndex;
+use super::PrState;
+
+/// Where a persisted `pr_author` came from. Absent on legacy state ⇒ untrusted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum AuthorSource {
+    ReviewAssignment,
+    Binding,
+    TaskAssignee,
+    /// `github_login` mapped to exactly one eligible team.
+    GhLogin,
+}
+
+/// The per-branch records that can identify the author, gathered outside
+/// the pr-state flock.
+#[derive(Debug, Default, Clone)]
+pub(crate) struct AuthorEvidence {
+    repo: String,
+    branch: String,
+    /// `review_author = Agent(..)` of the active typed assignments.
+    assignment_authors: Vec<String>,
+    /// Assignment targets (active + terminal-retired): reviewers of this PR.
+    reviewer_targets: Vec<String>,
+    /// Agents bound to the branch (repo-matched first, legacy branch-only after).
+    bound_agents: Vec<String>,
+    /// Owners of tasks that carry the branch (any board, not cancelled/superseded).
+    task_assignees: Vec<String>,
+}
+
+/// Outcome of the authoritative tiers, before logging.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Authoritative {
+    Resolved(String, AuthorSource),
+    /// A tier named more than one author.
+    Conflict(AuthorSource, Vec<String>),
+    /// No tier named anyone.
+    None,
+}
+
+impl AuthorEvidence {
+    /// Gather the records for `repo`/`branch`. `assignments` are the active
+    /// typed assignments the caller already listed (scanner) or `None` to list
+    /// them here. May run `git remote get-url` for a binding's local
+    /// `source_repo` — never call under the pr-state flock (#1617).
+    pub(crate) fn gather(
+        home: &Path,
+        repo: &str,
+        branch: &str,
+        assignments: Option<&[crate::daemon::assignment_authority::ActiveAssignment]>,
+    ) -> Self {
+        let listed;
+        let assignments = match assignments {
+            Some(a) => a,
+            None => {
+                listed = crate::daemon::assignment_authority::list_active(home, repo, branch);
+                listed.as_slice()
+            }
+        };
+        let mut assignment_authors = Vec::new();
+        let mut reviewer_targets = Vec::new();
+        for a in assignments {
+            push_unique(&mut reviewer_targets, &a.target);
+            if let crate::mcp::handlers::comms_gates::ReviewAuthor::Agent(name) = &a.review_author {
+                push_unique(&mut assignment_authors, name);
+            }
+        }
+        for retired in
+            crate::daemon::assignment_authority::terminal_retirement_instances(home, repo, branch)
+        {
+            push_unique(&mut reviewer_targets, &retired);
+        }
+        let bound_agents = bound_agents_on_branch(home, repo, branch);
+        let task_assignees = task_assignees_on_branch(home, branch);
+        Self {
+            repo: repo.to_string(),
+            branch: branch.to_string(),
+            assignment_authors,
+            reviewer_targets,
+            bound_agents,
+            task_assignees,
+        }
+    }
+
+    /// The evidence was gathered for this exact PR (the locked state must be
+    /// the one the pre-lock snapshot described).
+    pub(crate) fn is_for(&self, state: &PrState) -> bool {
+        self.repo == state.repo && self.branch == state.branch
+    }
+
+    /// `name` reviews this PR (assignment target, retired or active) or is a
+    /// reviewer instance: never the author.
+    pub(crate) fn is_reviewer(&self, index: &AuthorIndex, state: &PrState, name: &str) -> bool {
+        index.is_reviewer(name)
+            || self.reviewer_targets.iter().any(|t| t == name)
+            || verdict_reviewers(state).any(|r| r == name)
+    }
+
+    /// Run the three authoritative tiers against the fleet eligibility `index`.
+    pub(crate) fn resolve(&self, index: &AuthorIndex, state: &PrState) -> Authoritative {
+        let tiers: [(AuthorSource, &[String]); 3] = [
+            (AuthorSource::ReviewAssignment, &self.assignment_authors),
+            (AuthorSource::Binding, &self.bound_agents),
+            (AuthorSource::TaskAssignee, &self.task_assignees),
+        ];
+        for (source, names) in tiers {
+            // A typed assignment is keyed by this repo+branch and a binding
+            // carries the repo itself (or is a legacy branch-only binding, as
+            // before), so neither needs the fleet-eligibility gate. A task
+            // carries only the branch name, so its assignee must be eligible
+            // for the repo (the same branch name may exist on another board).
+            let require_eligible = matches!(source, AuthorSource::TaskAssignee);
+            let mut candidates: Vec<String> = Vec::new();
+            for n in names {
+                if (!require_eligible || index.is_eligible(n)) && !self.is_reviewer(index, state, n)
+                {
+                    push_unique(&mut candidates, n);
+                }
+            }
+            match candidates.len() {
+                0 => continue,
+                1 => return Authoritative::Resolved(candidates.remove(0), source),
+                _ => return Authoritative::Conflict(source, candidates),
+            }
+        }
+        Authoritative::None
+    }
+}
+
+/// The poller must (re)resolve this state's author: nothing stored, or a
+/// stored value without provenance (pre-r3 resolvers).
+pub(crate) fn needs_author(state: &PrState) -> bool {
+    state.pr_author.is_empty() || state.pr_author_source.is_none()
+}
+
+/// The persisted `pr_author`, if it was written by an r3 resolver (has a
+/// source) and is still an eligible non-reviewer. Legacy values (no source)
+/// and reviewers are never trusted.
+pub(crate) fn trusted_stored_author(
+    state: &PrState,
+    index: &AuthorIndex,
+    evidence: Option<&AuthorEvidence>,
+) -> Option<String> {
+    if state.pr_author.is_empty() || state.pr_author_source.is_none() {
+        return None;
+    }
+    let name = state.pr_author.as_str();
+    if !index.is_eligible(name) || index.is_reviewer(name) {
+        return None;
+    }
+    if evidence.is_some_and(|e| e.is_reviewer(index, state, name)) {
+        return None;
+    }
+    if verdict_reviewers(state).any(|r| r == name) {
+        return None;
+    }
+    Some(state.pr_author.clone())
+}
+
+/// Persist `name`/`source` as the PR author. Returns true when the state
+/// changed (callers mark it dirty).
+pub(crate) fn remember_author(state: &mut PrState, name: &str, source: AuthorSource) -> bool {
+    if state.pr_author == name && state.pr_author_source == Some(source) {
+        return false;
+    }
+    state.pr_author = name.to_string();
+    state.pr_author_source = Some(source);
+    true
+}
+
+fn verdict_reviewers(state: &PrState) -> impl Iterator<Item = &str> {
+    use super::VerdictState;
+    let v: Vec<&str> = match &state.verdict_state {
+        VerdictState::Verified { reviewers } => reviewers.iter().map(|(r, _)| r.as_str()).collect(),
+        VerdictState::Rejected { reviewer, .. } | VerdictState::Unverified { reviewer, .. } => {
+            vec![reviewer.as_str()]
+        }
+        VerdictState::None | VerdictState::Pending => Vec::new(),
+    };
+    v.into_iter()
+}
+
+fn push_unique(v: &mut Vec<String>, name: &str) {
+    if !name.is_empty() && !v.iter().any(|n| n == name) {
+        v.push(name.to_string());
+    }
+}
+
+/// Agents bound to `branch`. A binding whose `source_repo` canonicalizes to
+/// `repo` counts; a legacy binding (no `source_repo`) counts only when no
+/// repo-matched binding exists, mirroring the verdict recipient rule it
+/// replaces. A non-empty `source_repo` that cannot be resolved never counts.
+pub(crate) fn bound_agents_on_branch(home: &Path, repo: &str, branch: &str) -> Vec<String> {
+    if repo.is_empty() || branch.is_empty() {
+        return Vec::new();
+    }
+    let Some(canonical_repo) =
+        crate::mcp::handlers::dispatch_hook::canonical_repo_slug_for_source(Path::new(repo))
+    else {
+        return Vec::new();
+    };
+    let mut matched = Vec::new();
+    let mut legacy = Vec::new();
+    for (agent, binding) in crate::binding::binding_scan_all(home) {
+        if binding["branch"].as_str() != Some(branch) {
+            continue;
+        }
+        let source_repo = binding
+            .get("source_repo")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .unwrap_or("");
+        if source_repo.is_empty() {
+            push_unique(&mut legacy, &agent);
+            continue;
+        }
+        let slug = crate::mcp::handlers::dispatch_hook::canonical_repo_slug_for_source(Path::new(
+            source_repo,
+        ));
+        if slug.as_deref() == Some(canonical_repo.as_str()) {
+            push_unique(&mut matched, &agent);
+        }
+    }
+    if matched.is_empty() {
+        legacy
+    } else {
+        matched
+    }
+}
+
+/// Owners of tasks (every board) whose `branch` is this branch and that were
+/// not cancelled or superseded.
+fn task_assignees_on_branch(home: &Path, branch: &str) -> Vec<String> {
+    use crate::task_events::TaskStatus;
+    let mut out = Vec::new();
+    let Ok(tasks) = crate::task_events::catalog::for_home(home).all_tasks() else {
+        return out;
+    };
+    for task in tasks {
+        if task.branch.as_deref() != Some(branch)
+            || matches!(task.status, TaskStatus::Cancelled | TaskStatus::Superseded)
+        {
+            continue;
+        }
+        if let Some(owner) = &task.owner {
+            push_unique(&mut out, owner.as_str());
+        }
+    }
+    out
+}

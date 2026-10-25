@@ -62,6 +62,8 @@ Team 將 agent 組成具名單位，以進行結構化協作。每個 team 都�
 | `accept_from` | 可直接傳訊給 orchestrator 的外部 agent name；空值會拒絕 cross-team direct send |
 | `stale_members` | 僅供 view；在 live registry 找不到的 member |
 
+**作者通知送給誰。** fleet 通常共用一個 GitHub login，PR 的 `author.login` 認不出是哪個 agent。daemon 依自己的記錄認定作者，順序為：typed review assignment 的 `review_author`、branch 上的 live binding、帶該 branch 的 task 的 assignee。同一層必須剛好剩一個有資格的非 reviewer（多個 → 不送）。只有在沒有任何記錄時才用 `github_login`，且只在它對應到剛好一個 team 時成立。CI subscriber 不用來認作者；reviewer（`role_kind: reviewer`、assignment 的 target）也永遠不是作者。舊版 daemon 存下的 `pr_author`（沒有 provenance）只供顯示，不會用來送通知。認不出作者時不送通知，每個 PR 只記一次 WARN。
+
 ## 4. `team action=create`
 
 - `name` 與 `members` 必填。

@@ -733,6 +733,7 @@ fn cached_mergeready_without_current_review_coverage_self_heals_3182() {
 
     let mut state = merge_ready_state("owner/repo", "feat/review-dispatch-cache", head, 3182);
     state.pr_author = "dev".into();
+    state.pr_author_source = Some(super::super::author_authority::AuthorSource::GhLogin);
     state.validated_review_receipts.clear();
     state.last_gh_state = Some(open_pr_meta_oids(
         3182,
@@ -1278,6 +1279,7 @@ fn behind_needs_rebase_dedups_recipient_when_owner_is_authority() {
     .unwrap();
     let mut s = merge_ready_state("owner/repo", "feat/x", BEHIND_HEAD, 77);
     s.pr_author = "solo".into();
+    s.pr_author_source = Some(super::super::author_authority::AuthorSource::GhLogin);
     stamp_fresh_tuple(&mut s, BEHIND_HEAD, BEHIND_BASE, 1);
     save(&home, &s).unwrap();
 
@@ -2386,6 +2388,7 @@ fn pr_ready_recovers_after_fleet_identity_repair_209a() {
     write_foreign_fleet(&home);
     let mut s = merge_ready_state("owner/repo", "feat/x", BEHIND_HEAD, 77);
     s.pr_author = "dev".into();
+    s.pr_author_source = Some(super::super::author_authority::AuthorSource::GhLogin);
     stamp_fresh_tuple(&mut s, BEHIND_HEAD, BEHIND_BASE, 0);
     save(&home, &s).unwrap();
 

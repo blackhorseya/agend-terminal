@@ -348,6 +348,12 @@ pub fn scan_and_emit_with(
             may_emit_repo_notice(&snapshot, review_authority, &review_assignments)
                 .then(|| gh_poll::AuthorIndex::build(home, &repo));
         gh_poll::after_author_index_build();
+        // -18577-7 r3: the branch's authoritative author records (typed
+        // assignment author, live binding, task assignee), gathered outside the
+        // flock like the index — a binding's local source_repo may run git.
+        let author_evidence = author_index
+            .is_some()
+            .then(|| super::author_authority::AuthorEvidence::gather(home, &repo, &branch, None));
         // Under the flock: the pre-built index is used only if fleet.yaml is
         // byte-identical to what it was built from (plain read, NO git). No
         // index (locked state diverged from the snapshot) or a changed
@@ -576,10 +582,14 @@ pub fn scan_and_emit_with(
                             let mut recipients: Vec<String> =
                                 match emit_index(state, "pr-needs-rebase") {
                                     Some(index) => {
-                                        resolve_merge_authority_checked(home, state, index)
-                                            .into_iter()
-                                            .chain(resolve_author_checked(state, index))
-                                            .collect()
+                                        let authority =
+                                            resolve_merge_authority_checked(home, state, index);
+                                        let evidence =
+                                            author_evidence.as_ref().filter(|e| e.is_for(state));
+                                        let (author, repaired) =
+                                            resolve_author_checked(state, index, evidence);
+                                        dirty |= repaired;
+                                        authority.into_iter().chain(author).collect()
                                     }
                                     None => Vec::new(),
                                 };
@@ -790,7 +800,8 @@ pub fn scan_and_emit_with(
             // Terminal-state sweep.
             let already_emitted =
                 state.ready_emitted_for_sha.as_deref() == Some(state.head_sha.as_str());
-            match &state.merge_state {
+            // -18577-7 r3: cloned so the author resolver may repair `state` in the arms.
+            match state.merge_state.clone() {
                 MergeState::Merged {
                     merge_commit,
                     merged_at,
@@ -813,7 +824,8 @@ pub fn scan_and_emit_with(
                         // nested binding flock are the #1617 lock-while-blocking
                         // class). Record the branch; release runs post-unlock.
                         release_after_unlock = Some((state.branch.clone(), "merge"));
-                        let author = resolve_author_checked(state, index);
+                        let evidence = author_evidence.as_ref().filter(|e| e.is_for(state));
+                        let (author, _repaired) = resolve_author_checked(state, index, evidence);
                         let body = format!(
                             "[pr-merged] {}@{} (head_sha {}, merged_at {})\n\n\
                              ⚠ Action checklist:\n\
@@ -866,7 +878,8 @@ pub fn scan_and_emit_with(
                                 ScanAction::None
                             };
                         };
-                        let author = resolve_author_checked(state, index);
+                        let evidence = author_evidence.as_ref().filter(|e| e.is_for(state));
+                        let (author, _repaired) = resolve_author_checked(state, index, evidence);
                         let body = format!(
                             "[pr-closed-unmerged] {}@{} (closed_at {})\n\n\
                              ⚠ Action checklist:\n\
@@ -1309,9 +1322,11 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
                 // instance `source_repo`), so build its fleet index HERE —
                 // outside the per-PR flock — and only when some due state
                 // still needs its first-observation `pr_author`.
+                // -18577-7 r3: also when the stored author has no provenance
+                // (legacy value) — it is re-resolved, not trusted.
                 let author_index = due_states
                     .iter()
-                    .any(|s| s.pr_author.is_empty())
+                    .any(super::author_authority::needs_author)
                     .then(|| gh_poll::AuthorIndex::build(home, &repo));
                 for state in due_states {
                     let branch = state.branch.clone();
@@ -1334,8 +1349,20 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
                         );
                         continue;
                     }
+                    // -18577-7 r3: the branch's authoritative records, before the flock.
+                    let author_evidence = (author_index.is_some()
+                        && super::author_authority::needs_author(&state))
+                    .then(|| {
+                        super::author_authority::AuthorEvidence::gather(home, &repo, &branch, None)
+                    });
                     if let Err(e) = with_pr_state(home, &repo, &branch, |s| {
-                        apply_gh_observations(s, &prs, &now, author_index.as_ref());
+                        apply_gh_observations(
+                            s,
+                            &prs,
+                            &now,
+                            author_index.as_ref(),
+                            author_evidence.as_ref(),
+                        );
                         s.gh_poll_failures = 0;
                         s.last_gh_poll_at = Some(now.clone());
                     }) {
@@ -1386,6 +1413,7 @@ fn apply_gh_observations(
     prs: &[gh_poll::GhPrMetadata],
     now: &str,
     author_index: Option<&gh_poll::AuthorIndex>,
+    author_evidence: Option<&super::author_authority::AuthorEvidence>,
 ) {
     let Some(meta) = prs.iter().find(|m| m.head_ref == state.branch) else {
         return;
@@ -1432,33 +1460,37 @@ fn apply_gh_observations(
         }
     }
 
-    // First observation — populate identity fields.
-    // -18577-7 r2 P1-1: a reviewer stored by the pre-fix tier-3 guess is
-    // re-resolved from the live gh login, like an empty author.
-    let stored_reviewer = author_index.is_some_and(|index| index.is_reviewer(&state.pr_author));
-    if state.pr_author.is_empty() || stored_reviewer {
+    // First observation / repair — populate identity fields.
+    // -18577-7 r3: the stored author is used only with provenance (written by
+    // this resolver). A legacy value (alphabetical pick, subscriber guess, raw
+    // login) or a reviewer is re-resolved from the authoritative records and
+    // the gh login. No pre-lock index (the snapshot already had a trusted
+    // author, or delete→recreate race): leave it; the next poll resolves.
+    // While unresolvable this block re-runs on every poll; the resolver warns
+    // once per PR and the populate line is logged only when an author lands.
+    let trusted = author_index.and_then(|index| {
+        super::author_authority::trusted_stored_author(state, index, author_evidence)
+    });
+    if trusted.is_none() {
         state.pr_number = meta.number;
-        // `None` (fail-closed) leaves pr_author empty, so a later poll retries
-        // once the fleet config gives the author a repo identity.
-        // No pre-lock index (the snapshot already had pr_author but the locked
-        // state is fresh — delete→recreate race): leave it empty rather than
-        // build one here (git under the flock, #1617); the next poll resolves.
-        // -18577-7 (c): while the author is unresolvable this block re-runs on
-        // every poll; the resolver warns once per PR and the populate line is
-        // logged only when an author actually lands.
-        state.pr_author = author_index
-            .and_then(|index| {
-                gh_poll::resolve_author_logged_once(index, Some(&meta.author_login), state)
-            })
-            .unwrap_or_default();
-        if !state.pr_author.is_empty() {
-            tracing::info!(
-                repo = %state.repo,
-                branch = %state.branch,
-                pr_number = state.pr_number,
-                pr_author = %state.pr_author,
-                "#986 pr_state: first-observation populated PR identity"
-            );
+        if let Some(index) = author_index {
+            if let Some((name, source)) = gh_poll::resolve_author_logged_once(
+                index,
+                author_evidence,
+                Some(&meta.author_login),
+                state,
+            ) {
+                if super::author_authority::remember_author(state, &name, source) {
+                    tracing::info!(
+                        repo = %state.repo,
+                        branch = %state.branch,
+                        pr_number = state.pr_number,
+                        pr_author = %state.pr_author,
+                        ?source,
+                        "#986 pr_state: first-observation populated PR identity"
+                    );
+                }
+            }
         }
     }
 

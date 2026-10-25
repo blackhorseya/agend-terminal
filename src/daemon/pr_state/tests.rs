@@ -51,6 +51,8 @@ pub(super) fn new_state(head: &str, class: ReviewClass) -> PrState {
         branch: "feat/test".to_string(),
         head_sha: head.to_string(),
         pr_author: "dev".to_string(),
+        // -18577-7 r3: `new_state` models an ALREADY-RESOLVED author.
+        pr_author_source: Some(super::author_authority::AuthorSource::GhLogin),
         subscribers: vec!["dev".to_string()],
         ci_state: CiState::Pending,
         verdict_state: VerdictState::None,
@@ -941,19 +943,6 @@ fn t14_storage_roundtrip() {
     remove(&dir, &s.repo, &s.branch).unwrap();
     assert!(load(&dir, &s.repo, &s.branch).is_none());
     let _ = std::fs::remove_dir_all(&dir);
-}
-
-/// T15: resolve_author chain — explicit pr_author wins, then
-/// subscribers[0], then "fixup-lead" fallback.
-#[test]
-fn t15_resolve_author_chain() {
-    let mut s = new_state("sha-A", ReviewClass::Single);
-    // Default state has pr_author="dev" + subscribers=[dev]
-    assert_eq!(resolve_author(&s), "dev");
-    s.pr_author = String::new();
-    assert_eq!(resolve_author(&s), "dev"); // falls to subscribers[0]
-    s.subscribers.clear();
-    assert_eq!(resolve_author(&s), "fixup-lead"); // last-resort fallback
 }
 
 /// T16: format_ready_body uses pr_number when known, branch otherwise.
@@ -2444,13 +2433,15 @@ fn stale_ineligible_pr_author_is_not_delivered_to() {
             .all(|m| m.kind.as_deref() != Some("pr-merged")),
         "stale, repo-ineligible pr_author must not receive [pr-merged]"
     );
+    // -18577-7 r3 (option A): the subscriber `dev` is NOT inferred as the
+    // author; with the stored author ineligible nothing is sent.
     let msgs = crate::inbox::drain(&home, "dev");
     assert_eq!(
         msgs.iter()
             .filter(|m| m.kind.as_deref() == Some("pr-merged"))
             .count(),
-        1,
-        "eligible subscriber receives it instead"
+        0,
+        "the eligible subscriber is not the author either — nothing is sent"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
@@ -3284,7 +3275,13 @@ fn review_verdict_no_matching_binding_falls_back_to_author_2920() {
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(home.join("inbox")).unwrap();
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+    // -18577-7 r3: the stored author is used only with provenance and only when
+    // eligible for the PR's repo.
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  resolved-author-2919:\n    backend: claude\n    repo: owner/repo-c\n",
+    )
+    .unwrap();
     let repo_a = real_repo_with_github_origin(&root, "repo-a", "owner/repo-a");
     let repo_b = real_repo_with_github_origin(&root, "repo-b", "owner/repo-b");
     let branch = "feat/shared";
@@ -3295,6 +3292,7 @@ fn review_verdict_no_matching_binding_falls_back_to_author_2920() {
     let mut state = new_for_branch("owner/repo-c", branch, &head, ReviewClass::Single);
     state.pr_number = 2920;
     state.pr_author = "resolved-author-2919".into();
+    state.pr_author_source = Some(super::author_authority::AuthorSource::GhLogin);
     save(&home, &state).unwrap();
     let receipt = seed_route_assignment(&home, "owner/repo-c", branch, &head);
 
@@ -3675,13 +3673,9 @@ fn resolve_merge_authority_no_binding_still_routes_2059() {
     s.branch = "feat/released".to_string();
     s.pr_author = "dev-y".to_string();
     s.subscribers = vec!["dev-y".to_string()];
-    // No binding for feat/released → resolve_notify_recipient = author (dev-y);
-    // resolve_merge_authority = orchestrator (lead-y).
-    assert_eq!(
-        resolve_notify_recipient(&home, &s),
-        "dev-y",
-        "control: author-facing falls to author"
-    );
+    // No binding for feat/released: resolve_merge_authority = orchestrator (lead-y)
+    // via the subscribed member (-18577-7 r3 removed the author-facing
+    // subscriber fallback this test used as its control).
     assert_eq!(
         resolve_merge_authority(&home, &s),
         "lead-y",

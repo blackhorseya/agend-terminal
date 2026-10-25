@@ -241,8 +241,13 @@ fn a_foreign_reviewer_watcher_cannot_steer_the_author_notice() {
     };
     save(&home, &s).unwrap();
     scan(&home, vec![]);
+    // `third` may still receive merge-AUTHORITY notices through its reviewer's
+    // subscription; it must not receive the AUTHOR notice.
     for who in ["personal", "third", "third-rev"] {
-        assert!(kinds(&home, who).is_empty(), "{who} must receive nothing");
+        assert!(
+            !kinds(&home, who).iter().any(|k| k == "pr-merged"),
+            "{who} must not receive [pr-merged]"
+        );
     }
     logs_assert(|lines| exactly(lines, "failing closed (no author notice)", 1));
     let _ = std::fs::remove_dir_all(&home);

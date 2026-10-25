@@ -14,6 +14,7 @@
 //!  - log counts use `tracing_test` (per-test scoped), not a thread-local
 //!    `with_default` subscriber, which lost events under parallel tests.
 
+use super::author_authority::AuthorSource;
 use super::gh_poll::{resolve_author_with_gh, AuthorIndex};
 use super::*;
 
@@ -103,12 +104,14 @@ fn reviewer_subscriber_is_not_inferred_as_pr_author() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// Controls: a non-reviewer subscriber is still the tier-3 author, and the
-/// reviewer's subscription still routes merge authority to its orchestrator.
+/// Controls: a non-reviewer BOUND to the branch is the author (r3: subscribers
+/// never are), and the reviewer's subscription still routes merge authority to
+/// its orchestrator.
 #[test]
-fn non_reviewer_subscriber_still_resolves_and_reviewer_still_finds_the_lead() {
+fn bound_non_reviewer_still_resolves_and_reviewer_still_finds_the_lead() {
     let home = home_with_fleet("rev-ctl", TEAM_FLEET);
     let state = state_for("acme/game-goapi", "feat/z", &["lead"]);
+    crate::binding::bind(&home, "lead", "t-z", "feat/z");
     assert_eq!(
         resolve_author_with_gh(&home, Some("someone-else"), &state).as_deref(),
         Some("lead")
@@ -144,14 +147,14 @@ fn unresolvable_recipients_warn_once_per_pr() {
     let home = home_with_fleet("log-once", "instances: {}\n");
     let repo = format!("acme/log-once-{}", uuid::Uuid::new_v4().simple());
     let idx = AuthorIndex::build(&home, &repo);
-    let state = state_for(&repo, "feat/quiet", &[]);
-    let other = state_for(&repo, "feat/other-pr", &[]);
+    let mut state = state_for(&repo, "feat/quiet", &[]);
+    let mut other = state_for(&repo, "feat/other-pr", &[]);
     for _ in 0..3 {
-        assert_eq!(resolve_author_checked(&state, &idx), None);
+        assert_eq!(resolve_author_checked(&mut state, &idx, None).0, None);
         assert_eq!(resolve_merge_authority_checked(&home, &state, &idx), None);
     }
     // Control: a different PR is a different key and still warns.
-    assert_eq!(resolve_author_checked(&other, &idx), None);
+    assert_eq!(resolve_author_checked(&mut other, &idx, None).0, None);
     logs_assert(|lines| {
         exactly(lines, "no instance eligible for this repo", 2)?;
         exactly(lines, "no merge authority eligible", 1)
@@ -167,13 +170,17 @@ fn persisted_reviewer_author_is_not_used() {
     let idx = AuthorIndex::build(&home, "acme/game-goapi");
     let mut state = state_for("acme/game-goapi", "feat/old", &["rev"]);
     state.pr_author = "rev".to_string();
-    assert_eq!(resolve_author_checked(&state, &idx), None);
-    // Control: a persisted non-reviewer author is still used.
+    state.pr_author_source = Some(AuthorSource::GhLogin);
+    assert_eq!(resolve_author_checked(&mut state, &idx, None).0, None);
+    // r3: a persisted non-reviewer is used only WITH provenance …
     state.pr_author = "lead".to_string();
     assert_eq!(
-        resolve_author_checked(&state, &idx).as_deref(),
+        resolve_author_checked(&mut state, &idx, None).0.as_deref(),
         Some("lead")
     );
+    // … a legacy value (no source) is never routed, even when eligible.
+    state.pr_author_source = None;
+    assert_eq!(resolve_author_checked(&mut state, &idx, None).0, None);
     let _ = std::fs::remove_dir_all(&home);
 }
 
@@ -196,28 +203,29 @@ fn author_spanning_two_teams_fails_closed_once() {
     let state = state_for("acme/shared", "feat/amb", &[]);
     for _ in 0..3 {
         assert_eq!(
-            super::gh_poll::resolve_author_logged_once(&idx, Some("shared-bot"), &state),
+            super::gh_poll::resolve_author_logged_once(&idx, None, Some("shared-bot"), &state),
             None,
             "shared login + two owning teams must not pick one by sort order"
         );
     }
-    // tier 3 alone: two eligible subscribers from two teams.
+    // r3: subscribers from both teams do not narrow the login either (option A).
     let subs = state_for("acme/shared", "feat/amb-subs", &["lead-a", "lead-b"]);
     assert_eq!(
-        super::gh_poll::resolve_author_logged_once(&idx, Some("nobody"), &subs),
+        super::gh_poll::resolve_author_logged_once(&idx, None, Some("shared-bot"), &subs),
         None
     );
     logs_assert(|lines| exactly(lines, "more than one team", 2));
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// Controls: the PR's own subscriber narrows the shared-login hits to one
-/// team; a single owning team is unaffected.
+/// Controls: the branch's binding identifies the author among the shared-login
+/// hits (r3: the subscriber no longer does); a single owning team is unaffected.
 #[test]
-fn subscriber_disambiguates_and_single_team_is_unaffected() {
+fn binding_disambiguates_and_single_team_is_unaffected() {
     let home = home_with_fleet("two-teams-ctl", SHARED_FLEET);
     let idx = AuthorIndex::build(&home, "acme/shared");
     let state = state_for("acme/shared", "feat/sub", &["lead-b"]);
+    crate::binding::bind(&home, "lead-b", "t-sub", "feat/sub");
     assert_eq!(
         resolve_author_with_gh(&home, Some("shared-bot"), &state).as_deref(),
         Some("lead-b")
@@ -233,9 +241,10 @@ fn subscriber_disambiguates_and_single_team_is_unaffected() {
 
 /// The live agend-terminal shape: `personal` owns the repo by instance
 /// `repo`, `third` by its team's `source_repo`, both with the shared login.
-/// Today's subscriber-driven route to `personal` must survive.
+/// The author is the instance bound to the branch (r3), with `third` also
+/// subscribed as the CI watcher.
 #[test]
-fn live_shape_routes_to_the_subscribed_instance() {
+fn live_shape_routes_to_the_bound_instance() {
     let home = home_with_fleet(
         "live-shape",
         "instances:\n  \
@@ -245,7 +254,8 @@ fn live_shape_routes_to_the_subscribed_instance() {
          teams:\n  p:\n    orchestrator: personal\n    members: [personal]\n  \
          t:\n    orchestrator: third\n    members: [third, rev3]\n    source_repo: acme/term\n",
     );
-    let state = state_for("acme/term", "fix/x", &["personal"]);
+    let state = state_for("acme/term", "fix/x", &["personal", "third"]);
+    crate::binding::bind(&home, "personal", "t-x", "fix/x");
     assert_eq!(
         resolve_author_with_gh(&home, Some("shared-bot"), &state).as_deref(),
         Some("personal")
@@ -262,11 +272,11 @@ fn removing_pr_state_evicts_the_once_key() {
     let home = home_with_fleet("evict", "instances: {}\n");
     let repo = format!("acme/evict-{}", uuid::Uuid::new_v4().simple());
     let idx = AuthorIndex::build(&home, &repo);
-    let state = state_for(&repo, "feat/gone", &[]);
-    assert_eq!(resolve_author_checked(&state, &idx), None);
-    assert_eq!(resolve_author_checked(&state, &idx), None);
+    let mut state = state_for(&repo, "feat/gone", &[]);
+    assert_eq!(resolve_author_checked(&mut state, &idx, None).0, None);
+    assert_eq!(resolve_author_checked(&mut state, &idx, None).0, None);
     remove(&home, &repo, "feat/gone").unwrap();
-    assert_eq!(resolve_author_checked(&state, &idx), None);
+    assert_eq!(resolve_author_checked(&mut state, &idx, None).0, None);
     logs_assert(|lines| exactly(lines, "no instance eligible for this repo", 2));
     let _ = std::fs::remove_dir_all(&home);
 }

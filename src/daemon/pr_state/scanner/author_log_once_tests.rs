@@ -56,7 +56,7 @@ fn unresolvable_author_logs_once_across_polls() {
     state.subscribers.clear();
     let prs = vec![meta("deps/bump")];
     for _ in 0..5 {
-        apply_gh_observations(&mut state, &prs, "2026-10-25T00:00:00Z", Some(&idx));
+        apply_gh_observations(&mut state, &prs, "2026-10-25T00:00:00Z", Some(&idx), None);
     }
     assert!(state.pr_author.is_empty(), "nothing is eligible");
     assert_eq!(state.pr_number, 9);
@@ -80,10 +80,10 @@ fn author_resolving_later_is_still_logged() {
     let mut state = new_for_branch(&repo, "feat/late", "sha-A", ReviewClass::Single);
     let prs = vec![meta("feat/late")];
     let idx = AuthorIndex::build(&empty, &repo);
-    apply_gh_observations(&mut state, &prs, "t0", Some(&idx));
-    apply_gh_observations(&mut state, &prs, "t1", Some(&idx));
+    apply_gh_observations(&mut state, &prs, "t0", Some(&idx), None);
+    apply_gh_observations(&mut state, &prs, "t1", Some(&idx), None);
     let idx = AuthorIndex::build(&named, &repo);
-    apply_gh_observations(&mut state, &prs, "t2", Some(&idx));
+    apply_gh_observations(&mut state, &prs, "t2", Some(&idx), None);
     assert_eq!(state.pr_author, "dev");
     logs_assert(|lines| {
         exactly(lines, "first-observation populated", 1)?;
@@ -108,7 +108,7 @@ fn persisted_reviewer_author_is_re_resolved_on_poll() {
     let mut state = new_for_branch(&repo, "feat/rev", "sha-A", ReviewClass::Single);
     state.subscribers = vec!["rev".to_string()];
     state.pr_author = "rev".to_string();
-    apply_gh_observations(&mut state, &[meta("feat/rev")], "t0", Some(&idx));
+    apply_gh_observations(&mut state, &[meta("feat/rev")], "t0", Some(&idx), None);
     assert_eq!(state.pr_author, "lead");
     let _ = std::fs::remove_dir_all(&home);
 }
