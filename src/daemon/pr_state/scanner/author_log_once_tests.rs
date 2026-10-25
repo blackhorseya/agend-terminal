@@ -9,36 +9,16 @@ use super::super::gh_poll::{AuthorIndex, GhPrMetadata, GhPrState};
 use super::super::{new_for_branch, ReviewClass};
 use super::apply_gh_observations;
 
-fn capture_logs<F: FnOnce()>(f: F) -> String {
-    use std::io::Write;
-    use std::sync::{Arc, Mutex};
-    #[derive(Clone)]
-    struct Buf(Arc<Mutex<Vec<u8>>>);
-    impl Write for Buf {
-        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(b);
-            Ok(b.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
+fn exactly(lines: &[&str], needle: &str, want: usize) -> Result<(), String> {
+    let got = lines.iter().filter(|l| l.contains(needle)).count();
+    if got == want {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{needle}`: {got} lines, want {want}\n{}",
+            lines.join("\n")
+        ))
     }
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Buf {
-        type Writer = Buf;
-        fn make_writer(&'a self) -> Buf {
-            self.clone()
-        }
-    }
-    let buf = Arc::new(Mutex::new(Vec::new()));
-    let sub = tracing_subscriber::fmt()
-        .with_writer(Buf(buf.clone()))
-        .with_max_level(tracing::Level::TRACE)
-        .with_ansi(false)
-        .without_time()
-        .finish();
-    tracing::subscriber::with_default(sub, f);
-    let bytes = buf.lock().unwrap().clone();
-    String::from_utf8(bytes).unwrap()
 }
 
 fn meta(branch: &str) -> GhPrMetadata {
@@ -67,6 +47,7 @@ fn home_with_fleet(yaml: &str) -> std::path::PathBuf {
 }
 
 #[test]
+#[tracing_test::traced_test]
 fn unresolvable_author_logs_once_across_polls() {
     let home = home_with_fleet("instances: {}\n");
     let repo = format!("acme/scan-once-{}", uuid::Uuid::new_v4().simple());
@@ -74,28 +55,22 @@ fn unresolvable_author_logs_once_across_polls() {
     let mut state = new_for_branch(&repo, "deps/bump", "sha-A", ReviewClass::Single);
     state.subscribers.clear();
     let prs = vec![meta("deps/bump")];
-    let logs = capture_logs(|| {
-        for _ in 0..5 {
-            apply_gh_observations(&mut state, &prs, "2026-10-25T00:00:00Z", Some(&idx));
-        }
-    });
+    for _ in 0..5 {
+        apply_gh_observations(&mut state, &prs, "2026-10-25T00:00:00Z", Some(&idx));
+    }
     assert!(state.pr_author.is_empty(), "nothing is eligible");
     assert_eq!(state.pr_number, 9);
-    assert_eq!(
-        logs.matches("no instance eligible for this repo").count(),
-        1,
-        "{logs}"
-    );
-    assert!(
-        logs.matches("first-observation populated").count() <= 1,
-        "{logs}"
-    );
+    logs_assert(|lines| {
+        exactly(lines, "no instance eligible for this repo", 1)?;
+        exactly(lines, "first-observation populated", 0)
+    });
     let _ = std::fs::remove_dir_all(&home);
 }
 
 /// Control: once the fleet gives the author an identity, the next poll
 /// resolves and logs the populate line (the once-gate does not swallow it).
 #[test]
+#[tracing_test::traced_test]
 fn author_resolving_later_is_still_logged() {
     let repo = format!("acme/scan-later-{}", uuid::Uuid::new_v4().simple());
     let empty = home_with_fleet("instances: {}\n");
@@ -104,19 +79,36 @@ fn author_resolving_later_is_still_logged() {
     ));
     let mut state = new_for_branch(&repo, "feat/late", "sha-A", ReviewClass::Single);
     let prs = vec![meta("feat/late")];
-    let logs = capture_logs(|| {
-        let idx = AuthorIndex::build(&empty, &repo);
-        apply_gh_observations(&mut state, &prs, "t0", Some(&idx));
-        apply_gh_observations(&mut state, &prs, "t1", Some(&idx));
-        let idx = AuthorIndex::build(&named, &repo);
-        apply_gh_observations(&mut state, &prs, "t2", Some(&idx));
-    });
+    let idx = AuthorIndex::build(&empty, &repo);
+    apply_gh_observations(&mut state, &prs, "t0", Some(&idx));
+    apply_gh_observations(&mut state, &prs, "t1", Some(&idx));
+    let idx = AuthorIndex::build(&named, &repo);
+    apply_gh_observations(&mut state, &prs, "t2", Some(&idx));
     assert_eq!(state.pr_author, "dev");
-    assert!(
-        logs.lines()
-            .any(|l| l.contains("first-observation populated") && l.contains("pr_author=dev")),
-        "{logs}"
-    );
+    logs_assert(|lines| {
+        exactly(lines, "first-observation populated", 1)?;
+        exactly(lines, "pr_author=dev", 1)
+    });
     let _ = std::fs::remove_dir_all(&empty);
     let _ = std::fs::remove_dir_all(&named);
+}
+
+/// r2 P1-1: a reviewer persisted as `pr_author` by the old tier-3 guess is
+/// re-resolved on the next poll from the live gh login, not kept forever.
+#[test]
+fn persisted_reviewer_author_is_re_resolved_on_poll() {
+    let repo = format!("acme/scan-rev-{}", uuid::Uuid::new_v4().simple());
+    let home = home_with_fleet(&format!(
+        "instances:\n  \
+         lead:\n    backend: claude\n    github_login: shared-bot\n  \
+         rev:\n    backend: codex\n    role_kind: reviewer\n\
+         teams:\n  g:\n    orchestrator: lead\n    members: [lead, rev]\n    source_repo: {repo}\n"
+    ));
+    let idx = AuthorIndex::build(&home, &repo);
+    let mut state = new_for_branch(&repo, "feat/rev", "sha-A", ReviewClass::Single);
+    state.subscribers = vec!["rev".to_string()];
+    state.pr_author = "rev".to_string();
+    apply_gh_observations(&mut state, &[meta("feat/rev")], "t0", Some(&idx));
+    assert_eq!(state.pr_author, "lead");
+    let _ = std::fs::remove_dir_all(&home);
 }
