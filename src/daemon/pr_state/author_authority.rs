@@ -191,6 +191,12 @@ pub(crate) fn needs_author(state: &PrState) -> bool {
 /// The persisted `pr_author`, if it was written by an r3 resolver (has a
 /// source) and is still an eligible non-reviewer. Legacy values (no source)
 /// and reviewers are never trusted.
+///
+/// r5: the stored value only stands in for records that are GONE (an
+/// assignment retired at verdict, a released binding). When `evidence` is
+/// given, live evidence from the same or a higher tier than the stored
+/// source — including an unreadable assignment — overrides it, and the
+/// caller re-resolves from the live records.
 pub(crate) fn trusted_stored_author(
     state: &PrState,
     index: &AuthorIndex,
@@ -216,7 +222,29 @@ pub(crate) fn trusted_stored_author(
     if verdict_reviewers(state).any(|r| r == name) {
         return None;
     }
+    if let (Some(e), Some(stored)) = (evidence, state.pr_author_source) {
+        let live_rank = match e.resolve(index, state) {
+            Authoritative::Resolved(_, source) | Authoritative::Conflict(source, _) => {
+                Some(tier_rank(source))
+            }
+            Authoritative::Unreadable => Some(tier_rank(AuthorSource::ReviewAssignment)),
+            Authoritative::None => None,
+        };
+        if live_rank.is_some_and(|live| live <= tier_rank(stored)) {
+            return None;
+        }
+    }
     Some(state.pr_author.clone())
+}
+
+/// Priority of an author source; lower is stronger.
+fn tier_rank(source: AuthorSource) -> u8 {
+    match source {
+        AuthorSource::ReviewAssignment => 0,
+        AuthorSource::Binding => 1,
+        AuthorSource::TaskAssignee => 2,
+        AuthorSource::GhLogin => 3,
+    }
 }
 
 /// Persist `name`/`source` as the PR author. Returns true when the state
