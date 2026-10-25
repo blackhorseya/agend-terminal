@@ -952,3 +952,67 @@ fn r6_control_reviewer_retired_on_an_earlier_pr_can_author_this_one() {
     assert_eq!(kinds(&home, "third"), vec!["pr-merged"]);
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn reviewer_attack_corrupt_retired_targets_cannot_route_notice_to_reviewer() {
+    let home = home_with_fleet("corrupt-retired-targets", TWO_TEAM_FLEET);
+    let branch = "feat/corrupt-retired-targets";
+    retired_review(&home, branch, "third", 15);
+    let dir =
+        crate::daemon::assignment_authority::record_path_for_test(&home, REPO, branch, "third");
+    std::fs::write(
+        dir.parent().unwrap().join("retired_review_targets.json"),
+        b"{",
+    )
+    .unwrap();
+    crate::binding::bind(&home, "third", "t-review-worktree", branch);
+    save(&home, &merged_state(branch, &[], "")).unwrap();
+    scan(&home, vec![]);
+    assert!(
+        kinds(&home, "third").is_empty(),
+        "corrupt reviewer exclusion routed an author notice to retired reviewer"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn reviewer_attack_legacy_terminal_ledger_cannot_route_notice_to_same_pr_reviewer() {
+    let home = home_with_fleet("legacy-terminal-ledger", TWO_TEAM_FLEET);
+    let branch = "feat/legacy-terminal-ledger";
+    let dir =
+        crate::daemon::assignment_authority::record_path_for_test(&home, REPO, branch, "third");
+    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    std::fs::write(
+        dir.parent().unwrap().join("terminal_retirements.json"),
+        br#"[{"board":"old","task_id":"t-pr15","instance":"third","seq":1}]"#,
+    )
+    .unwrap();
+    crate::binding::bind(&home, "third", "t-review-worktree", branch);
+    save(&home, &merged_state(branch, &[], "")).unwrap();
+    scan(&home, vec![]);
+    assert!(
+        kinds(&home, "third").is_empty(),
+        "legacy reviewer exclusion routed an author notice to retired reviewer"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// r7: a later retirement must not rewrite an unreadable exclusion ledger from
+/// an empty set (that would erase the earlier exclusions).
+#[test]
+fn reviewer_attack_corrupt_retired_targets_are_not_erased_by_a_later_retirement() {
+    let home = home_with_fleet("corrupt-retired-targets-erase", TWO_TEAM_FLEET);
+    let branch = "feat/corrupt-retired-targets-erase";
+    retired_review(&home, branch, "third", 15);
+    let dir =
+        crate::daemon::assignment_authority::record_path_for_test(&home, REPO, branch, "third");
+    let ledger = dir.parent().unwrap().join("retired_review_targets.json");
+    std::fs::write(&ledger, b"{").unwrap();
+    retired_review(&home, branch, "other-rev", 15);
+    assert_eq!(
+        std::fs::read(&ledger).unwrap(),
+        b"{".to_vec(),
+        "an unreadable ledger was rewritten and its earlier exclusions erased"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
