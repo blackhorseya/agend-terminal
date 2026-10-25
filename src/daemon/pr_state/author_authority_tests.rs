@@ -1164,3 +1164,57 @@ fn reviewer_exclusion_at_binding_tier_does_not_fall_to_the_task_tier() {
     assert!(kinds(&home, "personal").is_empty());
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ---------------------------------------------------------------------------
+// -18577-7 r8 (Sean B+C, d-20261025043449453835-12): no legacy migration. A
+// branch whose only retirement record is the pre-r6 ledger (no PR number)
+// fails closed as a whole until the first new retirement writes the
+// generation-tagged ledger; from then on only the new ledger counts.
+// ---------------------------------------------------------------------------
+
+fn legacy_ledger(home: &std::path::Path, branch: &str, instances: &[&str]) {
+    let dir = crate::daemon::assignment_authority::record_path_for_test(home, REPO, branch, "x");
+    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    let rows: Vec<String> = instances
+        .iter()
+        .enumerate()
+        .map(|(i, n)| format!(r#"{{"board":"old","task_id":"t-{i}","instance":"{n}","seq":1}}"#))
+        .collect();
+    std::fs::write(
+        dir.parent().unwrap().join("terminal_retirements.json"),
+        format!("[{}]", rows.join(",")),
+    )
+    .unwrap();
+}
+
+#[test]
+fn legacy_ledger_without_new_ledger_fails_the_whole_branch_closed() {
+    let home = home_with_fleet("legacy-only-branch", TWO_TEAM_FLEET);
+    let branch = "feat/legacy-only-branch";
+    legacy_ledger(&home, branch, &["operator"]);
+    crate::binding::bind(&home, "personal", "t-author", branch);
+    save(&home, &merged_state(branch, &["personal"], "")).unwrap();
+    scan(&home, vec![]);
+    assert!(
+        kinds(&home, "personal").is_empty(),
+        "a branch with only the pre-r6 ledger must fail closed, not exclude by name"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn first_new_retirement_restores_author_notices_on_a_legacy_branch() {
+    let home = home_with_fleet("legacy-branch-restored", TWO_TEAM_FLEET);
+    let branch = "feat/legacy-branch-restored";
+    legacy_ledger(&home, branch, &["third"]);
+    retired_review(&home, branch, "other-rev", 15);
+    crate::binding::bind(&home, "third", "t-author", branch);
+    save(&home, &merged_state(branch, &["third"], "")).unwrap();
+    scan(&home, vec![]);
+    assert_eq!(
+        kinds(&home, "third"),
+        vec!["pr-merged"],
+        "once the new ledger exists the legacy rows no longer count"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
