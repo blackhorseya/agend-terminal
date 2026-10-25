@@ -698,7 +698,7 @@ pub(crate) fn list_active(home: &Path, repo: &str, branch: &str) -> Vec<ActiveAs
 /// from [`read_record`] propagates instead of silently dropping the record. The
 /// SOLE reader for the merge-gate-affecting reserved derivation (B4) — a corrupt
 /// record must NEVER be read as "no reservation".
-fn list_active_checked(
+pub(crate) fn list_active_checked(
     home: &Path,
     repo: &str,
     branch: &str,

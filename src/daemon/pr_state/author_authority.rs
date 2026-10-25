@@ -51,13 +51,18 @@ pub(crate) enum AuthorSource {
 pub(crate) struct AuthorEvidence {
     repo: String,
     branch: String,
-    /// `review_author = Agent(..)` of the active typed assignments.
-    assignment_authors: Vec<String>,
+    /// `review_author = Agent(..)` of the active typed assignments, with the
+    /// PR generation (`pr_number`) each one was dispatched for.
+    assignment_authors: Vec<(String, u64)>,
+    /// r4: an assignment record exists but cannot be read. A higher tier that
+    /// cannot be read is not absent: the chain fails closed.
+    assignments_unreadable: bool,
     /// Assignment targets (active + terminal-retired): reviewers of this PR.
     reviewer_targets: Vec<String>,
     /// Agents bound to the branch (repo-matched first, legacy branch-only after).
     bound_agents: Vec<String>,
-    /// Owners of tasks that carry the branch (any board, not cancelled/superseded).
+    /// Owners of live tasks that carry the branch (any board; done, cancelled
+    /// and superseded tasks belong to an earlier PR generation).
     task_assignees: Vec<String>,
 }
 
@@ -69,33 +74,36 @@ pub(crate) enum Authoritative {
     Conflict(AuthorSource, Vec<String>),
     /// No tier named anyone.
     None,
+    /// r4: the assignment records could not be read.
+    Unreadable,
 }
 
 impl AuthorEvidence {
-    /// Gather the records for `repo`/`branch`. `assignments` are the active
-    /// typed assignments the caller already listed (scanner) or `None` to list
-    /// them here. May run `git remote get-url` for a binding's local
-    /// `source_repo` — never call under the pr-state flock (#1617).
-    pub(crate) fn gather(
-        home: &Path,
-        repo: &str,
-        branch: &str,
-        assignments: Option<&[crate::daemon::assignment_authority::ActiveAssignment]>,
-    ) -> Self {
-        let listed;
-        let assignments = match assignments {
-            Some(a) => a,
-            None => {
-                listed = crate::daemon::assignment_authority::list_active(home, repo, branch);
-                listed.as_slice()
-            }
-        };
-        let mut assignment_authors = Vec::new();
+    /// Gather the records for `repo`/`branch`. Assignments are read with the
+    /// corruption-aware reader (r4 P1-1). May run `git remote get-url` for a
+    /// binding's local `source_repo` — never call under the pr-state flock
+    /// (#1617).
+    pub(crate) fn gather(home: &Path, repo: &str, branch: &str) -> Self {
+        let (assignments, assignments_unreadable) =
+            match crate::daemon::assignment_authority::list_active_checked(home, repo, branch) {
+                Ok(a) => (a, false),
+                Err(e) => {
+                    tracing::debug!(%repo, %branch, error = %e, "author evidence: unreadable assignment");
+                    (Vec::new(), true)
+                }
+            };
+        let mut assignment_authors: Vec<(String, u64)> = Vec::new();
         let mut reviewer_targets = Vec::new();
-        for a in assignments {
+        for a in &assignments {
             push_unique(&mut reviewer_targets, &a.target);
             if let crate::mcp::handlers::comms_gates::ReviewAuthor::Agent(name) = &a.review_author {
-                push_unique(&mut assignment_authors, name);
+                if !name.is_empty()
+                    && !assignment_authors
+                        .iter()
+                        .any(|(n, p)| n == name && *p == a.pr_number)
+                {
+                    assignment_authors.push((name.clone(), a.pr_number));
+                }
             }
         }
         for retired in
@@ -109,6 +117,7 @@ impl AuthorEvidence {
             repo: repo.to_string(),
             branch: branch.to_string(),
             assignment_authors,
+            assignments_unreadable,
             reviewer_targets,
             bound_agents,
             task_assignees,
@@ -131,18 +140,31 @@ impl AuthorEvidence {
 
     /// Run the three authoritative tiers against the fleet eligibility `index`.
     pub(crate) fn resolve(&self, index: &AuthorIndex, state: &PrState) -> Authoritative {
+        if self.assignments_unreadable {
+            return Authoritative::Unreadable;
+        }
+        // r4 P1-3: only assignments dispatched for THIS PR generation. A state
+        // without a PR number cannot prove the generation, so the tier is
+        // skipped (assignments are persisted only with a nonzero pr_number).
+        let current_assignment_authors: Vec<String> = self
+            .assignment_authors
+            .iter()
+            .filter(|(_, pr)| state.pr_number != 0 && *pr == state.pr_number)
+            .map(|(n, _)| n.clone())
+            .collect();
         let tiers: [(AuthorSource, &[String]); 3] = [
-            (AuthorSource::ReviewAssignment, &self.assignment_authors),
+            (AuthorSource::ReviewAssignment, &current_assignment_authors),
             (AuthorSource::Binding, &self.bound_agents),
             (AuthorSource::TaskAssignee, &self.task_assignees),
         ];
         for (source, names) in tiers {
-            // A typed assignment is keyed by this repo+branch and a binding
-            // carries the repo itself (or is a legacy branch-only binding, as
-            // before), so neither needs the fleet-eligibility gate. A task
-            // carries only the branch name, so its assignee must be eligible
-            // for the repo (the same branch name may exist on another board).
-            let require_eligible = matches!(source, AuthorSource::TaskAssignee);
+            // A typed assignment is keyed by repo+branch+PR number and its
+            // `review_author` is set by the owning team's orchestrator, so it
+            // needs no fleet-eligibility gate. A binding and a task can belong
+            // to an agent borrowed from another repo (r4 P1-2: a reviewer with
+            // a `repo` override is invisible to the reviewer predicate), so
+            // their names must be eligible for this repo.
+            let require_eligible = !matches!(source, AuthorSource::ReviewAssignment);
             let mut candidates: Vec<String> = Vec::new();
             for n in names {
                 if (!require_eligible || index.is_eligible(n)) && !self.is_reviewer(index, state, n)
@@ -179,6 +201,13 @@ pub(crate) fn trusted_stored_author(
     }
     let name = state.pr_author.as_str();
     if !index.is_eligible(name) || index.is_reviewer(name) {
+        return None;
+    }
+    // r4 P1-4 (d-20261025014213077350-7): a gh-login author holds only while
+    // the login still maps to exactly one team.
+    if state.pr_author_source == Some(AuthorSource::GhLogin)
+        && !index.login_author_still_unique(name)
+    {
         return None;
     }
     if evidence.is_some_and(|e| e.is_reviewer(index, state, name)) {
@@ -261,8 +290,9 @@ pub(crate) fn bound_agents_on_branch(home: &Path, repo: &str, branch: &str) -> V
     }
 }
 
-/// Owners of tasks (every board) whose `branch` is this branch and that were
-/// not cancelled or superseded.
+/// Owners of live tasks (every board) whose `branch` is this branch. Done,
+/// cancelled and superseded tasks are excluded: on a reused branch they
+/// belong to an earlier PR (r4 P1-3).
 fn task_assignees_on_branch(home: &Path, branch: &str) -> Vec<String> {
     use crate::task_events::TaskStatus;
     let mut out = Vec::new();
@@ -271,7 +301,10 @@ fn task_assignees_on_branch(home: &Path, branch: &str) -> Vec<String> {
     };
     for task in tasks {
         if task.branch.as_deref() != Some(branch)
-            || matches!(task.status, TaskStatus::Cancelled | TaskStatus::Superseded)
+            || matches!(
+                task.status,
+                TaskStatus::Done | TaskStatus::Cancelled | TaskStatus::Superseded
+            )
         {
             continue;
         }

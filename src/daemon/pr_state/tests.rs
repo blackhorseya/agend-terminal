@@ -3049,7 +3049,13 @@ fn verdict_home(tag: &str) -> std::path::PathBuf {
     let home = std::env::temp_dir().join(format!("agend-verdict-{}-{}", tag, std::process::id()));
     let _ = std::fs::remove_dir_all(&home);
     std::fs::create_dir_all(&home).unwrap();
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+    // -18577-7 r4: a bound agent is the author only when it is eligible for
+    // the repo, so the verdict fixtures' implementer owns `owner/repo`.
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  dev-x:\n    backend: claude\n    repo: owner/repo\n",
+    )
+    .unwrap();
     home
 }
 
@@ -3241,7 +3247,12 @@ fn review_verdict_routes_same_branch_by_binding_repo_2920() {
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(home.join("inbox")).unwrap();
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  repo-a-holder:\n    backend: claude\n    repo: owner/repo-a\n  \
+         repo-b-holder:\n    backend: claude\n    repo: owner/repo-b\n",
+    )
+    .unwrap();
     let repo_a = real_repo_with_github_origin(&root, "repo-a", "owner/repo-a");
     let repo_b = real_repo_with_github_origin(&root, "repo-b", "owner/repo-b");
     let branch = "feat/shared";
@@ -3316,7 +3327,11 @@ fn review_verdict_routes_legacy_binding_without_source_repo_2920() {
     let home = root.join("home");
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(home.join("inbox")).unwrap();
-    std::fs::write(crate::fleet::fleet_yaml_path(&home), "instances: {}\n").unwrap();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "instances:\n  legacy-holder:\n    backend: claude\n    repo: owner/repo\n",
+    )
+    .unwrap();
     let branch = "feat/legacy-shared";
     bind_route_agent(&home, "legacy-holder", branch, None);
 

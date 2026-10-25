@@ -1820,7 +1820,7 @@ pub(crate) fn record_validated_receipt(
     // git-origin subprocess).
     let author_index = gh_poll::AuthorIndex::build(home, &summary.repo);
     let author_evidence =
-        author_authority::AuthorEvidence::gather(home, &summary.repo, &summary.branch, None);
+        author_authority::AuthorEvidence::gather(home, &summary.repo, &summary.branch);
     // Keep the same assignment-OUTER / pr_state-INNER lock order used by the
     // CI drain. Authorization at the API sink precedes inbox delivery; a revoke
     // may race after that check. Re-acquire the exact subject's assignment lock
@@ -2003,7 +2003,7 @@ pub(crate) fn record_verdict(
         let label = verdict_label(&kind);
         // -18577-7 r3: index + authoritative records before the flock.
         let author_index = gh_poll::AuthorIndex::build(home, &repo);
-        let author_evidence = author_authority::AuthorEvidence::gather(home, &repo, &branch, None);
+        let author_evidence = author_authority::AuthorEvidence::gather(home, &repo, &branch);
         // #2 (t-verdict-to-author-routing): capture the verdict notification under
         // the flock, enqueue it AFTER `with_pr_state` returns (self-IPC safety —
         // mirrors the scanner's #1629 deferred-emit pattern).

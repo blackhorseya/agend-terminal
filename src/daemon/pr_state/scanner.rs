@@ -353,7 +353,7 @@ pub fn scan_and_emit_with(
         // flock like the index — a binding's local source_repo may run git.
         let author_evidence = author_index
             .is_some()
-            .then(|| super::author_authority::AuthorEvidence::gather(home, &repo, &branch, None));
+            .then(|| super::author_authority::AuthorEvidence::gather(home, &repo, &branch));
         // Under the flock: the pre-built index is used only if fleet.yaml is
         // byte-identical to what it was built from (plain read, NO git). No
         // index (locked state diverged from the snapshot) or a changed
@@ -1352,9 +1352,7 @@ fn apply_gh_poll(home: &Path, dir: &Path, poller: &dyn gh_poll::GhPoller) {
                     // -18577-7 r3: the branch's authoritative records, before the flock.
                     let author_evidence = (author_index.is_some()
                         && super::author_authority::needs_author(&state))
-                    .then(|| {
-                        super::author_authority::AuthorEvidence::gather(home, &repo, &branch, None)
-                    });
+                    .then(|| super::author_authority::AuthorEvidence::gather(home, &repo, &branch));
                     if let Err(e) = with_pr_state(home, &repo, &branch, |s| {
                         apply_gh_observations(
                             s,

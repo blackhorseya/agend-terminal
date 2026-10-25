@@ -410,7 +410,7 @@ pub(crate) fn resolve_author_with_gh(
     state: &super::PrState,
 ) -> Option<String> {
     let index = AuthorIndex::build(home, &state.repo);
-    let evidence = AuthorEvidence::gather(home, &state.repo, &state.branch, None);
+    let evidence = AuthorEvidence::gather(home, &state.repo, &state.branch);
     resolve_author_with_index(&index, Some(&evidence), gh_author, state).map(|(name, _)| name)
 }
 
@@ -463,6 +463,8 @@ pub(crate) enum AuthorOutcome {
     Ambiguous(Vec<String>),
     /// An authoritative tier names more than one author.
     Conflict(AuthorSource, Vec<String>),
+    /// r4: an assignment record exists but cannot be read.
+    Unreadable,
 }
 
 /// The chain without logging (d-20261025004632404221-3, option A):
@@ -486,6 +488,7 @@ fn resolve_author_outcome(
             Authoritative::Conflict(source, names) => {
                 return AuthorOutcome::Conflict(source, names)
             }
+            Authoritative::Unreadable => return AuthorOutcome::Unreadable,
             Authoritative::None => {}
         }
     }
@@ -617,6 +620,16 @@ fn warn_unresolved_author(
             );
             return;
         }
+        AuthorOutcome::Unreadable => {
+            tracing::warn!(
+                repo = %state.repo,
+                branch = %state.branch,
+                gh_author = ?gh_author,
+                "pr_state author resolution: a review assignment record for this branch \
+                 cannot be read — failing closed (no author notice)"
+            );
+            return;
+        }
         AuthorOutcome::Resolved(..) | AuthorOutcome::NoneEligible => {}
     }
     // Reviewer MANDATORY: warn-log so the operator sees the chain fail closed.
@@ -730,6 +743,31 @@ impl AuthorIndex {
         self.eligible
             .iter()
             .any(|c| c.name == name && c.is_reviewer)
+    }
+
+    /// r4 P1-4: a stored gh-login author `name` is still the only team's
+    /// match for its `github_login`. An instance without a `github_login` was
+    /// matched by instance name, which is unique by construction.
+    pub(crate) fn login_author_still_unique(&self, name: &str) -> bool {
+        let Some(login) = self
+            .eligible
+            .iter()
+            .find(|c| c.name == name)
+            .and_then(|c| c.github_login.as_deref())
+        else {
+            return true;
+        };
+        let hits: Vec<&AuthorCandidate> = self
+            .eligible
+            .iter()
+            .filter(|c| !c.is_reviewer)
+            .filter(|c| {
+                c.github_login
+                    .as_deref()
+                    .is_some_and(|gl| gl.eq_ignore_ascii_case(login))
+            })
+            .collect();
+        distinct_domains(&hits).len() <= 1
     }
 
     /// Tier 2: eligible non-reviewer instance literally named `gh_login`.
