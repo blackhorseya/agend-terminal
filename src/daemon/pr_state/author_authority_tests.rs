@@ -1065,3 +1065,102 @@ fn r7_control_legacy_rows_survive_a_second_new_retirement() {
     assert!(kinds(&home, "third").is_empty());
     let _ = std::fs::remove_dir_all(&home);
 }
+
+#[test]
+fn reviewer_attack_unknown_legacy_row_cannot_demote_current_typed_author_to_binding() {
+    let home = home_with_fleet("legacy-row-demotes-author", TWO_TEAM_FLEET);
+    let branch = "feat/legacy-row-demotes-author";
+    assign_review(
+        &home,
+        branch,
+        "third-rev",
+        ReviewAuthor::Agent("personal".into()),
+    );
+    let dir =
+        crate::daemon::assignment_authority::record_path_for_test(&home, REPO, branch, "third-rev");
+    std::fs::write(
+        dir.parent().unwrap().join("terminal_retirements.json"),
+        br#"[{"board":"old","task_id":"t-pr14","instance":"personal","seq":1}]"#,
+    )
+    .unwrap();
+    crate::binding::bind(&home, "third", "t-current-binding", branch);
+    save(&home, &merged_state(branch, &["personal", "third"], "")).unwrap();
+    scan(&home, vec![]);
+    let third = kinds(&home, "third");
+    let personal = kinds(&home, "personal");
+    assert!(third.is_empty(),
+        "unknown-generation legacy row demoted the current typed author: personal={personal:?}, third={third:?}");
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// r8: the same demotion through the gh-login tier. `personal` and `third`
+/// share the login inside ONE team (one domain); `personal` ranks first as the
+/// orchestrator. An unknown-generation row naming `personal` must not hand
+/// the author to `third` by dropping `personal` from the login hits.
+#[test]
+fn unknown_legacy_row_cannot_demote_the_login_author_to_another_member() {
+    let home = home_with_fleet(
+        "legacy-row-demotes-login",
+        "instances:\n  \
+         personal:\n    backend: claude\n    role_kind: orchestrator\n    github_login: shared-bot\n  \
+         third:\n    backend: claude\n    github_login: shared-bot\n\
+         teams:\n  personal-hq:\n    orchestrator: personal\n    members: [personal, third]\n    source_repo: acme/tool\n",
+    );
+    let branch = "feat/legacy-row-demotes-login";
+    let dir = crate::daemon::assignment_authority::record_path_for_test(&home, REPO, branch, "x");
+    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    std::fs::write(
+        dir.parent().unwrap().join("terminal_retirements.json"),
+        br#"[{"board":"old","task_id":"t-pr14","instance":"personal","seq":1}]"#,
+    )
+    .unwrap();
+    let mut state = new_for_branch(REPO, branch, &"a".repeat(40), ReviewClass::Single);
+    state.pr_number = 15;
+    save(&home, &state).unwrap();
+    scan(&home, vec![open_meta(branch)]);
+    let loaded = load(&home, REPO, branch).unwrap();
+    assert_ne!(
+        loaded.pr_author, "third",
+        "an unknown-generation row demoted the login author to another member"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// r8 (third's request): an evidence-based reviewer exclusion inside a tier
+/// fails the chain closed even when another candidate of the SAME tier
+/// remains — the excluded one may be the real author.
+#[test]
+fn reviewer_exclusion_inside_a_tier_does_not_hand_the_notice_to_a_peer() {
+    let home = home_with_fleet("legacy-row-same-tier-peer", TWO_TEAM_FLEET);
+    let branch = "feat/legacy-row-same-tier-peer";
+    let dir = crate::daemon::assignment_authority::record_path_for_test(&home, REPO, branch, "x");
+    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    std::fs::write(
+        dir.parent().unwrap().join("terminal_retirements.json"),
+        br#"[{"board":"old","task_id":"t-pr14","instance":"personal","seq":1}]"#,
+    )
+    .unwrap();
+    crate::binding::bind(&home, "personal", "t-author", branch);
+    crate::binding::bind(&home, "third", "t-peer", branch);
+    save(&home, &merged_state(branch, &["personal", "third"], "")).unwrap();
+    scan(&home, vec![]);
+    assert!(kinds(&home, "third").is_empty());
+    assert!(kinds(&home, "personal").is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// r8: every tier — an evidence-excluded candidate at the binding tier does
+/// not let the task tier answer.
+#[test]
+fn reviewer_exclusion_at_binding_tier_does_not_fall_to_the_task_tier() {
+    let home = home_with_fleet("excluded-binding-to-task", TWO_TEAM_FLEET);
+    let branch = "feat/excluded-binding-to-task";
+    retired_review(&home, branch, "personal", 15);
+    crate::binding::bind(&home, "personal", "t-review-worktree", branch);
+    task_on_branch(&home, "t-third-task", "third", branch);
+    save(&home, &merged_state(branch, &["personal", "third"], "")).unwrap();
+    scan(&home, vec![]);
+    assert!(kinds(&home, "third").is_empty());
+    assert!(kinds(&home, "personal").is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
