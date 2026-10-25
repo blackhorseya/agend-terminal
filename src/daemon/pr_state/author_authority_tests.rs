@@ -613,3 +613,126 @@ fn r4_control_assignment_precedes_different_live_binding() {
     assert!(kinds(&home, "third").is_empty());
     let _ = std::fs::remove_dir_all(&home);
 }
+
+// ---------------------------------------------------------------------------
+// -18577-7 r5 — third-hq-1 REJECTED r4 (729ed932, receipt
+// review-receipt:m-20261025021625191313-174): a stored author with
+// provenance was trusted BEFORE the live records were consulted, so a current
+// higher-tier assignment (or an unreadable one) was bypassed. Attack tests
+// taken verbatim from scratch-161/pr15-r4-adversarial-tests.patch; the two
+// `r5_control_*` tests are the reviewer's attacks that r4 already blocks.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn attack_current_typed_assignment_overrides_stored_binding_author() {
+    let home = home_with_fleet("typed-vs-stored-binding-review", TWO_TEAM_FLEET);
+    let branch = "feat/typed-vs-stored-binding-review";
+    assign_review(
+        &home,
+        branch,
+        "third-rev",
+        ReviewAuthor::Agent("third".into()),
+    );
+    let mut state = merged_state(branch, &["personal", "third"], "personal");
+    state.pr_author_source = Some(super::author_authority::AuthorSource::Binding);
+    save(&home, &state).unwrap();
+    scan(&home, vec![]);
+    let personal = kinds(&home, "personal");
+    let third = kinds(&home, "third");
+    assert!(
+        personal.is_empty(),
+        "stored binding author got {personal:?}; current assignment author got {third:?}"
+    );
+    assert_eq!(
+        third,
+        vec!["pr-merged"],
+        "current typed assignment is higher priority than stored binding provenance"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn attack_corrupt_assignment_cannot_reuse_stored_binding_author() {
+    let home = home_with_fleet("corrupt-vs-stored-binding-review", TWO_TEAM_FLEET);
+    let branch = "feat/corrupt-vs-stored-binding-review";
+    assign_review(
+        &home,
+        branch,
+        "third-rev",
+        ReviewAuthor::Agent("third".into()),
+    );
+    let path =
+        crate::daemon::assignment_authority::record_path_for_test(&home, REPO, branch, "third-rev");
+    std::fs::write(path, b"{").unwrap();
+    let mut state = merged_state(branch, &["personal", "third"], "personal");
+    state.pr_author_source = Some(super::author_authority::AuthorSource::Binding);
+    save(&home, &state).unwrap();
+    scan(&home, vec![]);
+    assert!(
+        kinds(&home, "personal").is_empty(),
+        "unreadable authoritative assignment cannot be bypassed by old binding provenance"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn r5_control_one_good_one_corrupt_assignment_fails_closed() {
+    let home = home_with_fleet("mixed-corrupt-assignment-review", TWO_TEAM_FLEET);
+    let branch = "feat/mixed-corrupt-assignment-review";
+    assign_review(
+        &home,
+        branch,
+        "third-rev",
+        ReviewAuthor::Agent("personal".into()),
+    );
+    assign_review(
+        &home,
+        branch,
+        "other-rev",
+        ReviewAuthor::Agent("personal".into()),
+    );
+    let path =
+        crate::daemon::assignment_authority::record_path_for_test(&home, REPO, branch, "other-rev");
+    std::fs::write(path, b"{").unwrap();
+    crate::binding::bind(&home, "third", "t-new-binding", branch);
+    save(&home, &merged_state(branch, &["personal", "third"], "")).unwrap();
+    scan(&home, vec![]);
+    assert!(kinds(&home, "personal").is_empty());
+    assert!(kinds(&home, "third").is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn r5_control_force_push_same_pr_number_keeps_assignment_author() {
+    let home = home_with_fleet("same-pr-force-push-review", TWO_TEAM_FLEET);
+    let branch = "feat/same-pr-force-push-review";
+    assign_review(
+        &home,
+        branch,
+        "third-rev",
+        ReviewAuthor::Agent("personal".into()),
+    );
+    let mut state = merged_state(branch, &["personal", "third"], "");
+    state.head_sha = "c".repeat(40); // the assignment still records head a*40
+    save(&home, &state).unwrap();
+    scan(&home, vec![]);
+    assert_eq!(kinds(&home, "personal"), vec!["pr-merged"]);
+    assert!(kinds(&home, "third").is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Control: a stored author from a HIGHER tier than the live evidence is kept
+/// (the assignment retired at verdict; a later bound agent does not take over).
+#[test]
+fn r5_control_stored_assignment_author_outranks_a_later_binding() {
+    let home = home_with_fleet("stored-assignment-vs-binding", TWO_TEAM_FLEET);
+    let branch = "feat/stored-assignment-vs-binding";
+    crate::binding::bind(&home, "third", "t-later-binding", branch);
+    let mut state = merged_state(branch, &["personal", "third"], "personal");
+    state.pr_author_source = Some(super::author_authority::AuthorSource::ReviewAssignment);
+    save(&home, &state).unwrap();
+    scan(&home, vec![]);
+    assert_eq!(kinds(&home, "personal"), vec!["pr-merged"]);
+    assert!(kinds(&home, "third").is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
