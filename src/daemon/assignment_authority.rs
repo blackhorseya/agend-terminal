@@ -280,7 +280,7 @@ fn terminal_retirements_file(home: &Path, repo: &str, branch: &str) -> PathBuf {
 fn is_metadata_json(path: &Path) -> bool {
     matches!(
         path.file_name().and_then(|name| name.to_str()),
-        Some("markers.json" | "terminal_retirements.json")
+        Some("markers.json" | "terminal_retirements.json" | "retired_review_targets.json")
     )
 }
 
@@ -390,6 +390,127 @@ fn read_terminal_retirements(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Default::default()),
         Err(error) => Err(error.into()),
     }
+}
+
+/// -18577-7 r6: a reviewer whose assignment on this branch was retired by a
+/// terminal task event, with the PR generation it reviewed. The idempotency
+/// ledger (`terminal_retirements.json`) carries no PR number, so the author
+/// exclusion keeps its own record (d-20261025030819687590-11).
+#[derive(Clone, Debug, serde::Deserialize, Eq, Ord, PartialEq, PartialOrd, serde::Serialize)]
+struct RetiredReviewTarget {
+    target: String,
+    pr_number: u64,
+}
+
+fn retired_review_targets_file(home: &Path, repo: &str, branch: &str) -> PathBuf {
+    branch_dir(home, repo, branch).join("retired_review_targets.json")
+}
+
+/// Three-state like [`read_record`]: `Ok(None)` = absent, `Err` = present but
+/// unreadable. An unreadable exclusion ledger is NEVER read as "no reviewer"
+/// (r7 P1-2).
+fn read_retired_review_targets(
+    path: &Path,
+) -> anyhow::Result<Option<std::collections::BTreeSet<RetiredReviewTarget>>> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).map(Some).map_err(|e| {
+            anyhow::anyhow!("corrupt retired reviewer ledger {}: {e}", path.display())
+        }),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(anyhow::anyhow!(
+            "unreadable retired reviewer ledger {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+/// The exclusion rows for a branch (Sean B+C, d-20261025043449453835-12: no
+/// legacy migration). `retired_review_targets.json` is the only source. A
+/// branch that has retirement history only in the pre-r6 ledger (no PR
+/// number) cannot tell its reviewers apart, so it is an error and author
+/// resolution fails closed for the whole branch until the first new
+/// retirement writes the new ledger. A branch with neither file has no
+/// reviewer history.
+fn retired_review_rows(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+) -> anyhow::Result<std::collections::BTreeSet<RetiredReviewTarget>> {
+    if let Some(rows) =
+        read_retired_review_targets(&retired_review_targets_file(home, repo, branch))?
+    {
+        return Ok(rows);
+    }
+    if !read_terminal_retirements(&terminal_retirements_file(home, repo, branch))?.is_empty() {
+        anyhow::bail!(
+            "branch {repo}@{branch} has retirements only in the pre-r6 ledger (no PR number)"
+        );
+    }
+    Ok(Default::default())
+}
+
+/// Record that `record`'s target reviewed `record.pr_number`. Caller holds
+/// the branch lock and writes the pre-r6 ledger only after this returns, so
+/// when the new ledger does not exist yet the pre-r6 ledger holds exactly the
+/// branch's earlier history. If that history is non-empty the new ledger is
+/// never started (d-…-13 (2a)): the branch stays failed closed for good. An
+/// unreadable new ledger is never rewritten (one WARN): the reader keeps
+/// failing closed and earlier rows are not erased (r7 P1-2).
+pub(crate) fn note_retired_review_target(
+    home: &Path,
+    record: &ActiveAssignment,
+) -> std::io::Result<()> {
+    let path = retired_review_targets_file(home, &record.repo, &record.branch);
+    let mut rows = match read_retired_review_targets(&path) {
+        Ok(Some(rows)) => rows,
+        Ok(None) => {
+            let legacy = terminal_retirements_file(home, &record.repo, &record.branch);
+            if read_terminal_retirements(&legacy).map_or(true, |rows| !rows.is_empty()) {
+                tracing::warn!(
+                    repo = %record.repo,
+                    branch = %record.branch,
+                    "branch has pre-r6 retirement history — not starting the retired reviewer \
+                     ledger; author notices for this branch stay failed closed"
+                );
+                return Ok(());
+            }
+            Default::default()
+        }
+        Err(error) => {
+            tracing::warn!(
+                repo = %record.repo,
+                branch = %record.branch,
+                %error,
+                "retired reviewer ledger unreadable — not rewriting it; author notices for \
+                 this branch fail closed until it is repaired"
+            );
+            return Ok(());
+        }
+    };
+    let new_row = rows.insert(RetiredReviewTarget {
+        target: record.target.clone(),
+        pr_number: record.pr_number,
+    });
+    if new_row || !path.exists() {
+        atomic_write_json(&path, &rows)?;
+    }
+    Ok(())
+}
+
+/// -18577-7 r6: `(reviewer, pr_number)` for every assignment on
+/// `repo`/`branch` retired by a terminal task event — a PR's reviewers after
+/// their verdict landed, tagged with the PR generation they reviewed.
+/// `Err` when the new ledger is unreadable or the branch has only pre-r6
+/// retirement history: the caller must fail closed.
+pub(crate) fn retired_review_targets(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+) -> anyhow::Result<Vec<(String, u64)>> {
+    Ok(retired_review_rows(home, repo, branch)?
+        .into_iter()
+        .map(|t| (t.target, t.pr_number))
+        .collect())
 }
 
 /// Read one authority record. Three-state (B4): `Ok(None)` = genuinely ABSENT
@@ -682,7 +803,7 @@ pub(crate) fn list_active(home: &Path, repo: &str, branch: &str) -> Vec<ActiveAs
 /// from [`read_record`] propagates instead of silently dropping the record. The
 /// SOLE reader for the merge-gate-affecting reserved derivation (B4) — a corrupt
 /// record must NEVER be read as "no reservation".
-fn list_active_checked(
+pub(crate) fn list_active_checked(
     home: &Path,
     repo: &str,
     branch: &str,
@@ -1335,6 +1456,7 @@ pub(crate) fn retire_for_terminal_event(
             .filter(|record| record.task_id == task_id)
             .collect::<Vec<_>>();
         for record in records {
+            note_retired_review_target(home, &record)?;
             retired += usize::from(retire_under_lock(
                 home,
                 &repo,
@@ -1432,12 +1554,20 @@ fn retire_operator_settlement_after_preflight(
                 if ledger.contains(&key) {
                     return Ok(());
                 }
+                let mut matched = false;
                 for record in list_active_checked(home, &repo, &branch)? {
                     if record.task_id == task_id {
+                        matched = true;
+                        note_retired_review_target(home, &record)?;
                         // The task is already terminal under its writer lock. Do not
                         // call cancellation, which would re-enter that same lock.
                         retired += usize::from(retire_delivery_under_lock(home, &record, now)?);
                     }
+                }
+                // Like the task-event path, key only branches this event retired
+                // on: a key elsewhere reads as pre-r6 history (d-…-13).
+                if !matched {
+                    return Ok(());
                 }
                 ledger.insert(key.clone());
                 Ok(atomic_write_json(&path, &ledger)?)

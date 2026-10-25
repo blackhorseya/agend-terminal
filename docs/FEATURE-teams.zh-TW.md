@@ -58,8 +58,11 @@ Team 將 agent 組成具名單位，以進行結構化協作。每個 team 都�
 | `created_at` | 建立時間戳 |
 | `source_repo` | Team 的 source repository path |
 | `project_id` | Optional 的 explicit project-board id override |
+| `repos` | Optional，team 在 `source_repo` 之外也負責的 GitHub `owner/repo`（單一或 list），例如 API checkout 旁的 frontend。屬於附加設定，只讓 team 的 instance 有資格收該 repo 的 pr-state 通知（作者／可合併／需 rebase）；worktree、dispatch 與 board 身分仍取自 `source_repo`。直接編輯 `fleet.yaml` 設定，team 改寫時會保留。 |
 | `accept_from` | 可直接傳訊給 orchestrator 的外部 agent name；空值會拒絕 cross-team direct send |
 | `stale_members` | 僅供 view；在 live registry 找不到的 member |
+
+**作者通知送給誰。** fleet 通常共用一個 GitHub login，PR 的 `author.login` 認不出是哪個 agent。daemon 依自己的記錄認定作者，順序為：typed review assignment 的 `review_author`、branch 上的 live binding、帶該 branch、仍在進行中（非 done、cancelled、superseded）的 task 的 assignee。assignment 只對它派發時的 PR number 有效，branch 重用時不會沿用上一個 PR 的作者。binding 的 agent 與 task assignee 必須對該 repo 有資格。同一層必須剛好剩一個有資格的非 reviewer（多個 → 不送）；assignment 記錄讀不了也不送。只有在沒有任何記錄時才用 `github_login`，且只在它仍對應到剛好一個 team 時成立；已存的 login 結果會在 fleet 變動後重新檢查。CI subscriber 不用來認作者；reviewer（`role_kind: reviewer`、assignment 的 target）也永遠不是作者。舊版 daemon 存下的 `pr_author`（沒有 provenance）只供顯示，不會用來送通知。已存的作者只在原記錄已消失時代用，而且只對它當初解析時的 PR number 有效：同層或更高層的 live 記錄、或讀不了的 assignment，都會蓋過它；branch 被新的 PR 重用時會重新解析。同一 branch 上前一個 PR 的 reviewer，不會因此被排除在後一個 PR 的作者之外；已有舊版 daemon 收回紀錄（沒有 PR number）的 branch，永遠不送作者通知。assignment 或 reviewer 收回紀錄讀不了時不送通知；紀錄顯示某個候選人是這個 PR 的 reviewer 時也不送，同層其他人或下一層都不會補位。認不出作者時不送通知，每個 PR 只記一次 WARN。
 
 ## 4. `team action=create`
 
@@ -89,6 +92,7 @@ Team 將 agent 組成具名單位，以進行結構化協作。每個 team 都�
 - `add` 強制執行 one-agent-one-team（不能加入已屬於另一 team 的 member）。
 - 未明確變更時，保留 `repository_path`。
 - 未明確提供時，也保留 `project_id` 與 `accept_from`。
+- `repos`（只存在 fleet.yaml）一律保留。
 - 成功時寫回 `fleet.yaml`。
 
 ## 7. `team action=delete`

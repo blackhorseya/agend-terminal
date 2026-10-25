@@ -396,24 +396,13 @@ pub fn backoff_window(failures: u32) -> Duration {
     Duration::from_secs(shifted).min(BACKOFF_CAP)
 }
 
-// ─── author resolution (4-tier, INVERTED per dev-2 Pushback 2) ─────────
+// ─── author resolution (-18577-7 r3: authoritative records, then login) ───
 
-/// Resolve PR author given gh-poll observation + existing PrState.
-/// Tier order (operator-explicit FIRST):
-///   1. `fleet.yaml github_login` field match for `author.login`
-///   2. `author.login` direct name lookup against fleet.yaml instances
-///   3. first `subscribers` entry (from ci_watch)
-///   4. `"fixup-lead"` final fallback
-///
-/// EVERY tier only yields an instance that is eligible for `state.repo`
-/// (see [`AuthorIndex`]): a subscriber or the fallback with no matching
-/// repo identity is skipped exactly like a tier-1/2 candidate. When no tier
-/// yields an eligible instance the result is `None` (fail-closed, with a
-/// `tracing::warn`) — callers must NOT deliver repo/branch-bearing notices.
-///
-/// Test convenience: builds the [`AuthorIndex`] inline (may run git). The
-/// scanner builds it OUTSIDE the per-PR flock and calls
-/// [`resolve_author_with_index`].
+use super::author_authority::{AuthorEvidence, AuthorSource, Authoritative};
+
+/// Resolve the PR author for `state`, building the [`AuthorIndex`] and
+/// gathering the branch's [`AuthorEvidence`] inline (may run git). Test
+/// convenience; production precomputes both outside the pr-state flock.
 #[cfg(test)]
 pub(crate) fn resolve_author_with_gh(
     home: &std::path::Path,
@@ -421,30 +410,255 @@ pub(crate) fn resolve_author_with_gh(
     state: &super::PrState,
 ) -> Option<String> {
     let index = AuthorIndex::build(home, &state.repo);
-    resolve_author_with_index(&index, gh_author, state)
+    let evidence = AuthorEvidence::gather(home, &state.repo, &state.branch);
+    resolve_author_with_index(&index, Some(&evidence), gh_author, state).map(|(name, _)| name)
 }
 
-/// [`resolve_author_with_gh`] against a precomputed [`AuthorIndex`]
-/// (built for `state.repo`). Pure — no fleet.yaml load, no subprocess —
-/// so it is safe to call under the pr-state flock.
+/// [`resolve_author_with_gh`] against a precomputed index and evidence. Pure —
+/// safe under the pr-state flock. Warns on EVERY failure; the per-tick paths
+/// use [`resolve_author_logged_once`].
+#[cfg(test)]
 pub(crate) fn resolve_author_with_index(
     index: &AuthorIndex,
+    evidence: Option<&AuthorEvidence>,
     gh_author: Option<&str>,
     state: &super::PrState,
-) -> Option<String> {
+) -> Option<(String, AuthorSource)> {
+    match resolve_author_outcome(index, evidence, gh_author, state) {
+        AuthorOutcome::Resolved(name, source) => Some((name, source)),
+        outcome => {
+            warn_unresolved_author(&outcome, gh_author, state);
+            None
+        }
+    }
+}
+
+/// -18577-7 (c): the resolver for paths that run every poll/tick — the
+/// fail-closed warn fires once per PR (repo, branch, number) until the author
+/// resolves, instead of once per poll.
+pub(crate) fn resolve_author_logged_once(
+    index: &AuthorIndex,
+    evidence: Option<&AuthorEvidence>,
+    gh_author: Option<&str>,
+    state: &super::PrState,
+) -> Option<(String, AuthorSource)> {
+    let outcome = resolve_author_outcome(index, evidence, gh_author, state);
+    let resolved = matches!(outcome, AuthorOutcome::Resolved(..));
+    if unresolved_first_time(UnresolvedKind::Author, state, !resolved) {
+        warn_unresolved_author(&outcome, gh_author, state);
+    }
+    match outcome {
+        AuthorOutcome::Resolved(name, source) => Some((name, source)),
+        _ => None,
+    }
+}
+
+/// Result of the author chain, before logging.
+pub(crate) enum AuthorOutcome {
+    Resolved(String, AuthorSource),
+    /// No record and no eligible login match.
+    NoneEligible,
+    /// d-20261025000739159728-1: the login maps to more than one team (or
+    /// team-less instance). Subscribers do NOT narrow this (option A).
+    Ambiguous(Vec<String>),
+    /// An authoritative tier names more than one author.
+    Conflict(AuthorSource, Vec<String>),
+    /// r4/r7: an assignment or reviewer-retirement record cannot be read.
+    Unreadable,
+    /// r8: a candidate is shown reviewing this PR by the records.
+    ReviewerExcluded(AuthorSource, Vec<String>),
+}
+
+/// The chain without logging (d-20261025004632404221-3, option A):
+/// 1. the authoritative records — typed assignment `review_author`, live
+///    binding, task assignee (see [`super::author_authority`]);
+/// 2. `github_login` match, only when it maps to exactly one team;
+/// 3. instance-name match of the login.
+///
+/// Reviewers (`role_kind`, assignment targets, verdict reviewers) are never
+/// the author on any tier. Subscribers never identify the author and there is
+/// no `fixup-lead` guess: nothing identifies the author → fail closed.
+fn resolve_author_outcome(
+    index: &AuthorIndex,
+    evidence: Option<&AuthorEvidence>,
+    gh_author: Option<&str>,
+    state: &super::PrState,
+) -> AuthorOutcome {
+    if let Some(evidence) = evidence {
+        match evidence.resolve(index, state) {
+            Authoritative::Resolved(name, source) => return AuthorOutcome::Resolved(name, source),
+            Authoritative::Conflict(source, names) => {
+                return AuthorOutcome::Conflict(source, names)
+            }
+            Authoritative::Unreadable => return AuthorOutcome::Unreadable,
+            Authoritative::ReviewerExcluded(source, names) => {
+                return AuthorOutcome::ReviewerExcluded(source, names)
+            }
+            Authoritative::None => {}
+        }
+    }
+    let reviews_this_pr = |name: &str| evidence.is_some_and(|e| e.reviews_this_pr(state, name));
     if let Some(login) = gh_author {
-        if let Some(name) = index.match_github_login(login) {
-            return Some(name);
+        let hits: Vec<&AuthorCandidate> = index
+            .eligible
+            .iter()
+            .filter(|c| !c.is_reviewer)
+            .filter(|c| {
+                c.github_login
+                    .as_deref()
+                    .is_some_and(|gl| gl.eq_ignore_ascii_case(login))
+            })
+            .collect();
+        // r8: a login match the records show reviewing this PR may be the
+        // author; another member of the login must not take its place.
+        let excluded: Vec<String> = hits
+            .iter()
+            .filter(|c| reviews_this_pr(&c.name))
+            .map(|c| c.name.clone())
+            .collect();
+        if !excluded.is_empty() {
+            return AuthorOutcome::ReviewerExcluded(AuthorSource::GhLogin, excluded);
+        }
+        if !hits.is_empty() {
+            let domains = distinct_domains(&hits);
+            if domains.len() > 1 {
+                return AuthorOutcome::Ambiguous(domains);
+            }
+            index.warn_on_rank_tie(login, &hits);
+            return AuthorOutcome::Resolved(hits[0].name.clone(), AuthorSource::GhLogin);
         }
         if let Some(name) = index.match_instance_name(login) {
-            return Some(name);
+            if reviews_this_pr(&name) {
+                return AuthorOutcome::ReviewerExcluded(AuthorSource::GhLogin, vec![name]);
+            }
+            return AuthorOutcome::Resolved(name, AuthorSource::GhLogin);
         }
     }
-    if let Some(sub) = state.subscribers.iter().find(|s| index.is_eligible(s)) {
-        return Some(sub.clone());
+    AuthorOutcome::NoneEligible
+}
+
+fn distinct_domains(cands: &[&AuthorCandidate]) -> Vec<String> {
+    let mut d: Vec<String> = cands.iter().map(|c| c.domain.clone()).collect();
+    d.sort();
+    d.dedup();
+    d
+}
+
+/// Which unresolvable-recipient warn a once-per-PR key belongs to.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) enum UnresolvedKind {
+    Author,
+    MergeAuthority,
+}
+
+/// -18577-7 (c): `true` the first time `state`'s PR is unresolved for
+/// `kind`; `false` on every repeat. A later successful resolution forgets
+/// the key, so a regression after a fix is logged again. Process-local: a
+/// daemon restart logs each still-unresolved PR once more. Keys are evicted
+/// when the PR's state is removed ([`forget_unresolved`]), so the set tracks
+/// live unresolved PRs; [`UNRESOLVED_SEEN_CAP`] is a backstop.
+pub(crate) fn unresolved_first_time(
+    kind: UnresolvedKind,
+    state: &super::PrState,
+    unresolved: bool,
+) -> bool {
+    let key = (
+        kind,
+        state.repo.to_ascii_lowercase(),
+        state.branch.clone(),
+        state.pr_number,
+    );
+    let mut seen = unresolved_seen().lock().unwrap_or_else(|e| e.into_inner());
+    if unresolved {
+        // Backstop only: removal evicts keys; a runaway set is reset, which
+        // at worst re-warns once per still-unresolved PR — like a restart.
+        if seen.len() >= UNRESOLVED_SEEN_CAP {
+            seen.clear();
+        }
+        seen.insert(key)
+    } else {
+        seen.remove(&key);
+        false
     }
-    if index.is_eligible("fixup-lead") {
-        return Some("fixup-lead".to_string());
+}
+
+const UNRESOLVED_SEEN_CAP: usize = 4096;
+
+/// (kind, lowercased repo, branch, PR number).
+type UnresolvedKey = (UnresolvedKind, String, String, u64);
+
+fn unresolved_seen() -> &'static std::sync::Mutex<std::collections::HashSet<UnresolvedKey>> {
+    static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<UnresolvedKey>>> =
+        std::sync::OnceLock::new();
+    SEEN.get_or_init(Default::default)
+}
+
+/// -18577-7 r2 P2: drop every once-per-PR key for (repo, branch) when the PR's
+/// state is removed (terminal or GC), so the set tracks live PRs and a branch
+/// reused by a later PR warns again.
+pub(crate) fn forget_unresolved(repo: &str, branch: &str) {
+    let repo = repo.to_ascii_lowercase();
+    unresolved_seen()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|(_, r, b, _)| !(r == &repo && b == branch));
+}
+
+fn warn_unresolved_author(
+    outcome: &AuthorOutcome,
+    gh_author: Option<&str>,
+    state: &super::PrState,
+) {
+    match outcome {
+        AuthorOutcome::Ambiguous(domains) => {
+            tracing::warn!(
+                repo = %state.repo,
+                branch = %state.branch,
+                gh_author = ?gh_author,
+                subscribers = ?state.subscribers,
+                ?domains,
+                "pr_state author resolution: the gh login maps to more than one team for \
+                 this repo and no review assignment, binding or task names the author — \
+                 failing closed (no author notice)"
+            );
+            return;
+        }
+        AuthorOutcome::Conflict(source, names) => {
+            tracing::warn!(
+                repo = %state.repo,
+                branch = %state.branch,
+                gh_author = ?gh_author,
+                ?source,
+                ?names,
+                "pr_state author resolution: the authoritative records name more than one \
+                 author — failing closed (no author notice)"
+            );
+            return;
+        }
+        AuthorOutcome::ReviewerExcluded(source, names) => {
+            tracing::warn!(
+                repo = %state.repo,
+                branch = %state.branch,
+                gh_author = ?gh_author,
+                ?source,
+                ?names,
+                "pr_state author resolution: the records show a candidate reviewing this PR — \
+                 failing closed (no author notice)"
+            );
+            return;
+        }
+        AuthorOutcome::Unreadable => {
+            tracing::warn!(
+                repo = %state.repo,
+                branch = %state.branch,
+                gh_author = ?gh_author,
+                "pr_state author resolution: a review assignment or reviewer-retirement record \
+                 for this branch cannot be read, or the branch has only pre-r6 retirement \
+                 history — failing closed (no author notice)"
+            );
+            return;
+        }
+        AuthorOutcome::Resolved(..) | AuthorOutcome::NoneEligible => {}
     }
     // Reviewer MANDATORY: warn-log so the operator sees the chain fail closed.
     tracing::warn!(
@@ -454,9 +668,9 @@ pub(crate) fn resolve_author_with_index(
         subscribers = ?state.subscribers,
         "#986 author resolution: no instance eligible for this repo — failing closed \
          (no author notice). Give the author a `repo`/`source_repo` or put it in a team \
-         whose `source_repo` is this repo"
+         whose `source_repo` or `repos` names this repo; a PR opened by an agent is \
+         identified by its review assignment, binding or task"
     );
-    None
 }
 
 /// Fleet instances eligible to be the author of a PR in one `repo`, i.e.
@@ -465,8 +679,8 @@ pub(crate) fn resolve_author_with_index(
 ///      entry) — invalid slug (e.g. the `repo: none` opt-out sentinel) → no
 ///      match, no fall-through;
 ///   2. instance `source_repo` (bare slug / URL / local origin remote);
-///   3. `source_repo` of the team(s) listing the instance in `members` or
-///      naming it `orchestrator`;
+///   3. `source_repo` (or any `repos` entry, -18577-7) of the team(s)
+///      listing the instance in `members` or naming it `orchestrator`;
 ///   4. none of the above → NOT eligible (fail-closed).
 ///
 /// Step 4 replaces the former match-any compat, under which every
@@ -494,6 +708,11 @@ struct AuthorCandidate {
     name: String,
     github_login: Option<String>,
     is_orchestrator: bool,
+    /// `role_kind: reviewer` — never the PR author on any tier.
+    is_reviewer: bool,
+    /// Routing domain: the sorted names of the teams listing this instance
+    /// (member or orchestrator), or `instance:<name>` when it is in none.
+    domain: String,
 }
 
 impl AuthorIndex {
@@ -542,20 +761,58 @@ impl AuthorIndex {
         now == self.fleet_fingerprint
     }
 
-    /// Tier 1: first eligible instance whose `github_login` matches.
-    fn match_github_login(&self, gh_login: &str) -> Option<String> {
+    /// Is `name` eligible to receive author notices for this repo?
+    pub(crate) fn is_eligible(&self, name: &str) -> bool {
+        self.eligible.iter().any(|c| c.name == name)
+    }
+
+    /// Is `name` an eligible instance with `role_kind: reviewer`?
+    pub(crate) fn is_reviewer(&self, name: &str) -> bool {
+        self.eligible
+            .iter()
+            .any(|c| c.name == name && c.is_reviewer)
+    }
+
+    /// r4 P1-4: a stored gh-login author `name` is still the only team's
+    /// match for its `github_login`. An instance without a `github_login` was
+    /// matched by instance name, which is unique by construction.
+    pub(crate) fn login_author_still_unique(&self, name: &str) -> bool {
+        let Some(login) = self
+            .eligible
+            .iter()
+            .find(|c| c.name == name)
+            .and_then(|c| c.github_login.as_deref())
+        else {
+            return true;
+        };
         let hits: Vec<&AuthorCandidate> = self
             .eligible
             .iter()
+            .filter(|c| !c.is_reviewer)
             .filter(|c| {
                 c.github_login
                     .as_deref()
-                    .is_some_and(|gl| gl.eq_ignore_ascii_case(gh_login))
+                    .is_some_and(|gl| gl.eq_ignore_ascii_case(login))
             })
             .collect();
-        let chosen = hits.first()?;
-        // Orchestrator-first is the routing rule, not an ambiguity; only a
-        // tie broken by name order is worth surfacing.
+        distinct_domains(&hits).len() <= 1
+    }
+
+    /// Tier 2: eligible non-reviewer instance literally named `gh_login`.
+    fn match_instance_name(&self, gh_login: &str) -> Option<String> {
+        self.eligible
+            .iter()
+            .find(|c| !c.is_reviewer && c.name.eq_ignore_ascii_case(gh_login))
+            .map(|c| c.name.clone())
+    }
+
+    /// d-20261025000739159728-1: `hits` (already in preference order) must
+    /// come from ONE routing domain. Several domains → keep only those of the
+    /// PR's own eligible subscribers; still not exactly one → `Err(domains)`.
+    /// Within one domain, orchestrator-first is the routing rule; only a tie
+    /// broken by name order is worth surfacing.
+    fn warn_on_rank_tie(&self, gh_login: &str, hits: &[&AuthorCandidate]) {
+        let chosen = hits[0];
         if hits
             .get(1)
             .is_some_and(|next| next.is_orchestrator == chosen.is_orchestrator)
@@ -571,20 +828,6 @@ impl AuthorIndex {
                  instance to disambiguate"
             );
         }
-        Some(chosen.name.clone())
-    }
-
-    /// Is `name` eligible to receive author notices for this repo?
-    pub(crate) fn is_eligible(&self, name: &str) -> bool {
-        self.eligible.iter().any(|c| c.name == name)
-    }
-
-    /// Tier 2: eligible instance literally named `gh_login`.
-    fn match_instance_name(&self, gh_login: &str) -> Option<String> {
-        self.eligible
-            .iter()
-            .find(|c| c.name.eq_ignore_ascii_case(gh_login))
-            .map(|c| c.name.clone())
     }
 }
 
@@ -643,18 +886,47 @@ fn eligible_for(cfg: &crate::fleet::FleetConfig, repo: &str) -> Vec<AuthorCandid
                     t.members.iter().any(|m| m == name)
                         || t.orchestrator.as_deref() == Some(name.as_str())
                 })
-                .filter_map(|t| t.source_repo.as_deref().and_then(|p| p.to_str()))
-                .any(|src| matches_repo(resolve(src)))
+                .any(|t| {
+                    t.source_repo
+                        .as_deref()
+                        .and_then(|p| p.to_str())
+                        .is_some_and(|src| matches_repo(resolve(src)))
+                        // -18577-7 (a): extra repos the team owns, additive.
+                        || t.repos.as_ref().is_some_and(|rs| {
+                            rs.iter().any(|r| {
+                                matches_repo(
+                                    crate::mcp::handlers::dispatch_hook::canonicalize_repo_slug(r),
+                                )
+                            })
+                        })
+                })
         };
         if matches {
             let is_orchestrator = cfg
                 .teams
                 .values()
                 .any(|t| t.orchestrator.as_deref() == Some(name.as_str()));
+            let mut teams: Vec<&str> = cfg
+                .teams
+                .iter()
+                .filter(|(_, t)| {
+                    t.members.iter().any(|m| m == name)
+                        || t.orchestrator.as_deref() == Some(name.as_str())
+                })
+                .map(|(team, _)| team.as_str())
+                .collect();
+            teams.sort_unstable();
+            let domain = if teams.is_empty() {
+                format!("instance:{name}")
+            } else {
+                teams.join(",")
+            };
             eligible.push(AuthorCandidate {
                 name: name.clone(),
                 github_login: inst.github_login.clone(),
                 is_orchestrator,
+                is_reviewer: inst.role_kind == Some(crate::fleet::RoleKind::Reviewer),
+                domain,
             });
         }
     }
@@ -816,6 +1088,8 @@ pub(crate) mod tests {
             branch: branch.to_string(),
             head_sha: "sha-A".to_string(),
             pr_author: String::new(),
+            pr_author_source: None,
+            pr_author_pr_number: 0,
             subscribers: vec!["dev".to_string()],
             ci_state: super::super::CiState::Pending,
             verdict_state: super::super::VerdictState::None,
@@ -980,8 +1254,10 @@ pub(crate) mod tests {
 
     /// T8-c: tier 3 — the first ELIGIBLE subscriber when no login match;
     /// an ineligible subscriber ahead of it is skipped.
+    /// T8-c (revised -18577-7 r3, option A): subscribers never identify the
+    /// author — an eligible subscriber with an unmatched login is not a guess.
     #[test]
-    fn t8c_subscribers_fallback_requires_eligibility() {
+    fn t8c_subscribers_never_identify_the_author() {
         let home = home_with_fleet(
             "auth-tier3",
             "instances:\n  stranger:\n    backend: claude\n  \
@@ -989,10 +1265,7 @@ pub(crate) mod tests {
         );
         let mut state = fresh_state("br");
         state.subscribers = vec!["stranger".to_string(), "dev".to_string()];
-        assert_eq!(
-            resolve(&home, Some("nobody-matches"), &state).as_deref(),
-            Some("dev")
-        );
+        assert_eq!(resolve(&home, Some("nobody-matches"), &state), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1012,34 +1285,33 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// T8-d2: `fixup-lead` is still the last resort, but only when it is
-    /// itself eligible for the repo.
+    /// T8-d2 (revised -18577-7 r3): `fixup-lead` is no longer an author
+    /// guess — an unidentified author sends nothing, even with an eligible
+    /// `fixup-lead` instance.
     #[test]
-    fn t8d2_fixup_lead_only_when_eligible() {
+    fn t8d2_fixup_lead_is_not_an_author_guess() {
         let home = home_with_fleet(
             "auth-fixup",
             "instances:\n  fixup-lead:\n    backend: claude\n    repo: owner/repo\n",
         );
         let mut state = fresh_state("br");
         state.subscribers.clear();
-        assert_eq!(
-            resolve(&home, Some("nobody"), &state).as_deref(),
-            Some("fixup-lead")
-        );
+        assert_eq!(resolve(&home, Some("nobody"), &state), None);
         state.repo = "owner/elsewhere".to_string();
         assert_eq!(resolve(&home, Some("nobody"), &state), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// T8-e: gh_author=None still falls through to eligible subscribers.
+    /// T8-e (revised -18577-7 r3): gh_author=None with no record fails closed;
+    /// the subscriber (`dev`) does not become the author.
     #[test]
-    fn t8e_none_gh_author_falls_to_subscribers() {
+    fn t8e_none_gh_author_without_records_fails_closed() {
         let home = home_with_fleet(
             "auth-none",
             "instances:\n  dev:\n    backend: claude\n    repo: owner/repo\n",
         );
         let state = fresh_state("br"); // subscribers = ["dev"]
-        assert_eq!(resolve(&home, None, &state).as_deref(), Some("dev"));
+        assert_eq!(resolve(&home, None, &state), None);
         let _ = std::fs::remove_dir_all(&home);
     }
 
@@ -1070,7 +1342,7 @@ pub(crate) mod tests {
     /// T8-g / #2918 Tier 2: instance name matches gh_login but repo
     /// mismatches → falls through to an eligible subscriber.
     #[test]
-    fn t8g_tier2_repo_mismatch_falls_to_subscriber() {
+    fn t8g_tier2_repo_mismatch_does_not_fall_to_subscriber() {
         let home = home_with_fleet(
             "auth-t2-repo",
             "instances:\n  \
@@ -1082,9 +1354,9 @@ pub(crate) mod tests {
         state.repo = "owner/target-repo".to_string();
         state.subscribers = vec!["the-subscriber".to_string()];
         assert_eq!(
-            resolve(&home, Some("shared-bot"), &state).as_deref(),
-            Some("the-subscriber"),
-            "Tier 2 repo mismatch must fall through to subscriber"
+            resolve(&home, Some("shared-bot"), &state),
+            None,
+            "Tier 2 repo mismatch does not fall through to a subscriber (r3)"
         );
         let _ = std::fs::remove_dir_all(&home);
     }
@@ -1213,10 +1485,12 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
-    /// T8-l: several matching non-orchestrator candidates → alphabetical
-    /// first, independent of HashMap iteration order.
+    /// T8-l (revised by d-20261025000739159728-1): several matching team-less
+    /// instances are separate routing domains, so the shared login alone does
+    /// not decide — fail closed instead of the former alphabetical pick; the
+    /// PR's own subscriber still decides among them.
     #[test]
-    fn t8l_multi_candidate_without_orchestrator_picks_name_order() {
+    fn t8l_multi_candidate_without_orchestrator_fails_closed_unless_bound() {
         let home = home_with_fleet(
             "auth-multi-name",
             "instances:\n  \
@@ -1226,11 +1500,24 @@ pub(crate) mod tests {
              bravo:\n    backend: claude\n    github_login: shared-bot\n    repo: owner/repo\n  \
              alpha:\n    backend: claude\n    github_login: shared-bot\n    repo: owner/other\n",
         );
-        let state = fresh_state("br");
+        let mut state = fresh_state("br");
+        state.subscribers.clear();
+        assert_eq!(
+            resolve(&home, Some("shared-bot"), &state),
+            None,
+            "four team-less matches: name order must not pick one"
+        );
+        state.subscribers = vec!["delta".to_string()];
+        assert_eq!(
+            resolve(&home, Some("shared-bot"), &state),
+            None,
+            "r3: the subscriber does not narrow the matches either"
+        );
+        crate::binding::bind(&home, "delta", "t-br", "br");
         assert_eq!(
             resolve(&home, Some("shared-bot"), &state).as_deref(),
-            Some("bravo"),
-            "alpha's repo mismatches; bravo is the alphabetical-first match"
+            Some("delta"),
+            "the branch's binding identifies the author among the matches"
         );
         let _ = std::fs::remove_dir_all(&home);
     }

@@ -4789,15 +4789,16 @@ fn code_review_distinct_author_receives_full_report_3177() {
     let reviewer_id = crate::types::InstanceId::new();
     let lead_id = crate::types::InstanceId::new();
     write_cross_team_review_fleet(&home, reviewer_id, lead_id);
-    let assignment = seed_cross_team_review_subject(
+    // -18577-7 r3: the author is identified from the typed assignment's
+    // `review_author`, never from a bare `pr_author` written without provenance.
+    let mut assignment = seed_cross_team_review_subject(
         &home,
         reviewer_id,
         crate::daemon::pr_state::ReviewClass::Dual,
     );
-    crate::daemon::pr_state::with_pr_state(&home, "owner/repo", "fix/cross-team", |state| {
-        state.pr_author = "ct-imposter".into()
-    })
-    .unwrap();
+    assignment.review_author =
+        crate::mcp::handlers::comms_gates::ReviewAuthor::Agent("ct-imposter".into());
+    crate::daemon::assignment_authority::persist(&home, &assignment).unwrap();
 
     let result = handle_send(
         &cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED"),
@@ -4830,15 +4831,16 @@ fn code_review_merge_ready_fans_full_report_to_distinct_author_3177() {
     let reviewer_id = crate::types::InstanceId::new();
     let lead_id = crate::types::InstanceId::new();
     write_cross_team_review_fleet(&home, reviewer_id, lead_id);
-    let assignment = seed_cross_team_review_subject(
+    // -18577-7 r3: the author is identified from the typed assignment's
+    // `review_author`, never from a bare `pr_author` written without provenance.
+    let mut assignment = seed_cross_team_review_subject(
         &home,
         reviewer_id,
         crate::daemon::pr_state::ReviewClass::Single,
     );
-    crate::daemon::pr_state::with_pr_state(&home, "owner/repo", "fix/cross-team", |state| {
-        state.pr_author = "ct-imposter".into()
-    })
-    .unwrap();
+    assignment.review_author =
+        crate::mcp::handlers::comms_gates::ReviewAuthor::Agent("ct-imposter".into());
+    crate::daemon::assignment_authority::persist(&home, &assignment).unwrap();
 
     let result = handle_send(
         &cross_team_review_params(assignment.assignment_id, "verified", "VERIFIED"),

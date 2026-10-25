@@ -60,8 +60,11 @@ Broadcast to a team with the `team` selector:
 | `created_at` | Creation timestamp |
 | `source_repo` | The team's source repository path |
 | `project_id` | Optional explicit project-board id override |
+| `repos` | Optional extra GitHub `owner/repo` slugs (one or a list) the team also owns beyond `source_repo`, e.g. a frontend next to the API checkout. Additive; only makes the team's instances eligible for that repo's pr-state notices (author / merge-ready / rebase). Worktree, dispatch and board identity still come from `source_repo`. Set by editing `fleet.yaml`; team rewrites preserve it. |
 | `accept_from` | External agent names allowed to message the orchestrator directly; empty denies cross-team direct sends |
 | `stale_members` | View-only; members not found in the live registry |
+
+**Who gets the author notices.** The fleet usually shares one GitHub login, so the PR's `author.login` cannot name the agent. The daemon identifies the PR author from its own records, in order: the typed review assignment's `review_author`, the live binding on the branch, the assignee of a live (not done, cancelled or superseded) task carrying the branch. An assignment counts only for the PR number it was dispatched for, so a reused branch does not inherit the previous PR's author. A bound agent or task assignee must be eligible for the repo. Within a tier exactly one eligible non-reviewer must remain (several → nothing is sent), and an unreadable assignment record also sends nothing. Only when no record exists does `github_login` decide, and only while it maps to exactly one team; a stored login result is re-checked when the fleet changes. CI subscribers never identify the author; reviewers (`role_kind: reviewer`, assignment targets) never do either. A `pr_author` persisted by an older daemon (no provenance) is display-only and never routes a notice. A stored author only stands in for records that are gone, and only for the PR number it was resolved for: a live record from the same or a higher tier, or an unreadable assignment, overrides it, and a new PR on a reused branch is resolved afresh. A reviewer of an earlier PR on the branch is not excluded from authoring a later one. A branch that already has retirement records from an older daemon (no PR number) never sends author notices. An unreadable assignment or reviewer-retirement record sends nothing, and so does a candidate the records show reviewing the PR: neither another candidate of that tier nor a lower tier takes its place. When nothing identifies the author the notice is not sent and one WARN per PR is logged.
 
 ## 4. `team action=create`
 
@@ -91,6 +94,7 @@ Broadcast to a team with the `team` selector:
 - `add` enforces one-agent-one-team (cannot add a member who belongs to another team).
 - `repository_path` is preserved if not explicitly changed.
 - `project_id` and `accept_from` are also preserved unless explicitly supplied.
+- `repos` (fleet.yaml-only) is always preserved.
 - Writes back to `fleet.yaml` on success.
 
 ## 7. `team action=delete`

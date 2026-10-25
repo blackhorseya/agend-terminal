@@ -730,6 +730,12 @@ pub struct TeamConfig {
     pub created_at: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_repo: Option<std::path::PathBuf>,
+    /// -18577-7: GitHub `owner/repo` slugs this team also owns beyond
+    /// `source_repo`'s origin (e.g. a frontend next to the goapi checkout).
+    /// Additive, and pr-state recipient eligibility ONLY — worktree, dispatch
+    /// and board identity still come from `source_repo`. One slug or a list.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repos: Option<RepoOverride>,
     /// #2509: explicit project-board id override. `project_id_from_source_repo`
     /// guesses `owner/repo` from `source_repo`'s last two path segments, which
     /// mis-slugs when the local clone sits under an intermediate directory

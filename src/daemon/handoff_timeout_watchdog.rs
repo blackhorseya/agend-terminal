@@ -1133,6 +1133,8 @@ mod tests {
                 branch: branch.to_string(),
                 head_sha: head_sha.to_string(),
                 pr_author: "dev".to_string(),
+                pr_author_source: None,
+                pr_author_pr_number: 0,
                 subscribers: vec!["reviewer".to_string()],
                 ci_state: CiState::Pending,
                 verdict_state: VerdictState::None,
