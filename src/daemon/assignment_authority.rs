@@ -428,9 +428,9 @@ fn read_retired_review_targets(
 /// legacy migration). `retired_review_targets.json` is the only source. A
 /// branch that has retirement history only in the pre-r6 ledger (no PR
 /// number) cannot tell its reviewers apart, so it is an error and author
-/// resolution fails closed for the whole branch until the first new
-/// retirement writes the new ledger. A branch with neither file has no
-/// reviewer history.
+/// resolution fails closed for the whole branch. Such a branch has pre-r6
+/// history, never starts the new ledger (d-…-13 (2a)), and stays failed closed
+/// for good. A branch with neither file has no reviewer history.
 fn retired_review_rows(
     home: &Path,
     repo: &str,
