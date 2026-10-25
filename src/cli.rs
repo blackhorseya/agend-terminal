@@ -402,6 +402,41 @@ pub(crate) fn classify_helper_staleness(
     daemon_exe: Option<&Path>,
     helper_path: &Path,
 ) -> HelperStaleness {
+    classify_helper_staleness_with_id(
+        BuildIdentity {
+            sha: env!("AGEND_BUILD_SHA"),
+            dirty: env!("AGEND_BUILD_DIRTY") == "1",
+        },
+        daemon_exe,
+        helper_path,
+    )
+}
+
+/// Build identity stamped by build.rs (`AGEND_BUILD_SHA` / `AGEND_BUILD_DIRTY`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BuildIdentity<'a> {
+    pub(crate) sha: &'a str,
+    pub(crate) dirty: bool,
+}
+
+/// Pure identity comparison of the daemon against a helper's raw bytes.
+/// `None` = not comparable by identity (an `unknown` sha on either side), so
+/// the caller falls back to mtime.
+pub(crate) fn classify_helper_identity(
+    daemon: BuildIdentity<'_>,
+    helper_bytes: &[u8],
+) -> Option<HelperStaleness> {
+    // RED stub: real implementation lands in the GREEN commit.
+    let _ = (daemon, helper_bytes);
+    Some(HelperStaleness::Stale)
+}
+
+fn classify_helper_staleness_with_id(
+    daemon_id: BuildIdentity<'_>,
+    daemon_exe: Option<&Path>,
+    helper_path: &Path,
+) -> HelperStaleness {
+    let _ = daemon_id;
     if !helper_path.exists() {
         return HelperStaleness::NotInstalled;
     }
@@ -1216,7 +1251,10 @@ mod gc_dry_run_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod helper_staleness_tests {
-    use super::{check_helper_staleness, classify_helper_staleness, HelperStaleness};
+    use super::{
+        check_helper_staleness, classify_helper_identity, classify_helper_staleness,
+        classify_helper_staleness_with_id, BuildIdentity, HelperStaleness,
+    };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1241,6 +1279,74 @@ mod helper_staleness_tests {
         std::fs::write(path, content).expect("write");
         // Tiny pause so the next write lands strictly later.
         std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+    }
+
+    fn marker(sha: &str, dirty: u8) -> Vec<u8> {
+        format!("\u{0}junk\u{0}AGEND-HELPER-BUILD-ID:{sha}:{dirty}\u{0}tail").into_bytes()
+    }
+
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn id(sha: &str, dirty: bool) -> BuildIdentity<'_> {
+        BuildIdentity { sha, dirty }
+    }
+
+    #[test]
+    fn identity_same_build_is_fresh() {
+        assert_eq!(
+            classify_helper_identity(id(SHA_A, false), &marker(SHA_A, 0)),
+            Some(HelperStaleness::Fresh)
+        );
+    }
+
+    #[test]
+    fn identity_different_sha_is_stale() {
+        assert_eq!(
+            classify_helper_identity(id(SHA_A, false), &marker(SHA_B, 0)),
+            Some(HelperStaleness::Stale)
+        );
+    }
+
+    #[test]
+    fn identity_different_dirty_flag_is_stale() {
+        assert_eq!(
+            classify_helper_identity(id(SHA_A, false), &marker(SHA_A, 1)),
+            Some(HelperStaleness::Stale)
+        );
+    }
+
+    #[test]
+    fn identity_missing_marker_is_stale() {
+        assert_eq!(
+            classify_helper_identity(id(SHA_A, false), b"old-helper-without-marker"),
+            Some(HelperStaleness::Stale)
+        );
+    }
+
+    #[test]
+    fn identity_unknown_sha_is_not_comparable() {
+        assert_eq!(
+            classify_helper_identity(id("unknown", false), &marker(SHA_A, 0)),
+            None
+        );
+        assert_eq!(
+            classify_helper_identity(id(SHA_A, false), &marker("unknown", 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn same_build_helper_written_before_daemon_is_fresh() {
+        // cargo install order: helper first (older mtime), daemon last.
+        let home = tmp_home("same-build");
+        let helper = home.join("agend-git");
+        write_then_pause(&helper, &marker(SHA_A, 0), 30);
+        let daemon = home.join("agend-terminal-fake");
+        write_then_pause(&daemon, b"daemon", 10);
+        let state = classify_helper_staleness_with_id(id(SHA_A, false), Some(&daemon), &helper);
+        assert_eq!(state, HelperStaleness::Fresh);
+        std::fs::remove_dir_all(&home).ok();
     }
 
     #[test]
