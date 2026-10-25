@@ -463,7 +463,7 @@ pub(crate) enum AuthorOutcome {
     Ambiguous(Vec<String>),
     /// An authoritative tier names more than one author.
     Conflict(AuthorSource, Vec<String>),
-    /// r4: an assignment record exists but cannot be read.
+    /// r4/r7: an assignment or reviewer-retirement record cannot be read.
     Unreadable,
 }
 
@@ -625,8 +625,8 @@ fn warn_unresolved_author(
                 repo = %state.repo,
                 branch = %state.branch,
                 gh_author = ?gh_author,
-                "pr_state author resolution: a review assignment record for this branch \
-                 cannot be read — failing closed (no author notice)"
+                "pr_state author resolution: a review assignment or reviewer-retirement record \
+                 for this branch cannot be read — failing closed (no author notice)"
             );
             return;
         }

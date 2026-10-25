@@ -54,9 +54,10 @@ pub(crate) struct AuthorEvidence {
     /// `review_author = Agent(..)` of the active typed assignments, with the
     /// PR generation (`pr_number`) each one was dispatched for.
     assignment_authors: Vec<(String, u64)>,
-    /// r4: an assignment record exists but cannot be read. A higher tier that
-    /// cannot be read is not absent: the chain fails closed.
-    assignments_unreadable: bool,
+    /// r4/r7: an assignment or reviewer-retirement record exists but cannot
+    /// be read. A record that cannot be read is not absent: the chain fails
+    /// closed.
+    records_unreadable: bool,
     /// Assignment targets (active + terminal-retired) with the PR number they
     /// review: reviewers of THAT generation only (r6 P2).
     reviewer_targets: Vec<(String, u64)>,
@@ -75,7 +76,8 @@ pub(crate) enum Authoritative {
     Conflict(AuthorSource, Vec<String>),
     /// No tier named anyone.
     None,
-    /// r4: the assignment records could not be read.
+    /// r4/r7: an assignment or reviewer-retirement record could not be read:
+    /// who authored or reviewed this PR is unknown.
     Unreadable,
 }
 
@@ -85,7 +87,7 @@ impl AuthorEvidence {
     /// binding's local `source_repo` — never call under the pr-state flock
     /// (#1617).
     pub(crate) fn gather(home: &Path, repo: &str, branch: &str) -> Self {
-        let (assignments, assignments_unreadable) =
+        let (assignments, records_unreadable) =
             match crate::daemon::assignment_authority::list_active_checked(home, repo, branch) {
                 Ok(a) => (a, false),
                 Err(e) => {
@@ -109,11 +111,20 @@ impl AuthorEvidence {
                 }
             }
         }
-        for retired in
-            crate::daemon::assignment_authority::retired_review_targets(home, repo, branch)
-        {
-            if !reviewer_targets.contains(&retired) {
-                reviewer_targets.push(retired);
+        let mut records_unreadable = records_unreadable;
+        match crate::daemon::assignment_authority::retired_review_targets(home, repo, branch) {
+            Ok(retired) => {
+                for row in retired {
+                    if !reviewer_targets.contains(&row) {
+                        reviewer_targets.push(row);
+                    }
+                }
+            }
+            Err(e) => {
+                // r7: who reviewed this PR is unknown, so nobody can be
+                // proven NOT to be a reviewer — fail closed.
+                tracing::debug!(%repo, %branch, error = %e, "author evidence: unreadable reviewer ledger");
+                records_unreadable = true;
             }
         }
         let bound_agents = bound_agents_on_branch(home, repo, branch);
@@ -122,7 +133,7 @@ impl AuthorEvidence {
             repo: repo.to_string(),
             branch: branch.to_string(),
             assignment_authors,
-            assignments_unreadable,
+            records_unreadable,
             reviewer_targets,
             bound_agents,
             task_assignees,
@@ -142,14 +153,15 @@ impl AuthorEvidence {
             || self.reviewer_targets.iter().any(|(t, pr)| {
                 // A state without a PR number cannot tell generations apart:
                 // keep excluding (the safe direction).
-                t == name && (state.pr_number == 0 || *pr == state.pr_number)
+                // `pr == 0`: a pre-r6 retirement of unknown generation.
+                t == name && (state.pr_number == 0 || *pr == 0 || *pr == state.pr_number)
             })
             || verdict_reviewers(state).any(|r| r == name)
     }
 
     /// Run the three authoritative tiers against the fleet eligibility `index`.
     pub(crate) fn resolve(&self, index: &AuthorIndex, state: &PrState) -> Authoritative {
-        if self.assignments_unreadable {
+        if self.records_unreadable {
             return Authoritative::Unreadable;
         }
         // r4 P1-3: only assignments dispatched for THIS PR generation. A state

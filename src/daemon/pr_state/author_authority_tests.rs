@@ -859,8 +859,15 @@ fn attack_same_tier_assignment_conflict_over_stored_author_fails_closed() {
 /// that agent authors PR #15 on the reused branch.
 #[test]
 fn attack_prior_pr_retired_reviewer_cannot_exclude_current_author() {
+    // r7: rewritten. The pre-r6 ledger alone carries no PR number, so on its
+    // own it now excludes (fail closed, see
+    // reviewer_attack_legacy_terminal_ledger_cannot_route_notice_to_same_pr_reviewer).
+    // Once the generation-tagged ledger exists it is the only source: a
+    // PR #14 row there, plus the same agent in the old ledger, does not
+    // exclude PR #15's author.
     let home = home_with_fleet("retired-reviewer-generation", TWO_TEAM_FLEET);
     let branch = "feat/retired-reviewer-generation";
+    retired_review(&home, branch, "third", 14);
     let record_path = crate::daemon::assignment_authority::record_path_for_test(
         &home,
         REPO,
@@ -868,7 +875,6 @@ fn attack_prior_pr_retired_reviewer_cannot_exclude_current_author() {
         "old-reviewer",
     );
     let dir = record_path.parent().unwrap();
-    std::fs::create_dir_all(dir).unwrap();
     std::fs::write(
         dir.join("terminal_retirements.json"),
         br#"[{"board":"old","task_id":"t-pr14","instance":"third","seq":1}]"#,
@@ -1014,5 +1020,48 @@ fn reviewer_attack_corrupt_retired_targets_are_not_erased_by_a_later_retirement(
         b"{".to_vec(),
         "an unreadable ledger was rewritten and its earlier exclusions erased"
     );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// r7 seeding: the first r6+ retirement on a branch carries the pre-r6 rows
+/// over with an unknown generation, so they keep excluding afterwards.
+#[test]
+fn r7_control_first_new_retirement_keeps_pre_r6_exclusions() {
+    let home = home_with_fleet("legacy-seeded-into-new-ledger", TWO_TEAM_FLEET);
+    let branch = "feat/legacy-seeded-into-new-ledger";
+    let dir = crate::daemon::assignment_authority::record_path_for_test(&home, REPO, branch, "x");
+    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    std::fs::write(
+        dir.parent().unwrap().join("terminal_retirements.json"),
+        br#"[{"board":"old","task_id":"t-pr15","instance":"third","seq":1}]"#,
+    )
+    .unwrap();
+    retired_review(&home, branch, "other-rev", 15);
+    crate::binding::bind(&home, "third", "t-review-worktree", branch);
+    save(&home, &merged_state(branch, &[], "")).unwrap();
+    scan(&home, vec![]);
+    assert!(kinds(&home, "third").is_empty());
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// r7 seeding: pre-r6 rows carried into the new ledger survive a SECOND new
+/// retirement on the branch (the writer reads the new file, inserts, rewrites).
+#[test]
+fn r7_control_legacy_rows_survive_a_second_new_retirement() {
+    let home = home_with_fleet("legacy-rows-second-retirement", TWO_TEAM_FLEET);
+    let branch = "feat/legacy-rows-second-retirement";
+    let dir = crate::daemon::assignment_authority::record_path_for_test(&home, REPO, branch, "x");
+    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    std::fs::write(
+        dir.parent().unwrap().join("terminal_retirements.json"),
+        br#"[{"board":"old","task_id":"t-pr15","instance":"third","seq":1}]"#,
+    )
+    .unwrap();
+    retired_review(&home, branch, "other-rev", 15);
+    retired_review(&home, branch, "third-rev", 16);
+    crate::binding::bind(&home, "third", "t-review-worktree", branch);
+    save(&home, &merged_state(branch, &[], "")).unwrap();
+    scan(&home, vec![]);
+    assert!(kinds(&home, "third").is_empty());
     let _ = std::fs::remove_dir_all(&home);
 }
