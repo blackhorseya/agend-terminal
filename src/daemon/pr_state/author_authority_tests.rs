@@ -1023,49 +1023,6 @@ fn reviewer_attack_corrupt_retired_targets_are_not_erased_by_a_later_retirement(
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// r7 seeding: the first r6+ retirement on a branch carries the pre-r6 rows
-/// over with an unknown generation, so they keep excluding afterwards.
-#[test]
-fn r7_control_first_new_retirement_keeps_pre_r6_exclusions() {
-    let home = home_with_fleet("legacy-seeded-into-new-ledger", TWO_TEAM_FLEET);
-    let branch = "feat/legacy-seeded-into-new-ledger";
-    let dir = crate::daemon::assignment_authority::record_path_for_test(&home, REPO, branch, "x");
-    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
-    std::fs::write(
-        dir.parent().unwrap().join("terminal_retirements.json"),
-        br#"[{"board":"old","task_id":"t-pr15","instance":"third","seq":1}]"#,
-    )
-    .unwrap();
-    retired_review(&home, branch, "other-rev", 15);
-    crate::binding::bind(&home, "third", "t-review-worktree", branch);
-    save(&home, &merged_state(branch, &[], "")).unwrap();
-    scan(&home, vec![]);
-    assert!(kinds(&home, "third").is_empty());
-    let _ = std::fs::remove_dir_all(&home);
-}
-
-/// r7 seeding: pre-r6 rows carried into the new ledger survive a SECOND new
-/// retirement on the branch (the writer reads the new file, inserts, rewrites).
-#[test]
-fn r7_control_legacy_rows_survive_a_second_new_retirement() {
-    let home = home_with_fleet("legacy-rows-second-retirement", TWO_TEAM_FLEET);
-    let branch = "feat/legacy-rows-second-retirement";
-    let dir = crate::daemon::assignment_authority::record_path_for_test(&home, REPO, branch, "x");
-    std::fs::create_dir_all(dir.parent().unwrap()).unwrap();
-    std::fs::write(
-        dir.parent().unwrap().join("terminal_retirements.json"),
-        br#"[{"board":"old","task_id":"t-pr15","instance":"third","seq":1}]"#,
-    )
-    .unwrap();
-    retired_review(&home, branch, "other-rev", 15);
-    retired_review(&home, branch, "third-rev", 16);
-    crate::binding::bind(&home, "third", "t-review-worktree", branch);
-    save(&home, &merged_state(branch, &[], "")).unwrap();
-    scan(&home, vec![]);
-    assert!(kinds(&home, "third").is_empty());
-    let _ = std::fs::remove_dir_all(&home);
-}
-
 #[test]
 fn reviewer_attack_unknown_legacy_row_cannot_demote_current_typed_author_to_binding() {
     let home = home_with_fleet("legacy-row-demotes-author", TWO_TEAM_FLEET);
@@ -1216,5 +1173,18 @@ fn first_new_retirement_restores_author_notices_on_a_legacy_branch() {
         vec!["pr-merged"],
         "once the new ledger exists the legacy rows no longer count"
     );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Control (r8): a branch with no retirement record at all has no reviewer
+/// history and resolves normally — only a legacy-only branch fails closed.
+#[test]
+fn branch_without_any_retirement_ledger_resolves_normally() {
+    let home = home_with_fleet("no-ledgers-at-all", TWO_TEAM_FLEET);
+    let branch = "feat/no-ledgers-at-all";
+    crate::binding::bind(&home, "personal", "t-author", branch);
+    save(&home, &merged_state(branch, &["personal"], "")).unwrap();
+    scan(&home, vec![]);
+    assert_eq!(kinds(&home, "personal"), vec!["pr-merged"]);
     let _ = std::fs::remove_dir_all(&home);
 }

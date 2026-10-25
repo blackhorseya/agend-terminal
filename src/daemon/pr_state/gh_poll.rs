@@ -653,7 +653,8 @@ fn warn_unresolved_author(
                 branch = %state.branch,
                 gh_author = ?gh_author,
                 "pr_state author resolution: a review assignment or reviewer-retirement record \
-                 for this branch cannot be read — failing closed (no author notice)"
+                 for this branch cannot be read, or the branch has only pre-r6 retirement \
+                 history — failing closed (no author notice)"
             );
             return;
         }

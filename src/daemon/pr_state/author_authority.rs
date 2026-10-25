@@ -164,8 +164,7 @@ impl AuthorEvidence {
         self.reviewer_targets.iter().any(|(t, pr)| {
             // A state without a PR number cannot tell generations apart:
             // keep excluding (the safe direction).
-            // `pr == 0`: a pre-r6 retirement of unknown generation.
-            t == name && (state.pr_number == 0 || *pr == 0 || *pr == state.pr_number)
+            t == name && (state.pr_number == 0 || *pr == state.pr_number)
         }) || verdict_reviewers(state).any(|r| r == name)
     }
 

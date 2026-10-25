@@ -406,10 +406,6 @@ fn retired_review_targets_file(home: &Path, repo: &str, branch: &str) -> PathBuf
     branch_dir(home, repo, branch).join("retired_review_targets.json")
 }
 
-/// `pr_number` of a row carried over from the pre-r6 ledger, which recorded
-/// no PR: the generation is unknown, so the row excludes on every PR.
-const UNKNOWN_PR: u64 = 0;
-
 /// Three-state like [`read_record`]: `Ok(None)` = absent, `Err` = present but
 /// unreadable. An unreadable exclusion ledger is NEVER read as "no reviewer"
 /// (r7 P1-2).
@@ -428,10 +424,13 @@ fn read_retired_review_targets(
     }
 }
 
-/// The exclusion rows for a branch. Once `retired_review_targets.json` exists
-/// it is the only source. Before that (a branch last retired by pre-r6 code)
-/// the instances of the terminal retirement ledger are used with an UNKNOWN
-/// generation, so they stay excluded (r7 P1-1, fail closed).
+/// The exclusion rows for a branch (Sean B+C, d-20261025043449453835-12: no
+/// legacy migration). `retired_review_targets.json` is the only source. A
+/// branch that has retirement history only in the pre-r6 ledger (no PR
+/// number) cannot tell its reviewers apart, so it is an error and author
+/// resolution fails closed for the whole branch until the first new
+/// retirement writes the new ledger. A branch with neither file has no
+/// reviewer history.
 fn retired_review_rows(
     home: &Path,
     repo: &str,
@@ -442,28 +441,26 @@ fn retired_review_rows(
     {
         return Ok(rows);
     }
-    Ok(
-        read_terminal_retirements(&terminal_retirements_file(home, repo, branch))?
-            .into_iter()
-            .map(|k| RetiredReviewTarget {
-                target: k.instance,
-                pr_number: UNKNOWN_PR,
-            })
-            .collect(),
-    )
+    if !read_terminal_retirements(&terminal_retirements_file(home, repo, branch))?.is_empty() {
+        anyhow::bail!(
+            "branch {repo}@{branch} has retirements only in the pre-r6 ledger (no PR number)"
+        );
+    }
+    Ok(Default::default())
 }
 
 /// Record that `record`'s target reviewed `record.pr_number`. Caller holds
-/// the branch lock and calls this BEFORE adding the event's key to the
-/// terminal retirement ledger, so a first write seeds only pre-r6 rows. When
-/// either ledger is unreadable nothing is written: the reader keeps failing
-/// closed and the earlier exclusions are not erased (r7 P1-2).
+/// the branch lock. The pre-r6 ledger is not migrated: the first write
+/// starts the new ledger with this row, which ends the fail-closed state of a
+/// legacy branch. An unreadable new ledger is never rewritten (one WARN): the
+/// reader keeps failing closed and earlier rows are not erased (r7 P1-2).
 pub(crate) fn note_retired_review_target(
     home: &Path,
     record: &ActiveAssignment,
 ) -> std::io::Result<()> {
-    let mut rows = match retired_review_rows(home, &record.repo, &record.branch) {
-        Ok(rows) => rows,
+    let path = retired_review_targets_file(home, &record.repo, &record.branch);
+    let mut rows = match read_retired_review_targets(&path) {
+        Ok(rows) => rows.unwrap_or_default(),
         Err(error) => {
             tracing::warn!(
                 repo = %record.repo,
@@ -475,7 +472,6 @@ pub(crate) fn note_retired_review_target(
             return Ok(());
         }
     };
-    let path = retired_review_targets_file(home, &record.repo, &record.branch);
     let new_row = rows.insert(RetiredReviewTarget {
         target: record.target.clone(),
         pr_number: record.pr_number,
@@ -489,8 +485,8 @@ pub(crate) fn note_retired_review_target(
 /// -18577-7 r6: `(reviewer, pr_number)` for every assignment on
 /// `repo`/`branch` retired by a terminal task event — a PR's reviewers after
 /// their verdict landed, tagged with the PR generation they reviewed.
-/// `pr_number == 0` = unknown generation (a pre-r6 row). `Err` when a ledger
-/// is unreadable: the caller must fail closed.
+/// `Err` when the new ledger is unreadable or the branch has only pre-r6
+/// retirement history: the caller must fail closed.
 pub(crate) fn retired_review_targets(
     home: &Path,
     repo: &str,
