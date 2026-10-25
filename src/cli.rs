@@ -454,17 +454,16 @@ fn parse_marker_body(body: &str) -> Option<HelperMarker<'_>> {
 
 /// Pure identity comparison of the daemon against a helper's raw bytes.
 /// `None` = not comparable by identity (an `unknown` sha on either side), so
-/// the caller falls back to mtime. Fail-closed: exactly one well-formed marker
-/// is required to be `Fresh`; zero, several (even if one matches) or a
-/// malformed one is `Stale`. A dirty build is only `Fresh` against the same
+/// the caller falls back to mtime. Fail-closed: the helper's markers are
+/// counted first, whatever the daemon's identity — zero, several (even if one
+/// matches) or a malformed one is `Stale`; only with exactly one well-formed
+/// marker may an `unknown` sha on either side defer to mtime.
+/// A dirty build is only `Fresh` against the same
 /// non-empty nonce — the sha alone cannot tell two dirty builds apart.
 pub(crate) fn classify_helper_identity(
     daemon: BuildIdentity<'_>,
     helper_bytes: &[u8],
 ) -> Option<HelperStaleness> {
-    if daemon.sha == UNKNOWN_SHA {
-        return None;
-    }
     let prefix = helper_marker_prefix!().as_bytes();
     let mut bodies = memchr_windows(helper_bytes, prefix).map(|at| {
         let rest = &helper_bytes[at + prefix.len()..];
@@ -477,7 +476,9 @@ pub(crate) fn classify_helper_identity(
     let Some(marker) = parse_marker_body(body) else {
         return Some(HelperStaleness::Stale);
     };
-    if marker.sha == UNKNOWN_SHA {
+    // Exactly one well-formed marker; only now may an unknown sha on either
+    // side defer to the mtime fallback.
+    if daemon.sha == UNKNOWN_SHA || marker.sha == UNKNOWN_SHA {
         return None;
     }
     let same = marker.sha == daemon.sha
