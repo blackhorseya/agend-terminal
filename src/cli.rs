@@ -351,10 +351,12 @@ fn now_epoch_ms() -> i64 {
 /// Sprint 58 Wave 2 PR-1 (#11): per-helper staleness summary line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HelperStaleness {
-    /// Helper binary present and at least as new as the daemon binary
-    /// — no operator action needed.
+    /// Helper binary carries the daemon's build identity (or, when
+    /// identity is unavailable, is at least as new as the daemon
+    /// binary) — no operator action needed.
     Fresh,
-    /// Helper binary mtime is older than the daemon binary — fix
+    /// Helper binary is from a different build than the daemon (marker
+    /// mismatch or no marker; mtime fallback: older than the daemon) — fix
     /// recommended (operator runs `cargo install --path . --force`
     /// or equivalent).
     Stale,
@@ -386,19 +388,123 @@ impl HelperStaleness {
 }
 
 /// Sprint 58 Wave 2 PR-1 (#11): pure helper that classifies a single
-/// helper binary's freshness vs the current daemon binary. Compares
-/// `mtime` (operator-side rebuild bumps the daemon binary's mtime;
-/// the helper at `$AGEND_HOME/bin/<name>` keeps the older mtime
-/// until the operator explicitly reinstalls).
+/// helper binary's freshness vs the current daemon binary.
 ///
-/// Why mtime instead of version-string: the helper binaries are
-/// minimal and don't currently embed a version constant; mtime
-/// comparison is a 1-syscall stat() vs 2-process-spawns + stdout
-/// parse. mtime can lie under filesystems that don't update it on
-/// content change — but no such filesystem is in production scope
-/// here. Sprint 59+ candidate: switch to embedded version constant
-/// if mtime turns out to be unreliable empirically.
+/// Compares build identity, not mtime: `cargo install` writes the helpers
+/// before the daemon, so a freshly installed helper is always older. Each
+/// helper embeds `AGEND-HELPER-BUILD-ID:<sha>:<dirty>\0` (see
+/// `helper_build_id.rs`); the daemon reads the helper's bytes and compares.
+///
+/// | daemon vs helper                                    | result              |
+/// |-----------------------------------------------------|---------------------|
+/// | helper file missing                                 | `NotInstalled`      |
+/// | identities equal                                    | `Fresh`             |
+/// | identities differ, or helper has no marker          | `Stale`             |
+/// | either sha `unknown`, or helper unreadable          | mtime comparison    |
 pub(crate) fn classify_helper_staleness(
+    daemon_exe: Option<&Path>,
+    helper_path: &Path,
+) -> HelperStaleness {
+    classify_helper_staleness_with_id(
+        BuildIdentity {
+            sha: env!("AGEND_BUILD_SHA"),
+            dirty: env!("AGEND_BUILD_DIRTY") == "1",
+            nonce: env!("AGEND_BUILD_NONCE_SUFFIX").trim_start_matches(':'),
+        },
+        daemon_exe,
+        helper_path,
+    )
+}
+
+/// Build identity stamped by build.rs (`AGEND_BUILD_SHA` / `AGEND_BUILD_DIRTY` /
+/// `AGEND_BUILD_NONCE_SUFFIX`). `nonce` is empty for clean builds; a dirty build
+/// carries one shared by all bins of that cargo build.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct BuildIdentity<'a> {
+    pub(crate) sha: &'a str,
+    pub(crate) dirty: bool,
+    pub(crate) nonce: &'a str,
+}
+
+/// Parsed `<sha>:<dirty>[:<nonce>]` marker body.
+struct HelperMarker<'a> {
+    sha: &'a str,
+    dirty: bool,
+    nonce: &'a str,
+}
+
+fn parse_marker_body(body: &str) -> Option<HelperMarker<'_>> {
+    let mut parts = body.split(':');
+    let sha = parts.next().filter(|s| !s.is_empty())?;
+    let dirty = match parts.next()? {
+        "0" => false,
+        "1" => true,
+        _ => return None,
+    };
+    let nonce = match parts.next() {
+        None => "",
+        Some(n) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_alphanumeric()) => n,
+        Some(_) => return None,
+    };
+    if parts.next().is_some() {
+        return None;
+    }
+    Some(HelperMarker { sha, dirty, nonce })
+}
+
+/// Pure identity comparison of the daemon against a helper's raw bytes.
+/// `None` = not comparable by identity (an `unknown` sha on either side), so
+/// the caller falls back to mtime. Fail-closed: the helper's markers are
+/// counted first, whatever the daemon's identity — zero, several (even if one
+/// matches) or a malformed one is `Stale`; only with exactly one well-formed
+/// marker may an `unknown` sha on either side defer to mtime.
+/// A dirty build is only `Fresh` against the same
+/// non-empty nonce — the sha alone cannot tell two dirty builds apart.
+pub(crate) fn classify_helper_identity(
+    daemon: BuildIdentity<'_>,
+    helper_bytes: &[u8],
+) -> Option<HelperStaleness> {
+    let prefix = helper_marker_prefix!().as_bytes();
+    let mut bodies = memchr_windows(helper_bytes, prefix).map(|at| {
+        let rest = &helper_bytes[at + prefix.len()..];
+        let end = rest.iter().position(|&b| b == 0)?;
+        std::str::from_utf8(&rest[..end]).ok()
+    });
+    let (Some(Some(body)), None) = (bodies.next(), bodies.next()) else {
+        return Some(HelperStaleness::Stale);
+    };
+    let Some(marker) = parse_marker_body(body) else {
+        return Some(HelperStaleness::Stale);
+    };
+    // Exactly one well-formed marker; only now may an unknown sha on either
+    // side defer to the mtime fallback.
+    if daemon.sha == UNKNOWN_SHA || marker.sha == UNKNOWN_SHA {
+        return None;
+    }
+    let same = marker.sha == daemon.sha
+        && marker.dirty == daemon.dirty
+        && marker.nonce == daemon.nonce
+        && (!marker.dirty || !marker.nonce.is_empty());
+    Some(if same {
+        HelperStaleness::Fresh
+    } else {
+        HelperStaleness::Stale
+    })
+}
+
+const UNKNOWN_SHA: &str = "unknown";
+
+/// Start offsets of every occurrence of `needle` in `haystack`.
+fn memchr_windows<'a>(haystack: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter(move |(_, w)| *w == needle)
+        .map(|(i, _)| i)
+}
+
+fn classify_helper_staleness_with_id(
+    daemon_id: BuildIdentity<'_>,
     daemon_exe: Option<&Path>,
     helper_path: &Path,
 ) -> HelperStaleness {
@@ -408,6 +514,15 @@ pub(crate) fn classify_helper_staleness(
     let Some(daemon_exe) = daemon_exe else {
         return HelperStaleness::UndeterminableDaemonPath;
     };
+    // Identity first: read the helper's bytes (never execute it) and compare
+    // the embedded build marker with the daemon's own.
+    if let Some(state) = std::fs::read(helper_path)
+        .ok()
+        .and_then(|bytes| classify_helper_identity(daemon_id, &bytes))
+    {
+        return state;
+    }
+    // Identity not comparable (unknown sha / unreadable file): mtime fallback.
     let helper_mtime = std::fs::metadata(helper_path)
         .and_then(|m| m.modified())
         .ok();
@@ -453,10 +568,12 @@ pub(crate) fn check_helper_staleness(home: &Path) -> String {
             HelperStaleness::Fresh => " ✓ (fresh)".to_string(),
             HelperStaleness::Stale => {
                 any_stale = true;
-                " ⚠ (stale — older than daemon binary)".to_string()
+                " ⚠ (stale — built from a different build than the daemon)".to_string()
             }
             HelperStaleness::NotInstalled => " - (not yet installed)".to_string(),
-            HelperStaleness::UndeterminableDaemonPath => " ? (mtime undeterminable)".to_string(),
+            HelperStaleness::UndeterminableDaemonPath => {
+                " ? (build identity undeterminable)".to_string()
+            }
         };
         lines.push(format!("{name} ({desc}){suffix}"));
     }
@@ -1216,7 +1333,10 @@ mod gc_dry_run_tests {
 #[cfg(test)]
 #[allow(clippy::unwrap_used, clippy::expect_used)]
 mod helper_staleness_tests {
-    use super::{check_helper_staleness, classify_helper_staleness, HelperStaleness};
+    use super::{
+        check_helper_staleness, classify_helper_identity, classify_helper_staleness,
+        classify_helper_staleness_with_id, BuildIdentity, HelperStaleness,
+    };
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -1241,6 +1361,241 @@ mod helper_staleness_tests {
         std::fs::write(path, content).expect("write");
         // Tiny pause so the next write lands strictly later.
         std::thread::sleep(std::time::Duration::from_millis(pause_ms));
+    }
+
+    fn marker(sha: &str, dirty: u8) -> Vec<u8> {
+        format!("\u{0}junk\u{0}AGEND-HELPER-BUILD-ID:{sha}:{dirty}\u{0}tail").into_bytes()
+    }
+
+    /// Marker carrying this test binary's own build identity.
+    fn own_marker() -> Vec<u8> {
+        format!(
+            "\u{0}AGEND-HELPER-BUILD-ID:{}:{}{}\u{0}",
+            env!("AGEND_BUILD_SHA"),
+            env!("AGEND_BUILD_DIRTY"),
+            env!("AGEND_BUILD_NONCE_SUFFIX")
+        )
+        .into_bytes()
+    }
+
+    const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+    fn id(sha: &str, dirty: bool) -> BuildIdentity<'_> {
+        BuildIdentity {
+            sha,
+            dirty,
+            nonce: "",
+        }
+    }
+
+    #[test]
+    fn identity_same_build_is_fresh() {
+        assert_eq!(
+            classify_helper_identity(id(SHA_A, false), &marker(SHA_A, 0)),
+            Some(HelperStaleness::Fresh)
+        );
+    }
+
+    #[test]
+    fn identity_different_sha_is_stale() {
+        assert_eq!(
+            classify_helper_identity(id(SHA_A, false), &marker(SHA_B, 0)),
+            Some(HelperStaleness::Stale)
+        );
+    }
+
+    #[test]
+    fn identity_different_dirty_flag_is_stale() {
+        assert_eq!(
+            classify_helper_identity(id(SHA_A, false), &marker(SHA_A, 1)),
+            Some(HelperStaleness::Stale)
+        );
+    }
+
+    #[test]
+    fn identity_missing_marker_is_stale() {
+        assert_eq!(
+            classify_helper_identity(id(SHA_A, false), b"old-helper-without-marker"),
+            Some(HelperStaleness::Stale)
+        );
+    }
+
+    fn dirty_id<'a>(sha: &'a str, nonce: &'a str) -> BuildIdentity<'a> {
+        BuildIdentity {
+            sha,
+            dirty: true,
+            nonce,
+        }
+    }
+
+    fn nonce_marker(sha: &str, dirty: u8, nonce: &str) -> Vec<u8> {
+        format!("\u{0}AGEND-HELPER-BUILD-ID:{sha}:{dirty}:{nonce}\u{0}").into_bytes()
+    }
+
+    #[test]
+    fn identity_dirty_same_nonce_is_fresh_other_nonce_is_stale() {
+        assert_eq!(
+            classify_helper_identity(dirty_id(SHA_A, "n1"), &nonce_marker(SHA_A, 1, "n1")),
+            Some(HelperStaleness::Fresh)
+        );
+        assert_eq!(
+            classify_helper_identity(dirty_id(SHA_A, "n2"), &nonce_marker(SHA_A, 1, "n1")),
+            Some(HelperStaleness::Stale)
+        );
+    }
+
+    #[test]
+    fn identity_nonce_shape_mismatch_is_stale() {
+        // clean daemon vs nonce'd helper, dirty daemon vs nonce-less helper
+        assert_eq!(
+            classify_helper_identity(id(SHA_A, false), &nonce_marker(SHA_A, 0, "n1")),
+            Some(HelperStaleness::Stale)
+        );
+        assert_eq!(
+            classify_helper_identity(dirty_id(SHA_A, "n1"), &marker(SHA_A, 1)),
+            Some(HelperStaleness::Stale)
+        );
+    }
+
+    #[test]
+    fn identity_malformed_marker_is_stale() {
+        for body in ["x:1:n:extra", "x:2", "x:1:", "x:1:n-!", ":1", "x"] {
+            let bytes = format!("\u{0}AGEND-HELPER-BUILD-ID:{body}\u{0}").into_bytes();
+            assert_eq!(
+                classify_helper_identity(id(SHA_A, false), &bytes),
+                Some(HelperStaleness::Stale),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn identity_contradicting_markers_are_stale_in_either_order() {
+        let mut ab = marker(SHA_A, 0);
+        ab.extend_from_slice(&marker(SHA_B, 0));
+        assert_eq!(
+            classify_helper_identity(id(SHA_A, false), &ab),
+            Some(HelperStaleness::Stale)
+        );
+    }
+
+    #[test]
+    fn identity_unknown_sha_is_not_comparable() {
+        assert_eq!(
+            classify_helper_identity(id("unknown", false), &marker(SHA_A, 0)),
+            None
+        );
+        assert_eq!(
+            classify_helper_identity(id(SHA_A, false), &marker("unknown", 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn reviewer_unknown_daemon_with_missing_marker_must_stay_stale() {
+        let home = tmp_home("unknown-daemon-no-marker");
+        let daemon = home.join("daemon");
+        write_then_pause(&daemon, b"daemon", 30);
+        let helper = home.join("agend-git");
+        write_then_pause(&helper, b"legacy helper without marker", 10);
+        let actual =
+            classify_helper_staleness_with_id(id("unknown", false), Some(&daemon), &helper);
+        assert_eq!(
+            actual,
+            HelperStaleness::Stale,
+            "a missing marker must stay stale even when the daemon SHA is unknown"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn reviewer_unknown_daemon_with_two_markers_must_stay_stale() {
+        let mut bytes = marker(SHA_A, 0);
+        bytes.extend_from_slice(&marker(SHA_B, 0));
+        assert_eq!(
+            classify_helper_identity(id("unknown", false), &bytes),
+            Some(HelperStaleness::Stale),
+            "multiple markers must stay stale even when the daemon SHA is unknown"
+        );
+    }
+
+    #[test]
+    fn same_build_helper_written_before_daemon_is_fresh() {
+        // cargo install order: helper first (older mtime), daemon last.
+        let home = tmp_home("same-build");
+        let helper = home.join("agend-git");
+        write_then_pause(&helper, &marker(SHA_A, 0), 30);
+        let daemon = home.join("agend-terminal-fake");
+        write_then_pause(&daemon, b"daemon", 10);
+        let state = classify_helper_staleness_with_id(id(SHA_A, false), Some(&daemon), &helper);
+        assert_eq!(state, HelperStaleness::Fresh);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn old_build_helper_written_before_daemon_is_stale() {
+        let home = tmp_home("old-build");
+        let helper = home.join("agend-git");
+        write_then_pause(&helper, &marker(SHA_B, 0), 30);
+        let daemon = home.join("agend-terminal-fake");
+        write_then_pause(&daemon, b"daemon", 10);
+        let state = classify_helper_staleness_with_id(id(SHA_A, false), Some(&daemon), &helper);
+        assert_eq!(state, HelperStaleness::Stale);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn unknown_sha_falls_back_to_mtime() {
+        let home = tmp_home("unknown-sha");
+        let helper = home.join("agend-git");
+        write_then_pause(&helper, &marker(SHA_A, 0), 30);
+        let daemon = home.join("agend-terminal-fake");
+        write_then_pause(&daemon, b"daemon", 10);
+        let state = classify_helper_staleness_with_id(id("unknown", false), Some(&daemon), &helper);
+        assert_eq!(state, HelperStaleness::Stale);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn reviewer_unknown_daemon_with_malformed_marker_must_stay_stale() {
+        let bytes = b"\0AGEND-HELPER-BUILD-ID:not-a-valid-marker\0";
+        assert_eq!(
+            classify_helper_identity(id("unknown", false), bytes),
+            Some(HelperStaleness::Stale),
+            "malformed marker must stay stale even when daemon SHA is unknown"
+        );
+    }
+
+    #[test]
+    fn reviewer_dirty_rebuild_at_same_commit_must_not_call_old_helper_fresh() {
+        let home = tmp_home("dirty-rebuild-same-sha");
+        let helper = home.join("agend-git");
+        let mut old_helper = marker(SHA_A, 1);
+        old_helper.extend_from_slice(b"old dirty source contents");
+        write_then_pause(&helper, &old_helper, 30);
+        let daemon = home.join("agend-terminal-fake");
+        let mut new_daemon = marker(SHA_A, 1);
+        new_daemon.extend_from_slice(b"new dirty source contents");
+        write_then_pause(&daemon, &new_daemon, 10);
+        let actual = classify_helper_staleness_with_id(id(SHA_A, true), Some(&daemon), &helper);
+        assert_eq!(
+            actual,
+            HelperStaleness::Stale,
+            "an old dirty build must not be fresh"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn reviewer_ambiguous_helper_markers_must_fail_closed() {
+        let mut helper = marker(SHA_B, 0);
+        helper.extend_from_slice(&marker(SHA_A, 0));
+        assert_eq!(
+            classify_helper_identity(id(SHA_A, false), &helper),
+            Some(HelperStaleness::Stale),
+            "an old helper with an extra matching marker must not be fresh"
+        );
     }
 
     #[test]
@@ -1276,13 +1631,13 @@ mod helper_staleness_tests {
         } else {
             bin.join("agend-git")
         };
-        write_then_pause(&helper_git, b"helper-binary", 10);
+        write_then_pause(&helper_git, &own_marker(), 10);
         let helper_bridge = if cfg!(windows) {
             bin.join("agend-mcp-bridge.exe")
         } else {
             bin.join("agend-mcp-bridge")
         };
-        write_then_pause(&helper_bridge, b"helper-binary", 10);
+        write_then_pause(&helper_bridge, &own_marker(), 10);
 
         // Direct classifier check (more deterministic than going
         // through current_exe()).

@@ -5,6 +5,9 @@
 // so it leads the module list. Defines the macro for the whole bin crate.
 #[macro_use]
 mod macros;
+// Marker macros shared with the helper bins; must precede `cli`.
+#[macro_use]
+mod helper_build_id;
 
 mod admin;
 mod agent;

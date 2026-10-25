@@ -143,8 +143,8 @@ pub(crate) fn scan_and_emit(
 /// BYTE-IDENTICAL text.
 fn helper_staleness_text(helper_name: &str) -> String {
     format!(
-        "[helper_staleness_watchdog] helper '{helper_name}' is older \
-         than the daemon binary. Run `cargo install --path . --force` \
+        "[helper_staleness_watchdog] helper '{helper_name}' was built \
+         from a different build than the daemon. Run `cargo install --path . --force` \
          then restart the daemon (`agend-terminal stop` → \
          `agend-terminal start`) so the refreshed helpers are loaded. \
          (Sprint 59 Wave 2 PR-3 #13 — proactive vantage; operator-pull \

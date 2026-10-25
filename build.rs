@@ -43,9 +43,23 @@ fn emit_build_identity() {
     // Re-stamp on repo movement (commit / branch switch / ref update). Emitted
     // whenever the tree is a git repo — existing paths only (rerun_paths), since
     // a registered-but-missing path makes cargo re-run on every build.
-    for p in rerun_paths(&manifest_dir) {
+    for p in rerun_paths(&manifest_dir)
+        .into_iter()
+        .chain(source_rerun_paths(&manifest_dir))
+    {
         println!("cargo:rerun-if-changed={}", p.display());
     }
+    // Dirty builds only: one nonce per build-script run, shared by every bin of
+    // this cargo build (daemon + helpers) and re-minted whenever a source
+    // changes (see source_rerun_paths) — see helper_build_id.rs.
+    let nonce_suffix = build_nonce_suffix(&id.sha, id.dirty, || {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        format!("{nanos:x}{:x}", std::process::id())
+    });
+    println!("cargo:rustc-env=AGEND_BUILD_NONCE_SUFFIX={nonce_suffix}");
     let semver = std::env::var("CARGO_PKG_VERSION").unwrap_or_else(|_| "0.0.0".to_string());
     println!("cargo:rustc-env=AGEND_BUILD_SHA={}", id.sha);
     println!(

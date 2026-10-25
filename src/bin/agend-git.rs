@@ -20,7 +20,14 @@ use std::env;
 #[path = "agend-git/kill_guard.rs"]
 mod kill_guard;
 
+// Build-identity marker the daemon's staleness check reads out of this binary.
+#[macro_use]
+#[path = "../helper_build_id.rs"]
+mod helper_build_id;
+embed_helper_build_id!();
+
 fn main() {
+    keep_helper_build_id();
     // #t-…777-1: kill-family shim dispatch. When invoked via the pkill/killall/kill
     // PATH-shadow symlink (binding/shim_install.rs::symlink_shim), argv[0]'s basename
     // routes here and NEVER returns (deny+exit(1) or exec the real kill binary).
