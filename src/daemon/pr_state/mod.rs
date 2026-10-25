@@ -2381,3 +2381,8 @@ mod watch_settlement_tests;
 #[allow(clippy::unwrap_used)]
 #[path = "recipient_routing_tests.rs"]
 mod recipient_routing_tests;
+
+// -18577-7 r3: authoritative author identification (option A).
+#[cfg(test)]
+#[path = "author_authority_tests.rs"]
+mod author_authority_tests;
