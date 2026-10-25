@@ -1448,3 +1448,57 @@ fn duplicate_terminal_event_key_is_a_durable_no_op() {
     assert_eq!(list_active(&home, "o/r", "feat/p3").len(), 1);
     std::fs::remove_dir_all(&home).ok();
 }
+
+#[test]
+/// d-…-13 (2a) path 2: an operator settlement records its key only on the
+/// branches it retired on. Writing it everywhere made an unrelated branch
+/// look legacy-only and fail its author notices closed.
+fn operator_settlement_does_not_mark_an_unrelated_branch_as_retired() {
+    use crate::task_events::{append, OperatorSettlement, OperatorSettlementTarget, TaskEvent};
+    let home = tmp_home("path2-taint");
+    let task_id = "settled-review";
+    seed_open_task_as(&home, task_id, "reviewer");
+    let mut settled = mk_record(
+        "o/r",
+        "feat/settled",
+        "reviewer",
+        42,
+        "2026-09-10T01:00:00Z",
+    );
+    settled.task_id = task_id.into();
+    persist(&home, &settled).unwrap();
+    let mut other = mk_record("o/r", "feat/other", "reviewer2", 43, "2026-09-10T01:00:00Z");
+    other.task_id = "unrelated-task".into();
+    persist(&home, &other).unwrap();
+    let seq = append(
+        &home,
+        &"operator".into(),
+        TaskEvent::OperatorSettled {
+            task_id: task_id.into(),
+            proof: OperatorSettlement {
+                operation_id: "op".into(),
+                preview_digest: "digest".into(),
+                by: "operator".into(),
+                holder_instance: Some("reviewer".into()),
+                target: OperatorSettlementTarget::Done,
+                result: "done".into(),
+            },
+        },
+    )
+    .unwrap();
+    retire_terminal_event_checked(
+        &home,
+        "default",
+        task_id,
+        "operator",
+        seq,
+        "2026-09-10T01:00:01Z",
+    )
+    .unwrap();
+    let other_history = retired_review_targets(&home, "o/r", "feat/other");
+    assert!(
+        other_history.is_ok(),
+        "unrelated settlement made feat/other look legacy-only: {other_history:?}"
+    );
+    std::fs::remove_dir_all(&home).unwrap();
+}

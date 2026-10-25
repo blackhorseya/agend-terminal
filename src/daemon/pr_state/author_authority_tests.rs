@@ -1159,19 +1159,120 @@ fn legacy_ledger_without_new_ledger_fails_the_whole_branch_closed() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
+/// d-…-13 (2a): a legacy branch stays failed closed for good — its first new
+/// retirement does not start the new ledger, so the pre-r6 rows (no PR
+/// number) can never be outweighed by a partial new ledger.
 #[test]
-fn first_new_retirement_restores_author_notices_on_a_legacy_branch() {
-    let home = home_with_fleet("legacy-branch-restored", TWO_TEAM_FLEET);
-    let branch = "feat/legacy-branch-restored";
+fn first_new_retirement_does_not_restore_author_notices_on_a_legacy_branch() {
+    let home = home_with_fleet("legacy-branch-stays-closed", TWO_TEAM_FLEET);
+    let branch = "feat/legacy-branch-stays-closed";
     legacy_ledger(&home, branch, &["third"]);
     retired_review(&home, branch, "other-rev", 15);
     crate::binding::bind(&home, "third", "t-author", branch);
     save(&home, &merged_state(branch, &["third"], "")).unwrap();
     scan(&home, vec![]);
-    assert_eq!(
-        kinds(&home, "third"),
-        vec!["pr-merged"],
-        "once the new ledger exists the legacy rows no longer count"
+    assert!(
+        kinds(&home, "third").is_empty(),
+        "a legacy branch must stay failed closed after its first new retirement"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// d-…-13 condition 4: a branch opened after the upgrade, whose review task
+/// retires (real terminal append, which writes BOTH ledgers) before the PR
+/// merges, still gets its author notice — (2a) must not read the idempotency
+/// ledger that every retirement writes as pre-r6 history.
+#[test]
+fn upgraded_branch_review_retired_before_merge_still_notifies_the_author() {
+    let home = home_with_fleet("upgraded-branch-retire-then-merge", TWO_TEAM_FLEET);
+    let branch = "feat/upgraded-branch-retire-then-merge";
+    let task_id = "t-review-upgraded";
+    crate::task_events::append(
+        &home,
+        &crate::task_events::InstanceName::from("system:test"),
+        crate::task_events::TaskEvent::Created {
+            task_id: crate::task_events::TaskId::from(task_id),
+            title: "review task".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            owner: Some(crate::task_events::InstanceName::from("other-rev")),
+            due_at: None,
+            depends_on: Vec::new(),
+            routed_to: None,
+            branch: Some(branch.into()),
+            bind: None,
+            eta_secs: None,
+            tags: Vec::new(),
+            parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
+        },
+    )
+    .unwrap();
+    let record = crate::daemon::assignment_authority::ActiveAssignment::new_pending_typed(
+        REPO,
+        branch,
+        "other-rev",
+        crate::types::InstanceId::new(),
+        15,
+        "a".repeat(40),
+        crate::review_receipt::ReviewSlot::Primary,
+        "third",
+        task_id,
+        ReviewClass::Single,
+        ReviewAuthor::Agent("personal".into()),
+        "review",
+        None,
+        None,
+        "2026-10-25T00:00:00Z",
+    );
+    crate::daemon::assignment_authority::persist(&home, &record).unwrap();
+    crate::task_events::append(
+        &home,
+        &"other-rev".into(),
+        crate::task_events::TaskEvent::Cancelled {
+            task_id: task_id.into(),
+            by: "other-rev".into(),
+            reason: "review finished".into(),
+        },
+    )
+    .unwrap();
+    let ledger_dir =
+        crate::daemon::assignment_authority::record_path_for_test(&home, REPO, branch, "x");
+    let legacy = std::fs::read_to_string(
+        ledger_dir
+            .parent()
+            .unwrap()
+            .join("terminal_retirements.json"),
+    )
+    .expect("the real terminal path must write the legacy ledger");
+    assert_ne!(
+        legacy.trim(),
+        "[]",
+        "precondition: the legacy ledger is non-empty"
+    );
+    crate::binding::bind(&home, "personal", "t-author", branch);
+    save(&home, &merged_state(branch, &["personal"], "")).unwrap();
+    scan(&home, vec![]);
+    assert_eq!(kinds(&home, "personal"), vec!["pr-merged"]);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+#[test]
+fn reviewer_attack_first_new_retirement_cannot_unmask_same_pr_legacy_reviewer() {
+    let home = home_with_fleet("legacy-same-pr-unmasked", TWO_TEAM_FLEET);
+    let branch = "feat/legacy-same-pr-unmasked";
+    // The pre-r6 task was a review task on this very PR. Its retired target
+    // still has a branch binding but must not receive an author notice.
+    legacy_ledger(&home, branch, &["third"]);
+    retired_review(&home, branch, "other-rev", 15);
+    crate::binding::bind(&home, "third", "t-retired-review-worktree", branch);
+    save(&home, &merged_state(branch, &[], "")).unwrap();
+    scan(&home, vec![]);
+    let third = kinds(&home, "third");
+    assert!(
+        third.is_empty(),
+        "same-PR retired reviewer received an author notice after first new retirement: {third:?}"
     );
     let _ = std::fs::remove_dir_all(&home);
 }
