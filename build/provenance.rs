@@ -221,14 +221,25 @@ pub fn compose_mcp_version(semver: &str, sha: &str, dirty: bool) -> String {
 /// Per-build nonce suffix for the helper build-id marker (`:<nonce>` or empty).
 /// A dirty tree can differ in content at the same HEAD sha, so a dirty build
 /// gets a nonce that every bin of ONE cargo build shares; a clean build is
-/// fully identified by its sha and gets no suffix (reproducible).
-pub fn build_nonce_suffix(_sha: &str, _dirty: bool, _seed: impl FnOnce() -> String) -> String {
-    String::new() // RED stub
+/// fully identified by its sha and gets no suffix (reproducible). `unknown`
+/// never gets one (it is not comparable by identity anyway).
+pub fn build_nonce_suffix(sha: &str, dirty: bool, seed: impl FnOnce() -> String) -> String {
+    if dirty && sha != "unknown" {
+        format!(":{}", seed())
+    } else {
+        String::new()
+    }
 }
 
 /// Source paths whose change must re-run the build script so a dirty nonce
-/// never outlives the sources it was minted for (covers untracked files that
-/// `rerun_paths`' tracked-file list cannot see).
-pub fn source_rerun_paths(_dir: &Path) -> Vec<PathBuf> {
-    Vec::new() // RED stub
+/// never outlives the sources it was minted for. `rerun_paths` lists only
+/// TRACKED files; the `src` directory (cargo scans it recursively) also
+/// catches new untracked files. Only existing paths are returned (a missing
+/// trigger path makes cargo re-run on every build).
+pub fn source_rerun_paths(dir: &Path) -> Vec<PathBuf> {
+    ["src", "Cargo.toml", "Cargo.lock", "build.rs", "build"]
+        .iter()
+        .map(|rel| dir.join(rel))
+        .filter(|p| p.exists())
+        .collect()
 }

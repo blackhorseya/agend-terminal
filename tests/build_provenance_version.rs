@@ -27,8 +27,8 @@ use common::git_isolated;
 mod provenance;
 
 use provenance::{
-    build_nonce_suffix, compose_cli_version, compose_mcp_version, git_probe, rerun_paths, resolve_identity,
-    source_rerun_paths, valid_full_sha,
+    build_nonce_suffix, compose_cli_version, compose_mcp_version, git_probe, rerun_paths,
+    resolve_identity, source_rerun_paths, valid_full_sha,
 };
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -584,7 +584,10 @@ fn main() {
     assert_eq!(run_fixture(&repo), "", "clean build carries no nonce");
     main_rs("edit one");
     let n1 = run_fixture(&repo);
-    assert!(n1.starts_with(':') && n1.len() > 1, "dirty build needs a nonce: {n1:?}");
+    assert!(
+        n1.starts_with(':') && n1.len() > 1,
+        "dirty build needs a nonce: {n1:?}"
+    );
     assert_eq!(run_fixture(&repo), n1, "no change keeps the cached nonce");
     main_rs("edit two");
     let n2 = run_fixture(&repo);
