@@ -351,10 +351,12 @@ fn now_epoch_ms() -> i64 {
 /// Sprint 58 Wave 2 PR-1 (#11): per-helper staleness summary line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum HelperStaleness {
-    /// Helper binary present and at least as new as the daemon binary
-    /// — no operator action needed.
+    /// Helper binary carries the daemon's build identity (or, when
+    /// identity is unavailable, is at least as new as the daemon
+    /// binary) — no operator action needed.
     Fresh,
-    /// Helper binary mtime is older than the daemon binary — fix
+    /// Helper binary is from a different build than the daemon (marker
+    /// mismatch or no marker; mtime fallback: older than the daemon) — fix
     /// recommended (operator runs `cargo install --path . --force`
     /// or equivalent).
     Stale,
@@ -386,18 +388,19 @@ impl HelperStaleness {
 }
 
 /// Sprint 58 Wave 2 PR-1 (#11): pure helper that classifies a single
-/// helper binary's freshness vs the current daemon binary. Compares
-/// `mtime` (operator-side rebuild bumps the daemon binary's mtime;
-/// the helper at `$AGEND_HOME/bin/<name>` keeps the older mtime
-/// until the operator explicitly reinstalls).
+/// helper binary's freshness vs the current daemon binary.
 ///
-/// Why mtime instead of version-string: the helper binaries are
-/// minimal and don't currently embed a version constant; mtime
-/// comparison is a 1-syscall stat() vs 2-process-spawns + stdout
-/// parse. mtime can lie under filesystems that don't update it on
-/// content change — but no such filesystem is in production scope
-/// here. Sprint 59+ candidate: switch to embedded version constant
-/// if mtime turns out to be unreliable empirically.
+/// Compares build identity, not mtime: `cargo install` writes the helpers
+/// before the daemon, so a freshly installed helper is always older. Each
+/// helper embeds `AGEND-HELPER-BUILD-ID:<sha>:<dirty>\0` (see
+/// `helper_build_id.rs`); the daemon reads the helper's bytes and compares.
+///
+/// | daemon vs helper                                    | result              |
+/// |-----------------------------------------------------|---------------------|
+/// | helper file missing                                 | `NotInstalled`      |
+/// | identities equal                                    | `Fresh`             |
+/// | identities differ, or helper has no marker          | `Stale`             |
+/// | either sha `unknown`, or helper unreadable          | mtime comparison    |
 pub(crate) fn classify_helper_staleness(
     daemon_exe: Option<&Path>,
     helper_path: &Path,
@@ -426,9 +429,45 @@ pub(crate) fn classify_helper_identity(
     daemon: BuildIdentity<'_>,
     helper_bytes: &[u8],
 ) -> Option<HelperStaleness> {
-    // RED stub: real implementation lands in the GREEN commit.
-    let _ = (daemon, helper_bytes);
+    if daemon.sha == UNKNOWN_SHA {
+        return None;
+    }
+    let prefix = helper_marker_prefix!().as_bytes();
+    for at in memchr_windows(helper_bytes, prefix) {
+        let rest = &helper_bytes[at + prefix.len()..];
+        let Some(end) = rest.iter().position(|&b| b == 0) else {
+            continue;
+        };
+        let Ok(body) = std::str::from_utf8(&rest[..end]) else {
+            continue;
+        };
+        let Some((sha, dirty)) = body.rsplit_once(':') else {
+            continue;
+        };
+        if sha.is_empty() || !matches!(dirty, "0" | "1") {
+            continue;
+        }
+        if sha == UNKNOWN_SHA {
+            return None;
+        }
+        if sha == daemon.sha && (dirty == "1") == daemon.dirty {
+            return Some(HelperStaleness::Fresh);
+        }
+    }
+    // A well-formed marker that never matched, or no marker at all (helper
+    // built before markers existed): not the daemon's build.
     Some(HelperStaleness::Stale)
+}
+
+const UNKNOWN_SHA: &str = "unknown";
+
+/// Start offsets of every occurrence of `needle` in `haystack`.
+fn memchr_windows<'a>(haystack: &'a [u8], needle: &'a [u8]) -> impl Iterator<Item = usize> + 'a {
+    haystack
+        .windows(needle.len())
+        .enumerate()
+        .filter(move |(_, w)| *w == needle)
+        .map(|(i, _)| i)
 }
 
 fn classify_helper_staleness_with_id(
@@ -436,13 +475,21 @@ fn classify_helper_staleness_with_id(
     daemon_exe: Option<&Path>,
     helper_path: &Path,
 ) -> HelperStaleness {
-    let _ = daemon_id;
     if !helper_path.exists() {
         return HelperStaleness::NotInstalled;
     }
     let Some(daemon_exe) = daemon_exe else {
         return HelperStaleness::UndeterminableDaemonPath;
     };
+    // Identity first: read the helper's bytes (never execute it) and compare
+    // the embedded build marker with the daemon's own.
+    if let Some(state) = std::fs::read(helper_path)
+        .ok()
+        .and_then(|bytes| classify_helper_identity(daemon_id, &bytes))
+    {
+        return state;
+    }
+    // Identity not comparable (unknown sha / unreadable file): mtime fallback.
     let helper_mtime = std::fs::metadata(helper_path)
         .and_then(|m| m.modified())
         .ok();
@@ -488,10 +535,12 @@ pub(crate) fn check_helper_staleness(home: &Path) -> String {
             HelperStaleness::Fresh => " ✓ (fresh)".to_string(),
             HelperStaleness::Stale => {
                 any_stale = true;
-                " ⚠ (stale — older than daemon binary)".to_string()
+                " ⚠ (stale — built from a different build than the daemon)".to_string()
             }
             HelperStaleness::NotInstalled => " - (not yet installed)".to_string(),
-            HelperStaleness::UndeterminableDaemonPath => " ? (mtime undeterminable)".to_string(),
+            HelperStaleness::UndeterminableDaemonPath => {
+                " ? (build identity undeterminable)".to_string()
+            }
         };
         lines.push(format!("{name} ({desc}){suffix}"));
     }
@@ -1285,6 +1334,14 @@ mod helper_staleness_tests {
         format!("\u{0}junk\u{0}AGEND-HELPER-BUILD-ID:{sha}:{dirty}\u{0}tail").into_bytes()
     }
 
+    /// Marker carrying this test binary's own build identity.
+    fn own_marker() -> Vec<u8> {
+        marker(
+            env!("AGEND_BUILD_SHA"),
+            u8::from(env!("AGEND_BUILD_DIRTY") == "1"),
+        )
+    }
+
     const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
     const SHA_B: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -1350,6 +1407,30 @@ mod helper_staleness_tests {
     }
 
     #[test]
+    fn old_build_helper_written_before_daemon_is_stale() {
+        let home = tmp_home("old-build");
+        let helper = home.join("agend-git");
+        write_then_pause(&helper, &marker(SHA_B, 0), 30);
+        let daemon = home.join("agend-terminal-fake");
+        write_then_pause(&daemon, b"daemon", 10);
+        let state = classify_helper_staleness_with_id(id(SHA_A, false), Some(&daemon), &helper);
+        assert_eq!(state, HelperStaleness::Stale);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn unknown_sha_falls_back_to_mtime() {
+        let home = tmp_home("unknown-sha");
+        let helper = home.join("agend-git");
+        write_then_pause(&helper, &marker(SHA_A, 0), 30);
+        let daemon = home.join("agend-terminal-fake");
+        write_then_pause(&daemon, b"daemon", 10);
+        let state = classify_helper_staleness_with_id(id("unknown", false), Some(&daemon), &helper);
+        assert_eq!(state, HelperStaleness::Stale);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn helper_staleness_state_string_taxonomy() {
         // Pin string identifiers downstream consumers (greppers,
         // doctor parsers, future Sprint 59 telemetry) will rely on.
@@ -1382,13 +1463,13 @@ mod helper_staleness_tests {
         } else {
             bin.join("agend-git")
         };
-        write_then_pause(&helper_git, b"helper-binary", 10);
+        write_then_pause(&helper_git, &own_marker(), 10);
         let helper_bridge = if cfg!(windows) {
             bin.join("agend-mcp-bridge.exe")
         } else {
             bin.join("agend-mcp-bridge")
         };
-        write_then_pause(&helper_bridge, b"helper-binary", 10);
+        write_then_pause(&helper_bridge, &own_marker(), 10);
 
         // Direct classifier check (more deterministic than going
         // through current_exe()).

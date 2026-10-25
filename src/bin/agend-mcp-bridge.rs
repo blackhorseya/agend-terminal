@@ -61,7 +61,14 @@ fn is_duplicate_call(
     })
 }
 
+// Build-identity marker the daemon's staleness check reads out of this binary.
+#[macro_use]
+#[path = "../helper_build_id.rs"]
+mod helper_build_id;
+embed_helper_build_id!();
+
 fn main() {
+    keep_helper_build_id();
     if let Err(e) = run() {
         eprintln!("agend-mcp-bridge: {e}");
         std::process::exit(1);
