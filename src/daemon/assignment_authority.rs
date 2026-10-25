@@ -450,17 +450,32 @@ fn retired_review_rows(
 }
 
 /// Record that `record`'s target reviewed `record.pr_number`. Caller holds
-/// the branch lock. The pre-r6 ledger is not migrated: the first write
-/// starts the new ledger with this row, which ends the fail-closed state of a
-/// legacy branch. An unreadable new ledger is never rewritten (one WARN): the
-/// reader keeps failing closed and earlier rows are not erased (r7 P1-2).
+/// the branch lock and writes the pre-r6 ledger only after this returns, so
+/// when the new ledger does not exist yet the pre-r6 ledger holds exactly the
+/// branch's earlier history. If that history is non-empty the new ledger is
+/// never started (d-…-13 (2a)): the branch stays failed closed for good. An
+/// unreadable new ledger is never rewritten (one WARN): the reader keeps
+/// failing closed and earlier rows are not erased (r7 P1-2).
 pub(crate) fn note_retired_review_target(
     home: &Path,
     record: &ActiveAssignment,
 ) -> std::io::Result<()> {
     let path = retired_review_targets_file(home, &record.repo, &record.branch);
     let mut rows = match read_retired_review_targets(&path) {
-        Ok(rows) => rows.unwrap_or_default(),
+        Ok(Some(rows)) => rows,
+        Ok(None) => {
+            let legacy = terminal_retirements_file(home, &record.repo, &record.branch);
+            if read_terminal_retirements(&legacy).map_or(true, |rows| !rows.is_empty()) {
+                tracing::warn!(
+                    repo = %record.repo,
+                    branch = %record.branch,
+                    "branch has pre-r6 retirement history — not starting the retired reviewer \
+                     ledger; author notices for this branch stay failed closed"
+                );
+                return Ok(());
+            }
+            Default::default()
+        }
         Err(error) => {
             tracing::warn!(
                 repo = %record.repo,
@@ -1539,13 +1554,20 @@ fn retire_operator_settlement_after_preflight(
                 if ledger.contains(&key) {
                     return Ok(());
                 }
+                let mut matched = false;
                 for record in list_active_checked(home, &repo, &branch)? {
                     if record.task_id == task_id {
+                        matched = true;
                         note_retired_review_target(home, &record)?;
                         // The task is already terminal under its writer lock. Do not
                         // call cancellation, which would re-enter that same lock.
                         retired += usize::from(retire_delivery_under_lock(home, &record, now)?);
                     }
+                }
+                // Like the task-event path, key only branches this event retired
+                // on: a key elsewhere reads as pre-r6 history (d-…-13).
+                if !matched {
+                    return Ok(());
                 }
                 ledger.insert(key.clone());
                 Ok(atomic_write_json(&path, &ledger)?)
