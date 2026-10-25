@@ -1492,6 +1492,34 @@ mod helper_staleness_tests {
     }
 
     #[test]
+    fn reviewer_unknown_daemon_with_missing_marker_must_stay_stale() {
+        let home = tmp_home("unknown-daemon-no-marker");
+        let daemon = home.join("daemon");
+        write_then_pause(&daemon, b"daemon", 30);
+        let helper = home.join("agend-git");
+        write_then_pause(&helper, b"legacy helper without marker", 10);
+        let actual =
+            classify_helper_staleness_with_id(id("unknown", false), Some(&daemon), &helper);
+        assert_eq!(
+            actual,
+            HelperStaleness::Stale,
+            "a missing marker must stay stale even when the daemon SHA is unknown"
+        );
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn reviewer_unknown_daemon_with_two_markers_must_stay_stale() {
+        let mut bytes = marker(SHA_A, 0);
+        bytes.extend_from_slice(&marker(SHA_B, 0));
+        assert_eq!(
+            classify_helper_identity(id("unknown", false), &bytes),
+            Some(HelperStaleness::Stale),
+            "multiple markers must stay stale even when the daemon SHA is unknown"
+        );
+    }
+
+    #[test]
     fn same_build_helper_written_before_daemon_is_fresh() {
         // cargo install order: helper first (older mtime), daemon last.
         let home = tmp_home("same-build");
@@ -1526,6 +1554,16 @@ mod helper_staleness_tests {
         let state = classify_helper_staleness_with_id(id("unknown", false), Some(&daemon), &helper);
         assert_eq!(state, HelperStaleness::Stale);
         std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn reviewer_unknown_daemon_with_malformed_marker_must_stay_stale() {
+        let bytes = b"\0AGEND-HELPER-BUILD-ID:not-a-valid-marker\0";
+        assert_eq!(
+            classify_helper_identity(id("unknown", false), bytes),
+            Some(HelperStaleness::Stale),
+            "malformed marker must stay stale even when daemon SHA is unknown"
+        );
     }
 
     #[test]
