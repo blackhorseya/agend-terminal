@@ -1431,6 +1431,33 @@ mod helper_staleness_tests {
     }
 
     #[test]
+    fn reviewer_dirty_rebuild_at_same_commit_must_not_call_old_helper_fresh() {
+        let home = tmp_home("dirty-rebuild-same-sha");
+        let helper = home.join("agend-git");
+        let mut old_helper = marker(SHA_A, 1);
+        old_helper.extend_from_slice(b"old dirty source contents");
+        write_then_pause(&helper, &old_helper, 30);
+        let daemon = home.join("agend-terminal-fake");
+        let mut new_daemon = marker(SHA_A, 1);
+        new_daemon.extend_from_slice(b"new dirty source contents");
+        write_then_pause(&daemon, &new_daemon, 10);
+        let actual = classify_helper_staleness_with_id(id(SHA_A, true), Some(&daemon), &helper);
+        assert_eq!(actual, HelperStaleness::Stale, "an old dirty build must not be fresh");
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn reviewer_ambiguous_helper_markers_must_fail_closed() {
+        let mut helper = marker(SHA_B, 0);
+        helper.extend_from_slice(&marker(SHA_A, 0));
+        assert_eq!(
+            classify_helper_identity(id(SHA_A, false), &helper),
+            Some(HelperStaleness::Stale),
+            "an old helper with an extra matching marker must not be fresh"
+        );
+    }
+
+    #[test]
     fn helper_staleness_state_string_taxonomy() {
         // Pin string identifiers downstream consumers (greppers,
         // doctor parsers, future Sprint 59 telemetry) will rely on.

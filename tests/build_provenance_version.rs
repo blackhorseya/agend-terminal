@@ -27,8 +27,8 @@ use common::git_isolated;
 mod provenance;
 
 use provenance::{
-    compose_cli_version, compose_mcp_version, git_probe, rerun_paths, resolve_identity,
-    valid_full_sha,
+    build_nonce_suffix, compose_cli_version, compose_mcp_version, git_probe, rerun_paths, resolve_identity,
+    source_rerun_paths, valid_full_sha,
 };
 
 const SHA_A: &str = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
@@ -476,6 +476,122 @@ fn main() {
         "committing the edit must re-stamp clean at the new HEAD; status: {:?}",
         git(&repo, &["status", "--porcelain"])
     );
+    let _ = std::fs::remove_dir_all(&repo);
+}
+
+// ---- helper build-id nonce (dirty builds at one HEAD must stay distinguishable) ----
+
+#[test]
+fn nonce_suffix_only_for_known_dirty_builds() {
+    assert_eq!(build_nonce_suffix(SHA_A, true, || "ab12".into()), ":ab12");
+    assert_eq!(build_nonce_suffix(SHA_A, false, || "ab12".into()), "");
+    assert_eq!(build_nonce_suffix("unknown", true, || "ab12".into()), "");
+}
+
+#[test]
+fn source_rerun_paths_cover_src_and_manifests() {
+    let d = scratch_dir("source-rerun");
+    std::fs::create_dir_all(d.join("src")).unwrap();
+    std::fs::write(d.join("Cargo.toml"), "").unwrap();
+    std::fs::write(d.join("Cargo.lock"), "").unwrap();
+    let got = source_rerun_paths(&d);
+    for want in ["src", "Cargo.toml", "Cargo.lock"] {
+        assert!(got.contains(&d.join(want)), "{want} missing from {got:?}");
+    }
+    let _ = std::fs::remove_dir_all(&d);
+}
+
+/// Real cargo builds of a fixture crate: every source change on a dirty tree
+/// must mint a NEW nonce (also for an untracked new file), and a rebuild with
+/// no change must keep the cached one.
+#[test]
+fn dirty_nonce_changes_when_sources_change() {
+    let repo = init_repo("nonce-cargo");
+    let manifest = Path::new(env!("CARGO_MANIFEST_DIR"));
+    std::fs::copy(
+        manifest.join("build/provenance.rs"),
+        repo.join("provenance.rs"),
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("Cargo.toml"),
+        "[package]\nname = \"prov-fixture\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join("build.rs"),
+        r#"include!("provenance.rs");
+fn main() {
+    let dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
+    let id = resolve_identity(None, None, || git_probe(&dir));
+    for p in rerun_paths(&dir).into_iter().chain(source_rerun_paths(&dir)) {
+        println!("cargo:rerun-if-changed={}", p.display());
+    }
+    let suffix = build_nonce_suffix(&id.sha, id.dirty, || {
+        let t = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        format!("{t:x}{:x}", std::process::id())
+    });
+    println!("cargo:rustc-env=FIXTURE_SUFFIX={suffix}");
+}
+"#,
+    )
+    .unwrap();
+    std::fs::create_dir_all(repo.join("src")).unwrap();
+    std::fs::write(
+        repo.join("src/main.rs"),
+        "fn main() {\n    println!(\"{}\", env!(\"FIXTURE_SUFFIX\"));\n}\n",
+    )
+    .unwrap();
+    std::fs::write(
+        repo.join(".gitignore"),
+        "/target-fixture\nCargo.lock\n*.profraw\n",
+    )
+    .unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-q", "--no-gpg-sign", "-m", "fixture"]);
+
+    let run_fixture = |repo: &Path| -> String {
+        let out = Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
+            .args(["run", "-q"])
+            .current_dir(repo)
+            .env_remove("RUSTFLAGS")
+            .env_remove("CARGO_ENCODED_RUSTFLAGS")
+            .env_remove("LLVM_PROFILE_FILE")
+            .env_remove("RUSTC_WRAPPER")
+            .env_remove("RUSTC_WORKSPACE_WRAPPER")
+            .env_remove("CARGO_LLVM_COV")
+            .env("CARGO_TARGET_DIR", repo.join("target-fixture"))
+            .output()
+            .expect("nested cargo run");
+        assert!(
+            out.status.success(),
+            "fixture build failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    let main_rs = |extra: &str| {
+        std::fs::write(
+            repo.join("src/main.rs"),
+            format!("fn main() {{\n    println!(\"{{}}\", env!(\"FIXTURE_SUFFIX\"));\n    // {extra}\n}}\n"),
+        )
+        .unwrap();
+    };
+    assert_eq!(run_fixture(&repo), "", "clean build carries no nonce");
+    main_rs("edit one");
+    let n1 = run_fixture(&repo);
+    assert!(n1.starts_with(':') && n1.len() > 1, "dirty build needs a nonce: {n1:?}");
+    assert_eq!(run_fixture(&repo), n1, "no change keeps the cached nonce");
+    main_rs("edit two");
+    let n2 = run_fixture(&repo);
+    assert_ne!(n2, n1, "a further source edit must mint a new nonce");
+    std::fs::write(repo.join("src/extra.rs"), "// untracked\n").unwrap();
+    let n3 = run_fixture(&repo);
+    assert_ne!(n3, n2, "an untracked new source file must mint a new nonce");
     let _ = std::fs::remove_dir_all(&repo);
 }
 
