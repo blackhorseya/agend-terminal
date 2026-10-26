@@ -704,16 +704,11 @@ pub(crate) fn resolve_for_target_correlation_reason(
 /// Resolve one listed track whose bound `task_id` reached a terminal status
 /// (Done / Cancelled / Superseded). The handoff obligation belongs to that task's
 /// assignee, so once the task ends there is nobody left to nudge; without this the
-/// track only converged on PR merge/close or the 24h backstop. Guarded by the same
-/// `sent_at` CAS as the other resolvers, so a freshly re-recorded episode survives.
+/// track only converged on PR merge/close or the 24h backstop. The delete is
+/// guarded by the track's full identity (`sent_at`, episode, `task_id`, head), not
+/// `sent_at` alone, so a re-recorded episode that reuses the timestamp survives.
 pub(crate) fn resolve_terminal_task(home: &Path, path: &Path, track: &CiHandoffTrack) -> bool {
-    let removed = remove_if_unchanged(
-        home,
-        path,
-        &track.target,
-        &track.correlation,
-        &track.sent_at,
-    );
+    let removed = remove_if_identity_unchanged(home, path, track);
     if removed {
         tracing::info!(
             tag = "#ci-handoff-task-terminal",
@@ -724,6 +719,31 @@ pub(crate) fn resolve_terminal_task(home: &Path, path: &Path, track: &CiHandoffT
         );
     }
     removed
+}
+
+/// Delete `path` only if the on-disk track still has the same identity as the
+/// listed `expected` one (`sent_at`, episode, `task_id`, `head_sha`), under the
+/// per-key lock.
+fn remove_if_identity_unchanged(home: &Path, path: &Path, expected: &CiHandoffTrack) -> bool {
+    let Ok(_lock) =
+        crate::store::acquire_file_lock(&lock_for(home, &expected.target, &expected.correlation))
+    else {
+        return false;
+    };
+    let current = std::fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice::<CiHandoffTrack>(&b).ok());
+    match current {
+        Some(t)
+            if t.sent_at == expected.sent_at
+                && t.ci_handoff_episode == expected.ci_handoff_episode
+                && t.task_id == expected.task_id
+                && t.head_sha == expected.head_sha =>
+        {
+            std::fs::remove_file(path).is_ok()
+        }
+        _ => false,
+    }
 }
 
 /// Resolve only `agent`'s track while accepting either correlation convention:
