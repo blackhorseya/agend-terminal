@@ -198,6 +198,20 @@ pub(crate) fn ack_start_for_test(
     instance: &str,
     delivery_id: Uuid,
 ) -> anyhow::Result<DeliveryReceipt> {
+    ack_start_at_for_test(home, instance, delivery_id, Utc::now())
+}
+
+/// [`ack_start_for_test`] with the acknowledgement time pinned by the caller.
+/// A test that asserts the exact late-by seconds seeds the accepted receipt
+/// and acknowledges against one shared base instant, so a slow runner between
+/// the two steps cannot shift the whole-second overshoot.
+#[cfg(test)]
+pub(crate) fn ack_start_at_for_test(
+    home: &Path,
+    instance: &str,
+    delivery_id: Uuid,
+    now: DateTime<Utc>,
+) -> anyhow::Result<DeliveryReceipt> {
     let store = ReceiptStore::for_instance(home, instance)?;
     let (envelope, current) = store
         .delivery(delivery_id)?
@@ -207,15 +221,7 @@ pub(crate) fn ack_start_for_test(
         .session_id
         .clone()
         .unwrap_or_else(|| "test-session".to_string());
-    record_self_kick_turn_started(
-        home,
-        instance,
-        &session_id,
-        &store,
-        &envelope,
-        current,
-        Utc::now(),
-    )
+    record_self_kick_turn_started(home, instance, &session_id, &store, &envelope, current, now)
 }
 
 /// One reconciliation outcome from a watchdog pass. The transport owns the
