@@ -1558,6 +1558,30 @@ mod helper_staleness_tests {
     }
 
     #[test]
+    fn known_daemon_with_unknown_helper_marker_newer_helper_is_fresh() {
+        let home = tmp_home("unknown-helper-sha-fresh");
+        let daemon = home.join("agend-terminal-fake");
+        write_then_pause(&daemon, b"daemon", 30);
+        let helper = home.join("agend-git");
+        write_then_pause(&helper, &marker("unknown", 0), 10);
+        let state = classify_helper_staleness_with_id(id(SHA_A, false), Some(&daemon), &helper);
+        assert_eq!(state, HelperStaleness::Fresh);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn known_daemon_with_unknown_helper_marker_older_helper_is_stale() {
+        let home = tmp_home("unknown-helper-sha-stale");
+        let helper = home.join("agend-git");
+        write_then_pause(&helper, &marker("unknown", 0), 30);
+        let daemon = home.join("agend-terminal-fake");
+        write_then_pause(&daemon, b"daemon", 10);
+        let state = classify_helper_staleness_with_id(id(SHA_A, false), Some(&daemon), &helper);
+        assert_eq!(state, HelperStaleness::Stale);
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
     fn reviewer_unknown_daemon_with_malformed_marker_must_stay_stale() {
         let bytes = b"\0AGEND-HELPER-BUILD-ID:not-a-valid-marker\0";
         assert_eq!(

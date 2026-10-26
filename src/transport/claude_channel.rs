@@ -32,7 +32,7 @@ mod replay;
 /// every `crate::transport::claude_channel::…` path keeps working.
 mod self_kick;
 #[cfg(test)]
-pub(crate) use self_kick::{ack_start_for_test, self_kick_watchdog_pass_at};
+pub(crate) use self_kick::{ack_start_at_for_test, ack_start_for_test, self_kick_watchdog_pass_at};
 pub(crate) use self_kick::{
     clear_self_kick_notice, record_self_kick_turn_started, self_kick_watchdog_pass,
     SelfKickOutcome, SelfKickOutcomeKind, TurnObservation,

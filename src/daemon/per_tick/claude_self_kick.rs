@@ -969,7 +969,10 @@ mod tests {
     fn late_ack_before_enqueue_delivers_overdue_then_late_notice() {
         let h = Harness::new("late-before-enqueue", LEAD);
         let handler = ClaudeSelfKickHandler::new(1);
-        let delivery_id = seed_accepted_kick(&h.home, Utc::now() - ChronoDuration::seconds(38));
+        // One shared instant for the seed and the ack, so a slow runner between
+        // them cannot shift the whole-second overshoot asserted below.
+        let base = Utc::now();
+        let delivery_id = seed_accepted_kick(&h.home, base - ChronoDuration::seconds(38));
 
         // The watchdog persists state=AckOverdue + the notice INTENT; the
         // daemon has not announced anything yet.
@@ -977,7 +980,7 @@ mod tests {
         assert!(h.notices(LEAD).is_empty(), "nothing delivered yet");
 
         // The real transition the consumer's ack_start drives.
-        crate::transport::claude_channel::ack_start_for_test(&h.home, AGENT, delivery_id)
+        crate::transport::claude_channel::ack_start_at_for_test(&h.home, AGENT, delivery_id, base)
             .expect("late ack");
         assert_eq!(
             latest_state(&h.home, delivery_id),
@@ -1016,9 +1019,12 @@ mod tests {
     fn crash_after_late_ack_before_enqueue_loses_nothing() {
         let h = Harness::new("late-crash-no-loss", LEAD);
         let handler = ClaudeSelfKickHandler::new(1);
-        let delivery_id = seed_accepted_kick(&h.home, Utc::now() - ChronoDuration::seconds(35));
+        // One shared instant for the seed and the ack, so a slow runner between
+        // them cannot shift the whole-second overshoot asserted below.
+        let base = Utc::now();
+        let delivery_id = seed_accepted_kick(&h.home, base - ChronoDuration::seconds(35));
         assert_eq!(crash_after_intent_cas(&h.home), 1);
-        crate::transport::claude_channel::ack_start_for_test(&h.home, AGENT, delivery_id)
+        crate::transport::claude_channel::ack_start_at_for_test(&h.home, AGENT, delivery_id, base)
             .expect("late ack");
         // The daemon dies here: a pass computed the outcome and announced
         // nothing.
