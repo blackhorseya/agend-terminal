@@ -223,6 +223,20 @@ pub(crate) fn scan_and_emit_with<F, G>(
                 }
             }
 
+            // The track is bound to the dispatch task that owed the handoff. Once
+            // that task is terminal (e.g. the author task was cancelled and the work
+            // moved to a successor) its assignee has nothing left to act on, so stop
+            // re-nudging/escalating instead of waiting for PR merge/close. A task
+            // that cannot be loaded keeps the pre-existing behaviour (fail-open).
+            if let Some(task_id) = track.task_id.as_deref() {
+                if crate::tasks::load_routed(home, task_id)
+                    .is_ok_and(|rt| rt.record().status.is_terminal())
+                {
+                    crate::daemon::ci_handoff_track::resolve_terminal_task(home, path, track);
+                    continue;
+                }
+            }
+
             // #26795: a PR already known to be merge-blocked (REJECTED verdict /
             // Draft) is unactionable by the target no matter how many times we
             // re-nudge — resolve right here instead of relying on the SEPARATE
@@ -1462,6 +1476,82 @@ mod tests {
                 eta_secs: None,
             },
         );
+    }
+
+    fn seed_task_bound_handoff(home: &Path, target: &str, corr: &str, task_id: &str) {
+        seed_handoff(home, target, corr, 5, false);
+        // `seed_handoff` records the track without a task binding; re-record it with one.
+        crate::daemon::ci_handoff_track::record(
+            home,
+            target,
+            corr,
+            &(chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339(),
+            None,
+            Some(task_id),
+        );
+    }
+
+    fn emit_terminal(home: &Path, event: crate::task_events::TaskEvent) {
+        let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+        let emitter = crate::task_events::InstanceName::from("test");
+        crate::task_events::append(&board, &emitter, event).unwrap();
+    }
+
+    /// PR #16 regression: the author task bound to the track was cancelled, so the
+    /// old assignee must stop being re-nudged and the track must be reaped.
+    #[test]
+    fn cancelled_bound_task_converges_handoff_without_renudge() {
+        use crate::task_events::{InstanceName, TaskEvent, TaskId};
+        let home = tmp_home("terminal-cancelled");
+        write_fleet(&home);
+        seed_snapshot(&home, "reviewer", "idle");
+        seed_nonterminal_task(&home, "t-author");
+        seed_task_bound_handoff(&home, "reviewer", "o/r@b", "t-author");
+        emit_terminal(
+            &home,
+            TaskEvent::Cancelled {
+                task_id: TaskId("t-author".into()),
+                by: InstanceName::from("test"),
+                reason: "superseded by successor".into(),
+            },
+        );
+
+        let nudged = run_watchdog(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert!(
+            nudged.is_empty(),
+            "a terminal bound task must not be re-nudged: {nudged:?}"
+        );
+        assert!(
+            crate::daemon::ci_handoff_track::list(&home).is_empty(),
+            "the track must converge once its bound task is terminal"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// No regression: while the bound task is still active the handoff keeps
+    /// re-nudging its assignee.
+    #[test]
+    fn active_bound_task_still_renudges() {
+        let home = tmp_home("terminal-active");
+        write_fleet(&home);
+        seed_snapshot(&home, "reviewer", "idle");
+        seed_nonterminal_task(&home, "t-author");
+        seed_task_bound_handoff(&home, "reviewer", "o/r@b", "t-author");
+
+        let nudged = run_watchdog(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert_eq!(nudged, vec!["reviewer".to_string()]);
+        assert_eq!(crate::daemon::ci_handoff_track::list(&home).len(), 1);
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]

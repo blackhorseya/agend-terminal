@@ -701,6 +701,31 @@ pub(crate) fn resolve_for_target_correlation_reason(
     resolved
 }
 
+/// Resolve one listed track whose bound `task_id` reached a terminal status
+/// (Done / Cancelled / Superseded). The handoff obligation belongs to that task's
+/// assignee, so once the task ends there is nobody left to nudge; without this the
+/// track only converged on PR merge/close or the 24h backstop. Guarded by the same
+/// `sent_at` CAS as the other resolvers, so a freshly re-recorded episode survives.
+pub(crate) fn resolve_terminal_task(home: &Path, path: &Path, track: &CiHandoffTrack) -> bool {
+    let removed = remove_if_unchanged(
+        home,
+        path,
+        &track.target,
+        &track.correlation,
+        &track.sent_at,
+    );
+    if removed {
+        tracing::info!(
+            tag = "#ci-handoff-task-terminal",
+            agent = %track.target,
+            correlation = %track.correlation,
+            task_id = track.task_id.as_deref().unwrap_or(""),
+            "ci-handoff track resolved — bound task is terminal"
+        );
+    }
+    removed
+}
+
 /// Resolve only `agent`'s track while accepting either correlation convention:
 /// the track's `repo@branch` correlation or its durable review task id. A typed
 /// receipt belongs to one reviewer, so it must never clear a peer reviewer's
