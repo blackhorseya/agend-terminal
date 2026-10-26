@@ -194,6 +194,26 @@ pub(crate) fn scan_and_emit_with<F, G>(
             let key = (target.clone(), corr.clone());
             active.insert(key.clone());
 
+            // The track is bound to the dispatch task that owed the handoff. Once
+            // that task is terminal (e.g. the author task was cancelled and the work
+            // moved to a successor) its assignee has nothing left to act on, so stop
+            // re-nudging/escalating instead of waiting for PR merge/close. A
+            // deferred track converges too (checked before the defer gate). A task
+            // that cannot be loaded keeps the pre-existing behaviour (fail-open).
+            if let Some(task_id) = track.task_id.as_deref() {
+                match crate::tasks::load_routed(home, task_id) {
+                    Ok(rt) if rt.record().status.is_terminal() => {
+                        crate::daemon::ci_handoff_track::resolve_terminal_task(home, path, track);
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        %target, %corr, %task_id, error = %e,
+                        "handoff_timeout_watchdog: bound task unreadable — keeping ci-handoff track"
+                    ),
+                }
+            }
+
             // Deferred tracks: evaluate wake predicate, skip renudge/escalation.
             if track.is_deferred() {
                 if track.is_defer_expired(now) {
@@ -1462,6 +1482,169 @@ mod tests {
                 eta_secs: None,
             },
         );
+    }
+
+    fn seed_task_bound_handoff(home: &Path, target: &str, corr: &str, task_id: &str) {
+        seed_handoff(home, target, corr, 5, false);
+        // `seed_handoff` records the track without a task binding; re-record it with one.
+        crate::daemon::ci_handoff_track::record(
+            home,
+            target,
+            corr,
+            &(chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339(),
+            None,
+            Some(task_id),
+        );
+    }
+
+    fn emit_terminal(home: &Path, event: crate::task_events::TaskEvent) {
+        let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+        let emitter = crate::task_events::InstanceName::from("test");
+        crate::task_events::append(&board, &emitter, event).unwrap();
+    }
+
+    /// PR #16 regression: the author task bound to the track was cancelled, so the
+    /// old assignee must stop being re-nudged and the track must be reaped.
+    #[test]
+    fn cancelled_bound_task_converges_handoff_without_renudge() {
+        use crate::task_events::{InstanceName, TaskEvent, TaskId};
+        let home = tmp_home("terminal-cancelled");
+        write_fleet(&home);
+        seed_snapshot(&home, "reviewer", "idle");
+        seed_nonterminal_task(&home, "t-author");
+        seed_task_bound_handoff(&home, "reviewer", "o/r@b", "t-author");
+        emit_terminal(
+            &home,
+            TaskEvent::Cancelled {
+                task_id: TaskId("t-author".into()),
+                by: InstanceName::from("test"),
+                reason: "superseded by successor".into(),
+            },
+        );
+
+        let nudged = run_watchdog(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert!(
+            nudged.is_empty(),
+            "a terminal bound task must not be re-nudged: {nudged:?}"
+        );
+        assert!(
+            crate::daemon::ci_handoff_track::list(&home).is_empty(),
+            "the track must converge once its bound task is terminal"
+        );
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// A re-recorded episode that reuses the old `sent_at` (clock adjustment) must
+    /// survive the old episode's terminal-task resolve.
+    #[test]
+    fn terminal_resolve_does_not_erase_new_episode_with_same_sent_at() {
+        let home = tmp_home("terminal-new-episode");
+        write_fleet(&home);
+        let sent_at = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        crate::daemon::ci_handoff_track::record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@b",
+            &sent_at,
+            None,
+            Some("t-old"),
+            Some("ep-old"),
+            None,
+        );
+        let (path, old) = crate::daemon::ci_handoff_track::list(&home).remove(0);
+        crate::daemon::ci_handoff_track::record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@b",
+            &sent_at,
+            None,
+            Some("t-new"),
+            Some("ep-new"),
+            None,
+        );
+        assert!(!crate::daemon::ci_handoff_track::resolve_terminal_task(
+            &home, &path, &old
+        ));
+        assert_eq!(crate::daemon::ci_handoff_track::list(&home).len(), 1);
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// A deferred track whose bound task went terminal converges immediately
+    /// instead of waiting out the defer window.
+    #[test]
+    fn deferred_track_converges_when_bound_task_terminal() {
+        use crate::task_events::{InstanceName, TaskEvent, TaskId};
+        let home = tmp_home("terminal-deferred");
+        write_fleet(&home);
+        seed_snapshot(&home, "reviewer", "idle");
+        seed_nonterminal_task(&home, "t-author");
+        seed_nonterminal_task(&home, "t-wake");
+        let sent_at = (chrono::Utc::now() - chrono::Duration::minutes(5)).to_rfc3339();
+        seed_handoff_with_episode(&home, "reviewer", "o/r@b", 5, "ep-1");
+        crate::daemon::ci_handoff_track::record_with_identity(
+            &home,
+            "reviewer",
+            "o/r@b",
+            &sent_at,
+            None,
+            Some("t-author"),
+            Some("ep-1"),
+            None,
+        );
+        crate::daemon::ci_handoff_track::defer_track(
+            &home,
+            &crate::daemon::ci_handoff_track::DeferRequest {
+                target: "reviewer",
+                correlation: "o/r@b",
+                episode: "ep-1",
+                deferred_by: "reviewer",
+                wake_task_id: "t-wake",
+                reason: "busy",
+                defer_secs: 600,
+            },
+        );
+        emit_terminal(
+            &home,
+            TaskEvent::Cancelled {
+                task_id: TaskId("t-author".into()),
+                by: InstanceName::from("test"),
+                reason: "superseded".into(),
+            },
+        );
+        run_watchdog(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert!(crate::daemon::ci_handoff_track::list(&home).is_empty());
+        std::fs::remove_dir_all(home).ok();
+    }
+
+    /// No regression: while the bound task is still active the handoff keeps
+    /// re-nudging its assignee.
+    #[test]
+    fn active_bound_task_still_renudges() {
+        let home = tmp_home("terminal-active");
+        write_fleet(&home);
+        seed_snapshot(&home, "reviewer", "idle");
+        seed_nonterminal_task(&home, "t-author");
+        seed_task_bound_handoff(&home, "reviewer", "o/r@b", "t-author");
+
+        let nudged = run_watchdog(
+            &home,
+            &chrono::Utc::now(),
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+        );
+        assert_eq!(nudged, vec!["reviewer".to_string()]);
+        assert_eq!(crate::daemon::ci_handoff_track::list(&home).len(), 1);
+        std::fs::remove_dir_all(home).ok();
     }
 
     #[test]
