@@ -201,11 +201,16 @@ pub(crate) fn scan_and_emit_with<F, G>(
             // deferred track converges too (checked before the defer gate). A task
             // that cannot be loaded keeps the pre-existing behaviour (fail-open).
             if let Some(task_id) = track.task_id.as_deref() {
-                if crate::tasks::load_routed(home, task_id)
-                    .is_ok_and(|rt| rt.record().status.is_terminal())
-                {
-                    crate::daemon::ci_handoff_track::resolve_terminal_task(home, path, track);
-                    continue;
+                match crate::tasks::load_routed(home, task_id) {
+                    Ok(rt) if rt.record().status.is_terminal() => {
+                        crate::daemon::ci_handoff_track::resolve_terminal_task(home, path, track);
+                        continue;
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(
+                        %target, %corr, %task_id, error = %e,
+                        "handoff_timeout_watchdog: bound task unreadable — keeping ci-handoff track"
+                    ),
                 }
             }
 
