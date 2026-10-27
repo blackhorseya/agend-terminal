@@ -127,7 +127,10 @@ impl Layout {
             .map(|(i, tab)| {
                 // "*" dot + label
                 let label = tab.tab_bar_label_with_team(i == self.active, team_view);
-                1 + label.width() as u16
+                // usize math, clamped to the bar before narrowing: a huge name
+                // must not wrap or overflow `u16`.
+                let w = (1 + label.width()).min(width.max(1) as usize);
+                w as u16
             })
             .collect();
         tab_bar_geometry(&widths, width)
@@ -682,6 +685,18 @@ fn collect_resize_needs(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    /// r2: a tab name whose width exceeds `u16` must clamp, not overflow.
+    #[test]
+    fn tab_bar_geometry_for_clamps_huge_label_width() {
+        let mut layout = Layout::new();
+        let name = "x".repeat(65_533);
+        layout.add_tab(Tab::new(name.clone(), leaf(1, "a")));
+        layout.add_tab(Tab::new(name, leaf(2, "b")));
+        let g = layout.tab_bar_geometry_for(24, None);
+        assert_eq!(g.tabs[0].map(|s| (s.row, s.width)), Some((0, 24)));
+        assert_eq!(g.tabs[1].map(|s| (s.row, s.width)), Some((1, 24)));
+    }
+
     /// The pane area tracks the tab-bar height: below it, above the status bar.
     #[test]
     fn pane_area_follows_tab_bar_rows() {

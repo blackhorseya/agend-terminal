@@ -40,7 +40,9 @@ pub struct TabBarGeometry {
 
 impl TabBarGeometry {
     pub fn hit(&self, row: u16, col: u16) -> Option<TabBarHit> {
-        let inside = |s: &TabBarSlot| s.row == row && col >= s.col && col < s.col + s.width;
+        let inside = |s: &TabBarSlot| {
+            s.row == row && col >= s.col && u32::from(col) < u32::from(s.col) + u32::from(s.width)
+        };
         if let Some(i) = self
             .tabs
             .iter()
@@ -73,7 +75,7 @@ pub fn tab_bar_geometry(tab_widths: &[u16], width: u16) -> TabBarGeometry {
         }
         let w = w.min(width);
         // `x == 0` means the row is empty: no separator, and a clipped tab fits.
-        if x > 0 && x + 1 + w > width {
+        if x > 0 && u32::from(x) + 1 + u32::from(w) > u32::from(width) {
             row += 1;
             x = 0;
         }
@@ -82,7 +84,7 @@ pub fn tab_bar_geometry(tab_widths: &[u16], width: u16) -> TabBarGeometry {
             tabs.push(None);
             continue;
         }
-        let col = if x == 0 { 0 } else { x + 1 };
+        let col = if x == 0 { 0 } else { x + 1 }; // fits: x + 1 + w <= width <= u16::MAX
         tabs.push(Some(TabBarSlot { row, col, width: w }));
         x = col + w;
     }
@@ -92,19 +94,19 @@ pub fn tab_bar_geometry(tab_widths: &[u16], width: u16) -> TabBarGeometry {
             .iter()
             .flatten()
             .filter(|s| s.row == row)
-            .map(|s| s.col + s.width)
+            .map(|s| s.col.saturating_add(s.width))
             .max()
             .unwrap_or(0);
     }
 
     let new_w = NEW_TAB_WIDTH.min(width);
-    if x + new_w > width {
+    if u32::from(x) + u32::from(new_w) > u32::from(width) {
         if row + 1 < MAX_TAB_BAR_ROWS {
             row += 1;
             x = 0;
         } else {
             // Last allowed row is full: hide trailing tabs until [+] fits.
-            while x + new_w > width {
+            while u32::from(x) + u32::from(new_w) > u32::from(width) {
                 let Some(last) = tabs
                     .iter_mut()
                     .rev()
@@ -118,7 +120,7 @@ pub fn tab_bar_geometry(tab_widths: &[u16], width: u16) -> TabBarGeometry {
                     .iter()
                     .flatten()
                     .filter(|s| s.row == row)
-                    .map(|s| s.col + s.width)
+                    .map(|s| s.col.saturating_add(s.width))
                     .max()
                     .unwrap_or(0);
             }
@@ -240,6 +242,18 @@ mod tests {
         assert_eq!(g.hit(1, 4), Some(TabBarHit::NewTab));
         assert_eq!(g.hit(0, 4), None, "separator column");
         assert_eq!(g.hit(2, 0), None, "below the bar");
+    }
+
+    /// r2: sums near `u16::MAX` (the pre-first-render width) must not overflow.
+    #[test]
+    fn extreme_widths_do_not_overflow() {
+        let g = tab_bar_geometry(&[u16::MAX, u16::MAX, 5], u16::MAX);
+        assert_eq!(g.tabs[0], slot(0, 0, u16::MAX));
+        assert_eq!(g.tabs[1], slot(1, 0, u16::MAX), "cannot share the row");
+        assert!(g.rows <= MAX_TAB_BAR_ROWS);
+        assert_eq!(g.hit(0, u16::MAX - 1), Some(TabBarHit::Tab(0)));
+        let g = tab_bar_geometry(&[u16::MAX - 2, 3, 3], u16::MAX);
+        assert!(g.rows <= MAX_TAB_BAR_ROWS);
     }
 
     #[test]

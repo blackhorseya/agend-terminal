@@ -1538,3 +1538,18 @@ fn tab_bar_stays_single_row_when_tabs_fit() {
     assert_eq!(y, 1);
     assert_eq!(active.focused_pane().unwrap().vterm.rows(), 8);
 }
+
+/// r2: a huge tab name must not overflow the u16 width math. The label is
+/// clipped to the bar width on its own row (it used to panic in debug).
+#[test]
+fn tab_bar_survives_huge_label_without_u16_overflow() {
+    let huge = "x".repeat(65_533);
+    let (layout, rows) = draw_tab_bar_frame(24, &[huge.as_str(), "b"]);
+    assert_eq!(layout.tab_bar_rows(), 2);
+    assert!(rows[0].starts_with("* xxx"), "row 0: {:?}", rows[0]);
+    assert!(
+        rows[1].contains('b') && rows[1].contains("[+]"),
+        "row 1: {:?}",
+        rows[1]
+    );
+}

@@ -609,7 +609,7 @@ fn render_tab_bar(
 
         rows[r].push(dot);
         rows[r].push(Span::styled(label, style));
-        used[r] = slot.col + slot.width;
+        used[r] = slot.col.saturating_add(slot.width);
     }
 
     let new_tab_style = if matches!(drag_tab_target, Some(DragTabTarget::NewTab)) {

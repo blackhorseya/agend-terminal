@@ -166,7 +166,8 @@ fn handle_down(
     // panes (whose top border coincides with the split line) can be grabbed
     // for drag-to-swap. Horizontal-split borders must be resized via keyboard.
     let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
-    let pa = Rect::new(0, 1, c, r.saturating_sub(2));
+    // Same pane area render uses (tab bar may span several rows).
+    let pa = layout.pane_area(c, r);
     // When a tab is zoomed, only the focused pane is visible; the split tree
     // still exists but its borders aren't rendered. Disable title-bar AND
     // border hit-tests so users can't drag invisible borders.
@@ -1027,6 +1028,74 @@ mod tests {
         );
         assert_eq!(layout.active, 3);
         assert!(out.needs_resize);
+    }
+
+    /// r2: with a wrapped (3-row) tab bar, `handle_down` must build the
+    /// split-border area from the same `pane_area` render uses. The old fixed
+    /// one-row rectangle started the lower split one row early, so a click on
+    /// pane content at the stale border start began a border drag.
+    #[test]
+    fn click_on_pane_content_with_wrapped_bar_is_not_a_border_drag() {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+        assert!(cols >= 20 && rows >= 15, "needs a usable terminal size");
+        let root = crate::layout::PaneNode::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            first: Box::new(crate::layout::PaneNode::Leaf(Box::new(leaf(1, "top")))),
+            second: Box::new(crate::layout::PaneNode::Split {
+                dir: SplitDir::Vertical,
+                ratio: 0.5,
+                first: Box::new(crate::layout::PaneNode::Leaf(Box::new(leaf(2, "bl")))),
+                second: Box::new(crate::layout::PaneNode::Leaf(Box::new(leaf(3, "br")))),
+            }),
+        };
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::with_root("x".repeat(cols as usize), root));
+        for i in 0..3 {
+            layout.add_tab(Tab::new("x".repeat(cols as usize), leaf(4 + i, "other")));
+        }
+        layout.active = 0;
+        layout.set_tab_bar_width(cols, None);
+        assert_eq!(layout.tab_bar_rows(), 3, "fixture must wrap to 3 rows");
+        let area = layout.pane_area(cols, rows);
+        // Where the lower split's vertical border would start on the legacy
+        // one-row rectangle (one row above the real one).
+        let legacy = (0, 1, cols, rows.saturating_sub(2));
+        let (_, lower) = crate::layout::split::split_child_areas(legacy, SplitDir::Horizontal, 0.5);
+        let (left, _) = crate::layout::split::split_child_areas(lower, SplitDir::Vertical, 0.5);
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: left.0 + left.2 - 1,
+            row: lower.1,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(
+            crate::layout::find_split_border(
+                layout.tabs[0].root(),
+                (area.x, area.y, area.width, area.height),
+                event.column,
+                event.row,
+            )
+            .is_none(),
+            "fixture must click pane content, away from the real split borders"
+        );
+        let registry: AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let mut state = MouseState::default();
+        let mut out = MouseOutcome::default();
+        handle_down(
+            event,
+            &mut layout,
+            &mut state,
+            Path::new("/nonexistent/fleet.yaml"),
+            &registry,
+            None,
+            &mut out,
+        );
+        assert!(
+            state.border_drag.is_none(),
+            "clicking pane content started a drag on a stale one-row split rectangle"
+        );
     }
 
     /// #777: `Tab::tab_bar_label` (the shared render/hit-test source of truth) wraps the
