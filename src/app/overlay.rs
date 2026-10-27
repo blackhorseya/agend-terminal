@@ -264,7 +264,7 @@ pub(super) fn handle_key(
                 {
                     if let Some(item) = items.into_iter().nth(sel) {
                         let pc = c.saturating_sub(2);
-                        let pr = r.saturating_sub(4);
+                        let pr = ctx.layout.pane_content_rows(r);
                         match super::pane_from_menu_item(
                             item,
                             ctx.fleet_path,
@@ -326,13 +326,10 @@ pub(super) fn handle_key(
                         std::mem::replace(overlay, Overlay::None)
                     {
                         if let Some(item) = items.into_iter().nth(sel) {
+                            let content_rows = ctx.layout.pane_content_rows(r);
                             let (pc, pr) = match split_dir {
-                                SplitDir::Vertical => {
-                                    (c.saturating_sub(2) / 2, r.saturating_sub(4))
-                                }
-                                SplitDir::Horizontal => {
-                                    (c.saturating_sub(2), r.saturating_sub(4) / 2)
-                                }
+                                SplitDir::Vertical => (c.saturating_sub(2) / 2, content_rows),
+                                SplitDir::Horizontal => (c.saturating_sub(2), content_rows / 2),
                             };
                             match super::pane_from_menu_item(
                                 item,

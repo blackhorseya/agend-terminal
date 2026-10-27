@@ -41,7 +41,11 @@ pub struct TabBarGeometry {
 impl TabBarGeometry {
     pub fn hit(&self, row: u16, col: u16) -> Option<TabBarHit> {
         let inside = |s: &TabBarSlot| s.row == row && col >= s.col && col < s.col + s.width;
-        if let Some(i) = self.tabs.iter().position(|s| s.as_ref().is_some_and(inside)) {
+        if let Some(i) = self
+            .tabs
+            .iter()
+            .position(|s| s.as_ref().is_some_and(inside))
+        {
             return Some(TabBarHit::Tab(i));
         }
         inside(&self.new_tab).then_some(TabBarHit::NewTab)
@@ -223,10 +227,7 @@ mod tests {
                 assert!(s.col + s.width <= g.new_tab.col);
             }
         }
-        assert_eq!(
-            g.hit(g.new_tab.row, g.new_tab.col),
-            Some(TabBarHit::NewTab)
-        );
+        assert_eq!(g.hit(g.new_tab.row, g.new_tab.col), Some(TabBarHit::NewTab));
     }
 
     #[test]

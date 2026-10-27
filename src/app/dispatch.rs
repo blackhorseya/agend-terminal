@@ -316,12 +316,13 @@ pub(super) fn dispatch(action: Action, ctx: &mut DispatchCtx<'_>) -> DispatchRes
                 Action::ResizeLeft => crate::layout::Direction::Left,
                 _ => crate::layout::Direction::Right,
             };
+            // Pane tree occupies terminal height minus the tab bar rows
+            // and status bar row (see render::render_app chrome layout).
+            let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+            let pa = ctx.layout.pane_area(cols, rows);
+            let area = (pa.x, pa.y, pa.width, pa.height);
             if let Some(tab) = ctx.layout.active_tab_mut() {
                 let focus = tab.focus_id;
-                // Pane tree occupies terminal height minus the tab bar row
-                // and status bar row (see render::render_app chrome layout).
-                let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
-                let area = (0, 1, cols, rows.saturating_sub(2));
                 crate::layout::resize_focused(tab.root_mut(), area, focus, dir, 0.05);
             }
             out.needs_resize = true;
@@ -492,13 +493,14 @@ where
     }
 
     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+    let pane_rows = ctx.layout.pane_content_rows(rows);
     match create_remote_pane(
         &name,
         ctx.home,
         ctx.fleet_path,
         ctx.layout,
         cols.saturating_sub(2),
-        rows.saturating_sub(4),
+        pane_rows,
         ctx.wakeup_tx,
     ) {
         Ok(pane) => match ctx.layout.reconnect_or_append_agent_pane(&name, pane) {

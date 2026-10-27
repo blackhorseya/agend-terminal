@@ -466,10 +466,16 @@ pub fn render_with_team(
     remote_states: Option<&HashMap<String, Option<AgentState>>>,
     team_view: Option<&TeamView>,
 ) {
+    // Tab bar wraps onto extra rows when the tabs outgrow the width; refresh
+    // the cached row count BEFORE splitting so panes, mouse routing and PTY
+    // sizing all see this frame's height. A change re-arms the resize pass.
+    if layout.set_tab_bar_width(frame.area().width, team_view) {
+        layout.tab_bar_resize_pending = true;
+    }
     let chunks = ratatui::layout::Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(crate::layout::TAB_BAR_HEIGHT),
+            Constraint::Length(layout.tab_bar_rows()),
             Constraint::Min(1),
             Constraint::Length(1),
         ])
@@ -524,9 +530,10 @@ pub fn highest_priority_state(
     best
 }
 
-/// SYNC: per-tab width must match `tab_bar_hit_test()` in app/mouse.rs. Both derive
-/// the label from `Tab::tab_bar_label`; the only other widths are the `*` dot (1), the
-/// inter-tab separator (1), and the trailing ` [+] ` (5).
+/// Paints the tab bar from `Layout::tab_bar_geometry_for` — the same geometry
+/// `tab_bar_hit_test()` in app/mouse.rs consumes, so wrap points and widths
+/// cannot drift between paint and click. Each tab is `*` dot + label; the
+/// geometry owns the separators and the trailing ` [+] `.
 fn render_tab_bar(
     frame: &mut Frame,
     area: Rect,
@@ -534,13 +541,26 @@ fn render_tab_bar(
     snapshot: &HashMap<String, Option<AgentState>>,
     team_view: Option<&TeamView>,
 ) {
-    let mut spans = Vec::new();
+    let geometry = layout.tab_bar_geometry_for(area.width, team_view);
+    let mut rows: Vec<Vec<Span>> = vec![Vec::new(); geometry.rows as usize];
+    // Pad up to `col` on a row with the (background-only) separator space.
+    fn pad_to(row: &mut Vec<Span<'_>>, used: &mut u16, col: u16) {
+        if col > *used {
+            row.push(Span::raw(" ".repeat((col - *used) as usize)));
+            *used = col;
+        }
+    }
+    let mut used = vec![0u16; rows.len()];
 
     let drag_tab_target = layout
         .active_tab()
         .and_then(|t| t.dragging_pane.and(t.drag_target_tab));
 
     for (i, tab) in layout.tabs.iter().enumerate() {
+        let Some(slot) = geometry.tabs[i] else {
+            continue; // hidden by the row cap
+        };
+        let r = slot.row as usize;
         let is_active = i == layout.active;
         let is_drag_drop =
             matches!(drag_tab_target, Some(DragTabTarget::ExistingTab(idx)) if idx == i);
@@ -564,9 +584,7 @@ fn render_tab_bar(
             Style::default().fg(Color::Gray)
         };
 
-        if i > 0 {
-            spans.push(Span::raw(" "));
-        }
+        pad_to(&mut rows[r], &mut used[r], slot.col);
 
         let blink = matches!(
             state,
@@ -589,8 +607,9 @@ fn render_tab_bar(
 
         let label = tab.tab_bar_label_with_team(is_active, team_view);
 
-        spans.push(dot);
-        spans.push(Span::styled(label, style));
+        rows[r].push(dot);
+        rows[r].push(Span::styled(label, style));
+        used[r] = slot.col + slot.width;
     }
 
     let new_tab_style = if matches!(drag_tab_target, Some(DragTabTarget::NewTab)) {
@@ -601,13 +620,18 @@ fn render_tab_bar(
     } else {
         Style::default().fg(Color::Gray)
     };
-    spans.push(Span::styled(" [+] ", new_tab_style));
+    let nr = geometry.new_tab.row as usize;
+    pad_to(&mut rows[nr], &mut used[nr], geometry.new_tab.col);
+    rows[nr].push(Span::styled(" [+] ", new_tab_style));
     // #1071: Clear pre-render blanks any cells that retained chars from
     // a prior longer tab strip (e.g. tab close shrinks the bar). ratatui's
     // Paragraph only writes cells covered by span text + applies the area
     // style; cells outside spans keep their prior char.
     frame.render_widget(Clear, area);
-    let tabs = Paragraph::new(Line::from(spans)).style(Style::default().bg(Color::DarkGray));
+    // One Line per row, no `Paragraph::wrap`: a label is never split, and an
+    // over-long one is simply clipped at the right edge of its own row.
+    let lines: Vec<Line> = rows.into_iter().map(Line::from).collect();
+    let tabs = Paragraph::new(lines).style(Style::default().bg(Color::DarkGray));
     frame.render_widget(tabs, area);
 }
 
