@@ -5,6 +5,7 @@ pub mod pane;
 pub mod preset;
 pub mod split;
 pub mod tab;
+pub mod tab_bar;
 pub mod tree;
 
 // Re-export all public types so callers keep using `crate::layout::X`.
@@ -13,6 +14,7 @@ pub use preset::LayoutPreset;
 pub(crate) use split::split_chunks;
 pub use split::{adjust_split_ratio, find_split_border, resize_focused, Direction, SplitBorderHit};
 pub use tab::{DragTabTarget, Tab};
+pub use tab_bar::{tab_bar_geometry, TabBarGeometry, TabBarHit, TabBarSlot, MAX_TAB_BAR_ROWS};
 pub use tree::{swap_panes, PaneNode, SplitDir};
 
 use crate::types::InstanceRef;
