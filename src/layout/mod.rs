@@ -5,6 +5,7 @@ pub mod pane;
 pub mod preset;
 pub mod split;
 pub mod tab;
+pub mod tab_bar;
 pub mod tree;
 
 // Re-export all public types so callers keep using `crate::layout::X`.
@@ -13,6 +14,7 @@ pub use preset::LayoutPreset;
 pub(crate) use split::split_chunks;
 pub use split::{adjust_split_ratio, find_split_border, resize_focused, Direction, SplitBorderHit};
 pub use tab::{DragTabTarget, Tab};
+pub use tab_bar::{tab_bar_geometry, TabBarGeometry, TabBarHit};
 pub use tree::{swap_panes, PaneNode, SplitDir};
 
 use crate::types::InstanceRef;
@@ -81,13 +83,17 @@ pub struct Layout {
     /// transaction, consumed by `:arrange undo`. Deliberately NOT the
     /// name-keyed `removed_pane_memory` above.
     pub organizer_undo: Option<organizer::LayoutSnapshot>,
-}
-
-pub const TAB_BAR_HEIGHT: u16 = 1;
-
-/// True if the given screen row is within the tab bar area.
-pub fn is_tab_bar_row(row: u16) -> bool {
-    row < TAB_BAR_HEIGHT
+    /// Rows the tab bar currently occupies (`1..=MAX_TAB_BAR_ROWS`). Recomputed
+    /// from the terminal width by [`Layout::set_tab_bar_width`] on every render
+    /// and resize, so mouse routing and PTY sizing read the same height the
+    /// frame was painted with.
+    tab_bar_rows: u16,
+    /// Terminal width the tab bar was last laid out for. `u16::MAX` until the
+    /// first render, which keeps the bar single-row (the pre-wrap behaviour).
+    tab_bar_width: u16,
+    /// Set by render when the tab-bar row count changed mid-frame; the app
+    /// loop turns it into a PTY resize pass after the draw.
+    pub tab_bar_resize_pending: bool,
 }
 
 impl Layout {
@@ -100,7 +106,83 @@ impl Layout {
             tab_reorder_target: None,
             removed_pane_memory: HashMap::new(),
             organizer_undo: None,
+            tab_bar_rows: 1,
+            tab_bar_width: u16::MAX,
+            tab_bar_resize_pending: false,
         }
+    }
+
+    /// Tab-bar geometry for `width` columns. The one layout render and mouse
+    /// hit-testing both consume (labels via [`Tab::tab_bar_label_with_team`]).
+    pub fn tab_bar_geometry_for(
+        &self,
+        width: u16,
+        team_view: Option<&crate::team_view::TeamView>,
+    ) -> TabBarGeometry {
+        use unicode_width::UnicodeWidthStr;
+        let widths: Vec<u16> = self
+            .tabs
+            .iter()
+            .enumerate()
+            .map(|(i, tab)| {
+                // "*" dot + label
+                let label = tab.tab_bar_label_with_team(i == self.active, team_view);
+                // usize math, clamped to the bar before narrowing: a huge name
+                // must not wrap or overflow `u16`.
+                let w = (1 + label.width()).min(width.max(1) as usize);
+                w as u16
+            })
+            .collect();
+        tab_bar_geometry(&widths, width)
+    }
+
+    /// Geometry at the width of the last render/resize.
+    pub fn tab_bar_geometry_cached(
+        &self,
+        team_view: Option<&crate::team_view::TeamView>,
+    ) -> TabBarGeometry {
+        self.tab_bar_geometry_for(self.tab_bar_width, team_view)
+    }
+
+    /// Re-lay-out the tab bar for a terminal `width` and cache the result.
+    /// Returns true when the row count changed, i.e. the pane area (and so the
+    /// PTY sizes) moved and a resize pass is needed.
+    pub fn set_tab_bar_width(
+        &mut self,
+        width: u16,
+        team_view: Option<&crate::team_view::TeamView>,
+    ) -> bool {
+        let rows = self.tab_bar_geometry_for(width, team_view).rows;
+        self.tab_bar_width = width;
+        let changed = rows != self.tab_bar_rows;
+        self.tab_bar_rows = rows;
+        changed
+    }
+
+    pub fn tab_bar_rows(&self) -> u16 {
+        self.tab_bar_rows
+    }
+
+    /// True if the given screen row is within the tab bar area.
+    pub fn is_tab_bar_row(&self, row: u16) -> bool {
+        row < self.tab_bar_rows
+    }
+
+    /// Rows of PTY content a new pane gets in a `rows`-high terminal (pane
+    /// area minus its two border rows). Equals the old `rows - 4` at one tab row.
+    pub fn pane_content_rows(&self, rows: u16) -> u16 {
+        self.pane_area(0, rows).height.saturating_sub(2)
+    }
+
+    /// Area the pane tree occupies in a `cols` x `rows` terminal: below the
+    /// tab bar, above the one-row status bar.
+    pub fn pane_area(&self, cols: u16, rows: u16) -> Rect {
+        Rect::new(
+            0,
+            self.tab_bar_rows,
+            cols,
+            rows.saturating_sub(self.tab_bar_rows + 1),
+        )
     }
 
     /// #render-first phase-(b): find a pane by id across ALL tabs (a deferred
@@ -603,6 +685,29 @@ fn collect_resize_needs(
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    /// r2: a tab name whose width exceeds `u16` must clamp, not overflow.
+    #[test]
+    fn tab_bar_geometry_for_clamps_huge_label_width() {
+        let mut layout = Layout::new();
+        let name = "x".repeat(65_533);
+        layout.add_tab(Tab::new(name.clone(), leaf(1, "a")));
+        layout.add_tab(Tab::new(name, leaf(2, "b")));
+        let g = layout.tab_bar_geometry_for(24, None);
+        assert_eq!(g.tabs[0].map(|s| (s.row, s.width)), Some((0, 24)));
+        assert_eq!(g.tabs[1].map(|s| (s.row, s.width)), Some((1, 24)));
+    }
+
+    /// The pane area tracks the tab-bar height: below it, above the status bar.
+    #[test]
+    fn pane_area_follows_tab_bar_rows() {
+        let mut layout = Layout::new();
+        assert_eq!(layout.pane_area(80, 24), Rect::new(0, 1, 80, 22));
+        assert!(layout.is_tab_bar_row(0) && !layout.is_tab_bar_row(1));
+        layout.tab_bar_rows = 3;
+        assert_eq!(layout.pane_area(80, 24), Rect::new(0, 3, 80, 20));
+        assert!(layout.is_tab_bar_row(2) && !layout.is_tab_bar_row(3));
+    }
+
     use super::*;
     use crate::layout::pane::PaneSource;
     use crate::types::{InstanceId, InstanceRef};

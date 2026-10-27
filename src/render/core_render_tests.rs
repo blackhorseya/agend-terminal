@@ -1428,3 +1428,128 @@ fn dim_pane_content_blends_only_the_nonfocused_region() {
     // The explicit Blue bg blended toward black.
     assert_eq!(buf[(7, 1)].bg, Color::Rgb(0, 0, 64), "coloured bg dimmed");
 }
+
+// --- multi-row tab bar ---
+
+fn tab_bar_test_pane(id: usize, name: &str) -> Pane {
+    Pane {
+        agent_name: name.into(),
+        instance_id: crate::types::InstanceId::default(),
+        instance_ref: None,
+        vterm: VTerm::new(10, 10),
+        rx: crossbeam_channel::bounded(1).1,
+        id,
+        backend: None,
+        working_dir: None,
+        display_name: None,
+        restart_error: None,
+        scroll_offset: 0,
+        has_notification: false,
+        fleet_instance_name: None,
+        last_input_at: None,
+        pending_notification_count: 0,
+        pending_decision_count: 0,
+        selection: None,
+        source: PaneSource::Local,
+        offthread: None,
+        _fwd_cancel: None,
+    }
+}
+
+fn draw_tab_bar_frame(width: u16, names: &[&str]) -> (Layout, Vec<String>) {
+    let backend = ratatui::backend::TestBackend::new(width, 12);
+    let mut terminal = ratatui::Terminal::new(backend).expect("test terminal");
+    let registry: AgentRegistry =
+        std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+    let mut layout = Layout::new();
+    for (i, name) in names.iter().enumerate() {
+        layout.add_tab(crate::layout::Tab::new(
+            name.to_string(),
+            tab_bar_test_pane(i + 1, name),
+        ));
+    }
+    terminal
+        .draw(|frame| {
+            render(
+                frame,
+                &mut layout,
+                false,
+                &registry,
+                TelegramStatus::NotConfigured,
+                false,
+                0,
+                crate::runtime::AgentListMode::Live,
+                None,
+            );
+        })
+        .expect("test draw");
+    let buf = terminal.backend().buffer();
+    let rows = (0..12u16)
+        .map(|y| {
+            (0..width)
+                .map(|x| buf.cell((x, y)).map(|c| c.symbol()).unwrap_or(" "))
+                .collect::<String>()
+        })
+        .collect();
+    (layout, rows)
+}
+
+/// Tabs that outgrow the width fold onto a second row instead of being cut off;
+/// the pane tree and the cached row count move down with it.
+#[test]
+fn tab_bar_wraps_onto_second_row_when_tabs_overflow() {
+    // " alpha " etc: dot + label = 8 / 8 / 10 / 8 columns, width 30.
+    let (layout, rows) = draw_tab_bar_frame(30, &["alpha", "bravo", "charlie", "delta"]);
+    assert_eq!(layout.tab_bar_rows(), 2);
+    assert!(rows[0].contains("alpha") && rows[0].contains("charlie"));
+    assert!(!rows[0].contains("delta"), "row 0: {:?}", rows[0]);
+    assert!(rows[1].contains("delta"), "row 1: {:?}", rows[1]);
+    assert!(
+        rows[1].contains("[+]"),
+        "[+] must stay visible: {:?}",
+        rows[1]
+    );
+    // pane tree starts below the bar (row 2), not on top of it
+    // add_tab activates the newest tab; its pane id is the last one.
+    let active = layout.active_tab().unwrap();
+    let (_, y, _, _) = active.pane_rects[&active.focus_id];
+    assert_eq!(y, 2, "pane area must start below both tab-bar rows");
+    // 12-row frame: 2 tab rows + 1 status row leave 9 pane rows, 7 of content.
+    assert_eq!(
+        active.focused_pane().unwrap().vterm.rows(),
+        7,
+        "PTY/VTerm must be sized for the shrunken pane area"
+    );
+    assert!(
+        layout.tab_bar_resize_pending,
+        "row-count change must queue a PTY resize pass"
+    );
+}
+
+/// Regression: when everything fits, the bar is the old single row.
+#[test]
+fn tab_bar_stays_single_row_when_tabs_fit() {
+    let (layout, rows) = draw_tab_bar_frame(80, &["alpha", "bravo", "charlie", "delta"]);
+    assert_eq!(layout.tab_bar_rows(), 1);
+    assert!(rows[0].contains("delta") && rows[0].contains("[+]"));
+    // add_tab activates the newest tab; its pane id is the last one.
+    let active = layout.active_tab().unwrap();
+    let (_, y, _, _) = active.pane_rects[&active.focus_id];
+    assert_eq!(y, 1);
+    assert_eq!(active.focused_pane().unwrap().vterm.rows(), 8);
+}
+
+/// r2: a huge tab name must not overflow the u16 width math. The label is
+/// clipped to the bar width on its own row (it used to panic in debug).
+#[test]
+fn tab_bar_survives_huge_label_without_u16_overflow() {
+    let huge = "x".repeat(65_533);
+    let (layout, rows) = draw_tab_bar_frame(24, &[huge.as_str(), "b"]);
+    assert_eq!(layout.tab_bar_rows(), 2);
+    assert!(rows[0].starts_with("* xxx"), "row 0: {:?}", rows[0]);
+    assert!(
+        rows[1].contains('b') && rows[1].contains("[+]"),
+        "row 1: {:?}",
+        rows[1]
+    );
+}

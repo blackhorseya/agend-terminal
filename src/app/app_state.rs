@@ -456,6 +456,8 @@ impl AppState {
         } = *deps;
         let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
         let pane_cols = cols.saturating_sub(2);
+        // Boot-time estimate (layout not restored yet, bar assumed 1 row); the
+        // `needs_resize: true` initial state re-sizes every PTY on the first pass.
         let pane_rows = rows.saturating_sub(4);
         // #render-first phase-(b): OWNED restore collects deferred attach jobs here;
         // the synchronous per-agent fork/exec + skills-install is replaced by
@@ -735,7 +737,10 @@ impl AppState {
         let AppDeps { registry, .. } = *deps;
         if self.needs_resize {
             let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
-            let pane_area = ratatui::layout::Rect::new(0, 1, c, r.saturating_sub(2));
+            // The tab bar may wrap onto more rows at this width; size the PTYs
+            // for the pane area it leaves, not a fixed one-row bar.
+            self.ui.layout.set_tab_bar_width(c, Some(&self.team_view));
+            let pane_area = self.ui.layout.pane_area(c, r);
             crate::layout::resize_panes(pane_area, &mut self.ui.layout, registry);
             // #1140: force full redraw to clear wide-char ghost artifacts.
             // ratatui's Buffer::diff() can leave stale spacer cells when
@@ -956,6 +961,14 @@ impl AppState {
                     );
                 }
             })?;
+            // The frame's tab bar wrapped to a different row count than the one
+            // the PTYs were sized for: queue a resize pass (and a repaint with
+            // the corrected pane area) for the next iteration.
+            if self.ui.layout.tab_bar_resize_pending {
+                self.ui.layout.tab_bar_resize_pending = false;
+                self.needs_resize = true;
+                self.dirty = true;
+            }
             // #freeze-4: while self.booting, keep cycling at frame cadence so the
             // time-capped catch-up runs every frame until the restart flood clears.
             // #freeze-2/#freeze-3: otherwise the budget-capped `drain_all_panes`
@@ -1112,7 +1125,10 @@ impl AppState {
                 }
             }
             Event::Resize(cols, rows) => {
-                let pane_area = ratatui::layout::Rect::new(0, 1, cols, rows.saturating_sub(2));
+                self.ui
+                    .layout
+                    .set_tab_bar_width(cols, Some(&self.team_view));
+                let pane_area = self.ui.layout.pane_area(cols, rows);
                 crate::layout::resize_panes(pane_area, &mut self.ui.layout, registry);
                 // #1140: an interactive terminal resize reflows pane widths
                 // (the wide→narrow transition that leaves stale wide-char
@@ -1737,13 +1753,14 @@ impl AppState {
         to_add.sort();
         let mut pane_builder = |name: &str, layout: &mut Layout| {
             let (dc, dr) = crossterm::terminal::size().unwrap_or((120, 40));
+            let pane_rows = layout.pane_content_rows(dr);
             pane_factory::create_remote_pane(
                 name,
                 home,
                 fleet_path,
                 layout,
                 dc.saturating_sub(2),
-                dr.saturating_sub(4),
+                pane_rows,
                 wakeup_tx,
             )
         };

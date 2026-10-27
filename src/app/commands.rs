@@ -387,7 +387,7 @@ where
             let fleet_path = crate::fleet::fleet_yaml_path(ctx.home);
             let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
             let pc = cols.saturating_sub(2);
-            let pr = rows.saturating_sub(4);
+            let pr = ctx.layout.pane_content_rows(rows);
 
             // unique_fleet_name guarantees inst_name is not yet in fleet.yaml
             let inst_name = super::pane_factory::unique_fleet_name(ctx.home, base_name);
@@ -591,7 +591,7 @@ where
 
                     let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
                     let pc = cols.saturating_sub(2);
-                    let pr = rows.saturating_sub(4);
+                    let pr = ctx.layout.pane_content_rows(rows);
                     ctx.name_counter.remove(&name);
 
                     let pane_result = if let Some(ref fname) = fleet_name {

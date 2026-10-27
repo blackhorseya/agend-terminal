@@ -122,7 +122,7 @@ pub(super) fn handle(
             );
         }
         MouseEventKind::Drag(MouseButton::Left) => {
-            handle_drag(mouse, layout, state);
+            handle_drag(mouse, layout, state, team_view);
         }
         MouseEventKind::Up(MouseButton::Left) => {
             handle_up(mouse, layout, state, &mut out);
@@ -141,8 +141,8 @@ fn handle_down(
     team_view: Option<&TeamView>,
     out: &mut MouseOutcome,
 ) {
-    if crate::layout::is_tab_bar_row(mouse.row) {
-        match tab_bar_hit_test_with_team(layout, mouse.column, team_view) {
+    if layout.is_tab_bar_row(mouse.row) {
+        match tab_bar_hit_test_with_team(layout, mouse.row, mouse.column, team_view) {
             Some(TabBarClick::Tab(idx)) => {
                 out.new_last_tab = Some(layout.active);
                 layout.goto_tab(idx);
@@ -166,7 +166,8 @@ fn handle_down(
     // panes (whose top border coincides with the split line) can be grabbed
     // for drag-to-swap. Horizontal-split borders must be resized via keyboard.
     let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
-    let pa = Rect::new(0, 1, c, r.saturating_sub(2));
+    // Same pane area render uses (tab bar may span several rows).
+    let pa = layout.pane_area(c, r);
     // When a tab is zoomed, only the focused pane is visible; the split tree
     // still exists but its borders aren't rendered. Disable title-bar AND
     // border hit-tests so users can't drag invisible borders.
@@ -206,7 +207,12 @@ fn handle_down(
     }
 }
 
-fn handle_drag(mouse: MouseEvent, layout: &mut Layout, state: &mut MouseState) {
+fn handle_drag(
+    mouse: MouseEvent,
+    layout: &mut Layout,
+    state: &mut MouseState,
+    team_view: Option<&TeamView>,
+) {
     if let Some((ref hit, ref pa)) = state.border_drag {
         let mouse_pos = match hit.dir {
             SplitDir::Horizontal => mouse.row,
@@ -226,22 +232,23 @@ fn handle_drag(mouse: MouseEvent, layout: &mut Layout, state: &mut MouseState) {
         // but resizing the PTY every mouse cell triggers the backend
         // (Claude/etc.) to reflow its entire UI and floods us with redraw
         // data. Defer the single PTY resize to mouse-up.
-    } else if layout.tab_reorder_source.is_some() && crate::layout::is_tab_bar_row(mouse.row) {
+    } else if layout.tab_reorder_source.is_some() && layout.is_tab_bar_row(mouse.row) {
         // Tab reorder drag: update drop target
-        layout.tab_reorder_target = match tab_bar_hit_test(layout, mouse.column) {
-            Some(TabBarClick::Tab(idx)) => Some(idx),
-            _ => None,
-        };
+        layout.tab_reorder_target =
+            match tab_bar_hit_test_with_team(layout, mouse.row, mouse.column, team_view) {
+                Some(TabBarClick::Tab(idx)) => Some(idx),
+                _ => None,
+            };
     } else if layout
         .active_tab()
         .is_some_and(|t| t.dragging_pane.is_some())
     {
-        // Pointer on the tab bar (row 0) is a cross-tab drop intent; pointer
+        // Pointer on the tab bar (any of its rows) is a cross-tab drop intent; pointer
         // inside the pane area is an intra-tab swap intent. Set exactly one
         // of `drag_target_tab` / `drag_target` per mouse position so that
         // render + mouse-up dispatch unambiguously.
-        if crate::layout::is_tab_bar_row(mouse.row) {
-            let hit = tab_bar_hit_test(layout, mouse.column);
+        if layout.is_tab_bar_row(mouse.row) {
+            let hit = tab_bar_hit_test_with_team(layout, mouse.row, mouse.column, team_view);
             let active_idx = layout.active;
             let tab_target = match hit {
                 // Hovering over the source's own tab is not a move target —
@@ -366,47 +373,24 @@ fn handle_up(
     }
 }
 
-#[derive(Debug, PartialEq)]
-enum TabBarClick {
-    Tab(usize),
-    NewTab,
-}
+type TabBarClick = crate::layout::TabBarHit;
 
-/// Hit-test the tab bar at the given column.
-/// SYNC: per-tab width must match `render_tab_bar()` in render/core_render.rs. Both
-/// derive the label from `Tab::tab_bar_label`; the other widths are the `*` dot (1),
-/// the inter-tab separator (1), and the trailing ` [+] ` (5).
-/// M4: This is O(n_tabs) string-width scan, not a full layout re-render.
-/// Caching tab positions would save ~5 iterations but adds invalidation
-/// complexity. Kept as-is — n_tabs is typically 1-5.
-fn tab_bar_hit_test(layout: &Layout, col: u16) -> Option<TabBarClick> {
-    tab_bar_hit_test_with_team(layout, col, None)
+/// Hit-test the tab bar at the given screen cell.
+/// SYNC: shares `Layout::tab_bar_geometry_for` (layout/tab_bar.rs) with
+/// `render_tab_bar()` in render/core_render.rs, laid out at the width of the
+/// last render, so paint and click cannot drift on widths or wrap points.
+#[cfg(test)]
+fn tab_bar_hit_test(layout: &Layout, row: u16, col: u16) -> Option<TabBarClick> {
+    tab_bar_hit_test_with_team(layout, row, col, None)
 }
 
 fn tab_bar_hit_test_with_team(
     layout: &Layout,
+    row: u16,
     col: u16,
     team_view: Option<&TeamView>,
 ) -> Option<TabBarClick> {
-    use unicode_width::UnicodeWidthStr;
-    let mut x: u16 = 0;
-    for (i, tab) in layout.tabs.iter().enumerate() {
-        if i > 0 {
-            x += 1;
-        } // separator space
-        let is_active = i == layout.active;
-        let label = tab.tab_bar_label_with_team(is_active, team_view);
-        let tab_w = 1 + label.width() as u16; // "*" dot + label
-        if col >= x && col < x + tab_w {
-            return Some(TabBarClick::Tab(i));
-        }
-        x += tab_w;
-    }
-    // " [+] " button
-    if col >= x && col < x + 5 {
-        return Some(TabBarClick::NewTab);
-    }
-    None
+    layout.tab_bar_geometry_cached(team_view).hit(row, col)
 }
 
 /// Handle mouse selection: down starts, drag extends, up copies to clipboard.
@@ -868,7 +852,7 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         };
 
-        handle_drag(event, &mut layout, &mut state);
+        handle_drag(event, &mut layout, &mut state, None);
         assert_eq!(layout.tab_reorder_target, Some(1));
     }
 
@@ -890,7 +874,7 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         };
 
-        handle_drag(event, &mut layout, &mut state);
+        handle_drag(event, &mut layout, &mut state, None);
         assert_eq!(
             layout.tabs[0].drag_target_tab,
             Some(DragTabTarget::ExistingTab(1))
@@ -915,7 +899,7 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         };
 
-        handle_drag(event, &mut layout, &mut state);
+        handle_drag(event, &mut layout, &mut state, None);
         assert_eq!(layout.tabs[0].drag_target_tab, Some(DragTabTarget::NewTab));
     }
 
@@ -941,7 +925,7 @@ mod tests {
             modifiers: KeyModifiers::empty(),
         };
 
-        handle_drag(event, &mut layout, &mut state);
+        handle_drag(event, &mut layout, &mut state, None);
         assert_eq!(layout.tabs[0].drag_target, Some(2));
         assert!(layout.tabs[0].drag_target_tab.is_none());
     }
@@ -953,7 +937,7 @@ mod tests {
         let mut layout = Layout::new();
         layout.add_tab(Tab::new("tab0".to_string(), leaf(1, "a")));
         // First tab starts at col 0: "*" (1) + " tab0 " (6) = 7 cols
-        let result = tab_bar_hit_test(&layout, 0);
+        let result = tab_bar_hit_test(&layout, 0, 0);
         assert_eq!(result, Some(TabBarClick::Tab(0)));
     }
 
@@ -964,7 +948,7 @@ mod tests {
         layout.add_tab(Tab::new("b".to_string(), leaf(2, "y")));
         // Tab "a": "*" + " a " = 4 cols (0..3). Separator: 1 col (4).
         // Tab "b": "*" + " b " = 4 cols (5..8).
-        let result = tab_bar_hit_test(&layout, 5);
+        let result = tab_bar_hit_test(&layout, 0, 5);
         assert_eq!(result, Some(TabBarClick::Tab(1)));
     }
 
@@ -973,7 +957,7 @@ mod tests {
         let mut layout = Layout::new();
         layout.add_tab(Tab::new("x".to_string(), leaf(1, "a")));
         // Tab "x": 4 cols (0..3). Then " [+] " at col 4..8.
-        let result = tab_bar_hit_test(&layout, 4);
+        let result = tab_bar_hit_test(&layout, 0, 4);
         assert_eq!(result, Some(TabBarClick::NewTab));
     }
 
@@ -982,7 +966,7 @@ mod tests {
         let mut layout = Layout::new();
         layout.add_tab(Tab::new("t".to_string(), leaf(1, "a")));
         // Way past all tabs + [+] button
-        let result = tab_bar_hit_test(&layout, 100);
+        let result = tab_bar_hit_test(&layout, 0, 100);
         assert_eq!(result, None);
     }
 
@@ -990,8 +974,128 @@ mod tests {
     fn tab_bar_hit_test_empty_layout_returns_new_tab() {
         let layout = Layout::new();
         // No tabs → only [+] button at col 0
-        let result = tab_bar_hit_test(&layout, 0);
+        let result = tab_bar_hit_test(&layout, 0, 0);
         assert_eq!(result, Some(TabBarClick::NewTab));
+    }
+
+    /// Multi-row bar: a click on the second row resolves to the tab (or `[+]`)
+    /// rendered there, using the same geometry render consumes.
+    #[test]
+    fn tab_bar_hit_test_resolves_second_row() {
+        let mut layout = Layout::new();
+        for (i, name) in ["alpha", "bravo", "charlie", "delta"].iter().enumerate() {
+            layout.add_tab(Tab::new(name.to_string(), leaf(i + 1, name)));
+        }
+        // Width 30: alpha/bravo/charlie on row 0 (8+1+8+1+10), delta + [+] on row 1.
+        assert!(layout.set_tab_bar_width(30, None));
+        assert_eq!(layout.tab_bar_rows(), 2);
+        assert!(layout.is_tab_bar_row(1));
+        assert!(!layout.is_tab_bar_row(2));
+        assert_eq!(tab_bar_hit_test(&layout, 0, 0), Some(TabBarClick::Tab(0)));
+        assert_eq!(tab_bar_hit_test(&layout, 0, 19), Some(TabBarClick::Tab(2)));
+        assert_eq!(tab_bar_hit_test(&layout, 1, 0), Some(TabBarClick::Tab(3)));
+        assert_eq!(tab_bar_hit_test(&layout, 1, 7), Some(TabBarClick::Tab(3)));
+        assert_eq!(tab_bar_hit_test(&layout, 1, 8), Some(TabBarClick::NewTab));
+        assert_eq!(tab_bar_hit_test(&layout, 2, 0), None, "pane area");
+    }
+
+    /// Clicking a second-row tab through the real `handle_down` switches to it.
+    #[test]
+    fn click_on_second_row_tab_activates_it() {
+        let mut layout = Layout::new();
+        for (i, name) in ["alpha", "bravo", "charlie", "delta"].iter().enumerate() {
+            layout.add_tab(Tab::new(name.to_string(), leaf(i + 1, name)));
+        }
+        layout.set_tab_bar_width(30, None);
+        let mut state = MouseState::default();
+        let mut out = MouseOutcome::default();
+        let registry: AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 2,
+            row: 1,
+            modifiers: KeyModifiers::empty(),
+        };
+        handle_down(
+            event,
+            &mut layout,
+            &mut state,
+            Path::new("/nonexistent/fleet.yaml"),
+            &registry,
+            None,
+            &mut out,
+        );
+        assert_eq!(layout.active, 3);
+        assert!(out.needs_resize);
+    }
+
+    /// r2: with a wrapped (3-row) tab bar, `handle_down` must build the
+    /// split-border area from the same `pane_area` render uses. The old fixed
+    /// one-row rectangle started the lower split one row early, so a click on
+    /// pane content at the stale border start began a border drag.
+    #[test]
+    fn click_on_pane_content_with_wrapped_bar_is_not_a_border_drag() {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((120, 40));
+        assert!(cols >= 20 && rows >= 15, "needs a usable terminal size");
+        let root = crate::layout::PaneNode::Split {
+            dir: SplitDir::Horizontal,
+            ratio: 0.5,
+            first: Box::new(crate::layout::PaneNode::Leaf(Box::new(leaf(1, "top")))),
+            second: Box::new(crate::layout::PaneNode::Split {
+                dir: SplitDir::Vertical,
+                ratio: 0.5,
+                first: Box::new(crate::layout::PaneNode::Leaf(Box::new(leaf(2, "bl")))),
+                second: Box::new(crate::layout::PaneNode::Leaf(Box::new(leaf(3, "br")))),
+            }),
+        };
+        let mut layout = Layout::new();
+        layout.add_tab(Tab::with_root("x".repeat(cols as usize), root));
+        for i in 0..3 {
+            layout.add_tab(Tab::new("x".repeat(cols as usize), leaf(4 + i, "other")));
+        }
+        layout.active = 0;
+        layout.set_tab_bar_width(cols, None);
+        assert_eq!(layout.tab_bar_rows(), 3, "fixture must wrap to 3 rows");
+        let area = layout.pane_area(cols, rows);
+        // Where the lower split's vertical border would start on the legacy
+        // one-row rectangle (one row above the real one).
+        let legacy = (0, 1, cols, rows.saturating_sub(2));
+        let (_, lower) = crate::layout::split::split_child_areas(legacy, SplitDir::Horizontal, 0.5);
+        let (left, _) = crate::layout::split::split_child_areas(lower, SplitDir::Vertical, 0.5);
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: left.0 + left.2 - 1,
+            row: lower.1,
+            modifiers: KeyModifiers::empty(),
+        };
+        assert!(
+            crate::layout::find_split_border(
+                layout.tabs[0].root(),
+                (area.x, area.y, area.width, area.height),
+                event.column,
+                event.row,
+            )
+            .is_none(),
+            "fixture must click pane content, away from the real split borders"
+        );
+        let registry: AgentRegistry =
+            std::sync::Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
+        let mut state = MouseState::default();
+        let mut out = MouseOutcome::default();
+        handle_down(
+            event,
+            &mut layout,
+            &mut state,
+            Path::new("/nonexistent/fleet.yaml"),
+            &registry,
+            None,
+            &mut out,
+        );
+        assert!(
+            state.border_drag.is_none(),
+            "clicking pane content started a drag on a stale one-row split rectangle"
+        );
     }
 
     /// #777: `Tab::tab_bar_label` (the shared render/hit-test source of truth) wraps the
@@ -1035,7 +1139,7 @@ mod tests {
             "tab identity must come from the authoritative member set"
         );
         assert_eq!(
-            tab_bar_hit_test_with_team(&layout, 0, Some(&view)),
+            tab_bar_hit_test_with_team(&layout, 0, 0, Some(&view)),
             Some(TabBarClick::Tab(0)),
             "hit-test must use the same authoritative label width"
         );
@@ -1063,20 +1167,20 @@ mod tests {
             }
             let w = 1 + tab.tab_bar_label(i == layout.active).width() as u16; // dot + label
             assert_eq!(
-                tab_bar_hit_test(&layout, x),
+                tab_bar_hit_test(&layout, 0, x),
                 Some(TabBarClick::Tab(i)),
                 "tab {i} first col {x}"
             );
             let last = x + w - 1;
             assert_eq!(
-                tab_bar_hit_test(&layout, last),
+                tab_bar_hit_test(&layout, 0, last),
                 Some(TabBarClick::Tab(i)),
                 "tab {i} last col {last}"
             );
             x += w;
         }
         assert_eq!(
-            tab_bar_hit_test(&layout, x),
+            tab_bar_hit_test(&layout, 0, x),
             Some(TabBarClick::NewTab),
             "col {x} right after the last tab must be the [+] button"
         );
