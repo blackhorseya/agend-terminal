@@ -308,6 +308,15 @@ fn render_active_overlay(
             };
             render::render_confirm(frame, msg);
         }
+        Overlay::ConfirmCreate { item, .. } => {
+            render::render_confirm(
+                frame,
+                &format!(
+                    "Create a NEW instance: {}? (y = create, any other key = cancel)",
+                    item.label
+                ),
+            );
+        }
         Overlay::ConfirmRestart { command } => {
             render::render_confirm(frame, &format!("Restart '{command}'? (y/n)"));
         }

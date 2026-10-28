@@ -72,6 +72,20 @@ pub enum BoardView {
     Monitor,
 }
 
+/// Where a menu-selected item should be placed.
+#[derive(Clone, Copy)]
+pub(super) enum MenuTarget {
+    Tab,
+    Split(SplitDir),
+}
+
+/// Whether choosing this item creates a NEW persistent daemon instance (fleet.yaml
+/// entry + backend process). Those need an explicit confirmation; local shells and
+/// existing fleet agents are only views and do not.
+fn creates_new_instance(kind: &MenuItemKind) -> bool {
+    matches!(kind, MenuItemKind::Backend(_) | MenuItemKind::Fugu)
+}
+
 pub(super) enum Overlay {
     None,
     /// New tab selection menu.
@@ -84,6 +98,12 @@ pub(super) enum Overlay {
         items: Vec<MenuItem>,
         selected: usize,
         dir: SplitDir,
+    },
+    /// `y` confirmation before a menu selection creates a new daemon instance.
+    /// Any other key cancels, so stray typing can never spawn one.
+    ConfirmCreate {
+        item: MenuItem,
+        target: MenuTarget,
     },
     RenameTab {
         input: String,
@@ -222,6 +242,72 @@ pub(super) struct OverlayOutcome {
     pub needs_resize: bool,
 }
 
+/// A menu item was chosen. Creating a NEW daemon instance asks for `y` first
+/// (a stray Enter must not spawn a billable agent); everything else runs now.
+fn choose_menu_item(
+    overlay: &mut Overlay,
+    item: MenuItem,
+    target: MenuTarget,
+    ctx: &mut OverlayCtx<'_>,
+    outcome: &mut OverlayOutcome,
+) {
+    if creates_new_instance(&item.kind) {
+        *overlay = Overlay::ConfirmCreate { item, target };
+    } else {
+        spawn_menu_item(item, target, ctx, outcome);
+    }
+}
+
+/// Build the pane for a chosen menu item and place it as a new tab or a split.
+fn spawn_menu_item(
+    item: MenuItem,
+    target: MenuTarget,
+    ctx: &mut OverlayCtx<'_>,
+    outcome: &mut OverlayOutcome,
+) {
+    let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
+    let content_rows = ctx.layout.pane_content_rows(r);
+    let (pc, pr) = match target {
+        MenuTarget::Tab => (c.saturating_sub(2), content_rows),
+        MenuTarget::Split(SplitDir::Vertical) => (c.saturating_sub(2) / 2, content_rows),
+        MenuTarget::Split(SplitDir::Horizontal) => (c.saturating_sub(2), content_rows / 2),
+    };
+    match super::pane_from_menu_item(
+        item,
+        ctx.fleet_path,
+        ctx.layout,
+        ctx.registry,
+        ctx.home,
+        pc,
+        pr,
+        ctx.wakeup_tx,
+        ctx.name_counter,
+    ) {
+        Ok(pane) => {
+            super::telegram_hooks::maybe_create_telegram_topic(ctx.registry, ctx.home, &pane);
+            super::discord_hooks::maybe_create_discord_binding(ctx.registry, &pane);
+            match target {
+                MenuTarget::Tab => {
+                    let tab_name = pane.agent_name.clone();
+                    ctx.layout.add_tab(Tab::new(tab_name.to_string(), pane));
+                }
+                MenuTarget::Split(dir) => {
+                    if let Some(tab) = ctx.layout.active_tab_mut() {
+                        tab.split_focused(dir, pane);
+                    }
+                }
+            }
+            outcome.needs_resize = true;
+        }
+        // #t-98760-1: surface a failed spawn instead of silently swallowing the
+        // Err — a swallowed Err looked to the operator like Ctrl+B c "did nothing".
+        Err(e) => match target {
+            MenuTarget::Tab => tracing::error!(error = %e, "new-tab spawn failed"),
+            MenuTarget::Split(_) => tracing::error!(error = %e, "split failed"),
+        },
+    }
+}
+
 fn execute_command(command: &str, ctx: &mut OverlayCtx<'_>, outcome: &mut OverlayOutcome) {
     let mut cctx = super::commands::CommandCtx {
         layout: &mut *ctx.layout,
@@ -259,45 +345,10 @@ pub(super) fn handle_key(
             }
             KeyCode::Enter => {
                 let sel = *selected;
-                let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
                 if let Overlay::NewTabMenu { items, .. } = std::mem::replace(overlay, Overlay::None)
                 {
                     if let Some(item) = items.into_iter().nth(sel) {
-                        let pc = c.saturating_sub(2);
-                        let pr = ctx.layout.pane_content_rows(r);
-                        match super::pane_from_menu_item(
-                            item,
-                            ctx.fleet_path,
-                            ctx.layout,
-                            ctx.registry,
-                            ctx.home,
-                            pc,
-                            pr,
-                            ctx.wakeup_tx,
-                            ctx.name_counter,
-                        ) {
-                            Ok(pane) => {
-                                super::telegram_hooks::maybe_create_telegram_topic(
-                                    ctx.registry,
-                                    ctx.home,
-                                    &pane,
-                                );
-                                super::discord_hooks::maybe_create_discord_binding(
-                                    ctx.registry,
-                                    &pane,
-                                );
-                                let tab_name = pane.agent_name.clone();
-                                ctx.layout.add_tab(Tab::new(tab_name.to_string(), pane));
-                                outcome.needs_resize = true;
-                            }
-                            // #t-98760-1: surface a failed new-tab spawn instead of
-                            // silently swallowing the Err (mirrors SplitMenu's error
-                            // log) — a swallowed Err looked to the operator like
-                            // Ctrl+B c "did nothing".
-                            Err(e) => {
-                                tracing::error!(error = %e, "new-tab spawn failed");
-                            }
-                        }
+                        choose_menu_item(overlay, item, MenuTarget::Tab, ctx, &mut outcome);
                     }
                 }
             }
@@ -321,44 +372,17 @@ pub(super) fn handle_key(
                 }
                 KeyCode::Enter => {
                     let sel = *selected;
-                    let (c, r) = crossterm::terminal::size().unwrap_or((120, 40));
                     if let Overlay::SplitMenu { items, .. } =
                         std::mem::replace(overlay, Overlay::None)
                     {
                         if let Some(item) = items.into_iter().nth(sel) {
-                            let content_rows = ctx.layout.pane_content_rows(r);
-                            let (pc, pr) = match split_dir {
-                                SplitDir::Vertical => (c.saturating_sub(2) / 2, content_rows),
-                                SplitDir::Horizontal => (c.saturating_sub(2), content_rows / 2),
-                            };
-                            match super::pane_from_menu_item(
+                            choose_menu_item(
+                                overlay,
                                 item,
-                                ctx.fleet_path,
-                                ctx.layout,
-                                ctx.registry,
-                                ctx.home,
-                                pc,
-                                pr,
-                                ctx.wakeup_tx,
-                                ctx.name_counter,
-                            ) {
-                                Ok(p) => {
-                                    super::telegram_hooks::maybe_create_telegram_topic(
-                                        ctx.registry,
-                                        ctx.home,
-                                        &p,
-                                    );
-                                    super::discord_hooks::maybe_create_discord_binding(
-                                        ctx.registry,
-                                        &p,
-                                    );
-                                    if let Some(tab) = ctx.layout.active_tab_mut() {
-                                        tab.split_focused(split_dir, p);
-                                    }
-                                    outcome.needs_resize = true;
-                                }
-                                Err(e) => tracing::error!(error = %e, "split failed"),
-                            }
+                                MenuTarget::Split(split_dir),
+                                ctx,
+                                &mut outcome,
+                            );
                         }
                     }
                 }
@@ -366,6 +390,15 @@ pub(super) fn handle_key(
                     *overlay = Overlay::None;
                 }
                 _ => {}
+            }
+        }
+        Overlay::ConfirmCreate { .. } => {
+            if let Overlay::ConfirmCreate { item, target } =
+                std::mem::replace(overlay, Overlay::None)
+            {
+                if matches!(key.code, KeyCode::Char('y') | KeyCode::Char('Y')) {
+                    spawn_menu_item(item, target, ctx, &mut outcome);
+                }
             }
         }
         Overlay::RenameTab { ref mut input } => match key.code {
@@ -1255,6 +1288,112 @@ mod tests {
 
     fn press(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::empty())
+    }
+
+    /// Drive one key through `handle_key` against an empty layout.
+    /// Returns (tabs after, overlay after).
+    fn menu_key(overlay: Overlay, code: KeyCode, tag: &str) -> (usize, Overlay) {
+        let home = dec_home(tag);
+        let registry: crate::agent::AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let mut layout = crate::layout::Layout::new();
+        let (wakeup_tx, _wakeup_rx) = crossbeam_channel::unbounded();
+        let mut name_counter = HashMap::new();
+        let mut reap_workers = Vec::new();
+        let mut overlay = overlay;
+        let mut ctx = OverlayCtx {
+            layout: &mut layout,
+            registry: &registry,
+            home: &home,
+            fleet_path: &home,
+            wakeup_tx: &wakeup_tx,
+            name_counter: &mut name_counter,
+            task_rpc_tx: &test_task_channel().0,
+            restart_request_tx: None,
+            reap_workers: &mut reap_workers,
+        };
+        handle_key(&mut overlay, press(code), &mut ctx);
+        let tabs = layout.tabs.len();
+        std::fs::remove_dir_all(home).ok();
+        (tabs, overlay)
+    }
+
+    fn backend_item() -> MenuItem {
+        MenuItem {
+            label: "[backend] claude".to_string(),
+            kind: MenuItemKind::Backend(Backend::ClaudeCode),
+        }
+    }
+
+    #[test]
+    fn creating_menu_items_need_confirmation_but_views_do_not() {
+        assert!(creates_new_instance(&MenuItemKind::Backend(
+            Backend::ClaudeCode
+        )));
+        assert!(creates_new_instance(&MenuItemKind::Fugu));
+        assert!(!creates_new_instance(&MenuItemKind::Shell));
+        assert!(!creates_new_instance(&MenuItemKind::FleetInstance(
+            "x".to_string()
+        )));
+    }
+
+    /// A single Enter on a backend entry must NOT create an instance: it only
+    /// asks for confirmation (the stray-Enter phantom-create path).
+    #[test]
+    fn split_menu_enter_on_backend_asks_instead_of_creating() {
+        let menu = Overlay::SplitMenu {
+            items: vec![backend_item()],
+            selected: 0,
+            dir: SplitDir::Vertical,
+        };
+        let (tabs, overlay) = menu_key(menu, KeyCode::Enter, "split_enter_confirm");
+        assert!(
+            matches!(overlay, Overlay::ConfirmCreate { .. }),
+            "Enter must open the create confirmation"
+        );
+        assert_eq!(tabs, 0);
+    }
+
+    #[test]
+    fn new_tab_menu_enter_on_backend_asks_instead_of_creating() {
+        let menu = Overlay::NewTabMenu {
+            items: vec![backend_item()],
+            selected: 0,
+        };
+        let (_, overlay) = menu_key(menu, KeyCode::Enter, "tab_enter_confirm");
+        assert!(matches!(overlay, Overlay::ConfirmCreate { .. }));
+    }
+
+    /// Anything but `y` cancels (Enter included), so a second stray Enter or
+    /// typed text can never confirm creation.
+    #[test]
+    fn confirm_create_cancels_on_enter_and_other_keys() {
+        for code in [
+            KeyCode::Enter,
+            KeyCode::Char('n'),
+            KeyCode::Esc,
+            KeyCode::Char('j'),
+        ] {
+            let ov = Overlay::ConfirmCreate {
+                item: backend_item(),
+                target: MenuTarget::Tab,
+            };
+            let (tabs, overlay) = menu_key(ov, code, "confirm_create_cancel");
+            assert!(matches!(overlay, Overlay::None), "{code:?} must close it");
+            assert_eq!(tabs, 0, "{code:?} must not create anything");
+        }
+    }
+
+    /// Only `y` proceeds to creation (fails here: no daemon in the test home,
+    /// so no tab is added, but the overlay is consumed and the attempt made).
+    #[test]
+    fn confirm_create_y_attempts_creation() {
+        let ov = Overlay::ConfirmCreate {
+            item: backend_item(),
+            target: MenuTarget::Tab,
+        };
+        let (tabs, overlay) = menu_key(ov, KeyCode::Char('y'), "confirm_create_y");
+        assert!(matches!(overlay, Overlay::None));
+        assert_eq!(tabs, 0, "no daemon in test home → creation fails cleanly");
     }
 
     #[test]

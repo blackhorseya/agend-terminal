@@ -9,6 +9,11 @@ use std::time::{Duration, Instant};
 /// How long repeat mode stays active after a repeatable key.
 const REPEAT_TIMEOUT: Duration = Duration::from_millis(1500);
 
+/// How long the bare `Ctrl+B` prefix waits for its follow-up key. A stale prefix
+/// would otherwise swallow a later, unrelated `"` / `%` and open the split menu
+/// in the middle of ordinary typing.
+const PREFIX_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Actions that can be triggered by keybindings.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Action {
@@ -71,8 +76,8 @@ pub enum Action {
 enum PrefixState {
     /// Normal mode — keys forwarded to PTY.
     Normal,
-    /// Waiting for first key after Ctrl+B (no timeout).
-    WaitingFirst,
+    /// Waiting for first key after Ctrl+B (expires after [`PREFIX_TIMEOUT`]).
+    WaitingFirst { since: Instant },
     /// Repeat mode — prefix stays active with timeout.
     Repeat { since: Instant },
 }
@@ -96,11 +101,16 @@ impl KeyHandler {
 
     /// Process a key event and return the resulting action.
     pub fn handle(&mut self, key: KeyEvent) -> Action {
+        self.handle_at(key, Instant::now())
+    }
+
+    /// [`Self::handle`] with an explicit clock (test seam for the timeouts).
+    fn handle_at(&mut self, key: KeyEvent, now: Instant) -> Action {
         match &self.state {
             PrefixState::Normal => {
                 // Check for Ctrl+B (prefix key)
                 if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
-                    self.state = PrefixState::WaitingFirst;
+                    self.state = PrefixState::WaitingFirst { since: now };
                     return Action::None;
                 }
                 // Cmd+C (macOS) → copy selection to clipboard
@@ -120,7 +130,13 @@ impl KeyHandler {
                 }
                 Action::Forward(key)
             }
-            PrefixState::WaitingFirst => {
+            PrefixState::WaitingFirst { since } => {
+                // A stale prefix expires: back to Normal and the key is plain
+                // input for the pane, never a command.
+                if now.saturating_duration_since(*since) > PREFIX_TIMEOUT {
+                    self.state = PrefixState::Normal;
+                    return Action::Forward(key);
+                }
                 // Ctrl+B Ctrl+B → forward Ctrl+B to PTY
                 if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
                     self.state = PrefixState::Normal;
@@ -273,6 +289,53 @@ mod tests {
             kind: KeyEventKind::Press,
             state: KeyEventState::NONE,
         }
+    }
+
+    // --- bare prefix expires: a stale Ctrl+B must not turn later typing into a command ---
+
+    fn ctrl_b() -> KeyEvent {
+        key(KeyCode::Char('b'), KeyModifiers::CONTROL)
+    }
+
+    #[test]
+    fn stale_prefix_forwards_split_key_instead_of_opening_menu() {
+        let t0 = Instant::now();
+        for ch in ['"', '%'] {
+            let mut h = KeyHandler::new();
+            assert_eq!(h.handle_at(ctrl_b(), t0), Action::None);
+            let k = key(KeyCode::Char(ch), KeyModifiers::empty());
+            assert_eq!(
+                h.handle_at(k, t0 + PREFIX_TIMEOUT + Duration::from_millis(1)),
+                Action::Forward(k),
+                "expired prefix must forward {ch:?} to the pane"
+            );
+            // And the handler is back to Normal: the next key is plain input.
+            let k2 = key(KeyCode::Char('x'), KeyModifiers::empty());
+            assert_eq!(
+                h.handle_at(k2, t0 + PREFIX_TIMEOUT * 2),
+                Action::Forward(k2)
+            );
+        }
+    }
+
+    #[test]
+    fn fresh_prefix_still_opens_split() {
+        let t0 = Instant::now();
+        let mut h = KeyHandler::new();
+        h.handle_at(ctrl_b(), t0);
+        let k = key(KeyCode::Char('"'), KeyModifiers::empty());
+        assert_eq!(
+            h.handle_at(k, t0 + Duration::from_millis(500)),
+            Action::SplitHorizontal
+        );
+        let mut h = KeyHandler::new();
+        h.handle_at(ctrl_b(), t0);
+        let k = key(KeyCode::Char('%'), KeyModifiers::empty());
+        assert_eq!(
+            h.handle_at(k, t0 + PREFIX_TIMEOUT),
+            Action::SplitVertical,
+            "exactly at the timeout is still inside the window"
+        );
     }
 
     // --- Shift+L: ResizeRight (not LastTab) ---
