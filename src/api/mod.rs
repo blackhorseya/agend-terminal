@@ -437,10 +437,12 @@ fn serve_inner(
     // demoted to YAGNI for single-user deploys).
     // 256: every instance keeps one resident `agend-mcp-bridge` connection
     // (~21 resident + ~9 transient workers ≈ 30 observed), which saturated the
-    // old 32 and locked the TUI/CLI out. A connection costs one thread + one
-    // fd, and the daemon already raises RLIMIT_NOFILE
-    // (`resource_limits::raise_daemon_nofile_limit`), so 256 leaves ~8x
-    // headroom for fleet growth without a meaningful resource bill.
+    // old 32 and locked the TUI/CLI out. Per-connection cost is more than one
+    // thread + fd: `handle_session` clones the stream, and a PID-bearing bridge
+    // adds a peer-PID watcher thread plus another cloned handle (~2 threads +
+    // ~3 fds worst case). At 256 that is ~512 threads / ~768 fds — well within
+    // what the daemon asks for via `resource_limits::raise_daemon_nofile_limit`
+    // (best-effort and platform-dependent, not guaranteed), and ~8x headroom.
     const API_MAX_CONNS: usize = 256;
     let max_conns: usize = API_MAX_CONNS;
     let active_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -632,6 +634,103 @@ pub static LISTENER_PHASE: std::sync::atomic::AtomicU8 =
 pub static ACTIVE_API_SESSIONS: std::sync::atomic::AtomicUsize =
     std::sync::atomic::AtomicUsize::new(0);
 
+/// Max concurrent at-capacity notifier threads; beyond this a rejected peer
+/// just gets a bare close (the pre-notice behaviour).
+const MAX_REJECT_NOTICES: usize = 8;
+/// Total wall-clock budget for one reject notice (read the peer's auth line,
+/// write the reply, close).
+const REJECT_NOTICE_BUDGET: std::time::Duration = std::time::Duration::from_secs(1);
+/// Byte cap for the peer's auth line (`{"auth":"<64 hex>"}` is ~77 bytes).
+const REJECT_NOTICE_MAX_LINE: usize = 512;
+static REJECT_NOTICES_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Releases one `REJECT_NOTICES_IN_FLIGHT` reservation on every exit path
+/// (normal end, spawn failure, panic unwind).
+struct RejectNoticeSlot;
+
+impl Drop for RejectNoticeSlot {
+    fn drop(&mut self) {
+        REJECT_NOTICES_IN_FLIGHT.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Read (and discard) the peer's first line, bounded by BOTH a total
+/// wall-clock `deadline` and `max_bytes`. A per-read `SO_RCVTIMEO` alone is not
+/// a bound: a peer trickling one byte per read keeps every read "in time".
+fn drain_first_line(stream: &mut TcpStream, deadline: std::time::Instant, max_bytes: usize) {
+    use std::io::Read;
+    let mut total = 0usize;
+    let mut buf = [0u8; 128];
+    loop {
+        let Some(remaining) = deadline
+            .checked_duration_since(std::time::Instant::now())
+            .filter(|d| !d.is_zero())
+        else {
+            return;
+        };
+        if stream.set_read_timeout(Some(remaining)).is_err() {
+            return;
+        }
+        let n = match stream.read(&mut buf) {
+            Ok(0) | Err(_) => return,
+            Ok(n) => n,
+        };
+        total += n;
+        if buf[..n].contains(&b'\n') || total >= max_bytes {
+            return;
+        }
+    }
+}
+
+/// Tell a rejected peer WHY it was refused, so clients can tell "API connection
+/// pool full" (all connections alive) from "daemon hung". The peer's first
+/// line is its auth handshake; we answer in the handshake-reply slot with
+/// `{"ok":false,"error":"at_capacity",...}` (see `auth_cookie::client_handshake_ndjson`).
+///
+/// The auth line must be consumed before closing: closing a socket with unread
+/// inbound data sends RST, which can discard our reply on the peer. That read
+/// is bounded in time AND bytes ([`drain_first_line`]), so it runs on a
+/// short-lived thread (capped by [`MAX_REJECT_NOTICES`]) to keep the accept
+/// loop non-blocking. Returns the notifier's handle (None = bare close).
+fn spawn_reject_notice(
+    stream: TcpStream,
+    active: usize,
+    max: usize,
+    budget: std::time::Duration,
+) -> Option<std::thread::JoinHandle<()>> {
+    use std::sync::atomic::Ordering;
+    if REJECT_NOTICES_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_REJECT_NOTICES {
+        REJECT_NOTICES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        return None; // bare close
+    }
+    let slot = RejectNoticeSlot; // moved into the closure; dropped on spawn failure too
+    std::thread::Builder::new()
+        .name("api_reject_notice".into())
+        .spawn(move || {
+            let _slot = slot;
+            let deadline = std::time::Instant::now() + budget;
+            let mut writer = stream;
+            drain_first_line(&mut writer, deadline, REJECT_NOTICE_MAX_LINE);
+            let _ = writer.set_write_timeout(Some(budget));
+            let reply = json!({
+                "ok": false,
+                "error": crate::auth_cookie::AT_CAPACITY_ERROR,
+                "active": active,
+                "max": max,
+            });
+            let _ = writeln!(writer, "{reply}");
+            let _ = writer.flush();
+            let _ = writer.shutdown(std::net::Shutdown::Both);
+        })
+        .ok() // fire-and-forget: ends within `budget` (read) + `budget` (write); slot released by RAII
+}
+
+fn reject_at_capacity(stream: TcpStream, active: usize, max: usize) {
+    // fire-and-forget: the notifier is time-bounded; no join needed.
+    let _ = spawn_reject_notice(stream, active, max, REJECT_NOTICE_BUDGET);
+}
+
 /// RAII reservation of an `active_conns` slot. `reserve` performs the #680
 /// atomic `fetch_add` (reserve-then-check) and returns the prior count for the
 /// capacity gate; `Drop` performs the matching `fetch_sub`. The guard is held
@@ -642,54 +741,6 @@ pub static ACTIVE_API_SESSIONS: std::sync::atomic::AtomicUsize =
 /// with a manual `fetch_sub` placed AFTER `handle_session`, which the unwind
 /// skipped — leaked slots accumulated to `API_MAX_CONNS` and locked out the
 /// control plane (bug-audit Rank1).
-/// Max concurrent at-capacity notifier threads; beyond this a rejected peer
-/// just gets a bare close (the pre-notice behaviour).
-const MAX_REJECT_NOTICES: usize = 8;
-static REJECT_NOTICES_IN_FLIGHT: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(0);
-
-/// Tell a rejected peer WHY it was refused, so clients can tell "API connection
-/// pool full" (all connections alive) from "daemon hung". The peer's first
-/// line is its auth handshake; we answer in the handshake-reply slot with
-/// `{"ok":false,"error":"at_capacity",...}` (see `auth_cookie::client_handshake_ndjson`).
-///
-/// The auth line must be consumed before closing: closing a socket with unread
-/// inbound data sends RST, which can discard our reply on the peer. That read
-/// is bounded, so it runs on a short-lived thread (capped by
-/// [`MAX_REJECT_NOTICES`]) to keep the accept loop non-blocking.
-fn reject_at_capacity(stream: TcpStream, active: usize, max: usize) {
-    use std::sync::atomic::Ordering;
-    if REJECT_NOTICES_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_REJECT_NOTICES {
-        REJECT_NOTICES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-        return; // bare close
-    }
-    // fire-and-forget: bounded by the 1s read timeout; the counter guard is
-    // released when the closure ends (or if spawn fails, below).
-    let spawned = std::thread::Builder::new()
-        .name("api_reject_notice".into())
-        .spawn(move || {
-            let mut writer = stream;
-            let _ = writer.set_read_timeout(Some(std::time::Duration::from_secs(1)));
-            if let Ok(clone) = writer.try_clone() {
-                let mut line = String::new();
-                let _ = BufReader::new(clone).read_line(&mut line);
-            }
-            let reply = json!({
-                "ok": false,
-                "error": crate::auth_cookie::AT_CAPACITY_ERROR,
-                "active": active,
-                "max": max,
-            });
-            let _ = writeln!(writer, "{reply}");
-            let _ = writer.flush();
-            let _ = writer.shutdown(std::net::Shutdown::Both);
-            REJECT_NOTICES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-        });
-    if spawned.is_err() {
-        REJECT_NOTICES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
-    }
-}
-
 struct ConnSlot {
     counter: Arc<std::sync::atomic::AtomicUsize>,
 }
