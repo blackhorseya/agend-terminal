@@ -2369,6 +2369,48 @@ instances:
     fs::remove_dir_all(&dir).ok();
 }
 
+/// Fleet-wide `defaults.model` / `defaults.model_tier` name a model of the
+/// DEFAULT backend (e.g. `sonnet` for claude). They must not leak into
+/// instances of a different backend (codex got `--model sonnet`); explicit
+/// per-instance / role tier policy still applies to any backend.
+#[test]
+fn resolve_instance_defaults_model_only_applies_to_default_backend() {
+    let dir = std::env::temp_dir().join(format!(
+        "agend-fleet-defaults-model-backend-{}-{}",
+        std::process::id(),
+        line!()
+    ));
+    let path = write_fleet(
+        &dir,
+        r#"
+model_tiers:
+  cheap: sonnet
+  codex_tier: gpt-5
+defaults:
+  backend: claude
+  model_tier: cheap
+instances:
+  same:
+    backend: claude
+  other:
+    backend: codex
+  other_explicit:
+    backend: codex
+    model_tier: codex_tier
+"#,
+    );
+    let config = FleetConfig::load(&path).expect("load");
+    let model = |n: &str| config.resolve_instance(n).expect(n).model;
+    assert_eq!(model("same").as_deref(), Some("sonnet"));
+    assert_eq!(
+        model("other"),
+        None,
+        "defaults.model_tier names a claude model; codex must not inherit it"
+    );
+    assert_eq!(model("other_explicit").as_deref(), Some("gpt-5"));
+    fs::remove_dir_all(&dir).ok();
+}
+
 // ── PR #2864 / Issue #2863: context threshold template→fleet contract ──
 
 #[test]
