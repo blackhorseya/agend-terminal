@@ -133,7 +133,9 @@ impl AgentListMode {
             AgentListMode::Live => None,
             AgentListMode::FallbackDaemonStuck => Some(
                 "(fallback — daemon API stuck. \
-                 May be transient (mid-restart); if persistent run `agend-terminal admin cleanup-zombies`)",
+                 May be transient (mid-restart) or the API connection limit reached \
+                 (instances are alive — check daemon log for `at capacity`); \
+                 if persistent run `agend-terminal admin cleanup-zombies`)",
             ),
             AgentListMode::FallbackDaemonAbsent => Some(
                 "(fallback — no daemon detected. \
@@ -627,6 +629,10 @@ mod tests {
         assert!(
             hint.contains("cleanup-zombies"),
             "stuck-hint must suggest cleanup-zombies; got: {hint}"
+        );
+        assert!(
+            hint.contains("connection limit"),
+            "stuck-hint must not blame zombies only — API at-capacity is a live-instance cause; got: {hint}"
         );
         assert_eq!(mode.as_str(), "fallback_daemon_stuck");
         fs::remove_dir_all(&home).ok();
