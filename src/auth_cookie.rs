@@ -271,6 +271,10 @@ pub fn server_handshake_ndjson<R: BufRead, W: Write>(
     Ok((principal, peer_pid))
 }
 
+/// `error` value the server puts in the handshake reply when it refuses a
+/// connection because the API pool is full (not an auth failure).
+pub const AT_CAPACITY_ERROR: &str = "at_capacity";
+
 /// Client-side NDJSON handshake: sends `{"auth":"<hex>"}`, reads one-line
 /// reply, returns Ok iff the server reported `ok:true`.
 pub fn client_handshake_ndjson<R: BufRead, W: Write>(
@@ -288,6 +292,13 @@ pub fn client_handshake_ndjson<R: BufRead, W: Write>(
         serde_json::from_str(line.trim()).map_err(|e| anyhow!("auth: parse error: {e}"))?;
     if parsed.get("ok").and_then(|x| x.as_bool()).unwrap_or(false) {
         Ok(())
+    } else if parsed.get("error").and_then(|x| x.as_str()) == Some(AT_CAPACITY_ERROR) {
+        let n = |k: &str| parsed.get(k).and_then(|x| x.as_u64()).unwrap_or(0);
+        Err(anyhow!(
+            "api at capacity: daemon is alive but its connection limit is reached ({}/{})",
+            n("active"),
+            n("max")
+        ))
     } else {
         Err(anyhow!("auth: rejected"))
     }

@@ -435,7 +435,13 @@ fn serve_inner(
     // #680: connection counter — limits concurrent API sessions.
     // Fixed const (#env-cleanup: was env-overridable via `AGEND_API_MAX_CONNS`;
     // demoted to YAGNI for single-user deploys).
-    const API_MAX_CONNS: usize = 32;
+    // 256: every instance keeps one resident `agend-mcp-bridge` connection
+    // (~21 resident + ~9 transient workers ≈ 30 observed), which saturated the
+    // old 32 and locked the TUI/CLI out. A connection costs one thread + one
+    // fd, and the daemon already raises RLIMIT_NOFILE
+    // (`resource_limits::raise_daemon_nofile_limit`), so 256 leaves ~8x
+    // headroom for fleet growth without a meaningful resource bill.
+    const API_MAX_CONNS: usize = 256;
     let max_conns: usize = API_MAX_CONNS;
     let active_conns = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
@@ -497,8 +503,12 @@ fn serve_inner(
         // the slot when that call panicked.
         let (conn_slot, prev) = ConnSlot::reserve(&active_conns);
         if prev >= max_conns {
-            tracing::warn!("API connection rejected — at capacity");
-            drop(stream);
+            tracing::warn!(
+                active = prev,
+                max = max_conns,
+                "API connection rejected — at capacity"
+            );
+            reject_at_capacity(stream, prev, max_conns);
             continue; // `conn_slot` drops here → reservation released
         }
         if prev >= max_conns * 3 / 4 {
@@ -632,6 +642,54 @@ pub static ACTIVE_API_SESSIONS: std::sync::atomic::AtomicUsize =
 /// with a manual `fetch_sub` placed AFTER `handle_session`, which the unwind
 /// skipped — leaked slots accumulated to `API_MAX_CONNS` and locked out the
 /// control plane (bug-audit Rank1).
+/// Max concurrent at-capacity notifier threads; beyond this a rejected peer
+/// just gets a bare close (the pre-notice behaviour).
+const MAX_REJECT_NOTICES: usize = 8;
+static REJECT_NOTICES_IN_FLIGHT: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Tell a rejected peer WHY it was refused, so clients can tell "API connection
+/// pool full" (all connections alive) from "daemon hung". The peer's first
+/// line is its auth handshake; we answer in the handshake-reply slot with
+/// `{"ok":false,"error":"at_capacity",...}` (see `auth_cookie::client_handshake_ndjson`).
+///
+/// The auth line must be consumed before closing: closing a socket with unread
+/// inbound data sends RST, which can discard our reply on the peer. That read
+/// is bounded, so it runs on a short-lived thread (capped by
+/// [`MAX_REJECT_NOTICES`]) to keep the accept loop non-blocking.
+fn reject_at_capacity(stream: TcpStream, active: usize, max: usize) {
+    use std::sync::atomic::Ordering;
+    if REJECT_NOTICES_IN_FLIGHT.fetch_add(1, Ordering::SeqCst) >= MAX_REJECT_NOTICES {
+        REJECT_NOTICES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        return; // bare close
+    }
+    // fire-and-forget: bounded by the 1s read timeout; the counter guard is
+    // released when the closure ends (or if spawn fails, below).
+    let spawned = std::thread::Builder::new()
+        .name("api_reject_notice".into())
+        .spawn(move || {
+            let mut writer = stream;
+            let _ = writer.set_read_timeout(Some(std::time::Duration::from_secs(1)));
+            if let Ok(clone) = writer.try_clone() {
+                let mut line = String::new();
+                let _ = BufReader::new(clone).read_line(&mut line);
+            }
+            let reply = json!({
+                "ok": false,
+                "error": crate::auth_cookie::AT_CAPACITY_ERROR,
+                "active": active,
+                "max": max,
+            });
+            let _ = writeln!(writer, "{reply}");
+            let _ = writer.flush();
+            let _ = writer.shutdown(std::net::Shutdown::Both);
+            REJECT_NOTICES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+        });
+    if spawned.is_err() {
+        REJECT_NOTICES_IN_FLIGHT.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 struct ConnSlot {
     counter: Arc<std::sync::atomic::AtomicUsize>,
 }

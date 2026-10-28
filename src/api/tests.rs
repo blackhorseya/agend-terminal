@@ -1423,3 +1423,26 @@ fn session_count_decrements_on_panic_unwind() {
         "SessionCount::drop must decrement on panic unwind"
     );
 }
+
+/// At-capacity reject must be distinguishable from a hung daemon: the rejected
+/// client (which has already written its auth line) reads a parseable
+/// `at_capacity` reply instead of a bare EOF, and `client_handshake_ndjson`
+/// surfaces it as a dedicated error.
+#[test]
+fn reject_at_capacity_replies_with_parseable_error() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let client = std::thread::spawn(move || {
+        let stream = TcpStream::connect(addr).unwrap();
+        let mut writer = stream.try_clone().unwrap();
+        let mut reader = BufReader::new(stream);
+        crate::auth_cookie::client_handshake_ndjson(&mut reader, &mut writer, &[7u8; 32])
+    });
+    let (server_side, _) = listener.accept().unwrap();
+    reject_at_capacity(server_side, 256, 256);
+    let err = client.join().unwrap().unwrap_err().to_string();
+    assert!(
+        err.contains("at capacity") && err.contains("256"),
+        "client must see a dedicated at-capacity error, got: {err}"
+    );
+}
