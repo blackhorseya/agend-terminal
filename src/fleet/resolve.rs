@@ -89,6 +89,7 @@ fn resolve_model(
     fleet: &super::FleetConfig,
     inst: &super::InstanceConfig,
     name: &str,
+    backend: &Backend,
 ) -> Option<String> {
     if let Some(model) = inst.model.clone() {
         return Some(model);
@@ -99,6 +100,18 @@ fn resolve_model(
             .and_then(|role| fleet.role_model_tiers.get(&role).cloned())
     }) {
         return resolve_tier_model(fleet, name, tier);
+    }
+
+    // Fleet-wide defaults name a model of the DEFAULT backend (e.g. `sonnet`
+    // for claude); applying them to another backend (codex got `--model
+    // sonnet`) is wrong, so they only reach instances on the default backend.
+    let default_backend = fleet
+        .defaults
+        .backend
+        .clone()
+        .unwrap_or(Backend::ClaudeCode);
+    if *backend != default_backend {
+        return None;
     }
 
     if let Some(model) = fleet.defaults.model.clone() {
@@ -188,7 +201,7 @@ pub(super) fn resolve_instance(
             .and_then(|h| crate::channel::telegram::lookup_topic_for_instance(h, name))
             .or(inst.topic_id),
         git_branch: inst.git_branch.clone(),
-        model: resolve_model(fleet, inst, name),
+        model: resolve_model(fleet, inst, name, &backend),
         effort: resolve_effort(fleet, inst),
         worktree: inst.worktree,
         instructions: inst

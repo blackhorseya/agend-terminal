@@ -306,6 +306,14 @@ fn open_event_stream(run_dir: &Path) -> Result<(BufReader<TcpStream>, String), S
     Ok((reader, source.to_string()))
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test seam: how many times THIS thread entered [`create_instance`]
+    /// (thread-local so parallel tests cannot disturb each other's count).
+    pub(super) static CREATE_INSTANCE_CALLS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+
 /// Create a managed instance through the daemon's lifecycle API.
 ///
 /// The app is a thin client: it may request a new instance, but it must never
@@ -319,6 +327,8 @@ pub(super) fn create_instance(
     args: &[String],
     env: &HashMap<String, String>,
 ) -> Result<String, String> {
+    #[cfg(test)]
+    CREATE_INSTANCE_CALLS.with(|c| c.set(c.get() + 1));
     create_instance_with(
         home,
         name,
