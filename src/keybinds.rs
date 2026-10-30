@@ -561,7 +561,7 @@ mod tests {
             handler.handle(key(KeyCode::Left, KeyModifiers::NONE)),
             Action::FocusLeft
         );
-        // Prefix stays sticky: a following Ctrl+Right is still a prefix-mode key.
+        // Prefix stays sticky: a following plain Right (no modifier) is still a prefix-mode key.
         assert_eq!(
             handler.handle(key(KeyCode::Right, KeyModifiers::NONE)),
             Action::FocusRight

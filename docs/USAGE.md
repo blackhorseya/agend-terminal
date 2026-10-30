@@ -207,7 +207,7 @@ allowlist and operator authority gates.
 
 ## TUI Keyboard Shortcuts
 
-All shortcuts use `Ctrl+B` as the prefix key (like tmux).
+Most shortcuts use `Ctrl+B` as the prefix key (like tmux). The exception is `Ctrl+←` / `Ctrl+→`, which switch tabs without the prefix.
 
 ### Tab Management
 

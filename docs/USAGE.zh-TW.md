@@ -175,7 +175,7 @@ allowlist 缺漏或為空時，inbound 指令與 outbound 通知都會 fail-clos
 
 ## TUI Keyboard Shortcuts
 
-所有快捷鍵都以 `Ctrl+B` 作為前綴鍵（類似 tmux）。
+多數快捷鍵以 `Ctrl+B` 作為前綴鍵（類似 tmux）；例外是 `Ctrl+←` / `Ctrl+→`，不需前綴即可切換分頁。
 
 ### 分頁管理
 
