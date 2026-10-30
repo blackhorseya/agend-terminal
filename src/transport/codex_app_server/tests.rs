@@ -315,6 +315,67 @@ fn managed_app_server_never_gets_git_bypass_keys() {
     }
 }
 
+/// The managed app-server hosts Codex's tool shells, so its PATH must lead with
+/// the AgEnD shim dir (`$AGEND_HOME/bin`) exactly like a PTY-spawned backend's;
+/// otherwise the agent's `git` bypasses the agend-git shim.
+#[test]
+fn managed_app_server_path_leads_with_shim_dir() {
+    let root = std::env::temp_dir().join(format!("agend-codex-path-{}", Uuid::new_v4()));
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    let endpoint = root.join("transport/codex/path.sock");
+    let executable = root.join("fake-codex");
+    let env_log = executable.with_extension("env");
+    let instance = "codex-path-server";
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(
+        home.join("fleet.yaml"),
+        format!("instances:\n  {instance}:\n    backend: codex\n"),
+    )
+    .expect("fleet.yaml");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\nprintf '%s\\n' \"$PATH\" > \"$0.env\"\nfor arg in \"$@\"; do endpoint=\"$arg\"; done\nendpoint=${endpoint#unix://}\ntouch \"$endpoint\"\ntrap 'exit 0' TERM\nsleep 5\n",
+    )
+    .expect("fake Codex executable");
+    let mut permissions = std::fs::metadata(&executable)
+        .expect("fake Codex metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&executable, permissions).expect("fake Codex permissions");
+
+    let locator = SessionLocator::codex(endpoint.clone(), None);
+    prepare_managed_tui(
+        &home,
+        instance,
+        executable.to_str().expect("UTF-8 executable"),
+        locator,
+        Some(&workspace),
+    )
+    .expect("launch managed fake Codex app-server");
+
+    let captured = std::fs::read_to_string(&env_log).expect("captured app-server PATH");
+    let mut server = managed_servers()
+        .lock()
+        .expect("managed server lock")
+        .remove(&server_key(&home, instance))
+        .expect("managed fake server");
+    server.child.kill().expect("stop managed fake server");
+    let _ = server.child.wait();
+    let _ = std::fs::remove_file(endpoint);
+    let _ = std::fs::remove_dir_all(&root);
+
+    let first = std::env::split_paths(captured.trim_end())
+        .next()
+        .expect("PATH has a first entry");
+    assert_eq!(
+        first,
+        home.join("bin"),
+        "app-server PATH must lead with $AGEND_HOME/bin; PATH={captured:?}"
+    );
+}
+
 #[test]
 fn drain_server_output_continues_past_invalid_utf8_to_eof() {
     use std::sync::atomic::{AtomicBool, Ordering};
