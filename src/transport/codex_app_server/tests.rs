@@ -151,6 +151,91 @@ fn managed_app_server_launch_carries_config_before_subcommand_3402() {
     let _ = std::fs::remove_dir_all(root);
 }
 
+/// The managed app-server is the process that actually runs Codex's tool
+/// shells, so it must get the same env a PTY-spawned backend gets: the
+/// instance's fleet.yaml `env:` (minus sensitive keys), the AgEnD identity pins
+/// the git shim and kill guard rely on, and never a sensitive override.
+#[test]
+fn managed_app_server_gets_fleet_env_and_identity_pins() {
+    let root = std::env::temp_dir().join(format!("agend-codex-env-{}", Uuid::new_v4()));
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    let endpoint = root.join("transport/codex/env.sock");
+    let executable = root.join("fake-codex");
+    let env_log = executable.with_extension("env");
+    let instance = "codex-env-server";
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    std::fs::write(
+        home.join("fleet.yaml"),
+        format!(
+            "instances:\n  {instance}:\n    backend: codex\n    env:\n      GH_CONFIG_DIR: /fleet/gh-config\n      LD_AUDIT: /tmp/evil.so\n"
+        ),
+    )
+    .expect("fleet.yaml");
+    std::fs::write(
+        &executable,
+        "#!/bin/sh\n{\n  printf 'GH_CONFIG_DIR=%s\\n' \"${GH_CONFIG_DIR-<unset>}\"\n  printf 'LD_AUDIT=%s\\n' \"${LD_AUDIT-<unset>}\"\n  printf 'AGEND_INSTANCE_NAME=%s\\n' \"${AGEND_INSTANCE_NAME-<unset>}\"\n  printf 'AGEND_HOME=%s\\n' \"${AGEND_HOME-<unset>}\"\n  printf 'AGEND_DAEMON_PID=%s\\n' \"${AGEND_DAEMON_PID-<unset>}\"\n} > \"$0.env\"\nfor arg in \"$@\"; do endpoint=\"$arg\"; done\nendpoint=${endpoint#unix://}\ntouch \"$endpoint\"\ntrap 'exit 0' TERM\nsleep 5\n",
+    )
+    .expect("fake Codex executable");
+    let mut permissions = std::fs::metadata(&executable)
+        .expect("fake Codex metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&executable, permissions).expect("fake Codex permissions");
+
+    let locator = SessionLocator::codex(endpoint.clone(), None);
+    prepare_managed_tui(
+        &home,
+        instance,
+        executable.to_str().expect("UTF-8 executable"),
+        locator,
+        Some(&workspace),
+    )
+    .expect("launch managed fake Codex app-server");
+
+    let captured = std::fs::read_to_string(&env_log).expect("captured app-server env");
+    let mut server = managed_servers()
+        .lock()
+        .expect("managed server lock")
+        .remove(&server_key(&home, instance))
+        .expect("managed fake server");
+    server.child.kill().expect("stop managed fake server");
+    let _ = server.child.wait();
+    let _ = std::fs::remove_file(endpoint);
+    let _ = std::fs::remove_dir_all(&root);
+
+    let env: std::collections::HashMap<&str, &str> = captured
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    assert_eq!(
+        env.get("GH_CONFIG_DIR"),
+        Some(&"/fleet/gh-config"),
+        "fleet.yaml env must reach the app-server; captured={captured:?}"
+    );
+    assert_eq!(
+        env.get("LD_AUDIT"),
+        Some(&"<unset>"),
+        "sensitive fleet.yaml keys must stay dropped; captured={captured:?}"
+    );
+    assert_eq!(
+        env.get("AGEND_INSTANCE_NAME"),
+        Some(&instance),
+        "captured={captured:?}"
+    );
+    assert_eq!(
+        env.get("AGEND_HOME").copied(),
+        home.to_str(),
+        "captured={captured:?}"
+    );
+    assert_eq!(
+        env.get("AGEND_DAEMON_PID").copied(),
+        Some(std::process::id().to_string().as_str()),
+        "captured={captured:?}"
+    );
+}
+
 #[test]
 fn drain_server_output_continues_past_invalid_utf8_to_eof() {
     use std::sync::atomic::{AtomicBool, Ordering};
