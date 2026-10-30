@@ -1210,6 +1210,9 @@ fn managed_server_env(home: &Path, instance: &str) -> crate::agent::child_env::C
             .into_iter()
             .map(|(k, v)| (k, v.into())),
     );
+    // Last, like the PTY path: the shim dir leads PATH and a fleet `PATH` cannot
+    // displace it, so the tool shells' git goes through the agend-git shim.
+    env.vars.extend(crate::agent::child_env::shim_env(Some(home)));
     env
 }
 

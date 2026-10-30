@@ -4,13 +4,13 @@
 //! see the same isolation, identity pins and fleet.yaml `env:` as a PTY backend.
 
 use super::{
-    env_isolation_enabled, env_key_in, is_sensitive_env_key, resolve_child_env,
-    warn_env_isolation_disabled_once,
+    env_isolation_enabled, env_key_in, git_search_without_shim, is_sensitive_env_key,
+    resolve_child_env, warn_env_isolation_disabled_once,
 };
 use crate::backend::Backend;
 use std::collections::HashMap;
 use std::ffi::OsString;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Every key the agentic-git shim honours as a bypass (`AGEND_`/`AGENTIC_` x
 /// plain/`_AGENT`/`_UNTIL`). #708: agents must go through the shim, not inherit
@@ -159,6 +159,52 @@ pub(crate) fn fleet_env_overrides(
             }
         }
         out.push((k.clone(), v.clone()));
+    }
+    out
+}
+
+/// PATH and AGEND_REAL_GIT for a backend child, in apply order. Apply AFTER the
+/// fleet.yaml env so a fleet `PATH` cannot displace the shim dir.
+///
+/// PATH is the agend-terminal binary dir and, ahead of it, `$AGEND_HOME/bin`
+/// (the agend-git shim shadows /usr/bin/git), then the daemon's own PATH.
+/// AGEND_REAL_GIT lets the shim exec the real git without recursion (R12
+/// mitigation); it is skipped when the daemon env already carries one.
+pub(crate) fn shim_env(home: Option<&Path>) -> Vec<(String, OsString)> {
+    let mut out = Vec::new();
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            let mut paths: Vec<PathBuf> = Vec::new();
+            // Phase 2: prepend $AGEND_HOME/bin/ for git shim shadowing.
+            if let Some(h) = home {
+                paths.push(h.join("bin"));
+            }
+            paths.push(bin_dir.to_path_buf());
+            if let Some(existing) = std::env::var_os("PATH") {
+                paths.extend(std::env::split_paths(&existing));
+            }
+            if let Ok(joined) = std::env::join_paths(paths) {
+                out.push(("PATH".to_string(), joined));
+            }
+        }
+    }
+
+    // Phase 1 git-shim: inject AGEND_REAL_GIT so the shim can exec the
+    // real git binary without recursion. Excludes $AGEND_HOME/bin/ from PATH to
+    // avoid resolving to the shim itself.
+    if std::env::var("AGEND_REAL_GIT").is_err() {
+        // #1504: build the git search PATH using the platform-aware separator.
+        // The prior `.split(':')` was hardcoded Unix; on Windows PATH is
+        // `;`-separated AND entries carry drive-colons (`C:\…`), so `:`-splitting
+        // shredded PATH → `which_in` failed → AGEND_REAL_GIT never got injected →
+        // the shim later resolved git to itself (recursive-spawn storm, #1504 L1).
+        let agend_bin: Option<PathBuf> = home.map(|h| h.join("bin"));
+        let path_os = std::env::var_os("PATH").unwrap_or_default();
+        let search = std::env::join_paths(git_search_without_shim(&path_os, agend_bin.as_deref()))
+            .unwrap_or_default();
+        if let Ok(git_path) = which::which_in("git", Some(search), ".") {
+            out.push(("AGEND_REAL_GIT".to_string(), git_path.into()));
+        }
     }
     out
 }
