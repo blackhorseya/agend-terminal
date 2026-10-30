@@ -964,6 +964,10 @@ pub(crate) fn codex_managed_config_args(
     workspace: Option<&Path>,
 ) -> anyhow::Result<Vec<String>> {
     let mut args = codex_mcp_config_args(home, instance_name);
+    // A login shell re-runs the user's profile (`brew shellenv`, path_helper) and
+    // puts Homebrew ahead of the shim dir, so tool-shell `git` skipped the
+    // agend-git shim. Without it the tool shell keeps the PATH the launcher set.
+    args.extend(["-c".to_string(), "allow_login_shell=false".to_string()]);
     if let Some(workspace) = workspace {
         args.extend(codex_project_trust_args(workspace)?);
     }
