@@ -56,6 +56,7 @@ To send a literal `Ctrl+B` to the agent, press `Ctrl+B Ctrl+B`.
 | `Ctrl+B c` | New tab (opens selection menu for agent/backend/shell) |
 | `Ctrl+B n` | Next tab |
 | `Ctrl+B p` | Previous tab |
+| `Ctrl+←` / `Ctrl+→` | Previous / next tab (no prefix needed) |
 | `Ctrl+B l` | Switch to last-used tab |
 | `Ctrl+B 0-9` | Jump to tab N |
 | `Ctrl+B &` | Close tab (with confirmation) |

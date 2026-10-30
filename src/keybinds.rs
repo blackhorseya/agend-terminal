@@ -113,6 +113,15 @@ impl KeyHandler {
                     self.state = PrefixState::WaitingFirst { since: now };
                     return Action::None;
                 }
+                // Ctrl+←/→ → previous/next tab without the prefix. Exact match on
+                // CONTROL so Shift/Alt/Super combos still reach the pane as before.
+                if key.modifiers == KeyModifiers::CONTROL {
+                    match key.code {
+                        KeyCode::Left => return Action::PrevTab,
+                        KeyCode::Right => return Action::NextTab,
+                        _ => {}
+                    }
+                }
                 // Cmd+C (macOS) → copy selection to clipboard
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::SUPER) {
                     return Action::CopySelection;
@@ -511,6 +520,52 @@ mod tests {
             KeyModifiers::CONTROL | KeyModifiers::SHIFT,
         ));
         assert_eq!(upper, Action::CopySelection);
+    }
+
+    #[test]
+    fn ctrl_arrow_switches_tab_without_prefix() {
+        let mut handler = KeyHandler::new();
+        assert_eq!(
+            handler.handle(key(KeyCode::Left, KeyModifiers::CONTROL)),
+            Action::PrevTab
+        );
+        assert_eq!(
+            handler.handle(key(KeyCode::Right, KeyModifiers::CONTROL)),
+            Action::NextTab
+        );
+    }
+
+    #[test]
+    fn other_arrow_combos_still_forward() {
+        let mut handler = KeyHandler::new();
+        for (code, mods) in [
+            (KeyCode::Left, KeyModifiers::NONE),
+            (KeyCode::Right, KeyModifiers::NONE),
+            (KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            (KeyCode::Right, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            (KeyCode::Left, KeyModifiers::ALT),
+            (KeyCode::Right, KeyModifiers::ALT),
+            (KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::ALT),
+            (KeyCode::Right, KeyModifiers::CONTROL | KeyModifiers::SUPER),
+        ] {
+            let k = key(code, mods);
+            assert_eq!(handler.handle(k), Action::Forward(k), "{code:?} {mods:?}");
+        }
+    }
+
+    #[test]
+    fn prefix_arrow_keeps_focus_bindings() {
+        let mut handler = KeyHandler::new();
+        assert_eq!(handler.handle(ctrl_b()), Action::None);
+        assert_eq!(
+            handler.handle(key(KeyCode::Left, KeyModifiers::NONE)),
+            Action::FocusLeft
+        );
+        // Prefix stays sticky: a following Ctrl+Right is still a prefix-mode key.
+        assert_eq!(
+            handler.handle(key(KeyCode::Right, KeyModifiers::NONE)),
+            Action::FocusRight
+        );
     }
 
     #[test]

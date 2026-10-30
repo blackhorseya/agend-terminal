@@ -56,6 +56,7 @@ agend-terminal app
 | `Ctrl+B c` | 新增 tab（開啟選單選擇 agent/backend/shell） |
 | `Ctrl+B n` | 下一個 tab |
 | `Ctrl+B p` | 上一個 tab |
+| `Ctrl+←` / `Ctrl+→` | 上一個／下一個 tab（不需 prefix） |
 | `Ctrl+B l` | 切換至上次使用的 tab |
 | `Ctrl+B 0-9` | 直接跳到第 N 個 tab |
 | `Ctrl+B &` | 關閉 tab（含確認提示） |

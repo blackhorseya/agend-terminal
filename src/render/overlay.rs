@@ -239,6 +239,7 @@ pub fn render_help(frame: &mut Frame) {
         "  Tab Management",
         "    Ctrl+B c       New tab",
         "    Ctrl+B n / p   Next / previous tab",
+        "    Ctrl+Left/Right  Previous / next tab (no prefix)",
         "    Ctrl+B l       Last used tab",
         "    Ctrl+B 0-9     Go to tab N",
         "    Ctrl+B &       Close tab",
