@@ -215,6 +215,7 @@ All shortcuts use `Ctrl+B` as the prefix key (like tmux).
 |---|---|
 | `Ctrl+B c` | New tab (opens menu) |
 | `Ctrl+B n` / `Ctrl+B p` | Next / previous tab |
+| `Ctrl+←` / `Ctrl+→` | Previous / next tab (no prefix needed) |
 | `Ctrl+B 0-9` | Go to tab by number |
 | `Ctrl+B l` | Last active tab |
 | `Ctrl+B &` | Close tab |

@@ -113,6 +113,15 @@ impl KeyHandler {
                     self.state = PrefixState::WaitingFirst { since: now };
                     return Action::None;
                 }
+                // Ctrl+←/→ → previous/next tab without the prefix. Exact match on
+                // CONTROL so Shift/Alt/Super combos still reach the pane as before.
+                if key.modifiers == KeyModifiers::CONTROL {
+                    match key.code {
+                        KeyCode::Left => return Action::PrevTab,
+                        KeyCode::Right => return Action::NextTab,
+                        _ => {}
+                    }
+                }
                 // Cmd+C (macOS) → copy selection to clipboard
                 if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::SUPER) {
                     return Action::CopySelection;

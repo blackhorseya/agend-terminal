@@ -183,6 +183,7 @@ allowlist 缺漏或為空時，inbound 指令與 outbound 通知都會 fail-clos
 |---|---|
 | `Ctrl+B c` | 新分頁（開啟選單） |
 | `Ctrl+B n` / `Ctrl+B p` | 下一個／上一個分頁 |
+| `Ctrl+←` / `Ctrl+→` | 上一個／下一個分頁（不需 prefix） |
 | `Ctrl+B 0-9` | 依編號切換分頁 |
 | `Ctrl+B l` | 最近使用的分頁 |
 | `Ctrl+B w` | 列出所有分頁 |
