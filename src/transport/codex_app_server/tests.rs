@@ -37,6 +37,7 @@ fn codex_launch_stdio_probe_helper() {
         &locator,
         &root,
         &[],
+        &crate::agent::child_env::ChildEnv::default(),
     )
     .expect("launch fake Codex app-server");
     std::thread::sleep(Duration::from_millis(50));

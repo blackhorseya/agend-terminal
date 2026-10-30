@@ -210,6 +210,8 @@ pub fn lock_external(
 mod sensitive_env;
 use sensitive_env::SENSITIVE_ENV_KEYS;
 
+pub(crate) mod child_env;
+
 // Shared marker + direct-PTY defer gate. Kept out of this (grandfathered) file
 // to respect its LOC ceiling; the child reaches `daemon_auto_prefix` via
 // `super::`.
@@ -926,58 +928,21 @@ fn build_command(
     // the argv back later could disagree with what this generation is running.
     let spawn_provenance = dev_modal::SpawnProvenance::capture(&cmd);
 
-    // #1440: agent-backend env isolation. INVARIANT: env_clear() must run here,
+    // #1440 env isolation + the AgEnD identity pins (AGEND_INSTANCE_NAME,
+    // AGEND_DAEMON_PID, AGEND_HOME, AGENTIC_GIT_HOME). INVARIANT: the clear runs
     // before any env injection below, or the explicit keys we set would be wiped.
-    // Default off (phased rollout) — when off, behavior is unchanged except a
-    // one-time warn listing the inherited keys that isolation would drop.
-    {
-        let source_env: std::collections::BTreeMap<String, String> = std::env::vars().collect();
-        let passthrough = (*home)
-            .and_then(|h| crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(h)).ok())
-            .map(|f| f.resolve_passthrough_env(name))
-            .unwrap_or_default();
-        let plan = resolve_child_env(detected_backend.as_ref(), &passthrough, &source_env);
-        if env_isolation_enabled() {
-            cmd.env_clear();
-            for (k, v) in &plan.injected {
-                cmd.env(k, v);
-            }
-        } else {
-            warn_env_isolation_disabled_once(&plan.dropped);
-        }
+    // Shared with the Codex managed app-server launch (`child_env`).
+    let base_env = child_env::base_child_env(name, detected_backend.as_ref(), *home);
+    if base_env.clear {
+        cmd.env_clear();
+    }
+    for (k, v) in &base_env.vars {
+        cmd.env(k, v);
     }
 
     cmd.env("TERM", "xterm-256color");
     cmd.env("COLORTERM", "truecolor");
     cmd.env("FORCE_COLOR", "1");
-    cmd.env("AGEND_INSTANCE_NAME", name);
-    // #t-…777-1: hand the spawned agent the daemon's own pid so the kill-family shim
-    // (kill_guard.rs) can DENY `kill <daemon-pid>` (a host-tier blast an agent has no legit
-    // reason to issue). This spawn runs in the daemon process, so process::id() IS the daemon.
-    cmd.env("AGEND_DAEMON_PID", std::process::id().to_string());
-    // MED-5: AGEND_HOME is on the env-isolation SENSITIVE deny-list (so
-    // `env_clear` drops it and the fleet passthrough loop never re-adds it), but
-    // the spawned agent's in-pane `agend-terminal` subcommands need it to resolve
-    // the daemon's home — without it they fall back to the default
-    // `~/.agend-terminal`, pointing at the wrong daemon. Re-inject unconditionally
-    // after the clear, exactly like AGEND_INSTANCE_NAME above.
-    if let Some(h) = *home {
-        cmd.env("AGEND_HOME", h);
-        // #1504 family (t-…-65): the agentic-git shim on the agent's PATH derives
-        // its own self-exclusion dir from AGENTIC_GIT_HOME, falling back to
-        // AGEND_HOME. Tests that scope AGEND_HOME to a temp dir (ScopedAgendHome)
-        // and then spawn `git` otherwise make the shim resolve to itself and trip
-        // its recursion guard. Pin the PRIMARY name to the daemon home so the shim
-        // keeps knowing where its own binary lives whatever the crate's home is
-        // scoped to. Same deny-list class as AGEND_HOME, and nothing can redirect
-        // it: `resolve_child_env` drops sensitive keys when it builds the isolation
-        // plan, so the `env_clear` + injected loop above never carries one in; this
-        // pin is written after that loop, so by ordering it wins over anything the
-        // plan injected; and the per-instance fleet.yaml `env:` loop further down
-        // skips sensitive keys unless they are the backend's own credential keys
-        // (#2106), which this is not.
-        cmd.env("AGENTIC_GIT_HOME", h);
-    }
 
     // #2413 Shadow Observer — LOCAL plane (default-ON; `AGEND_SHADOW_OBSERVER=0` disables).
     // Inject a per-session unix-socket path + a freshly-minted 256-bit token scoped to
@@ -1038,53 +1003,10 @@ fn build_command(
         cmd.env("LANG", "en_US.UTF-8");
     }
 
-    // User env from fleet.yaml. Drop entries on the sensitive-env deny-list
-    // so a hostile template cannot override ANTHROPIC_API_KEY, LD_PRELOAD,
-    // AGEND_HOME, etc. with attacker-controlled values inherited by the
-    // spawned agent process.
-    //
-    // #2106: EXCEPTION — a sensitive key is allowed through when it is a
-    // credential the detected backend declares (`credential_env_keys`, the same
-    // per-backend override the #1440 isolation path applies in
-    // `resolve_child_env`). Operators legitimately point an instance at a
-    // third-party provider (e.g. an `ANTHROPIC_BASE_URL` proxy +
-    // `ANTHROPIC_AUTH_TOKEN`), and the operator's fleet.yaml is a TRUSTED source
-    // under the single-machine single-user threat model (anyone who can write
-    // fleet.yaml can already run arbitrary code as the user). This stays NARROW:
-    // only THIS backend's own credential keys pass — linker-injection
-    // (`LD_*`/`DYLD_*`), home/identity redirect (`AGEND_HOME`,
-    // `AGEND_INSTANCE_NAME`), and foreign credentials (`AWS_*`, `GITHUB_TOKEN`,
-    // another backend's key) are NOT in this backend's credential set, so they
-    // are still dropped even from fleet.yaml. `is_sensitive_env_key` / the
-    // deny-list itself are unchanged, so every OTHER enforcement point (the
-    // isolation passthrough, etc.) keeps its protection.
-    let backend_creds: &[&str] = detected_backend
-        .as_ref()
-        .map(|b| b.credential_env_keys())
-        .unwrap_or(&[]);
-    if let Some(env_map) = *env {
-        for (k, v) in env_map {
-            if is_sensitive_env_key(k) {
-                if env_key_in(k, backend_creds) {
-                    // Audit the override (key NAME only — never the secret value).
-                    // One line per spawn of an instance that sets a per-instance
-                    // credential; not a per-tick flood.
-                    tracing::info!(
-                        instance = %name,
-                        key = %k,
-                        "#2106: injecting operator fleet.yaml credential override (backend-declared credential key)"
-                    );
-                } else {
-                    tracing::warn!(
-                        instance = %name,
-                        key = %k,
-                        "dropping fleet.yaml env override for sensitive key"
-                    );
-                    continue;
-                }
-            }
-            cmd.env(k, v);
-        }
+    // User env from fleet.yaml, filtered through the sensitive-env deny-list
+    // (see `child_env::fleet_env_overrides`).
+    for (k, v) in child_env::fleet_env_overrides(name, detected_backend.as_ref(), *env) {
+        cmd.env(k, v);
     }
 
     // #1519: per-instance opencode session isolation. opencode stores ALL
