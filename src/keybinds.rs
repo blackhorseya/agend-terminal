@@ -514,6 +514,52 @@ mod tests {
     }
 
     #[test]
+    fn ctrl_arrow_switches_tab_without_prefix() {
+        let mut handler = KeyHandler::new();
+        assert_eq!(
+            handler.handle(key(KeyCode::Left, KeyModifiers::CONTROL)),
+            Action::PrevTab
+        );
+        assert_eq!(
+            handler.handle(key(KeyCode::Right, KeyModifiers::CONTROL)),
+            Action::NextTab
+        );
+    }
+
+    #[test]
+    fn other_arrow_combos_still_forward() {
+        let mut handler = KeyHandler::new();
+        for (code, mods) in [
+            (KeyCode::Left, KeyModifiers::NONE),
+            (KeyCode::Right, KeyModifiers::NONE),
+            (KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            (KeyCode::Right, KeyModifiers::CONTROL | KeyModifiers::SHIFT),
+            (KeyCode::Left, KeyModifiers::ALT),
+            (KeyCode::Right, KeyModifiers::ALT),
+            (KeyCode::Left, KeyModifiers::CONTROL | KeyModifiers::ALT),
+            (KeyCode::Right, KeyModifiers::CONTROL | KeyModifiers::SUPER),
+        ] {
+            let k = key(code, mods);
+            assert_eq!(handler.handle(k), Action::Forward(k), "{code:?} {mods:?}");
+        }
+    }
+
+    #[test]
+    fn prefix_arrow_keeps_focus_bindings() {
+        let mut handler = KeyHandler::new();
+        assert_eq!(handler.handle(ctrl_b()), Action::None);
+        assert_eq!(
+            handler.handle(key(KeyCode::Left, KeyModifiers::NONE)),
+            Action::FocusLeft
+        );
+        // Prefix stays sticky: a following Ctrl+Right is still a prefix-mode key.
+        assert_eq!(
+            handler.handle(key(KeyCode::Right, KeyModifiers::NONE)),
+            Action::FocusRight
+        );
+    }
+
+    #[test]
     fn ctrl_c_still_forwards_for_sigint() {
         // The Ctrl+Shift+C copy binding must NOT swallow plain Ctrl+C: it has no
         // SHIFT, so it stays forwarded to the PTY (where it is the SIGINT byte).
