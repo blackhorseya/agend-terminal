@@ -1873,6 +1873,25 @@ mod tests {
     }
 
     #[test]
+    fn codex_managed_config_args_disable_login_shell_so_tool_shell_keeps_shim_path() {
+        // A login shell re-runs the user's profile (`brew shellenv`, path_helper),
+        // which puts Homebrew ahead of `~/.agend/bin`, so the tool shell's `git`
+        // bypassed the agend-git shim. Measured at codex 0.164.0:
+        // `-c allow_login_shell=false` keeps the PATH the launcher set.
+        let home = std::env::temp_dir();
+        for workspace in [None, Some(home.as_path())] {
+            let args = codex_managed_config_args(&home, Some("w"), workspace).expect("args");
+            let pairs: Vec<_> = args.chunks(2).collect();
+            assert!(
+                pairs
+                    .iter()
+                    .any(|p| p == &["-c", "allow_login_shell=false"]),
+                "missing allow_login_shell=false in {args:?}"
+            );
+        }
+    }
+
+    #[test]
     fn codex_project_trust_override_escapes_apostrophe_path_3402() {
         let path = r"C:\Users\alice\it's workspace";
         let args = codex_project_trust_args_from(path);
