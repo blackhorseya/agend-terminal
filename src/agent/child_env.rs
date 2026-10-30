@@ -12,6 +12,19 @@ use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::Path;
 
+/// Every key the agentic-git shim honours as a bypass (`AGEND_`/`AGENTIC_` x
+/// plain/`_AGENT`/`_UNTIL`). #708: agents must go through the shim, not inherit
+/// a blanket bypass, so none of these may reach a spawned backend — whether it
+/// comes from the daemon's env or from fleet.yaml `env:`.
+pub(crate) const GIT_BYPASS_KEYS: [&str; 6] = [
+    "AGEND_GIT_BYPASS",
+    "AGENTIC_GIT_BYPASS",
+    "AGEND_GIT_BYPASS_AGENT",
+    "AGENTIC_GIT_BYPASS_AGENT",
+    "AGEND_GIT_BYPASS_UNTIL",
+    "AGENTIC_GIT_BYPASS_UNTIL",
+];
+
 /// Env to apply to a child process: optionally clear the inherited env first,
 /// then set `vars` in order (later entries win).
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -22,13 +35,18 @@ pub(crate) struct ChildEnv {
 
 impl ChildEnv {
     /// Apply to a `std::process::Command` (the CommandBuilder path applies the
-    /// same fields itself).
+    /// same fields itself). Only the Unix-only Codex NativeShared launch uses it.
+    #[cfg(unix)]
     pub(crate) fn apply_to_command(&self, command: &mut std::process::Command) {
         if self.clear {
             command.env_clear();
         }
         for (k, v) in &self.vars {
             command.env(k, v);
+        }
+        // Last, so neither the daemon env nor fleet.yaml can re-introduce them.
+        for key in GIT_BYPASS_KEYS {
+            command.env_remove(key);
         }
     }
 }

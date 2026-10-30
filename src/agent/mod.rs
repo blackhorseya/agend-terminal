@@ -1213,9 +1213,11 @@ fn build_command(
         }
     }
 
-    // #708: strip AGEND_GIT_BYPASS from child env — agents must use the
-    // git shim (which checks the var), not inherit a blanket bypass.
-    cmd.env_remove("AGEND_GIT_BYPASS");
+    // #708: strip every git-shim bypass key from the child env — agents must use
+    // the git shim, not inherit a blanket bypass. Last, after the fleet env.
+    for key in child_env::GIT_BYPASS_KEYS {
+        cmd.env_remove(key);
+    }
 
     Ok((cmd, detected_backend, spawn_provenance))
 }

@@ -1193,10 +1193,10 @@ fn valid_managed_endpoint_name(instance: &str, name: &str) -> bool {
         .is_some_and(|uuid| format!("{safe_instance}-{uuid}.sock") == name)
 }
 
-#[cfg(unix)]
 /// Env for the managed app-server: the same isolation, identity pins and
 /// fleet.yaml `env:` a PTY-spawned Codex gets (`agent::child_env`). Only the
 /// app-server gets this; the `--remote` client is spawned through the PTY path.
+#[cfg(unix)]
 fn managed_server_env(home: &Path, instance: &str) -> crate::agent::child_env::ChildEnv {
     use crate::agent::child_env::{base_child_env, fleet_env_overrides};
     let backend = crate::backend::Backend::Codex;
@@ -1213,6 +1213,7 @@ fn managed_server_env(home: &Path, instance: &str) -> crate::agent::child_env::C
     env
 }
 
+#[cfg(unix)]
 fn launch_managed_server(
     home: &Path,
     instance: &str,
