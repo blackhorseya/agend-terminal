@@ -251,6 +251,7 @@ impl CodexNativeShared {
         locator: &SessionLocator,
         cwd: &Path,
         config_args: &[String],
+        child_env: &crate::agent::child_env::ChildEnv,
     ) -> anyhow::Result<std::process::Child> {
         #[cfg(unix)]
         {
@@ -291,6 +292,7 @@ impl CodexNativeShared {
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::piped())
                 .process_group(0);
+            child_env.apply_to_command(&mut command);
             let mut child = command.spawn()?;
             if let Some(stdout) = child.stdout.take() {
                 // fire-and-forget: drain the managed server stream so it cannot
@@ -330,7 +332,7 @@ impl CodexNativeShared {
         }
         #[cfg(not(unix))]
         {
-            let _ = (codex, locator, cwd, config_args);
+            let _ = (codex, locator, cwd, config_args, child_env);
             Err(anyhow::anyhow!("Codex NativeShared requires Unix sockets"))
         }
     }
@@ -1191,6 +1193,30 @@ fn valid_managed_endpoint_name(instance: &str, name: &str) -> bool {
         .is_some_and(|uuid| format!("{safe_instance}-{uuid}.sock") == name)
 }
 
+/// Env for the managed app-server: the same isolation, identity pins and
+/// fleet.yaml `env:` a PTY-spawned Codex gets (`agent::child_env`). Only the
+/// app-server gets this; the `--remote` client is spawned through the PTY path.
+#[cfg(unix)]
+fn managed_server_env(home: &Path, instance: &str) -> crate::agent::child_env::ChildEnv {
+    use crate::agent::child_env::{base_child_env, fleet_env_overrides};
+    let backend = crate::backend::Backend::Codex;
+    let fleet_env = crate::fleet::FleetConfig::load(&crate::fleet::fleet_yaml_path(home))
+        .ok()
+        .and_then(|fleet| fleet.resolve_instance(instance))
+        .map(|resolved| resolved.env);
+    let mut env = base_child_env(instance, Some(&backend), Some(home));
+    env.vars.extend(
+        fleet_env_overrides(instance, Some(&backend), fleet_env.as_ref())
+            .into_iter()
+            .map(|(k, v)| (k, v.into())),
+    );
+    // Last, like the PTY path: the shim dir leads PATH and a fleet `PATH` cannot
+    // displace it, so the tool shells' git goes through the agend-git shim.
+    env.vars
+        .extend(crate::agent::child_env::shim_env(Some(home)));
+    env
+}
+
 #[cfg(unix)]
 fn launch_managed_server(
     home: &Path,
@@ -1211,7 +1237,8 @@ fn launch_managed_server(
         "sandbox_mode=\"danger-full-access\"".to_string(),
     ]);
     let cwd = cwd.unwrap_or_else(|| Path::new("."));
-    let child = CodexNativeShared::launch(codex, locator, cwd, &config_args)?;
+    let child_env = managed_server_env(home, instance);
+    let child = CodexNativeShared::launch(codex, locator, cwd, &config_args, &child_env)?;
     let pid = child.id();
     let start_token = crate::process::process_start_token(pid);
     locator.managed = true;

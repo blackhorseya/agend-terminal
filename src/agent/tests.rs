@@ -2098,6 +2098,49 @@ fn build_command_strips_agend_git_bypass() {
     std::env::remove_var("AGEND_GIT_BYPASS");
 }
 
+/// The git shim honours six bypass keys (`AGEND_`/`AGENTIC_` x plain/`_AGENT`/
+/// `_UNTIL`). Whatever the daemon env or a fleet.yaml `env:` carries, none of
+/// them may reach a spawned agent: agents must go through the shim, not a
+/// blanket bypass.
+#[test]
+fn build_command_strips_every_git_bypass_key_even_from_fleet_env() {
+    const KEYS: [&str; 6] = [
+        "AGEND_GIT_BYPASS",
+        "AGENTIC_GIT_BYPASS",
+        "AGEND_GIT_BYPASS_AGENT",
+        "AGENTIC_GIT_BYPASS_AGENT",
+        "AGEND_GIT_BYPASS_UNTIL",
+        "AGENTIC_GIT_BYPASS_UNTIL",
+    ];
+    let env: std::collections::HashMap<String, String> = KEYS
+        .iter()
+        .map(|k| (k.to_string(), "1".to_string()))
+        .collect();
+    let config = SpawnConfig {
+        name: "strip-all-bypass",
+        backend: None,
+        backend_command: "echo",
+        args: &[],
+        spawn_mode: crate::backend::SpawnMode::Fresh,
+        cols: 80,
+        rows: 24,
+        env: Some(&env),
+        working_dir: None,
+        submit_key: "\r",
+        home: None,
+        crash_tx: None,
+        shutdown: None,
+    };
+    let (cmd, _, _prov) = build_command(&config).expect("build_command");
+    for key in KEYS {
+        assert_eq!(
+            cmd.get_env(key),
+            None,
+            "{key} must not reach the spawned agent"
+        );
+    }
+}
+
 /// Phase A Piece-3: GIT_EDITOR + friends must all be set to
 /// `"true"` (no-op editor binary) in the daemon-spawned agent
 /// process env so `git rebase --continue` / `git commit`
