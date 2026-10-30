@@ -237,6 +237,84 @@ fn managed_app_server_gets_fleet_env_and_identity_pins() {
     );
 }
 
+/// The shim's bypass keys must not reach the managed app-server (whose tool
+/// shells run the agent's git), even when fleet.yaml `env:` sets them.
+#[test]
+fn managed_app_server_never_gets_git_bypass_keys() {
+    const KEYS: [&str; 6] = [
+        "AGEND_GIT_BYPASS",
+        "AGENTIC_GIT_BYPASS",
+        "AGEND_GIT_BYPASS_AGENT",
+        "AGENTIC_GIT_BYPASS_AGENT",
+        "AGEND_GIT_BYPASS_UNTIL",
+        "AGENTIC_GIT_BYPASS_UNTIL",
+    ];
+    let root = std::env::temp_dir().join(format!("agend-codex-bypass-{}", Uuid::new_v4()));
+    let home = root.join("home");
+    let workspace = root.join("workspace");
+    let endpoint = root.join("transport/codex/bypass.sock");
+    let executable = root.join("fake-codex");
+    let env_log = executable.with_extension("env");
+    let instance = "codex-bypass-server";
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&workspace).expect("workspace");
+    let env_lines: String = KEYS.iter().map(|k| format!("      {k}: '1'\n")).collect();
+    std::fs::write(
+        home.join("fleet.yaml"),
+        format!("instances:\n  {instance}:\n    backend: codex\n    env:\n{env_lines}"),
+    )
+    .expect("fleet.yaml");
+    let probes: String = KEYS
+        .iter()
+        .map(|k| format!("  printf '{k}=%s\\n' \"${{{k}-<unset>}}\"\n"))
+        .collect();
+    std::fs::write(
+        &executable,
+        format!(
+            "#!/bin/sh\n{{\n{probes}}} > \"$0.env\"\nfor arg in \"$@\"; do endpoint=\"$arg\"; done\nendpoint=${{endpoint#unix://}}\ntouch \"$endpoint\"\ntrap 'exit 0' TERM\nsleep 5\n"
+        ),
+    )
+    .expect("fake Codex executable");
+    let mut permissions = std::fs::metadata(&executable)
+        .expect("fake Codex metadata")
+        .permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&executable, permissions).expect("fake Codex permissions");
+
+    let locator = SessionLocator::codex(endpoint.clone(), None);
+    prepare_managed_tui(
+        &home,
+        instance,
+        executable.to_str().expect("UTF-8 executable"),
+        locator,
+        Some(&workspace),
+    )
+    .expect("launch managed fake Codex app-server");
+
+    let captured = std::fs::read_to_string(&env_log).expect("captured app-server env");
+    let mut server = managed_servers()
+        .lock()
+        .expect("managed server lock")
+        .remove(&server_key(&home, instance))
+        .expect("managed fake server");
+    server.child.kill().expect("stop managed fake server");
+    let _ = server.child.wait();
+    let _ = std::fs::remove_file(endpoint);
+    let _ = std::fs::remove_dir_all(&root);
+
+    let env: std::collections::HashMap<&str, &str> = captured
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .collect();
+    for key in KEYS {
+        assert_eq!(
+            env.get(key),
+            Some(&"<unset>"),
+            "{key} must not reach the app-server; captured={captured:?}"
+        );
+    }
+}
+
 #[test]
 fn drain_server_output_continues_past_invalid_utf8_to_eof() {
     use std::sync::atomic::{AtomicBool, Ordering};
