@@ -964,6 +964,10 @@ pub(crate) fn codex_managed_config_args(
     workspace: Option<&Path>,
 ) -> anyhow::Result<Vec<String>> {
     let mut args = codex_mcp_config_args(home, instance_name);
+    // A login shell re-runs the user's profile (`brew shellenv`, path_helper) and
+    // puts Homebrew ahead of the shim dir, so tool-shell `git` skipped the
+    // agend-git shim. Without it the tool shell keeps the PATH the launcher set.
+    args.extend(["-c".to_string(), "allow_login_shell=false".to_string()]);
     if let Some(workspace) = workspace {
         args.extend(codex_project_trust_args(workspace)?);
     }
@@ -1870,6 +1874,25 @@ mod tests {
             parsed["projects"][path]["trust_level"].as_str(),
             Some("trusted")
         );
+    }
+
+    #[test]
+    fn codex_managed_config_args_disable_login_shell_so_tool_shell_keeps_shim_path() {
+        // A login shell re-runs the user's profile (`brew shellenv`, path_helper),
+        // which puts Homebrew ahead of `~/.agend/bin`, so the tool shell's `git`
+        // bypassed the agend-git shim. Measured at codex 0.164.0:
+        // `-c allow_login_shell=false` keeps the PATH the launcher set.
+        let home = std::env::temp_dir();
+        for workspace in [None, Some(home.as_path())] {
+            let args = codex_managed_config_args(&home, Some("w"), workspace).expect("args");
+            let pairs: Vec<_> = args.chunks(2).collect();
+            assert!(
+                pairs
+                    .iter()
+                    .any(|p| p == &["-c", "allow_login_shell=false"]),
+                "missing allow_login_shell=false in {args:?}"
+            );
+        }
     }
 
     #[test]
