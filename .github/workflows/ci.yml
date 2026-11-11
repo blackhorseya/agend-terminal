@@ -41,6 +41,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      # The background-job cleanup idiom is proven under bash AND zsh; a missing
+      # zsh fails that test rather than skipping it. macOS ships zsh; ubuntu
+      # runners may not.
+      - name: Ensure zsh (ubuntu)
+        if: runner.os == 'Linux'
+        run: command -v zsh >/dev/null || (sudo apt-get update && sudo apt-get install -y zsh)
       # #772 v3 (root-cause prevention): Swatinem/rust-cache@v2 by
       # default caches `~/.cargo/bin/` along with the rest of cargo
       # state. The cache write occasionally captures a stale
