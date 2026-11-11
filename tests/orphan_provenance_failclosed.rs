@@ -1107,6 +1107,108 @@ fn the_provenance_handler_is_wired_into_the_default_per_tick_handlers() {
 // 7. Prevention — incidence reduction only, never authority
 // ---------------------------------------------------------------------------
 
+/// The indented (4-space) shell block under "Set up the cleanup", verbatim.
+fn cleanup_idiom_lines(text: &str) -> Vec<&str> {
+    let mut lines = text
+        .lines()
+        .skip_while(|l| !l.contains("Set up the cleanup"));
+    lines.next();
+    lines
+        .skip_while(|l| l.trim().is_empty())
+        .take_while(|l| l.starts_with("    "))
+        .collect()
+}
+
+/// Run the guidance's own idiom under `shell`, with both demo commands swapped
+/// for a uniquely-tagged `sleep`, let the shell exit normally (EXIT trap), and
+/// return `(shell exit ok, jobs seen running before exit, jobs still alive after)`.
+/// Leftovers are killed here so a failing run does not leak.
+#[cfg(unix)]
+fn run_cleanup_idiom(shell: &str, flags: &[&str], tag: u32) -> (bool, usize, usize) {
+    use std::process::{Command, Stdio};
+    let marker = format!("300.{tag}");
+    let pattern = format!("^sleep {marker}$");
+    // The jobs inherit the shell's stdio. Piping it would make `output()` wait
+    // for the leaked jobs to exit (300s) and mask the very bug under test, so
+    // stdio is null and the count travels through a file.
+    let report = std::env::temp_dir().join(format!("agend-cleanup-idiom-{tag}.out"));
+    let _ = std::fs::remove_file(&report);
+    let block = cleanup_idiom_lines(background_process_guidance())
+        .join("\n")
+        .replace("my-load-generator", &format!("sleep {marker}"))
+        .replace("my-second-worker", &format!("sleep {marker}"));
+    let script = format!(
+        "{block}\nsleep 0.3\npgrep -f '{pattern}' | wc -l | tr -d ' ' > '{}'\n",
+        report.display()
+    );
+    let status = Command::new(shell)
+        .args(flags)
+        .arg(&script)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap_or_else(|e| panic!("{shell} must be installed to prove the idiom: {e}"));
+    let started: usize = std::fs::read_to_string(&report)
+        .ok()
+        .and_then(|n| n.trim().parse().ok())
+        .unwrap_or_else(|| panic!("{shell}: script did not report a job count (status {status})"));
+    let _ = std::fs::remove_file(&report);
+    let alive = || -> Vec<String> {
+        Command::new("pgrep")
+            .args(["-f", &pattern])
+            .output()
+            .map(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .lines()
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let mut left = alive();
+    for _ in 0..20 {
+        if left.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        left = alive();
+    }
+    // Do not leak what a failing run leaves behind (explicit pids only).
+    for pid in &left {
+        let _ = Command::new("kill").arg(pid).status();
+    }
+    (status.success(), started, left.len())
+}
+
+/// zsh does not word-split unquoted parameters, so a `kill $LOAD` over a
+/// space-joined string reaches `kill` as ONE bad pid, the error is swallowed by
+/// `2>/dev/null`, and every job leaks. Run the real block under both shells.
+/// A missing zsh is a FAILURE, not a skip (CI installs it).
+#[cfg(unix)]
+#[test]
+fn cleanup_idiom_reaps_every_background_job_under_bash_and_zsh() {
+    let pid = std::process::id();
+    for (i, (shell, flags)) in [("bash", &["-c"][..]), ("zsh", &["-f", "-c"][..])]
+        .into_iter()
+        .enumerate()
+    {
+        let (ok, started, left) = run_cleanup_idiom(shell, flags, pid * 10 + i as u32);
+        assert_eq!(
+            started, 2,
+            "{shell}: both background jobs must have been running"
+        );
+        assert_eq!(
+            left, 0,
+            "{shell}: {left} of 2 background jobs survived the EXIT trap"
+        );
+        assert!(
+            ok,
+            "{shell}: the EXIT trap must not turn a clean exit into a failure"
+        );
+    }
+}
+
 /// #3273 fix 2, and the only proposal in the issue that stops this class from
 /// being created. It is NOT containment: nothing a shell installs on itself
 /// survives `SIGKILL`, so the text must say so.
@@ -1116,33 +1218,41 @@ fn agent_instructions_carry_a_multi_job_safe_cleanup_trap_idiom() {
 
     // The collection is initialised and the trap installed BEFORE anything is
     // launched, so a job that starts and the shell that dies in between are
-    // still covered. A single-PID `LOAD=$!` idiom is unsafe: it remembers only
-    // the last job and leaks every earlier one.
-    let init_at = text
-        .find("LOAD=\"\"")
-        .expect("guidance must initialise the pid collection empty");
-    let trap_at = text.find("trap '").expect("guidance must install a trap");
-    let launch_at = text
-        .find(" & LOAD=")
-        .or_else(|| text.find("& LOAD="))
-        .expect("guidance must show appending each job's pid after launching it");
+    // still covered. The exact spelling is NOT pinned here (it used to be, and
+    // that pinned a `kill $LOAD` that zsh never word-splits); the behavioural
+    // test below runs the block under bash and zsh instead.
+    let block = cleanup_idiom_lines(text);
+    let trap_at = block
+        .iter()
+        .position(|l| l.trim_start().starts_with("trap "))
+        .expect("guidance must install a trap");
+    let launch_lines: Vec<usize> = block
+        .iter()
+        .enumerate()
+        .filter(|(_, l)| l.contains(" & "))
+        .map(|(i, _)| i)
+        .collect();
     assert!(
-        init_at < trap_at && trap_at < launch_at,
-        "order matters: initialise, then trap, then launch. got init@{init_at} trap@{trap_at} \
-         launch@{launch_at} in: {text}"
-    );
-
-    assert!(
-        text.contains("LOAD=\"$LOAD $!\""),
-        "every job's pid must be APPENDED, not overwritten: {text}"
-    );
-    assert!(
-        text.contains("test -z \"$LOAD\" || kill $LOAD 2>/dev/null"),
-        "the trap must be a no-op when nothing was launched, and must not word-split badly: {text}"
+        launch_lines.len() >= 2,
+        "the idiom must show at least two launched jobs, or it does not demonstrate \
+         accumulation: {block:?}"
     );
     assert!(
-        text.contains("EXIT") && text.contains("INT") && text.contains("TERM"),
-        "the trap must cover normal exit, INT and TERM: {text}"
+        trap_at > 0 && !block[0].contains(" & ") && trap_at < launch_lines[0],
+        "order matters: initialise, then trap, then launch. got trap@{trap_at} \
+         launch@{launch_lines:?} in: {block:?}"
+    );
+    for &i in &launch_lines {
+        assert!(
+            block[i].contains("$!"),
+            "every launched job must record its own pid: {}",
+            block[i]
+        );
+    }
+    let trap_line = block[trap_at];
+    assert!(
+        trap_line.contains("EXIT") && trap_line.contains("INT") && trap_line.contains("TERM"),
+        "the trap must cover normal exit, INT and TERM: {trap_line}"
     );
     assert!(
         text.contains("SIGKILL"),
