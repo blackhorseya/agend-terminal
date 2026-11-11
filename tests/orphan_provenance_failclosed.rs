@@ -1119,12 +1119,22 @@ fn cleanup_idiom_lines(text: &str) -> Vec<&str> {
         .collect()
 }
 
-/// Run the guidance's own idiom under `shell`, with both demo commands swapped
-/// for a uniquely-tagged `sleep`, let the shell exit normally (EXIT trap), and
-/// return `(shell exit ok, jobs seen running before exit, jobs still alive after)`.
-/// Leftovers are killed here so a failing run does not leak.
+/// What one run of the guidance's idiom did.
 #[cfg(unix)]
-fn run_cleanup_idiom(shell: &str, flags: &[&str], tag: u32) -> (bool, usize, usize) {
+struct IdiomRun {
+    status: std::process::ExitStatus,
+    /// Jobs seen running before the shell exited / was signalled.
+    started: Option<usize>,
+    /// Jobs still alive after the shell was gone (killed here, never leaked).
+    left: usize,
+}
+
+/// Run the guidance's own idiom under `shell`, with both demo commands swapped
+/// for a uniquely-tagged `sleep`. With `signal: None` the shell exits normally
+/// (EXIT trap); with `Some(sig)` it parks in `wait` and is sent `sig` once both
+/// jobs are up. Cleanup of leftovers always runs before the caller asserts.
+#[cfg(unix)]
+fn run_cleanup_idiom(shell: &str, flags: &[&str], tag: u32, signal: Option<&str>) -> IdiomRun {
     use std::process::{Command, Stdio};
     let marker = format!("300.{tag}");
     let pattern = format!("^sleep {marker}$");
@@ -1137,22 +1147,36 @@ fn run_cleanup_idiom(shell: &str, flags: &[&str], tag: u32) -> (bool, usize, usi
         .join("\n")
         .replace("my-load-generator", &format!("sleep {marker}"))
         .replace("my-second-worker", &format!("sleep {marker}"));
-    let script = format!(
-        "{block}\nsleep 0.3\npgrep -f '{pattern}' | wc -l | tr -d ' ' > '{}'\n",
+    let count = format!(
+        "sleep 0.3\npgrep -f '{pattern}' | wc -l | tr -d ' ' > '{}'\n",
         report.display()
     );
-    let status = Command::new(shell)
+    let tail = if signal.is_some() { "wait\n" } else { "" };
+    let script = format!("{block}\n{count}{tail}");
+    let mut child = Command::new(shell)
         .args(flags)
         .arg(&script)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
+        .spawn()
         .unwrap_or_else(|e| panic!("{shell} must be installed to prove the idiom: {e}"));
-    let started: usize = std::fs::read_to_string(&report)
+    if let Some(sig) = signal {
+        for _ in 0..100 {
+            if report.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        let _ = Command::new("kill")
+            .arg(format!("-{sig}"))
+            .arg(child.id().to_string())
+            .status();
+    }
+    let status = child.wait().expect("wait for shell");
+    let started = std::fs::read_to_string(&report)
         .ok()
-        .and_then(|n| n.trim().parse().ok())
-        .unwrap_or_else(|| panic!("{shell}: script did not report a job count (status {status})"));
+        .and_then(|n| n.trim().parse().ok());
     let _ = std::fs::remove_file(&report);
     let alive = || -> Vec<String> {
         Command::new("pgrep")
@@ -1178,8 +1202,15 @@ fn run_cleanup_idiom(shell: &str, flags: &[&str], tag: u32) -> (bool, usize, usi
     for pid in &left {
         let _ = Command::new("kill").arg(pid).status();
     }
-    (status.success(), started, left.len())
+    IdiomRun {
+        status,
+        started,
+        left: left.len(),
+    }
 }
+
+#[cfg(unix)]
+const IDIOM_SHELLS: [(&str, &[&str]); 2] = [("bash", &["-c"]), ("zsh", &["-f", "-c"])];
 
 /// zsh does not word-split unquoted parameters, so a `kill $LOAD` over a
 /// space-joined string reaches `kill` as ONE bad pid, the error is swallowed by
@@ -1189,23 +1220,55 @@ fn run_cleanup_idiom(shell: &str, flags: &[&str], tag: u32) -> (bool, usize, usi
 #[test]
 fn cleanup_idiom_reaps_every_background_job_under_bash_and_zsh() {
     let pid = std::process::id();
-    for (i, (shell, flags)) in [("bash", &["-c"][..]), ("zsh", &["-f", "-c"][..])]
-        .into_iter()
-        .enumerate()
-    {
-        let (ok, started, left) = run_cleanup_idiom(shell, flags, pid * 10 + i as u32);
+    for (i, (shell, flags)) in IDIOM_SHELLS.into_iter().enumerate() {
+        let run = run_cleanup_idiom(shell, flags, pid * 100 + i as u32, None);
         assert_eq!(
-            started, 2,
+            run.started,
+            Some(2),
             "{shell}: both background jobs must have been running"
         );
         assert_eq!(
-            left, 0,
-            "{shell}: {left} of 2 background jobs survived the EXIT trap"
+            run.left, 0,
+            "{shell}: {} of 2 background jobs survived the EXIT trap",
+            run.left
         );
         assert!(
-            ok,
-            "{shell}: the EXIT trap must not turn a clean exit into a failure"
+            run.status.success(),
+            "{shell}: the EXIT trap must not turn a clean exit into a failure: {:?}",
+            run.status
         );
+    }
+}
+
+/// A tool shell that is interrupted or terminated must still reap its jobs AND
+/// still report the interruption: exiting 0 from a signal trap makes a
+/// cancelled shell look successful to its caller (zsh did exactly that when one
+/// `...; true` trap served EXIT, INT and TERM). Conventional status is 128+n.
+#[cfg(unix)]
+#[test]
+fn cleanup_idiom_reaps_jobs_and_keeps_the_signal_status_under_bash_and_zsh() {
+    let pid = std::process::id();
+    for (si, (sig, want)) in [("TERM", 143), ("INT", 130)].into_iter().enumerate() {
+        for (i, (shell, flags)) in IDIOM_SHELLS.into_iter().enumerate() {
+            let tag = pid * 100 + 10 + (si * 2 + i) as u32;
+            let run = run_cleanup_idiom(shell, flags, tag, Some(sig));
+            assert_eq!(
+                run.started,
+                Some(2),
+                "{shell}/{sig}: both jobs must be up before the signal"
+            );
+            assert_eq!(
+                run.left, 0,
+                "{shell}/{sig}: {} of 2 jobs survived the signal trap",
+                run.left
+            );
+            assert_eq!(
+                run.status.code(),
+                Some(want),
+                "{shell}/{sig}: a signalled shell must exit {want} (128+n), not report success: {:?}",
+                run.status
+            );
+        }
     }
 }
 
@@ -1249,10 +1312,17 @@ fn agent_instructions_carry_a_multi_job_safe_cleanup_trap_idiom() {
             block[i]
         );
     }
-    let trap_line = block[trap_at];
+    // EXIT, INT and TERM may be one trap or several (they need different
+    // handling: a signal must keep its status), but all three must be covered.
+    let traps = block
+        .iter()
+        .filter(|l| l.trim_start().starts_with("trap "))
+        .copied()
+        .collect::<Vec<_>>()
+        .join("\n");
     assert!(
-        trap_line.contains("EXIT") && trap_line.contains("INT") && trap_line.contains("TERM"),
-        "the trap must cover normal exit, INT and TERM: {trap_line}"
+        traps.contains("EXIT") && traps.contains("INT") && traps.contains("TERM"),
+        "the traps must cover normal exit, INT and TERM: {traps}"
     );
     assert!(
         text.contains("SIGKILL"),
