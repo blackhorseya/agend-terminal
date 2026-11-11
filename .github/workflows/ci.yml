@@ -492,7 +492,9 @@ jobs:
         run: |
           grep -rlZ 'packages\.microsoft\.com' /etc/apt/sources.list.d | xargs -0r sudo rm -f
           sudo apt-get update
-          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev
+          # zsh: the background-job cleanup idiom test runs under bash AND zsh and
+          # fails (never skips) when zsh is missing.
+          sudo apt-get install -y libgtk-3-dev libayatana-appindicator3-dev libxdo-dev zsh
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: Install nextest for coverage isolation (#3281)
