@@ -26,7 +26,9 @@ cannot prove it belongs to you, so nothing reaps it for you.
 Set up the cleanup BEFORE launching anything:
 
     pids=()
-    trap '(( ${#pids[@]} )) && kill "${pids[@]}" 2>/dev/null; true' EXIT INT TERM
+    trap '(( ${#pids[@]} )) && kill "${pids[@]}" 2>/dev/null; true' EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
     my-load-generator & pids+=($!)
     my-second-worker  & pids+=($!)
 
@@ -34,9 +36,11 @@ Initialise first, install the trap second, launch third. A job started before
 the trap exists is unprotected, and `pids=$!` on its own remembers only the last
 job, so every earlier one is left behind. Use an array, not a space-joined
 string: zsh does not word-split an unquoted `$VAR`, so `kill $LOAD` would get one
-bad pid, fail silently under `2>/dev/null`, and leak every job. This form runs
-the same in bash (3.2 included) and zsh. When the work is done, confirm nothing
-is left with `kill -0 <pid>` or `pgrep -f <command>`.
+bad pid, fail silently under `2>/dev/null`, and leak every job. INT and TERM
+only `exit`, so the EXIT trap does the killing and the shell still reports 130 or
+143 instead of looking successful when cancelled. This form runs the same in
+bash (3.2 included) and zsh. When the work is done, confirm nothing is left with
+`kill -0 <pid>` or `pgrep -f <command>`.
 
 This reduces how often the leak happens; it does not remove it. A shell ended
 with SIGKILL runs no trap at all, and nothing a shell installs on itself can
