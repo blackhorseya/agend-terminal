@@ -262,3 +262,80 @@ fn foreign_repo_subdir_is_never_mapped_into_the_worktree() {
     assert_eq!(stdout(&out), "pkgs/identity/", "reads in a foreign repo stay in that repo");
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
+
+// ── reviewer P1 (PR #28) regressions ────────────────────────────────────────
+
+/// A leading `-C` is stripped for mutating commands, so the run directory must
+/// follow the `-C` target (not the process cwd): `git -C ../.. add <root-relative>`
+/// from the subdirectory must behave like native git.
+#[test]
+fn leading_relative_dash_c_add_uses_the_dash_c_directory() {
+    let fx = fixture("dashc-add");
+    modify_in_worktree(&fx);
+    let out = run_shim(&sub(&fx), &fx.home, &["-C", "../..", "add", FILE], &fx.real_git);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(
+        stdout(&run_real_git(&fx.real_git, &fx.worktree, &["diff", "--cached", "--name-only"])),
+        FILE
+    );
+    std::fs::remove_dir_all(&fx.root).unwrap();
+}
+
+/// Control: a non-mutating leading `-C` is kept, and resolves against the run
+/// directory exactly as it does for native git from the same cwd.
+#[test]
+fn leading_relative_dash_c_read_matches_native_git() {
+    let fx = fixture("dashc-read");
+    modify_in_worktree(&fx);
+    let out = run_shim(&sub(&fx), &fx.home, &["-C", "../..", "diff", "--name-only"], &fx.real_git);
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(stdout(&out), FILE);
+    std::fs::remove_dir_all(&fx.root).unwrap();
+}
+
+/// A bound-worktree path that is a symlink to another repo must not carry the
+/// ChdirPass out of the worktree: the foreign repo's index stays untouched.
+#[test]
+fn symlinked_worktree_subdir_cannot_redirect_a_write_into_another_repo() {
+    let fx = fixture("symlink-escape");
+    let foreign = fx.root.join("foreign");
+    std::fs::create_dir_all(&foreign).unwrap();
+    run_real_git(&fx.real_git, &foreign, &["init", "-q", "-b", "main"]);
+    std::fs::write(foreign.join("injected"), "x\n").unwrap();
+    std::fs::remove_dir_all(fx.worktree.join("pkgs/identity")).unwrap();
+    std::os::unix::fs::symlink(&foreign, fx.worktree.join("pkgs/identity")).unwrap();
+    let out = run_shim(
+        &fx.source.join("pkgs/identity"),
+        &fx.home,
+        &["add", "injected"],
+        &fx.real_git,
+    );
+    assert!(!out.status.success(), "an escaping mapped subdir must be denied, not run");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("outside"),
+        "deny must say the mapped directory is outside the bound worktree: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout(&run_real_git(&fx.real_git, &foreign, &["diff", "--cached", "--name-only"])),
+        "",
+        "the shim must not stage files in a repository outside the bound worktree"
+    );
+    std::fs::remove_dir_all(&fx.root).unwrap();
+}
+
+/// Same routing structure for `checkout -- <root-relative path>` under a leading `-C`.
+#[test]
+fn leading_relative_dash_c_checkout_uses_the_dash_c_directory() {
+    let fx = fixture("dashc-checkout");
+    modify_in_worktree(&fx);
+    let out = run_shim(
+        &sub(&fx),
+        &fx.home,
+        &["-C", "../..", "checkout", "--", FILE],
+        &fx.real_git,
+    );
+    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert_eq!(std::fs::read_to_string(fx.worktree.join(FILE)).unwrap(), "original\n");
+    std::fs::remove_dir_all(&fx.root).unwrap();
+}

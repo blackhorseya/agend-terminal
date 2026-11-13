@@ -390,7 +390,7 @@ fn shim_main() {
     match action {
         Action::Passthrough => exec_real_git(&args, None),
         Action::ChdirPass(worktree) if is_conflict_capable(subcommand) => {
-            let run_dir = chdir_run_dir(&worktree);
+            let run_dir = chdir_run_dir(&worktree, &effective_target);
             exec_with_conflict_guidance(
                 &strip_target_overrides(&args),
                 &worktree,
@@ -401,7 +401,7 @@ fn shim_main() {
             );
         }
         Action::ChdirPass(worktree) => {
-            let run_dir = chdir_run_dir(&worktree);
+            let run_dir = chdir_run_dir(&worktree, &effective_target);
             exec_real_git(&strip_target_overrides(&args), Some(&run_dir))
         }
         Action::CleanupAndChdirPushPass(worktree) => {
@@ -669,9 +669,9 @@ fn is_bound(binding: &Binding) -> bool {
 /// Directory a ChdirPass runs in: the worktree root plus the caller's
 /// repo-relative subdirectory (see `chdir_target`). An unreadable cwd degrades to
 /// the root, as before.
-fn chdir_run_dir(worktree: &str) -> String {
+fn chdir_run_dir(worktree: &str, _base: &Path) -> String {
     env::current_dir()
-        .map(|cwd| chdir_target(worktree, &cwd))
+        .map(|cwd| chdir_target(worktree, &cwd).unwrap_or_else(|_| worktree.to_string()))
         .unwrap_or_else(|_| worktree.to_string())
 }
 

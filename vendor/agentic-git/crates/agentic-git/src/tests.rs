@@ -5270,6 +5270,10 @@ fn foreign_cwd_config_retarget_fails_closed() {
 // `git diff --quiet -- <relpath>` was a false green, and relative pathspecs for
 // checkout/add did not match.
 
+fn chdir_ok(worktree: &str, cwd: &Path) -> String {
+    chdir_target(worktree, cwd).expect("mapping must not be denied here")
+}
+
 fn chdir_fixture(tag: &str) -> (PathBuf, PathBuf) {
     let src = uniq_tmp_1463(&format!("{tag}-src"));
     fake_source_repo(&src);
@@ -5284,12 +5288,12 @@ fn chdir_target_keeps_subdir_inside_the_worktree() {
     let (_src, wt) = chdir_fixture("chdir-a");
     std::fs::create_dir_all(wt.join("pkgs/identity")).unwrap();
     assert_eq!(
-        chdir_target(wt.to_str().unwrap(), &wt.join("pkgs/identity")),
+        chdir_ok(wt.to_str().unwrap(), &wt.join("pkgs/identity")),
         wt.join("pkgs/identity").to_str().unwrap(),
         "(a) cwd in a worktree subdir keeps the prefix"
     );
     assert_eq!(
-        chdir_target(wt.to_str().unwrap(), &wt),
+        chdir_ok(wt.to_str().unwrap(), &wt),
         wt.to_str().unwrap(),
         "worktree root stays the root"
     );
@@ -5301,13 +5305,13 @@ fn chdir_target_maps_canonical_subdir_into_the_worktree() {
     std::fs::create_dir_all(src.join("pkgs/identity")).unwrap();
     std::fs::create_dir_all(wt.join("pkgs/identity")).unwrap();
     assert_eq!(
-        chdir_target(wt.to_str().unwrap(), &src.join("pkgs/identity")),
+        chdir_ok(wt.to_str().unwrap(), &src.join("pkgs/identity")),
         wt.join("pkgs/identity").to_str().unwrap(),
         "(b) a canonical subdir maps to the same worktree subdir"
     );
     std::fs::create_dir_all(src.join("only-in-canonical")).unwrap();
     assert_eq!(
-        chdir_target(wt.to_str().unwrap(), &src.join("only-in-canonical")),
+        chdir_ok(wt.to_str().unwrap(), &src.join("only-in-canonical")),
         wt.to_str().unwrap(),
         "(b) a canonical subdir missing from the worktree falls back to the root"
     );
@@ -5322,7 +5326,7 @@ fn chdir_target_maps_sibling_worktree_subdir() {
     std::fs::create_dir_all(sib.join("pkgs/identity")).unwrap();
     std::fs::create_dir_all(wt.join("pkgs/identity")).unwrap();
     assert_eq!(
-        chdir_target(wt.to_str().unwrap(), &sib.join("pkgs/identity")),
+        chdir_ok(wt.to_str().unwrap(), &sib.join("pkgs/identity")),
         wt.join("pkgs/identity").to_str().unwrap()
     );
 }
@@ -5335,14 +5339,14 @@ fn chdir_target_ignores_foreign_and_nonrepo_cwds() {
     fake_source_repo(&foreign);
     std::fs::create_dir_all(foreign.join("sub")).unwrap();
     assert_eq!(
-        chdir_target(wt.to_str().unwrap(), &foreign.join("sub")),
+        chdir_ok(wt.to_str().unwrap(), &foreign.join("sub")),
         wt.to_str().unwrap(),
         "(c) a foreign repo's subdir must NOT be mapped into the worktree"
     );
     let nonrepo = uniq_tmp_1463("chdir-nonrepo");
     std::fs::create_dir_all(nonrepo.join("sub")).unwrap();
     assert_eq!(
-        chdir_target(wt.to_str().unwrap(), &nonrepo.join("sub")),
+        chdir_ok(wt.to_str().unwrap(), &nonrepo.join("sub")),
         wt.to_str().unwrap(),
         "(c) a non-repo cwd keeps today's root routing"
     );
@@ -5357,8 +5361,43 @@ fn chdir_target_resolves_symlinked_cwd() {
     std::fs::remove_dir_all(&link).ok();
     std::os::unix::fs::symlink(&wt, &link).unwrap();
     assert_eq!(
-        chdir_target(wt.to_str().unwrap(), &link.join("pkgs/identity")),
+        chdir_ok(wt.to_str().unwrap(), &link.join("pkgs/identity")),
         wt.join("pkgs/identity").to_str().unwrap(),
         "a symlinked cwd must compare by realpath (macOS /tmp → /private/tmp)"
+    );
+}
+
+// Reviewer P1 (PR #28): the mapped subdirectory must stay INSIDE the bound
+// worktree's own repo. `is_dir()` follows symlinks and says nothing about the
+// target's repository, so a worktree path that is a symlink to (or a nested repo
+// at) the mapped subdirectory used to redirect the ChdirPass into another repo.
+#[cfg(unix)]
+#[test]
+fn chdir_target_rejects_symlink_escaping_the_worktree() {
+    let (src, wt) = chdir_fixture("chdir-esc");
+    std::fs::create_dir_all(src.join("pkgs/identity")).unwrap();
+    let foreign = uniq_tmp_1463("chdir-esc-foreign");
+    fake_source_repo(&foreign);
+    std::fs::create_dir_all(wt.join("pkgs")).unwrap();
+    std::os::unix::fs::symlink(&foreign, wt.join("pkgs/identity")).unwrap();
+    let denied = chdir_target(wt.to_str().unwrap(), &src.join("pkgs/identity"));
+    assert!(
+        matches!(&denied, Err(m) if m.contains("outside")),
+        "a mapped subdir that is a symlink out of the worktree must be DENIED \
+         (falling back to the root would silently change relative-pathspec \
+         semantics), got {denied:?}"
+    );
+}
+
+#[test]
+fn chdir_target_rejects_nested_repo_at_the_mapped_subdir() {
+    let (src, wt) = chdir_fixture("chdir-nested");
+    std::fs::create_dir_all(src.join("pkgs/identity")).unwrap();
+    std::fs::create_dir_all(wt.join("pkgs/identity")).unwrap();
+    fake_source_repo(&wt.join("pkgs/identity")); // a separate repo at that path
+    let denied = chdir_target(wt.to_str().unwrap(), &src.join("pkgs/identity"));
+    assert!(
+        matches!(&denied, Err(m) if m.contains("outside")),
+        "a mapped subdir that is its own repository must be DENIED, got {denied:?}"
     );
 }

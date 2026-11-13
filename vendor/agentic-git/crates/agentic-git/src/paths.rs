@@ -221,7 +221,11 @@ fn find_repo_root(start: &Path) -> Option<PathBuf> {
 /// Paths are compared by realpath so macOS `/tmp` → `/private/tmp` (and any
 /// symlinked cwd) cannot make the prefix computation miss. Never fails: every
 /// uncertainty degrades to today's behavior (the worktree root).
-pub(crate) fn chdir_target(worktree: &str, cwd: &Path) -> String {
+pub(crate) fn chdir_target(worktree: &str, cwd: &Path) -> Result<String, String> {
+    Ok(chdir_target_inner(worktree, cwd))
+}
+
+fn chdir_target_inner(worktree: &str, cwd: &Path) -> String {
     let root_fallback = || worktree.to_string();
     let (Ok(wt), Ok(cwd)) = (
         std::fs::canonicalize(worktree),
