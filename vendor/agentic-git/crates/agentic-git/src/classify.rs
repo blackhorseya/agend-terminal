@@ -372,26 +372,231 @@ pub(crate) fn apply_foreign_repo_passthrough(
     action
 }
 
+/// The bound read-only subcommands that must run where the caller actually is
+/// when that is NOT the bound worktree's repo — a non-repository cwd (#3142) or a
+/// foreign repo. ONE list for both paths so they cannot drift.
+///
+/// `fetch` / `remote` / `branch` / `tag` have write surfaces (refs, objects,
+/// config) but are listed on purpose: every consumer only fires when the target
+/// is NOT the bound worktree's object store (non-repo, or a store
+/// `paths_are_foreign` proved separate — canonical and every sibling worktree
+/// share the worktree's commondir and never qualify), so Passthrough can only
+/// touch the repo the caller aimed at. Leaving them ChdirPass'd is the worse
+/// failure: they would silently act on the bound worktree's repo instead.
+pub(crate) fn is_readonly_local(subcmd: &str) -> bool {
+    matches!(
+        subcmd,
+        "status"
+            | "log"
+            | "diff"
+            | "show"
+            | "blame"
+            | "ls-files"
+            | "ls-tree"
+            | "rev-parse"
+            | "fetch"
+            | "remote"
+            | "branch"
+            | "tag"
+            | "describe"
+            | "shortlog"
+            | "reflog"
+    )
+}
+
+/// Foreign-repo ALLOWLIST: subcommands that, run verbatim in a repo whose object
+/// store is proven SEPARATE from the bound worktree's, can only touch that repo
+/// (plus its own remotes) — so they run there (Passthrough) instead of being
+/// ChdirPass'd into the bound worktree. Anything not listed is denied in a
+/// foreign cwd (default-deny): a new subcommand must be classified here on
+/// purpose rather than silently inheriting ChdirPass.
+///
+/// Classification of everything `classify` can route to ChdirPass:
+/// - read-only / read plumbing (`is_readonly_local` + `cat-file`, `rev-list`,
+///   `show-ref`, `for-each-ref`, `merge-base`, …) → allow.
+/// - local mutating porcelain (`is_mutating_local`: commit/add/reset/…, #1463),
+///   `checkout`/`switch`/`restore`, `clean`, `gc`-family, `bisect`,
+///   `sparse-checkout` (#2950) → allow: they act on the foreign repo only.
+///   `checkout`/`switch` were kept ChdirPass'd for the BOUND repo's cross-branch
+///   fence (#1463); that fence protects the worktree's branch and does not
+///   apply to a repo the agent does not own.
+/// - ref writes `update-ref` / `symbolic-ref` / `pack-refs` / `notes` /
+///   `replace` → allow. Refs live in the COMMON dir, so ChdirPass'ing them from
+///   a foreign cwd rewrote the CANONICAL repo's refs (x-monorepo incident).
+/// - `submodule`: write → deny; read → unchanged ChdirPass (#34 pins foreign-cwd
+///   submodule reads to the bound worktree; handled in `apply_foreign_strict`).
+/// - `push` → DENY (not here): Passthrough would skip the protected-ref and
+///   trust-root push guards for a foreign clone that shares a remote with the
+///   fleet, while ChdirPass pushes the bound branch — both wrong.
+/// - `worktree` / `submodule--helper` are already `Deny` in `classify`.
+/// - everything else (`send-email`, unknown/aliased commands, …) → DENY.
+pub(crate) fn foreign_local_op_allowed(subcmd: &str) -> bool {
+    is_readonly_local(subcmd)
+        || is_mutating_local(subcmd)
+        || matches!(
+            subcmd,
+            // read plumbing
+            "cat-file"
+                | "rev-list"
+                | "show-ref"
+                | "for-each-ref"
+                | "merge-base"
+                | "merge-tree"
+                | "name-rev"
+                | "ls-remote"
+                | "grep"
+                | "check-ignore"
+                | "check-attr"
+                | "diff-tree"
+                | "diff-index"
+                | "diff-files"
+                | "count-objects"
+                | "fsck"
+                | "verify-commit"
+                | "verify-tag"
+                | "whatchanged"
+                | "cherry"
+                | "range-diff"
+                | "format-patch"
+                | "archive"
+                | "var"
+                // object / ref / working-tree writes confined to the foreign store
+                | "hash-object"
+                | "write-tree"
+                | "commit-tree"
+                | "mktree"
+                | "mktag"
+                | "unpack-file"
+                | "update-ref"
+                | "symbolic-ref"
+                | "pack-refs"
+                | "notes"
+                | "replace"
+                | "checkout"
+                | "switch"
+                | "restore"
+                | "clean"
+                | "gc"
+                | "prune"
+                | "repack"
+                | "maintenance"
+                | "bisect"
+                | "sparse-checkout"
+        )
+}
+
+/// Whether the GLOBAL region `args[..sub_idx]` carries a `--git-dir` /
+/// `--work-tree` retarget (separate-value, `=` or glued form). Passthrough runs
+/// argv verbatim, so such a global could aim an otherwise-allowed foreign-cwd
+/// command at canonical. (A plain `-C <dir>` is NOT a retarget here: its effective
+/// directory is what `target_is_foreign_repo` already judged.)
+pub(crate) fn has_leading_target_override(args: &[String], sub_idx: usize) -> bool {
+    let mut i = 0;
+    while i < sub_idx.min(args.len()) {
+        let a = args[i].as_str();
+        if a == "--git-dir"
+            || a == "--work-tree"
+            || a.starts_with("--git-dir=")
+            || a.starts_with("--work-tree=")
+        {
+            return true;
+        }
+        // Value-taking globals consume their value (same set as `subcommand_index`).
+        i += if matches!(
+            a,
+            "-C" | "-c" | "--namespace" | "--super-prefix" | "--config-env" | "--exec-path"
+        ) {
+            2
+        } else {
+            1
+        };
+    }
+    false
+}
+
+fn foreign_deny(subcmd: &str, why: &str) -> Action {
+    Action::Deny(format!(
+        "`git {subcmd}` from a foreign repository is denied — {why}. The cwd is a \
+         separate repository, so routing this into your bound worktree would act on \
+         the WRONG repo (refs are shared with canonical). Run it from inside your \
+         bound worktree, or use `AGENTIC_GIT_BYPASS=1` if you really mean this repo."
+    ))
+}
+
+/// Strict foreign routing for a classified ChdirPass / push action when the
+/// target is a foreign repo that is NOT the stale workspace clone: allowlisted
+/// local ops → `Passthrough` (run in the repo the caller aimed at), push /
+/// retargeted / unlisted / submodule-write → `Deny`, submodule read unchanged. Every other action (already Deny, native
+/// Passthrough, SilentExempt) is returned untouched, so classify's own policy
+/// (cross-branch fence, worktree deny, …) is never overridden.
+fn apply_foreign_strict(
+    action: Action,
+    subcmd: &str,
+    args: &[String],
+    leading_override: bool,
+) -> Action {
+    if !matches!(
+        action,
+        Action::ChdirPass(_) | Action::CleanupAndChdirPushPass(_)
+    ) {
+        return action;
+    }
+    if leading_override {
+        return foreign_deny(
+            subcmd,
+            "a leading --git-dir/--work-tree could retarget it at another repository",
+        );
+    }
+    if matches!(action, Action::CleanupAndChdirPushPass(_)) {
+        return foreign_deny(
+            subcmd,
+            "push would bypass the protected-ref / trust-root guards or push the bound branch",
+        );
+    }
+    if subcmd == "submodule" {
+        let sub_idx = subcommand_index(args).unwrap_or(0);
+        // #34: a submodule READ deliberately keeps routing to the bound worktree
+        // (pinned by tests/submodule_policy.rs; it cannot mutate the target).
+        return if submodule_op_is_write(&args[sub_idx + 1..]) {
+            foreign_deny(subcmd, "submodule writes are not allowed here")
+        } else {
+            action
+        };
+    }
+    if foreign_local_op_allowed(subcmd) {
+        Action::Passthrough
+    } else {
+        foreign_deny(subcmd, "it is not on the foreign-repo allowlist")
+    }
+}
+
 /// Foreign-repo routing for a bound agent's classified `action`, evaluated on the
-/// FULL argv (leading globals included). Stub: today's behavior — only the legacy
-/// `apply_foreign_repo_passthrough` conversion.
+/// FULL argv (leading globals included). Composition:
+/// 1. `foreign && !workspace_clone` → `apply_foreign_strict` (default-deny +
+///    allowlist). The workspace clone (#2234) is a separate store but every bound
+///    agent's default cwd, so it keeps today's routing exactly (operator ruling:
+///    warn-only, never block).
+/// 2. then the legacy `apply_foreign_repo_passthrough` (#1463/#2027/#2950), a
+///    no-op for anything step 1 already converted, and unchanged for the clone.
+///
+/// An invocation with NO subcommand (`git --version`) has no operation to
+/// protect and is left as classified.
 pub(crate) fn apply_foreign_policy(
     action: Action,
     args: &[String],
     foreign: bool,
-    _workspace_clone: bool,
+    workspace_clone: bool,
 ) -> Action {
     let sub_idx = subcommand_index(args);
     let subcmd = sub_idx.and_then(|i| args.get(i)).map_or("", |s| s.as_str());
     let norm_args = sub_idx.map_or(args, |i| &args[i..]);
+    let action = match sub_idx {
+        Some(i) if foreign && !workspace_clone => {
+            apply_foreign_strict(action, subcmd, norm_args, has_leading_target_override(args, i))
+        }
+        _ => action,
+    };
     apply_foreign_repo_passthrough(action, subcmd, norm_args, foreign)
-}
-
-/// Whether the GLOBAL region `args[..sub_idx]` carries a `--git-dir` /
-/// `--work-tree` retarget (separate-value, `=` or glued form). Stub: never.
-#[allow(dead_code)] // stub: wired into `apply_foreign_policy` by the fix commit
-pub(crate) fn has_leading_target_override(_args: &[String], _sub_idx: usize) -> bool {
-    false
 }
 
 /// #3142: convert only the bound read-only commands to passthrough when the
@@ -402,27 +607,7 @@ pub(crate) fn apply_nonrepo_read_passthrough(
     subcmd: &str,
     cwd_nonrepo: bool,
 ) -> Action {
-    if cwd_nonrepo
-        && matches!(action, Action::ChdirPass(_))
-        && matches!(
-            subcmd,
-            "status"
-                | "log"
-                | "diff"
-                | "show"
-                | "blame"
-                | "ls-files"
-                | "ls-tree"
-                | "rev-parse"
-                | "fetch"
-                | "remote"
-                | "branch"
-                | "tag"
-                | "describe"
-                | "shortlog"
-                | "reflog"
-        )
-    {
+    if cwd_nonrepo && matches!(action, Action::ChdirPass(_)) && is_readonly_local(subcmd) {
         Action::Passthrough
     } else {
         action
