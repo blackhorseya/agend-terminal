@@ -423,8 +423,8 @@ pub(crate) fn is_readonly_local(subcmd: &str) -> bool {
 /// - ref writes `update-ref` / `symbolic-ref` / `pack-refs` / `notes` /
 ///   `replace` → allow. Refs live in the COMMON dir, so ChdirPass'ing them from
 ///   a foreign cwd rewrote the CANONICAL repo's refs (x-monorepo incident).
-/// - `submodule`: write → deny; read → unchanged ChdirPass (#34 pins foreign-cwd
-///   submodule reads to the bound worktree; handled in `apply_foreign_strict`).
+/// - `submodule`: read → allow, write (incl. `foreach`) → deny (handled in
+///   `apply_foreign_strict`; #34 only requires the writes to fail closed).
 /// - `push` → DENY (not here): Passthrough would skip the protected-ref and
 ///   trust-root push guards for a foreign clone that shares a remote with the
 ///   fleet, while ChdirPass pushes the bound branch — both wrong.
@@ -485,14 +485,24 @@ pub(crate) fn foreign_local_op_allowed(subcmd: &str) -> bool {
         )
 }
 
-/// Whether the GLOBAL region `args[..sub_idx]` carries a `--git-dir` /
-/// `--work-tree` retarget (separate-value, `=` or glued form). Passthrough runs
-/// argv verbatim, so such a global could aim an otherwise-allowed foreign-cwd
-/// command at canonical. (A plain `-C <dir>` is NOT a retarget here: its effective
-/// directory is what `target_is_foreign_repo` already judged.)
+/// `-c`/`--config-env` keys that retarget git at another work tree or flip it to
+/// bare, exactly like `--work-tree` does. Compared case-insensitively (git config
+/// keys are).
+fn is_retarget_config_key(key: &str) -> bool {
+    key.eq_ignore_ascii_case("core.worktree") || key.eq_ignore_ascii_case("core.bare")
+}
+
+/// Whether the GLOBAL region `args[..sub_idx]` carries a retarget: `--git-dir` /
+/// `--work-tree` (separate-value, `=` or glued form), or a `-c` / `--config-env`
+/// setting of `core.worktree` / `core.bare`. Passthrough runs argv verbatim, so
+/// any of these could aim an otherwise-allowed foreign-cwd command at canonical.
+/// Unrelated `-c` settings do not trip it, and a plain `-C <dir>` is NOT a
+/// retarget here: its effective directory is what `target_is_foreign_repo`
+/// already judged.
 pub(crate) fn has_leading_target_override(args: &[String], sub_idx: usize) -> bool {
+    let end = sub_idx.min(args.len());
     let mut i = 0;
-    while i < sub_idx.min(args.len()) {
+    while i < end {
         let a = args[i].as_str();
         if a == "--git-dir"
             || a == "--work-tree"
@@ -500,6 +510,19 @@ pub(crate) fn has_leading_target_override(args: &[String], sub_idx: usize) -> bo
             || a.starts_with("--work-tree=")
         {
             return true;
+        }
+        // `-c <key>=<value>` / `--config-env <key>=<ENVVAR>` (and `--config-env=…`).
+        let config_kv = match a {
+            "-c" | "--config-env" => args.get(i + 1).filter(|_| i + 1 < end),
+            _ => None,
+        };
+        let config_kv = config_kv
+            .map(String::as_str)
+            .or_else(|| a.strip_prefix("--config-env="));
+        if let Some(kv) = config_kv {
+            if is_retarget_config_key(kv.split('=').next().unwrap_or("")) {
+                return true;
+            }
         }
         // Value-taking globals consume their value (same set as `subcommand_index`).
         i += if matches!(
@@ -526,7 +549,7 @@ fn foreign_deny(subcmd: &str, why: &str) -> Action {
 /// Strict foreign routing for a classified ChdirPass / push action when the
 /// target is a foreign repo that is NOT the stale workspace clone: allowlisted
 /// local ops → `Passthrough` (run in the repo the caller aimed at), push /
-/// retargeted / unlisted / submodule-write → `Deny`, submodule read unchanged. Every other action (already Deny, native
+/// retargeted / unlisted / submodule-write → `Deny`. Every other action (already Deny, native
 /// Passthrough, SilentExempt) is returned untouched, so classify's own policy
 /// (cross-branch fence, worktree deny, …) is never overridden.
 fn apply_foreign_strict(
@@ -544,7 +567,7 @@ fn apply_foreign_strict(
     if leading_override {
         return foreign_deny(
             subcmd,
-            "a leading --git-dir/--work-tree could retarget it at another repository",
+            "a leading --git-dir/--work-tree or -c core.worktree/core.bare could retarget it at another repository",
         );
     }
     if matches!(action, Action::CleanupAndChdirPushPass(_)) {
@@ -555,12 +578,14 @@ fn apply_foreign_strict(
     }
     if subcmd == "submodule" {
         let sub_idx = subcommand_index(args).unwrap_or(0);
-        // #34: a submodule READ deliberately keeps routing to the bound worktree
-        // (pinned by tests/submodule_policy.rs; it cannot mutate the target).
+        // #34 only requires foreign submodule WRITES (update/init/foreach/…; `foreach`
+        // runs arbitrary commands) to fail closed. A READ can mutate nothing, and
+        // redirecting it would silently report the bound worktree's submodules for a
+        // repo the caller is not in — so it runs in the foreign repo like any read.
         return if submodule_op_is_write(&args[sub_idx + 1..]) {
             foreign_deny(subcmd, "submodule writes are not allowed here")
         } else {
-            action
+            Action::Passthrough
         };
     }
     if foreign_local_op_allowed(subcmd) {
