@@ -390,7 +390,12 @@ fn shim_main() {
     match action {
         Action::Passthrough => exec_real_git(&args, None),
         Action::ChdirPass(worktree) if is_conflict_capable(subcommand) => {
-            let run_dir = chdir_run_dir(&worktree, &effective_target);
+            let run_dir = chdir_run_dir(
+                &worktree,
+                &args,
+                &effective_target,
+                (&home, &agent, &binding, subcommand),
+            );
             exec_with_conflict_guidance(
                 &strip_target_overrides(&args),
                 &worktree,
@@ -401,7 +406,12 @@ fn shim_main() {
             );
         }
         Action::ChdirPass(worktree) => {
-            let run_dir = chdir_run_dir(&worktree, &effective_target);
+            let run_dir = chdir_run_dir(
+                &worktree,
+                &args,
+                &effective_target,
+                (&home, &agent, &binding, subcommand),
+            );
             exec_real_git(&strip_target_overrides(&args), Some(&run_dir))
         }
         Action::CleanupAndChdirPushPass(worktree) => {
@@ -667,12 +677,40 @@ fn is_bound(binding: &Binding) -> bool {
 // `pub(crate) use` globs keep every item addressable from the crate root,
 // so `tests.rs` (`use super::*`) and cross-module callers are unchanged.
 /// Directory a ChdirPass runs in: the worktree root plus the caller's
-/// repo-relative subdirectory (see `chdir_target`). An unreadable cwd degrades to
-/// the root, as before.
-fn chdir_run_dir(worktree: &str, _base: &Path) -> String {
-    env::current_dir()
-        .map(|cwd| chdir_target(worktree, &cwd).unwrap_or_else(|_| worktree.to_string()))
-        .unwrap_or_else(|_| worktree.to_string())
+/// repo-relative subdirectory (see `chdir_target`). `base` is the process cwd
+/// unless the caller's leading `-C` is stripped from the argv, in which case it is
+/// the `-C`-resolved directory. An unreadable cwd degrades to the root, as before;
+/// a mapped directory that escapes the bound worktree's repository is DENIED.
+fn chdir_run_dir(
+    worktree: &str,
+    args: &[String],
+    effective_target: &Path,
+    ctx: (&str, &str, &Binding, &str),
+) -> String {
+    let (home, agent, binding, subcommand) = ctx;
+    let base = if strip_target_overrides(args) != args {
+        effective_target.to_path_buf()
+    } else {
+        match env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(_) => return worktree.to_string(),
+        }
+    };
+    match chdir_target(worktree, &base) {
+        Ok(dir) => dir,
+        Err(reason) => {
+            emit_deny_error(subcommand, &reason, agent, Some(binding));
+            write_git_event_typed(
+                home,
+                agent,
+                subcommand,
+                "deny_chdir_escape",
+                None,
+                Some(&reason),
+            );
+            std::process::exit(1);
+        }
+    }
 }
 
 mod classify;
