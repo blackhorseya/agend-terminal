@@ -515,7 +515,7 @@ fn bypass_submodule_read_no_audit() {
 // ── Foreign-cwd routing ───────────────────────────────────────────────
 
 #[test]
-fn foreign_cwd_submodule_read_routes_to_worktree() {
+fn foreign_cwd_submodule_read_runs_in_foreign_repo() {
     let root = tempdir("foreign-read");
     let real_git = resolve_real_git();
     let (parent, _sub) = setup_parent_with_submodule(&root, &real_git);
@@ -528,7 +528,9 @@ fn foreign_cwd_submodule_read_routes_to_worktree() {
     std::fs::create_dir_all(&foreign).unwrap();
     init_repo(&real_git, &foreign);
 
-    // Run from foreign cwd — read must route to bound worktree (ChdirPass).
+    // Run from foreign cwd — a READ must run in the foreign repo, not be
+    // redirected to the bound worktree (which would silently report the
+    // worktree's submodules for a repo the agent is not standing in).
     // The worktree has a submodule at vendor/sub; the foreign repo does not.
     let out = run_shim(
         &foreign,
@@ -540,16 +542,13 @@ fn foreign_cwd_submodule_read_routes_to_worktree() {
     );
     assert!(
         out.status.success(),
-        "foreign-cwd submodule read must route to worktree (ChdirPass); stderr={}",
+        "foreign-cwd submodule read must succeed; stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Discriminating: if the shim ran in the foreign repo (old Passthrough
-    // behavior), stdout would be empty (no submodules there). ChdirPass to
-    // the bound worktree must show the worktree's registered submodule.
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("vendor/sub"),
-        "foreign-cwd read must show bound worktree's submodule (proves ChdirPass); stdout={stdout}"
+        !stdout.contains("vendor/sub"),
+        "foreign-cwd read must reflect the FOREIGN repo (no submodules), not the bound worktree's; stdout={stdout}"
     );
     cleanup(&root);
 }

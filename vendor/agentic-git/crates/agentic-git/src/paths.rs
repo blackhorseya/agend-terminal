@@ -188,3 +188,82 @@ pub(crate) fn lexical_path_eq(a: &std::path::Path, b: &std::path::Path) -> bool 
         na == nb
     }
 }
+
+/// Nearest ancestor of `start` (inclusive, canonical) that holds a `.git` entry —
+/// the work tree root git itself would report for `start`.
+fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    let mut dir: &Path = start;
+    loop {
+        if std::fs::symlink_metadata(dir.join(".git")).is_ok() {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+}
+
+/// Where a bound agent's ChdirPass must actually run for a caller whose EFFECTIVE
+/// directory is `base`: the bound worktree root PLUS the caller's repo-relative
+/// subdirectory. A plain `-C <worktree root>` dropped that subdirectory, so from
+/// `<worktree>/pkgs/identity` `rev-parse --show-prefix` was empty,
+/// `diff --quiet -- <relpath>` was a false green and relative pathspecs for
+/// checkout/add did not match.
+///
+/// `base` is the process cwd, except when the caller's leading `-C` is stripped
+/// from the argv (`strip_target_overrides`, mutating commands): then it is the cwd
+/// after applying those `-C`s, because that is the directory the caller's
+/// relative paths were written against.
+///
+/// Decisions, per base shape:
+/// - (a) inside the bound worktree → keep the subdirectory.
+/// - (b) inside the canonical source repo or a sibling worktree (same commondir,
+///   i.e. a directory the shim redirects INTO the worktree) → the same
+///   repo-relative subdirectory of the bound worktree; if the worktree has no such
+///   directory (a path that exists only in the other checkout) → the worktree
+///   root, as before.
+/// - (c) a foreign repo, a non-repo directory, or anything unresolvable → the
+///   worktree root, unchanged: a foreign repo's layout says nothing about the
+///   worktree's.
+///
+/// `Err` (the caller must Deny): the mapped directory exists but does not stay
+/// inside the bound worktree's own repository — it canonicalizes outside the
+/// worktree (a symlink out) or belongs to a different repository (a nested repo).
+/// Running there would write a repo the binding does not authorize, and falling
+/// back to the root would silently change what the caller's relative paths mean.
+///
+/// Paths are compared by realpath so macOS `/tmp` → `/private/tmp` (and any
+/// symlinked directory) cannot make the prefix computation miss.
+pub(crate) fn chdir_target(worktree: &str, base: &Path) -> Result<String, String> {
+    let root_fallback = || Ok(worktree.to_string());
+    let (Ok(wt), Ok(base)) = (std::fs::canonicalize(worktree), std::fs::canonicalize(base))
+    else {
+        return root_fallback();
+    };
+    let wt_common = resolve_commondir(&wt);
+    match (resolve_commondir(&base), &wt_common) {
+        (Some(c), Some(w)) if c == *w => {}
+        _ => return root_fallback(),
+    }
+    let Some(rel) = find_repo_root(&base).and_then(|root| {
+        base.strip_prefix(&root)
+            .ok()
+            .map(Path::to_path_buf)
+            .filter(|rel| !rel.as_os_str().is_empty())
+    }) else {
+        return root_fallback();
+    };
+    let target = wt.join(rel);
+    if !target.is_dir() {
+        return root_fallback();
+    }
+    match std::fs::canonicalize(&target) {
+        Ok(real) if real.starts_with(&wt) && resolve_commondir(&real) == wt_common => {
+            Ok(real.to_string_lossy().into_owned())
+        }
+        _ => Err(format!(
+            "the bound worktree's `{}` resolves outside the bound worktree's own \
+             repository (a symlink or a nested repo), so running there would act on \
+             a repository this binding does not authorize",
+            target.strip_prefix(&wt).unwrap_or(&target).display()
+        )),
+    }
+}

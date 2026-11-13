@@ -5020,3 +5020,384 @@ fn real_branch_switch_still_denied_with_existing_text_3479() {
         other => panic!("real branch switch must stay denied, got {other:?}"),
     }
 }
+
+// ── foreign-cwd routing: every ChdirPass-bound command must either run in the
+// foreign repo (Passthrough) or fail closed (Deny) — never silently hit the
+// bound worktree / shared refs. Driven from REAL `classify_argv` output so the
+// matrix covers what production feeds the policy (incl. push's
+// CleanupAndChdirPushPass and cross-branch Denies).
+fn foreign_test_binding() -> Binding {
+    Binding {
+        task_id: Some("t".into()),
+        branch: Some("feat".into()),
+        worktree: Some("/wt".into()),
+    }
+}
+
+/// Production composition: classify → foreign policy.
+fn foreign_route(argv: &[&str], foreign: bool, workspace_clone: bool) -> Action {
+    let args = s(argv);
+    let action = classify_argv(&args, &foreign_test_binding(), false, false, true);
+    apply_foreign_policy(action, &args, foreign, workspace_clone)
+}
+
+#[test]
+fn foreign_cwd_local_ops_passthrough() {
+    for argv in [
+        // reads
+        &["status"][..],
+        &["log", "--oneline"],
+        &["diff", "--name-only", "HEAD~1", "HEAD"],
+        &["show", "HEAD"],
+        &["rev-parse", "--show-toplevel"],
+        &["branch"],
+        &["tag"],
+        &["cat-file", "-p", "HEAD"],
+        &["rev-list", "HEAD"],
+        &["for-each-ref"],
+        &["merge-base", "a", "b"],
+        // ref / state writes — the update-ref incident (shared refs live in the common dir)
+        &["update-ref", "refs/heads/probe", "HEAD"],
+        &["symbolic-ref", "HEAD", "refs/heads/x"],
+        &["pack-refs", "--all"],
+        &["notes", "add", "-m", "n"],
+        &["replace", "a", "b"],
+        // porcelain that previously ChdirPass'd or already Passthrough'd
+        &["checkout", "-b", "change"],
+        &["switch", "-c", "change"],
+        &["restore", "--staged", "f"],
+        &["commit", "-m", "m"],
+        &["add", "."],
+        &["mv", "a", "b"],
+        &["tag", "-f", "v1"],
+        &["clean", "-fd"],
+        &["gc"],
+    ] {
+        assert_eq!(
+            foreign_route(argv, true, false),
+            Action::Passthrough,
+            "foreign cwd `git {}` must run in the foreign repo",
+            argv.join(" ")
+        );
+    }
+}
+
+#[test]
+fn foreign_cwd_unlisted_or_outward_ops_deny() {
+    // push: Passthrough would skip the protected-ref / trust-root guards for a
+    // foreign clone that shares the remote; ChdirPass'd it pushes the bound branch.
+    for argv in [
+        &["push"][..],
+        &["push", "origin", "HEAD"],
+        // not on the foreign allowlist → fail closed (no silent ChdirPass)
+        &["send-email", "x"],
+        &["frobnicate"],
+        &["submodule", "update"],
+        &["submodule", "foreach", "git", "status"],
+    ] {
+        let action = foreign_route(argv, true, false);
+        assert!(
+            matches!(&action, Action::Deny(m) if m.contains("foreign repository")),
+            "foreign cwd `git {}` must Deny with a foreign-repo message, got {action:?}",
+            argv.join(" ")
+        );
+    }
+}
+
+#[test]
+fn foreign_cwd_preserves_existing_denies_and_exempts() {
+    // classify's own cross-branch Deny is not overridden by the foreign step.
+    let action = foreign_route(&["checkout", "other-branch"], true, false);
+    assert!(
+        matches!(&action, Action::Deny(m) if m.contains("cross-branch")),
+        "cross-branch deny must survive, got {action:?}"
+    );
+    assert!(matches!(
+        foreign_route(&["worktree", "add", "x"], true, false),
+        Action::Deny(_)
+    ));
+    // Native Passthrough (config/help/…) is untouched.
+    assert_eq!(foreign_route(&["config", "--list"], true, false), Action::Passthrough);
+    // #34's issue only requires foreign submodule WRITES to fail closed; it gives no
+    // reason a foreign-cwd READ must be redirected, and the redirect silently reads
+    // the bound worktree's submodules instead of the foreign repo's. Reads run in
+    // the foreign repo; writes (incl. `foreach`, which runs arbitrary commands) deny.
+    for argv in [&["submodule"][..], &["submodule", "status"], &["submodule", "summary"]] {
+        assert_eq!(
+            foreign_route(argv, true, false),
+            Action::Passthrough,
+            "foreign `git {}` must run in the foreign repo",
+            argv.join(" ")
+        );
+    }
+}
+
+#[test]
+fn foreign_cwd_leading_git_dir_or_work_tree_fails_closed() {
+    // Passthrough runs argv verbatim: a leading --git-dir/--work-tree could aim a
+    // newly-allowed write at canonical.
+    for argv in [
+        &["--git-dir=/canon/.git", "update-ref", "refs/heads/x", "HEAD"][..],
+        &["--git-dir", "/canon/.git", "update-ref", "refs/heads/x", "HEAD"],
+        &["--work-tree=/canon", "checkout", "-b", "x"],
+        &["--work-tree", "/canon", "diff"],
+    ] {
+        let action = foreign_route(argv, true, false);
+        assert!(
+            matches!(action, Action::Deny(_)),
+            "`git {}` in a foreign repo must Deny, got {action:?}",
+            argv.join(" ")
+        );
+    }
+    // Plain `-C <foreign>` (the x-monorepo fixture form) is NOT a retarget guard hit.
+    assert_eq!(
+        foreign_route(&["-C", "/tmp/fx", "update-ref", "refs/heads/x", "HEAD"], true, false),
+        Action::Passthrough
+    );
+    assert!(has_leading_target_override(&s(&["--git-dir=/x", "status"]), 1));
+    assert!(!has_leading_target_override(&s(&["-C", "/x", "status"]), 2));
+    // A POST-subcommand --work-tree-looking token is an operand, not a global.
+    assert!(!has_leading_target_override(&s(&["status", "--git-dir=/x"]), 0));
+}
+
+#[test]
+fn non_foreign_and_workspace_clone_routing_unchanged() {
+    // NOT foreign (worktree / canonical / sibling): byte-identical ChdirPass.
+    for argv in [
+        &["update-ref", "refs/heads/x", "HEAD"][..],
+        &["diff"],
+        &["frobnicate"],
+        &["checkout", "-b", "x"],
+    ] {
+        assert_eq!(
+            foreign_route(argv, false, false),
+            Action::ChdirPass("/wt".into()),
+            "non-foreign `git {}` must stay ChdirPass",
+            argv.join(" ")
+        );
+    }
+    assert!(matches!(
+        foreign_route(&["push"], false, false),
+        Action::CleanupAndChdirPushPass(_)
+    ));
+}
+
+// #2234: the stale workspace clone (foreign store, default cwd of every bound
+// agent) keeps TODAY's routing exactly — reads/plumbing ChdirPass to the worktree,
+// legacy mutating Passthrough — and never gets the new default-deny.
+#[test]
+fn workspace_clone_keeps_legacy_routing() {
+    for argv in [
+        &["diff"][..],
+        &["update-ref", "refs/heads/x", "HEAD"],
+        &["frobnicate"],
+        &["checkout", "-b", "x"],
+    ] {
+        assert_eq!(
+            foreign_route(argv, true, true),
+            Action::ChdirPass("/wt".into()),
+            "workspace-clone `git {}` must keep ChdirPass",
+            argv.join(" ")
+        );
+    }
+    assert!(matches!(
+        foreign_route(&["push"], true, true),
+        Action::CleanupAndChdirPushPass(_)
+    ));
+    // legacy mutating-local foreign Passthrough is unchanged there too.
+    assert_eq!(foreign_route(&["commit", "-m", "m"], true, true), Action::Passthrough);
+}
+
+// No subcommand → no operation to protect (or to misroute): `git --version` /
+// `git --help` from a foreign cwd must not hit the new default-deny.
+#[test]
+fn foreign_cwd_without_subcommand_is_untouched() {
+    for argv in [&["--version"][..], &["--help"], &[]] {
+        let before = {
+            let args = s(argv);
+            classify_argv(&args, &foreign_test_binding(), false, false, true)
+        };
+        assert!(
+            !matches!(foreign_route(argv, true, false), Action::Deny(_)),
+            "`git {}` must not be denied in a foreign cwd (classify said {before:?})",
+            argv.join(" ")
+        );
+    }
+}
+
+// `-c core.worktree=…` / `core.bare` (and the `--config-env` spelling) retarget git
+// at another work tree just like `--work-tree`; fail closed in a foreign cwd.
+// Unrelated `-c` settings (the #34 harness passes `-c protocol.file.allow=always`)
+// must NOT trip the guard.
+#[test]
+fn foreign_cwd_config_retarget_fails_closed() {
+    for argv in [
+        &["-c", "core.worktree=/canon", "checkout", "-b", "x"][..],
+        &["-c", "core.worktree=/canon", "update-ref", "refs/heads/x", "HEAD"],
+        &["-c", "CORE.WorkTree=/canon", "diff"],
+        &["-c", "core.bare=true", "update-ref", "refs/heads/x", "HEAD"],
+        &["-c", "protocol.file.allow=always", "-c", "core.worktree=/canon", "diff"],
+        &["--config-env=core.worktree=SOME_VAR", "diff"],
+        &["--config-env", "core.worktree=SOME_VAR", "diff"],
+    ] {
+        let action = foreign_route(argv, true, false);
+        assert!(
+            matches!(action, Action::Deny(_)),
+            "`git {}` in a foreign repo must Deny, got {action:?}",
+            argv.join(" ")
+        );
+    }
+    for argv in [
+        &["-c", "protocol.file.allow=always", "diff"][..],
+        &["-c", "user.name=t", "log"],
+        &["-c", "core.quotepath=false", "status"],
+    ] {
+        assert_eq!(
+            foreign_route(argv, true, false),
+            Action::Passthrough,
+            "unrelated -c must still run in the foreign repo: git {}",
+            argv.join(" ")
+        );
+    }
+    assert!(has_leading_target_override(&s(&["-c", "core.worktree=/x", "status"]), 2));
+    assert!(!has_leading_target_override(&s(&["-c", "core.quotepath=x", "status"]), 2));
+    // a post-subcommand `-c` is an operand, not a global
+    assert!(!has_leading_target_override(&s(&["log", "-c", "core.worktree=/x"]), 0));
+}
+
+// ── ChdirPass must keep the caller's repo-relative subdirectory ─────────────
+// Before: `-C <worktree root>` only, so `git rev-parse --show-prefix` was empty,
+// `git diff --quiet -- <relpath>` was a false green, and relative pathspecs for
+// checkout/add did not match.
+
+fn chdir_ok(worktree: &str, cwd: &Path) -> String {
+    chdir_target(worktree, cwd).expect("mapping must not be denied here")
+}
+
+fn chdir_fixture(tag: &str) -> (PathBuf, PathBuf) {
+    let src = uniq_tmp_1463(&format!("{tag}-src"));
+    fake_source_repo(&src);
+    let wt = uniq_tmp_1463(&format!("{tag}-wt"));
+    fake_worktree(&src, &wt, "w1");
+    // canonicalize: macOS temp dirs live under the /var → /private/var symlink.
+    (src.canonicalize().unwrap(), wt.canonicalize().unwrap())
+}
+
+#[test]
+fn chdir_target_keeps_subdir_inside_the_worktree() {
+    let (_src, wt) = chdir_fixture("chdir-a");
+    std::fs::create_dir_all(wt.join("pkgs/identity")).unwrap();
+    assert_eq!(
+        chdir_ok(wt.to_str().unwrap(), &wt.join("pkgs/identity")),
+        wt.join("pkgs/identity").to_str().unwrap(),
+        "(a) cwd in a worktree subdir keeps the prefix"
+    );
+    assert_eq!(
+        chdir_ok(wt.to_str().unwrap(), &wt),
+        wt.to_str().unwrap(),
+        "worktree root stays the root"
+    );
+}
+
+#[test]
+fn chdir_target_maps_canonical_subdir_into_the_worktree() {
+    let (src, wt) = chdir_fixture("chdir-b");
+    std::fs::create_dir_all(src.join("pkgs/identity")).unwrap();
+    std::fs::create_dir_all(wt.join("pkgs/identity")).unwrap();
+    assert_eq!(
+        chdir_ok(wt.to_str().unwrap(), &src.join("pkgs/identity")),
+        wt.join("pkgs/identity").to_str().unwrap(),
+        "(b) a canonical subdir maps to the same worktree subdir"
+    );
+    std::fs::create_dir_all(src.join("only-in-canonical")).unwrap();
+    assert_eq!(
+        chdir_ok(wt.to_str().unwrap(), &src.join("only-in-canonical")),
+        wt.to_str().unwrap(),
+        "(b) a canonical subdir missing from the worktree falls back to the root"
+    );
+}
+
+#[test]
+fn chdir_target_maps_sibling_worktree_subdir() {
+    let (src, wt) = chdir_fixture("chdir-sib");
+    let sib = uniq_tmp_1463("chdir-sib-other");
+    fake_worktree(&src, &sib, "w2");
+    let sib = sib.canonicalize().unwrap();
+    std::fs::create_dir_all(sib.join("pkgs/identity")).unwrap();
+    std::fs::create_dir_all(wt.join("pkgs/identity")).unwrap();
+    assert_eq!(
+        chdir_ok(wt.to_str().unwrap(), &sib.join("pkgs/identity")),
+        wt.join("pkgs/identity").to_str().unwrap()
+    );
+}
+
+#[test]
+fn chdir_target_ignores_foreign_and_nonrepo_cwds() {
+    let (_src, wt) = chdir_fixture("chdir-c");
+    std::fs::create_dir_all(wt.join("sub")).unwrap();
+    let foreign = uniq_tmp_1463("chdir-foreign");
+    fake_source_repo(&foreign);
+    std::fs::create_dir_all(foreign.join("sub")).unwrap();
+    assert_eq!(
+        chdir_ok(wt.to_str().unwrap(), &foreign.join("sub")),
+        wt.to_str().unwrap(),
+        "(c) a foreign repo's subdir must NOT be mapped into the worktree"
+    );
+    let nonrepo = uniq_tmp_1463("chdir-nonrepo");
+    std::fs::create_dir_all(nonrepo.join("sub")).unwrap();
+    assert_eq!(
+        chdir_ok(wt.to_str().unwrap(), &nonrepo.join("sub")),
+        wt.to_str().unwrap(),
+        "(c) a non-repo cwd keeps today's root routing"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn chdir_target_resolves_symlinked_cwd() {
+    let (_src, wt) = chdir_fixture("chdir-d");
+    std::fs::create_dir_all(wt.join("pkgs/identity")).unwrap();
+    let link = uniq_tmp_1463("chdir-link");
+    std::fs::remove_dir_all(&link).ok();
+    std::os::unix::fs::symlink(&wt, &link).unwrap();
+    assert_eq!(
+        chdir_ok(wt.to_str().unwrap(), &link.join("pkgs/identity")),
+        wt.join("pkgs/identity").to_str().unwrap(),
+        "a symlinked cwd must compare by realpath (macOS /tmp → /private/tmp)"
+    );
+}
+
+// Reviewer P1 (PR #28): the mapped subdirectory must stay INSIDE the bound
+// worktree's own repo. `is_dir()` follows symlinks and says nothing about the
+// target's repository, so a worktree path that is a symlink to (or a nested repo
+// at) the mapped subdirectory used to redirect the ChdirPass into another repo.
+#[cfg(unix)]
+#[test]
+fn chdir_target_rejects_symlink_escaping_the_worktree() {
+    let (src, wt) = chdir_fixture("chdir-esc");
+    std::fs::create_dir_all(src.join("pkgs/identity")).unwrap();
+    let foreign = uniq_tmp_1463("chdir-esc-foreign");
+    fake_source_repo(&foreign);
+    std::fs::create_dir_all(wt.join("pkgs")).unwrap();
+    std::os::unix::fs::symlink(&foreign, wt.join("pkgs/identity")).unwrap();
+    let denied = chdir_target(wt.to_str().unwrap(), &src.join("pkgs/identity"));
+    assert!(
+        matches!(&denied, Err(m) if m.contains("outside")),
+        "a mapped subdir that is a symlink out of the worktree must be DENIED \
+         (falling back to the root would silently change relative-pathspec \
+         semantics), got {denied:?}"
+    );
+}
+
+#[test]
+fn chdir_target_rejects_nested_repo_at_the_mapped_subdir() {
+    let (src, wt) = chdir_fixture("chdir-nested");
+    std::fs::create_dir_all(src.join("pkgs/identity")).unwrap();
+    std::fs::create_dir_all(wt.join("pkgs/identity")).unwrap();
+    fake_source_repo(&wt.join("pkgs/identity")); // a separate repo at that path
+    let denied = chdir_target(wt.to_str().unwrap(), &src.join("pkgs/identity"));
+    assert!(
+        matches!(&denied, Err(m) if m.contains("outside")),
+        "a mapped subdir that is its own repository must be DENIED, got {denied:?}"
+    );
+}

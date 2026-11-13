@@ -11,6 +11,7 @@ use super::*;
 pub(crate) fn exec_with_conflict_guidance(
     args: &[String],
     worktree: &str,
+    run_dir: &str,
     home: &str,
     agent: &str,
     subcmd: &str,
@@ -21,7 +22,7 @@ pub(crate) fn exec_with_conflict_guidance(
     let status = Command::new(&git)
         .env("AGENTIC_GIT_SHIM_DEPTH", (shim_depth() + 1).to_string())
         .arg("-C")
-        .arg(worktree)
+        .arg(run_dir)
         .args(args)
         .status();
     match status {

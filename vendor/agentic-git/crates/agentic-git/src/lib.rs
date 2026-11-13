@@ -341,7 +341,7 @@ fn shim_main() {
     // operate on THAT repo, not be redirected into the worktree. The effective
     // target includes leading `-C`; env-based retargets still fail closed.
     let action = apply_nonrepo_read_passthrough(
-        apply_foreign_repo_passthrough(
+        apply_foreign_policy(
             classify_argv(
                 &args,
                 &binding,
@@ -349,9 +349,13 @@ fn shim_main() {
                 canonical_cwd,
                 is_agent_caller,
             ),
-            subcommand,
-            norm_args,
+            &args,
             target_is_foreign_repo(&binding, &effective_target),
+            // #2234: the stale workspace clone is a separate store but every bound
+            // agent's default cwd — its routing must not change.
+            binding.worktree.as_deref().is_some_and(|wt| {
+                is_workspace_clone_drift(&home, &agent, &effective_target, Path::new(wt))
+            }),
         ),
         subcommand,
         cwd_is_nonrepo(),
@@ -386,16 +390,29 @@ fn shim_main() {
     match action {
         Action::Passthrough => exec_real_git(&args, None),
         Action::ChdirPass(worktree) if is_conflict_capable(subcommand) => {
+            let run_dir = chdir_run_dir(
+                &worktree,
+                &args,
+                &effective_target,
+                (&home, &agent, &binding, subcommand),
+            );
             exec_with_conflict_guidance(
                 &strip_target_overrides(&args),
                 &worktree,
+                &run_dir,
                 &home,
                 &agent,
                 subcommand,
             );
         }
         Action::ChdirPass(worktree) => {
-            exec_real_git(&strip_target_overrides(&args), Some(&worktree))
+            let run_dir = chdir_run_dir(
+                &worktree,
+                &args,
+                &effective_target,
+                (&home, &agent, &binding, subcommand),
+            );
+            exec_real_git(&strip_target_overrides(&args), Some(&run_dir))
         }
         Action::CleanupAndChdirPushPass(worktree) => {
             // #2379 ③ denylist-core: refuse a push whose range carries a
@@ -659,6 +676,43 @@ fn is_bound(binding: &Binding) -> bool {
 // The former single-file shim body lives in five internal modules. The
 // `pub(crate) use` globs keep every item addressable from the crate root,
 // so `tests.rs` (`use super::*`) and cross-module callers are unchanged.
+/// Directory a ChdirPass runs in: the worktree root plus the caller's
+/// repo-relative subdirectory (see `chdir_target`). `base` is the process cwd
+/// unless the caller's leading `-C` is stripped from the argv, in which case it is
+/// the `-C`-resolved directory. An unreadable cwd degrades to the root, as before;
+/// a mapped directory that escapes the bound worktree's repository is DENIED.
+fn chdir_run_dir(
+    worktree: &str,
+    args: &[String],
+    effective_target: &Path,
+    ctx: (&str, &str, &Binding, &str),
+) -> String {
+    let (home, agent, binding, subcommand) = ctx;
+    let base = if strip_target_overrides(args) != args {
+        effective_target.to_path_buf()
+    } else {
+        match env::current_dir() {
+            Ok(cwd) => cwd,
+            Err(_) => return worktree.to_string(),
+        }
+    };
+    match chdir_target(worktree, &base) {
+        Ok(dir) => dir,
+        Err(reason) => {
+            emit_deny_error(subcommand, &reason, agent, Some(binding));
+            write_git_event_typed(
+                home,
+                agent,
+                subcommand,
+                "deny_chdir_escape",
+                None,
+                Some(&reason),
+            );
+            std::process::exit(1);
+        }
+    }
+}
+
 mod classify;
 mod exec;
 mod paths;
