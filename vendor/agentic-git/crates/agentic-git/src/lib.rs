@@ -390,16 +390,19 @@ fn shim_main() {
     match action {
         Action::Passthrough => exec_real_git(&args, None),
         Action::ChdirPass(worktree) if is_conflict_capable(subcommand) => {
+            let run_dir = chdir_run_dir(&worktree);
             exec_with_conflict_guidance(
                 &strip_target_overrides(&args),
                 &worktree,
+                &run_dir,
                 &home,
                 &agent,
                 subcommand,
             );
         }
         Action::ChdirPass(worktree) => {
-            exec_real_git(&strip_target_overrides(&args), Some(&worktree))
+            let run_dir = chdir_run_dir(&worktree);
+            exec_real_git(&strip_target_overrides(&args), Some(&run_dir))
         }
         Action::CleanupAndChdirPushPass(worktree) => {
             // #2379 ③ denylist-core: refuse a push whose range carries a
@@ -663,6 +666,15 @@ fn is_bound(binding: &Binding) -> bool {
 // The former single-file shim body lives in five internal modules. The
 // `pub(crate) use` globs keep every item addressable from the crate root,
 // so `tests.rs` (`use super::*`) and cross-module callers are unchanged.
+/// Directory a ChdirPass runs in: the worktree root plus the caller's
+/// repo-relative subdirectory (see `chdir_target`). An unreadable cwd degrades to
+/// the root, as before.
+fn chdir_run_dir(worktree: &str) -> String {
+    env::current_dir()
+        .map(|cwd| chdir_target(worktree, &cwd))
+        .unwrap_or_else(|_| worktree.to_string())
+}
+
 mod classify;
 mod exec;
 mod paths;

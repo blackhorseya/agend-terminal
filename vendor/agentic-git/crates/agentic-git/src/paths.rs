@@ -189,10 +189,62 @@ pub(crate) fn lexical_path_eq(a: &std::path::Path, b: &std::path::Path) -> bool 
     }
 }
 
+/// Nearest ancestor of `start` (inclusive, canonical) that holds a `.git` entry —
+/// the work tree root git itself would report for `start`.
+fn find_repo_root(start: &Path) -> Option<PathBuf> {
+    let mut dir: &Path = start;
+    loop {
+        if std::fs::symlink_metadata(dir.join(".git")).is_ok() {
+            return Some(dir.to_path_buf());
+        }
+        dir = dir.parent()?;
+    }
+}
+
 /// Where a bound agent's ChdirPass must actually run for a caller standing in
-/// `cwd`: the bound worktree root PLUS the caller's repo-relative subdirectory
-/// (see the fix commit). Stub: always the worktree root (current behavior).
-#[allow(dead_code)] // stub: wired into the ChdirPass exec arms by the fix commit
-pub(crate) fn chdir_target(worktree: &str, _cwd: &Path) -> String {
-    worktree.to_string()
+/// `cwd`: the bound worktree root PLUS the caller's repo-relative subdirectory.
+/// A plain `-C <worktree root>` dropped that subdirectory, so from
+/// `<worktree>/pkgs/identity` `rev-parse --show-prefix` was empty,
+/// `diff --quiet -- <relpath>` was a false green and relative pathspecs for
+/// checkout/add did not match.
+///
+/// Decisions, per cwd shape:
+/// - (a) inside the bound worktree → keep the subdirectory.
+/// - (b) inside the canonical source repo or a sibling worktree (same commondir,
+///   i.e. a cwd the shim redirects INTO the worktree) → the same repo-relative
+///   subdirectory of the bound worktree; if the worktree has no such directory
+///   (a path that exists only in the other checkout) → the worktree root, as
+///   before.
+/// - (c) a foreign repo, a non-repo cwd, or anything unresolvable → the worktree
+///   root, unchanged: a foreign repo's layout says nothing about the worktree's.
+///
+/// Paths are compared by realpath so macOS `/tmp` → `/private/tmp` (and any
+/// symlinked cwd) cannot make the prefix computation miss. Never fails: every
+/// uncertainty degrades to today's behavior (the worktree root).
+pub(crate) fn chdir_target(worktree: &str, cwd: &Path) -> String {
+    let root_fallback = || worktree.to_string();
+    let (Ok(wt), Ok(cwd)) = (
+        std::fs::canonicalize(worktree),
+        std::fs::canonicalize(cwd),
+    ) else {
+        return root_fallback();
+    };
+    match (resolve_commondir(&cwd), resolve_commondir(&wt)) {
+        (Some(c), Some(w)) if c == w => {}
+        _ => return root_fallback(),
+    }
+    let Some(rel) = find_repo_root(&cwd).and_then(|root| {
+        cwd.strip_prefix(&root)
+            .ok()
+            .map(Path::to_path_buf)
+            .filter(|rel| !rel.as_os_str().is_empty())
+    }) else {
+        return root_fallback();
+    };
+    let target = wt.join(rel);
+    if target.is_dir() {
+        target.to_string_lossy().into_owned()
+    } else {
+        root_fallback()
+    }
 }
