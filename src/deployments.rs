@@ -1508,10 +1508,7 @@ fn deployment_member_cleanup_admitted(
         tracing::warn!(instance, path = %candidate.display(), "deployment cleanup refused: instance name has been re-admitted");
         return false;
     }
-    if !deployment_path_cleanup_admitted(fleet, home, candidate, owned_path, &[]) {
-        return false;
-    }
-    true
+    deployment_path_cleanup_admitted(fleet, home, candidate, owned_path, &[])
 }
 
 fn deployment_path_cleanup_admitted(
