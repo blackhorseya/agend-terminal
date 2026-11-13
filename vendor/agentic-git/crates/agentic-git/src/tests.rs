@@ -5093,6 +5093,7 @@ fn foreign_cwd_unlisted_or_outward_ops_deny() {
         &["send-email", "x"],
         &["frobnicate"],
         &["submodule", "update"],
+        &["submodule", "foreach", "git", "status"],
     ] {
         let action = foreign_route(argv, true, false);
         assert!(
@@ -5117,12 +5118,18 @@ fn foreign_cwd_preserves_existing_denies_and_exempts() {
     ));
     // Native Passthrough (config/help/…) is untouched.
     assert_eq!(foreign_route(&["config", "--list"], true, false), Action::Passthrough);
-    // #34: a foreign-cwd submodule READ deliberately routes to the bound worktree
-    // (pinned by tests/submodule_policy.rs); it cannot mutate the target.
-    assert_eq!(
-        foreign_route(&["submodule", "status"], true, false),
-        Action::ChdirPass("/wt".into())
-    );
+    // #34's issue only requires foreign submodule WRITES to fail closed; it gives no
+    // reason a foreign-cwd READ must be redirected, and the redirect silently reads
+    // the bound worktree's submodules instead of the foreign repo's. Reads run in
+    // the foreign repo; writes (incl. `foreach`, which runs arbitrary commands) deny.
+    for argv in [&["submodule"][..], &["submodule", "status"], &["submodule", "summary"]] {
+        assert_eq!(
+            foreign_route(argv, true, false),
+            Action::Passthrough,
+            "foreign `git {}` must run in the foreign repo",
+            argv.join(" ")
+        );
+    }
 }
 
 #[test]
@@ -5216,4 +5223,44 @@ fn foreign_cwd_without_subcommand_is_untouched() {
             argv.join(" ")
         );
     }
+}
+
+// `-c core.worktree=…` / `core.bare` (and the `--config-env` spelling) retarget git
+// at another work tree just like `--work-tree`; fail closed in a foreign cwd.
+// Unrelated `-c` settings (the #34 harness passes `-c protocol.file.allow=always`)
+// must NOT trip the guard.
+#[test]
+fn foreign_cwd_config_retarget_fails_closed() {
+    for argv in [
+        &["-c", "core.worktree=/canon", "checkout", "-b", "x"][..],
+        &["-c", "core.worktree=/canon", "update-ref", "refs/heads/x", "HEAD"],
+        &["-c", "CORE.WorkTree=/canon", "diff"],
+        &["-c", "core.bare=true", "update-ref", "refs/heads/x", "HEAD"],
+        &["-c", "protocol.file.allow=always", "-c", "core.worktree=/canon", "diff"],
+        &["--config-env=core.worktree=SOME_VAR", "diff"],
+        &["--config-env", "core.worktree=SOME_VAR", "diff"],
+    ] {
+        let action = foreign_route(argv, true, false);
+        assert!(
+            matches!(action, Action::Deny(_)),
+            "`git {}` in a foreign repo must Deny, got {action:?}",
+            argv.join(" ")
+        );
+    }
+    for argv in [
+        &["-c", "protocol.file.allow=always", "diff"][..],
+        &["-c", "user.name=t", "log"],
+        &["-c", "core.quotepath=false", "status"],
+    ] {
+        assert_eq!(
+            foreign_route(argv, true, false),
+            Action::Passthrough,
+            "unrelated -c must still run in the foreign repo: git {}",
+            argv.join(" ")
+        );
+    }
+    assert!(has_leading_target_override(&s(&["-c", "core.worktree=/x", "status"]), 2));
+    assert!(!has_leading_target_override(&s(&["-c", "core.quotepath=x", "status"]), 2));
+    // a post-subcommand `-c` is an operand, not a global
+    assert!(!has_leading_target_override(&s(&["log", "-c", "core.worktree=/x"]), 0));
 }

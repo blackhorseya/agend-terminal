@@ -451,6 +451,22 @@ fn foreign_cwd_git_dir_retarget_cannot_reach_canonical() {
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
 
+#[test]
+fn foreign_cwd_core_worktree_retarget_cannot_reach_canonical() {
+    let fx = fixture("coreworktree");
+    let before = bound_snapshot(&fx);
+    let worktree_cfg = format!("core.worktree={}", fx.source.display());
+    let out = run_shim(
+        &fx.foreign,
+        &fx.home,
+        &["-c", &worktree_cfg, "checkout", "-q", "-b", "evil"],
+        &fx.real_git,
+    );
+    assert!(!out.status.success(), "a core.worktree retarget from a foreign cwd must be denied");
+    assert_bound_repos_untouched(&fx, &before);
+    std::fs::remove_dir_all(&fx.root).unwrap();
+}
+
 // ── controls: behavior that must NOT change ─────────────────────────────────
 
 /// x-monorepo fixture form: `git -C <foreign> <op>` already ran in the foreign repo.
