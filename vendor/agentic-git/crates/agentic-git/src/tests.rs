@@ -5264,3 +5264,101 @@ fn foreign_cwd_config_retarget_fails_closed() {
     // a post-subcommand `-c` is an operand, not a global
     assert!(!has_leading_target_override(&s(&["log", "-c", "core.worktree=/x"]), 0));
 }
+
+// ── ChdirPass must keep the caller's repo-relative subdirectory ─────────────
+// Before: `-C <worktree root>` only, so `git rev-parse --show-prefix` was empty,
+// `git diff --quiet -- <relpath>` was a false green, and relative pathspecs for
+// checkout/add did not match.
+
+fn chdir_fixture(tag: &str) -> (PathBuf, PathBuf) {
+    let src = uniq_tmp_1463(&format!("{tag}-src"));
+    fake_source_repo(&src);
+    let wt = uniq_tmp_1463(&format!("{tag}-wt"));
+    fake_worktree(&src, &wt, "w1");
+    // canonicalize: macOS temp dirs live under the /var → /private/var symlink.
+    (src.canonicalize().unwrap(), wt.canonicalize().unwrap())
+}
+
+#[test]
+fn chdir_target_keeps_subdir_inside_the_worktree() {
+    let (_src, wt) = chdir_fixture("chdir-a");
+    std::fs::create_dir_all(wt.join("pkgs/identity")).unwrap();
+    assert_eq!(
+        chdir_target(wt.to_str().unwrap(), &wt.join("pkgs/identity")),
+        wt.join("pkgs/identity").to_str().unwrap(),
+        "(a) cwd in a worktree subdir keeps the prefix"
+    );
+    assert_eq!(
+        chdir_target(wt.to_str().unwrap(), &wt),
+        wt.to_str().unwrap(),
+        "worktree root stays the root"
+    );
+}
+
+#[test]
+fn chdir_target_maps_canonical_subdir_into_the_worktree() {
+    let (src, wt) = chdir_fixture("chdir-b");
+    std::fs::create_dir_all(src.join("pkgs/identity")).unwrap();
+    std::fs::create_dir_all(wt.join("pkgs/identity")).unwrap();
+    assert_eq!(
+        chdir_target(wt.to_str().unwrap(), &src.join("pkgs/identity")),
+        wt.join("pkgs/identity").to_str().unwrap(),
+        "(b) a canonical subdir maps to the same worktree subdir"
+    );
+    std::fs::create_dir_all(src.join("only-in-canonical")).unwrap();
+    assert_eq!(
+        chdir_target(wt.to_str().unwrap(), &src.join("only-in-canonical")),
+        wt.to_str().unwrap(),
+        "(b) a canonical subdir missing from the worktree falls back to the root"
+    );
+}
+
+#[test]
+fn chdir_target_maps_sibling_worktree_subdir() {
+    let (src, wt) = chdir_fixture("chdir-sib");
+    let sib = uniq_tmp_1463("chdir-sib-other");
+    fake_worktree(&src, &sib, "w2");
+    let sib = sib.canonicalize().unwrap();
+    std::fs::create_dir_all(sib.join("pkgs/identity")).unwrap();
+    std::fs::create_dir_all(wt.join("pkgs/identity")).unwrap();
+    assert_eq!(
+        chdir_target(wt.to_str().unwrap(), &sib.join("pkgs/identity")),
+        wt.join("pkgs/identity").to_str().unwrap()
+    );
+}
+
+#[test]
+fn chdir_target_ignores_foreign_and_nonrepo_cwds() {
+    let (_src, wt) = chdir_fixture("chdir-c");
+    std::fs::create_dir_all(wt.join("sub")).unwrap();
+    let foreign = uniq_tmp_1463("chdir-foreign");
+    fake_source_repo(&foreign);
+    std::fs::create_dir_all(foreign.join("sub")).unwrap();
+    assert_eq!(
+        chdir_target(wt.to_str().unwrap(), &foreign.join("sub")),
+        wt.to_str().unwrap(),
+        "(c) a foreign repo's subdir must NOT be mapped into the worktree"
+    );
+    let nonrepo = uniq_tmp_1463("chdir-nonrepo");
+    std::fs::create_dir_all(nonrepo.join("sub")).unwrap();
+    assert_eq!(
+        chdir_target(wt.to_str().unwrap(), &nonrepo.join("sub")),
+        wt.to_str().unwrap(),
+        "(c) a non-repo cwd keeps today's root routing"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn chdir_target_resolves_symlinked_cwd() {
+    let (_src, wt) = chdir_fixture("chdir-d");
+    std::fs::create_dir_all(wt.join("pkgs/identity")).unwrap();
+    let link = uniq_tmp_1463("chdir-link");
+    std::fs::remove_dir_all(&link).ok();
+    std::os::unix::fs::symlink(&wt, &link).unwrap();
+    assert_eq!(
+        chdir_target(wt.to_str().unwrap(), &link.join("pkgs/identity")),
+        wt.join("pkgs/identity").to_str().unwrap(),
+        "a symlinked cwd must compare by realpath (macOS /tmp → /private/tmp)"
+    );
+}

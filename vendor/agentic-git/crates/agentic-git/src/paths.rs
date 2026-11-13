@@ -188,3 +188,11 @@ pub(crate) fn lexical_path_eq(a: &std::path::Path, b: &std::path::Path) -> bool 
         na == nb
     }
 }
+
+/// Where a bound agent's ChdirPass must actually run for a caller standing in
+/// `cwd`: the bound worktree root PLUS the caller's repo-relative subdirectory
+/// (see the fix commit). Stub: always the worktree root (current behavior).
+#[allow(dead_code)] // stub: wired into the ChdirPass exec arms by the fix commit
+pub(crate) fn chdir_target(worktree: &str, _cwd: &Path) -> String {
+    worktree.to_string()
+}
