@@ -341,7 +341,7 @@ fn shim_main() {
     // operate on THAT repo, not be redirected into the worktree. The effective
     // target includes leading `-C`; env-based retargets still fail closed.
     let action = apply_nonrepo_read_passthrough(
-        apply_foreign_repo_passthrough(
+        apply_foreign_policy(
             classify_argv(
                 &args,
                 &binding,
@@ -349,9 +349,13 @@ fn shim_main() {
                 canonical_cwd,
                 is_agent_caller,
             ),
-            subcommand,
-            norm_args,
+            &args,
             target_is_foreign_repo(&binding, &effective_target),
+            // #2234: the stale workspace clone is a separate store but every bound
+            // agent's default cwd — its routing must not change.
+            binding.worktree.as_deref().is_some_and(|wt| {
+                is_workspace_clone_drift(&home, &agent, &effective_target, Path::new(wt))
+            }),
         ),
         subcommand,
         cwd_is_nonrepo(),

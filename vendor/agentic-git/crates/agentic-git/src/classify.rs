@@ -372,6 +372,28 @@ pub(crate) fn apply_foreign_repo_passthrough(
     action
 }
 
+/// Foreign-repo routing for a bound agent's classified `action`, evaluated on the
+/// FULL argv (leading globals included). Stub: today's behavior — only the legacy
+/// `apply_foreign_repo_passthrough` conversion.
+pub(crate) fn apply_foreign_policy(
+    action: Action,
+    args: &[String],
+    foreign: bool,
+    _workspace_clone: bool,
+) -> Action {
+    let sub_idx = subcommand_index(args);
+    let subcmd = sub_idx.and_then(|i| args.get(i)).map_or("", |s| s.as_str());
+    let norm_args = sub_idx.map_or(args, |i| &args[i..]);
+    apply_foreign_repo_passthrough(action, subcmd, norm_args, foreign)
+}
+
+/// Whether the GLOBAL region `args[..sub_idx]` carries a `--git-dir` /
+/// `--work-tree` retarget (separate-value, `=` or glued form). Stub: never.
+#[allow(dead_code)] // stub: wired into `apply_foreign_policy` by the fix commit
+pub(crate) fn has_leading_target_override(_args: &[String], _sub_idx: usize) -> bool {
+    false
+}
+
 /// #3142: convert only the bound read-only commands to passthrough when the
 /// caller cwd is not inside a repository. Mutating commands retain their
 /// existing bound-worktree policy; leading `-C` routing is handled separately.
