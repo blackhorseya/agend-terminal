@@ -1064,10 +1064,7 @@ fn decision_matches(
     let Ok(created) = chrono::DateTime::parse_from_rfc3339(&decision.created_at) else {
         return false;
     };
-    if since.is_some_and(|bound| created < bound) || until.is_some_and(|bound| created > bound) {
-        return false;
-    }
-    true
+    !(since.is_some_and(|bound| created < bound) || until.is_some_and(|bound| created > bound))
 }
 
 pub fn list(home: &Path, args: &Value) -> Value {

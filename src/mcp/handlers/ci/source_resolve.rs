@@ -93,15 +93,15 @@ pub(super) fn resolve_checkout_source_path(
 
 /// The system-directory policy, applied to every path this module hands back.
 fn is_system_dir(p: &Path) -> bool {
-    if p.starts_with("/etc")
+    let unix_system_dir = p.starts_with("/etc")
         || p.starts_with("/usr")
         || p.starts_with("/sys")
-        || p.starts_with("/proc")
-    {
-        return true;
-    }
+        || p.starts_with("/proc");
     #[cfg(windows)]
     {
+        if unix_system_dir {
+            return true;
+        }
         let system_root = std::env::var_os("SystemRoot")
             .or_else(|| std::env::var_os("WINDIR"))
             .and_then(|root| dunce::canonicalize(PathBuf::from(root)).ok());
@@ -109,7 +109,7 @@ fn is_system_dir(p: &Path) -> bool {
             return p.starts_with(root);
         }
     }
-    false
+    unix_system_dir
 }
 
 /// The contracted rejection — error string preserved byte-for-byte (any matcher/test).

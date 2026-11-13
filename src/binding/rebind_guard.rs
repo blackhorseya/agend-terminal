@@ -30,11 +30,7 @@ pub(super) fn same_agent_metadata_catchup_allowed(
         return false;
     }
     let source_repo_str = source_repo.display().to_string();
-    if super::scan_existing_branch_binding(home, &source_repo_str, branch, agent).is_some()
+    !(super::scan_existing_branch_binding(home, &source_repo_str, branch, agent).is_some()
         || super::agent_has_active_ci_watch_on_branch(home, agent, ex_branch)
-        || super::branch_has_active_task(home, ex_branch)
-    {
-        return false;
-    }
-    true
+        || super::branch_has_active_task(home, ex_branch))
 }
