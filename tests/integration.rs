@@ -28,12 +28,12 @@ const SHELL_BIN: &str = "cmd.exe";
 const SHELL_BIN: &str = "/bin/bash";
 
 fn binary() -> PathBuf {
-    // Use debug build
-    let mut path = std::env::current_exe().expect("current_exe");
-    path.pop(); // remove test binary name
-    path.pop(); // remove deps/
-    path.push("agend-terminal");
-    path
+    // Cargo hands the exact path of the crate binary to integration tests. Do NOT
+    // infer it from `current_exe()`: Cargo 1.100 moved test executables from
+    // `target/<profile>/deps/` to `target/<profile>/build/<pkg>/<hash>/out/`, so
+    // popping two components no longer lands next to `agend-terminal`
+    // (every daemon-spawning test failed with `spawn daemon: NotFound`).
+    PathBuf::from(env!("CARGO_BIN_EXE_agend-terminal"))
 }
 
 struct TestDaemon {
