@@ -1,0 +1,1624 @@
+use super::*;
+
+fn tmp_dir(tag: &str) -> PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!(
+        "agend-intent-test-{}-{}-{}",
+        std::process::id(),
+        tag,
+        id
+    ));
+    std::fs::create_dir_all(&dir).ok();
+    dir
+}
+
+fn tmp_repo(tag: &str) -> PathBuf {
+    let dir = tmp_dir(tag);
+    std::process::Command::new("git")
+        .args(["init", "-b", "main"])
+        .current_dir(&dir)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok();
+    std::process::Command::new("git")
+        .args([
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ])
+        .current_dir(&dir)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .ok();
+    dir
+}
+
+fn git_in(wt: &Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .args(args)
+        .current_dir(wt)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git");
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+fn branch_tip(repo: &Path, branch: &str) -> String {
+    crate::git_helpers::git_cmd(repo, &["rev-parse", branch])
+        .expect("rev-parse")
+        .trim()
+        .to_string()
+}
+
+fn branch_exists(repo: &Path, branch: &str) -> bool {
+    crate::git_helpers::git_ok(repo, &["rev-parse", "--verify", branch])
+}
+
+fn make_branch(repo: &Path, name: &str) -> String {
+    git_in(repo, &["checkout", "-b", name]);
+    std::fs::write(repo.join("f.txt"), "content").ok();
+    git_in(repo, &["add", "."]);
+    git_in(
+        repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "work",
+        ],
+    );
+    let tip = branch_tip(repo, name);
+    git_in(repo, &["checkout", "main"]);
+    tip
+}
+
+#[test]
+fn settle_merged_exact_head_deletes_branch() {
+    let home = tmp_dir("settle-ok");
+    let repo = tmp_repo("settle-ok-repo");
+    let tip = make_branch(&repo, "feat/settle-test");
+    let rs = repo.display().to_string();
+    persist_intent(
+        &home,
+        &rs,
+        "feat/settle-test",
+        &tip,
+        "t-123",
+        None,
+        Some(42),
+    )
+    .expect("persist");
+    let obligation_id = seed_obligation(&home, &rs, "feat/settle-test", &tip, Some("owner"));
+    assert_eq!(
+        obligation(&home, &obligation_id).status,
+        crate::task_events::TaskStatus::Open,
+        "precondition: matching lane has an open retention obligation"
+    );
+
+    let outcome = settle_intent(&home, &rs, "feat/settle-test", true, Some(42));
+    assert!(matches!(outcome, Some(SettleOutcome::Deleted)));
+    assert!(!branch_exists(&repo, "feat/settle-test"));
+    assert!(!has_intent(&home, &rs, "feat/settle-test"));
+    assert_eq!(
+        obligation(&home, &obligation_id).status,
+        crate::task_events::TaskStatus::Done,
+        "a matching PR generation must reach merged-lane retirement"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn settle_not_merged_preserves_branch_and_intent() {
+    let home = tmp_dir("settle-pending");
+    let repo = tmp_repo("settle-pending-repo");
+    let tip = make_branch(&repo, "feat/pending-test");
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, "feat/pending-test", &tip, "t-456", None, None).expect("persist");
+
+    let outcome = settle_intent(&home, &rs, "feat/pending-test", false, None);
+    assert!(matches!(outcome, Some(SettleOutcome::Pending(_))));
+    assert!(branch_exists(&repo, "feat/pending-test"));
+    assert!(has_intent(&home, &rs, "feat/pending-test"));
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn settle_head_drift_preserves_branch_and_intent() {
+    let home = tmp_dir("settle-drift");
+    let repo = tmp_repo("settle-drift-repo");
+    let _tip = make_branch(&repo, "feat/drift-test");
+    let rs = repo.display().to_string();
+    persist_intent(
+        &home,
+        &rs,
+        "feat/drift-test",
+        "0000000000000000000000000000000000000000",
+        "t-789",
+        None,
+        None,
+    )
+    .expect("persist");
+
+    let outcome = settle_intent(&home, &rs, "feat/drift-test", true, None);
+    assert!(matches!(outcome, Some(SettleOutcome::HeadDrift(_))));
+    assert!(branch_exists(&repo, "feat/drift-test"));
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn restart_preserves_then_merged_settles() {
+    let home = tmp_dir("restart-settle");
+    let repo = tmp_repo("restart-settle-repo");
+    let tip = make_branch(&repo, "feat/restart-test");
+    let rs = repo.display().to_string();
+    persist_intent(
+        &home,
+        &rs,
+        "feat/restart-test",
+        &tip,
+        "t-restart",
+        None,
+        Some(10),
+    )
+    .expect("persist");
+
+    // Restart: merged=false → preserved
+    let outcome = settle_intent(&home, &rs, "feat/restart-test", false, None);
+    assert!(matches!(outcome, Some(SettleOutcome::Pending(_))));
+    assert!(branch_exists(&repo, "feat/restart-test"));
+    assert!(has_intent(&home, &rs, "feat/restart-test"));
+
+    // PR merges with matching generation
+    let outcome = settle_intent(&home, &rs, "feat/restart-test", true, Some(10));
+    assert!(matches!(outcome, Some(SettleOutcome::Deleted)));
+    assert!(!branch_exists(&repo, "feat/restart-test"));
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn old_generation_event_does_not_settle_newer_intent() {
+    let home = tmp_dir("gen-mismatch");
+    let repo = tmp_repo("gen-mismatch-repo");
+    let tip = make_branch(&repo, "feat/gen-test");
+    let rs = repo.display().to_string();
+    // Intent for PR #20 (newer)
+    persist_intent(&home, &rs, "feat/gen-test", &tip, "t-gen", None, Some(20)).expect("persist");
+
+    // Old PR #10 merged event → generation mismatch → preserved
+    let outcome = settle_intent(&home, &rs, "feat/gen-test", true, Some(10));
+    assert!(matches!(outcome, Some(SettleOutcome::Pending(_))));
+    assert!(branch_exists(&repo, "feat/gen-test"));
+    assert!(has_intent(&home, &rs, "feat/gen-test"));
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn transient_git_error_preserves_intent_for_retry() {
+    let home = tmp_dir("git-error");
+    // Non-existent repo path → git error, not branch absence
+    persist_intent(
+        &home,
+        "/nonexistent/repo/path",
+        "feat/error-test",
+        "abc123",
+        "t-err",
+        None,
+        None,
+    )
+    .expect("persist");
+
+    let outcome = settle_intent(
+        &home,
+        "/nonexistent/repo/path",
+        "feat/error-test",
+        true,
+        None,
+    );
+    assert!(
+        matches!(outcome, Some(SettleOutcome::GitError(_))),
+        "git error must NOT clear intent: {outcome:?}"
+    );
+    assert!(
+        has_intent(&home, "/nonexistent/repo/path", "feat/error-test"),
+        "intent must survive git error"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+fn real_missing_branch_clears_intent() {
+    let home = tmp_dir("missing-branch");
+    let repo = tmp_repo("missing-branch-repo");
+    let rs = repo.display().to_string();
+    // Intent for a branch that never existed in this repo
+    persist_intent(
+        &home,
+        &rs,
+        "feat/definitely-missing-branch",
+        "abc123",
+        "t-miss",
+        None,
+        None,
+    )
+    .expect("persist");
+
+    let outcome = settle_intent(&home, &rs, "feat/definitely-missing-branch", true, None);
+    assert!(
+        matches!(outcome, Some(SettleOutcome::BranchAbsent)),
+        "real missing branch must be BranchAbsent (not GitError): {outcome:?}"
+    );
+    assert!(
+        !has_intent(&home, &rs, "feat/definitely-missing-branch"),
+        "intent must be cleared for confirmed absent branch"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn non_git_directory_preserves_intent_as_git_error() {
+    let home = tmp_dir("non-git-dir");
+    let non_git = tmp_dir("plain-dir-not-git");
+    let rs = non_git.display().to_string();
+    persist_intent(&home, &rs, "feat/x", "abc", "t-1", None, None).expect("persist");
+
+    let outcome = settle_intent(&home, &rs, "feat/x", true, None);
+    assert!(
+        matches!(outcome, Some(SettleOutcome::GitError(_))),
+        "non-git directory must be GitError (not BranchAbsent): {outcome:?}"
+    );
+    assert!(has_intent(&home, &rs, "feat/x"), "intent must survive");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&non_git).ok();
+}
+
+#[test]
+fn missing_event_generation_fails_closed_when_intent_has_one() {
+    let home = tmp_dir("gen-failclosed");
+    let repo = tmp_repo("gen-failclosed-repo");
+    let tip = make_branch(&repo, "feat/gen-fc");
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, "feat/gen-fc", &tip, "t-fc", None, Some(42)).expect("persist");
+    let obligation_id = seed_obligation(&home, &rs, "feat/gen-fc", &tip, Some("owner"));
+
+    // Merged event with NO pr_number → intent has #42 → fail-closed
+    let outcome = settle_intent(&home, &rs, "feat/gen-fc", true, None);
+    assert!(
+        matches!(outcome, Some(SettleOutcome::Pending(_))),
+        "missing event generation must fail-closed: {outcome:?}"
+    );
+    assert!(branch_exists(&repo, "feat/gen-fc"), "branch must survive");
+    assert!(has_intent(&home, &rs, "feat/gen-fc"), "intent must survive");
+    assert_eq!(
+        obligation(&home, &obligation_id).status,
+        crate::task_events::TaskStatus::Open,
+        "missing event generation must return before merged-lane retirement"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn persist_failure_is_surfaced() {
+    // Persist to an unwritable path
+    let result = persist_intent(
+        Path::new(if cfg!(windows) {
+            r"\\?\Z:\nonexistent\root\agend-test"
+        } else {
+            "/nonexistent/root/agend-test"
+        }),
+        "/repo",
+        "feat/x",
+        "abc",
+        "t-1",
+        None,
+        None,
+    );
+    assert!(result.is_err(), "persist to unwritable path must fail");
+}
+
+#[test]
+fn settle_by_slug_matches_scm_identity() {
+    let home = tmp_dir("slug-settle");
+    let repo = tmp_repo("slug-settle-repo");
+    let tip = make_branch(&repo, "feat/slug-test");
+    let rs = repo.display().to_string();
+    persist_intent(
+        &home,
+        &rs,
+        "feat/slug-test",
+        &tip,
+        "t-slug",
+        Some("owner/repo"),
+        Some(5),
+    )
+    .expect("persist");
+
+    let outcome = settle_by_scm_slug(&home, "owner/repo", "feat/slug-test", true, Some(5));
+    assert!(matches!(outcome, Some(SettleOutcome::Deleted)));
+    assert!(!branch_exists(&repo, "feat/slug-test"));
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn intent_repos_contributes_to_discovery() {
+    let home = tmp_dir("intent-repos");
+    persist_intent(
+        &home,
+        "/path/to/repo-a",
+        "feat/a",
+        "abc123",
+        "t-1",
+        None,
+        None,
+    )
+    .expect("persist");
+    persist_intent(
+        &home,
+        "/path/to/repo-b",
+        "feat/b",
+        "def456",
+        "t-2",
+        None,
+        None,
+    )
+    .expect("persist");
+    persist_intent(
+        &home,
+        "/path/to/repo-a",
+        "feat/c",
+        "ghi789",
+        "t-3",
+        None,
+        None,
+    )
+    .expect("persist");
+
+    let repos = intent_repos(&home);
+    assert!(repos.contains(&"/path/to/repo-a".to_string()));
+    assert!(repos.contains(&"/path/to/repo-b".to_string()));
+    assert_eq!(repos.len(), 2, "deduplication: {repos:?}");
+
+    std::fs::remove_dir_all(&home).ok();
+}
+
+fn seed_terminal_task(home: &Path, task_id: &str) {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let tid = TaskId(task_id.to_string());
+    let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+    std::fs::create_dir_all(&board).ok();
+    let emitter = InstanceName::from("test");
+    let _ = crate::task_events::append(
+        &board,
+        &emitter,
+        TaskEvent::Created {
+            task_id: tid.clone(),
+            title: "test".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            tags: Vec::new(),
+            owner: None,
+            depends_on: Vec::new(),
+            parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
+            branch: None,
+            due_at: None,
+            routed_to: None,
+            bind: None,
+            eta_secs: None,
+        },
+    );
+    let _ = crate::task_events::append(
+        &board,
+        &emitter,
+        TaskEvent::Done {
+            task_id: tid,
+            by: emitter.clone(),
+            source: crate::task_events::DoneSource::ReportAutoClose {
+                report_summary: "test done".into(),
+                closed_at: chrono::Utc::now().to_rfc3339(),
+            },
+        },
+    );
+}
+
+fn seed_open_task(home: &Path, task_id: &str, branch: &str) {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+    std::fs::create_dir_all(&board).ok();
+    crate::task_events::append(
+        &board,
+        &InstanceName::from("test"),
+        TaskEvent::Created {
+            task_id: TaskId(task_id.to_string()),
+            title: "merged subject".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            tags: Vec::new(),
+            owner: None,
+            depends_on: Vec::new(),
+            parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
+            branch: Some(branch.to_string()),
+            due_at: None,
+            routed_to: None,
+            bind: None,
+            eta_secs: None,
+        },
+    )
+    .expect("seed open task");
+}
+
+#[cfg(unix)]
+fn seed_cancelled_task(home: &Path, task_id: &str) {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let tid = TaskId(task_id.to_string());
+    let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+    std::fs::create_dir_all(&board).ok();
+    let emitter = InstanceName::from("test");
+    let _ = crate::task_events::append_batch_at(
+        &board,
+        &emitter,
+        vec![
+            TaskEvent::Created {
+                task_id: tid.clone(),
+                title: "test".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                tags: Vec::new(),
+                owner: None,
+                depends_on: Vec::new(),
+                parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
+                branch: None,
+                due_at: None,
+                routed_to: None,
+                bind: None,
+                eta_secs: None,
+            },
+            TaskEvent::Cancelled {
+                task_id: tid,
+                by: emitter.clone(),
+                reason: "review invalidated".into(),
+            },
+        ],
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn reconcile_terminal_review_intent_deletes_branch() {
+    let home = tmp_dir("reconcile-ok");
+    let repo = tmp_repo("reconcile-ok-repo");
+    let tip = make_branch(&repo, "review/pr-999-test");
+    let rs = repo.display().to_string();
+    persist_intent(
+        &home,
+        &rs,
+        "review/pr-999-test",
+        &tip,
+        "t-reconcile-ok",
+        None,
+        None,
+    )
+    .expect("persist");
+    seed_terminal_task(&home, "t-reconcile-ok");
+
+    let result = reconcile_terminal_review_intents(&home, false);
+
+    assert_eq!(
+        result.settled, 1,
+        "terminal intent must be settled: {result:?}"
+    );
+    assert!(
+        !branch_exists(&repo, "review/pr-999-test"),
+        "review branch must be deleted"
+    );
+    assert!(
+        !has_intent(&home, &rs, "review/pr-999-test"),
+        "intent file must be removed"
+    );
+    // Recovery ref must exist.
+    let refs_out = crate::git_helpers::git_cmd(
+        &repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/agend/recovery/review/pr-999-test/",
+        ],
+    )
+    .unwrap_or_default();
+    assert!(
+        refs_out.lines().any(|l| l.trim() == tip),
+        "recovery ref must point to deleted tip"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn reconcile_cancelled_review_intent_deletes_branch() {
+    let home = tmp_dir("reconcile-cancelled");
+    let repo = tmp_repo("reconcile-cancelled-repo");
+    let branch = "review/pr-cancelled";
+    let tip = make_branch(&repo, branch);
+    let rs = repo.display().to_string();
+    persist_intent(
+        &home,
+        &rs,
+        branch,
+        &tip,
+        "t-reconcile-cancelled",
+        None,
+        None,
+    )
+    .expect("persist");
+    seed_cancelled_task(&home, "t-reconcile-cancelled");
+
+    let result = reconcile_terminal_review_intents(&home, false);
+
+    assert_eq!(
+        result.settled, 1,
+        "cancelled review task is terminal and must settle: {result:?}"
+    );
+    assert!(!branch_exists(&repo, branch));
+    assert!(!has_intent(&home, &rs, branch));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn reconcile_terminal_review_intent_preserves_open_pr_branch() {
+    let home = tmp_dir("reconcile-open-pr");
+    let repo = tmp_repo("reconcile-open-pr-repo");
+    let branch = "review/pr-999-open";
+    let tip = make_branch(&repo, branch);
+    git_in(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/repo.git",
+        ],
+    );
+    let provider =
+        crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::Branches(vec![
+            branch.into()
+        ]));
+    let _provider_guard = crate::scm::set_test_scm_provider(provider);
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, branch, &tip, "t-reconcile-open-pr", None, None).expect("persist");
+    seed_terminal_task(&home, "t-reconcile-open-pr");
+
+    let result = reconcile_terminal_review_intents(&home, false);
+
+    assert_eq!(
+        result.preserved, 1,
+        "open PR must preserve terminal intent: {result:?}"
+    );
+    assert!(
+        branch_exists(&repo, branch),
+        "open PR branch must be preserved"
+    );
+    assert!(
+        has_intent(&home, &rs, branch),
+        "open PR intent must be preserved"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn reconcile_preserves_non_terminal_task() {
+    let home = tmp_dir("reconcile-nt");
+    let repo = tmp_repo("reconcile-nt-repo");
+    let tip = make_branch(&repo, "review/pr-888-keep");
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, "review/pr-888-keep", &tip, "t-nt", None, None).expect("persist");
+
+    let result = reconcile_terminal_review_intents(&home, false);
+
+    assert_eq!(
+        result.preserved, 1,
+        "non-terminal must be preserved: {result:?}"
+    );
+    assert!(branch_exists(&repo, "review/pr-888-keep"));
+    assert!(has_intent(&home, &rs, "review/pr-888-keep"));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn reconcile_preserves_head_drift() {
+    let home = tmp_dir("reconcile-drift");
+    let repo = tmp_repo("reconcile-drift-repo");
+    let _tip = make_branch(&repo, "review/pr-777-drift");
+    let rs = repo.display().to_string();
+    persist_intent(
+        &home,
+        &rs,
+        "review/pr-777-drift",
+        "deadbeef00",
+        "t-drift",
+        None,
+        None,
+    )
+    .expect("persist");
+    seed_terminal_task(&home, "t-drift");
+
+    let result = reconcile_terminal_review_intents(&home, false);
+
+    assert_eq!(result.preserved, 1, "drift must preserve: {result:?}");
+    assert!(branch_exists(&repo, "review/pr-777-drift"));
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn reconcile_idempotent_on_replay() {
+    let home = tmp_dir("reconcile-idem");
+    let repo = tmp_repo("reconcile-idem-repo");
+    let tip = make_branch(&repo, "review/pr-555-idem");
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, "review/pr-555-idem", &tip, "t-idem", None, None).expect("persist");
+    seed_terminal_task(&home, "t-idem");
+
+    let r1 = reconcile_terminal_review_intents(&home, false);
+    assert_eq!(r1.settled, 1);
+
+    let r2 = reconcile_terminal_review_intents(&home, false);
+    assert_eq!(r2.candidates.len(), 0, "no candidates on replay");
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn reconcile_skips_non_review_branches() {
+    let home = tmp_dir("reconcile-nonreview");
+    persist_intent(
+        &home,
+        "/tmp/fake",
+        "feat/not-review",
+        "abc",
+        "t-x",
+        None,
+        None,
+    )
+    .expect("persist");
+
+    let result = reconcile_terminal_review_intents(&home, false);
+    assert!(result.candidates.is_empty(), "non-review skipped");
+    std::fs::remove_dir_all(&home).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn reconcile_dry_run_does_not_mutate() {
+    let home = tmp_dir("reconcile-dryrun");
+    let repo = tmp_repo("reconcile-dryrun-repo");
+    let tip = make_branch(&repo, "review/pr-444-dry");
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, "review/pr-444-dry", &tip, "t-dry", None, None).expect("persist");
+    seed_terminal_task(&home, "t-dry");
+
+    let result = reconcile_terminal_review_intents(&home, true);
+
+    assert!(
+        result
+            .candidates
+            .iter()
+            .any(|c| c.outcome.contains("dry_run")),
+        "dry-run must produce qualified candidate: {result:?}"
+    );
+    assert!(
+        branch_exists(&repo, "review/pr-444-dry"),
+        "branch must survive dry-run"
+    );
+    assert!(
+        has_intent(&home, &rs, "review/pr-444-dry"),
+        "intent must survive dry-run"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn reconcile_git_error_preserves_intent() {
+    let home = tmp_dir("reconcile-giterr");
+    let non_git = tmp_dir("reconcile-notgit");
+    let rs = non_git.display().to_string();
+    persist_intent(&home, &rs, "review/pr-333-err", "abc", "t-err", None, None).expect("persist");
+    seed_terminal_task(&home, "t-err");
+
+    let result = reconcile_terminal_review_intents(&home, false);
+
+    assert!(
+        result
+            .candidates
+            .iter()
+            .any(|c| c.outcome.contains("preserved:git")),
+        "git error must preserve: {result:?}"
+    );
+    assert!(
+        has_intent(&home, &rs, "review/pr-333-err"),
+        "intent must survive git error"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&non_git).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn reconcile_candidate_id_is_stable() {
+    let home = tmp_dir("reconcile-candid");
+    let repo = tmp_repo("reconcile-candid-repo");
+    let tip = make_branch(&repo, "review/pr-222-cid");
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, "review/pr-222-cid", &tip, "t-cid", None, None).expect("persist");
+    seed_terminal_task(&home, "t-cid");
+
+    let expected_cid = intent_key(&rs, "review/pr-222-cid");
+    let result = reconcile_terminal_review_intents(&home, false);
+
+    assert!(
+        result
+            .candidates
+            .iter()
+            .any(|c| c.candidate_id == expected_cid),
+        "candidate_id must be stable derived from intent identity: {result:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn reconcile_dry_run_head_drift_preserved() {
+    let home = tmp_dir("dryrun-drift");
+    let repo = tmp_repo("dryrun-drift-repo");
+    let _tip = make_branch(&repo, "review/pr-333-drift");
+    let rs = repo.display().to_string();
+    persist_intent(
+        &home,
+        &rs,
+        "review/pr-333-drift",
+        "0000000000000000000000000000000000000000",
+        "t-dryrun-drift",
+        None,
+        None,
+    )
+    .unwrap();
+    seed_terminal_task(&home, "t-dryrun-drift");
+
+    let result = reconcile_terminal_review_intents(&home, true);
+    assert!(
+        !result
+            .candidates
+            .iter()
+            .any(|c| c.outcome.starts_with("qualified")),
+        "head-drift dry-run must be preserved, never qualified: {result:?}"
+    );
+    assert!(
+        branch_exists(&repo, "review/pr-333-drift"),
+        "branch must survive drift dry-run"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn reconcile_cas_stale_ref_survives() {
+    let home = tmp_dir("cas-stale");
+    let repo = tmp_repo("cas-stale-repo");
+    let old_tip = make_branch(&repo, "review/pr-444-cas");
+    let rs = repo.display().to_string();
+    persist_intent(
+        &home,
+        &rs,
+        "review/pr-444-cas",
+        &old_tip,
+        "t-cas-stale",
+        None,
+        None,
+    )
+    .unwrap();
+    seed_terminal_task(&home, "t-cas-stale");
+
+    // Advance the branch head so the CAS expected_head is now stale.
+    git_in(&repo, &["checkout", "review/pr-444-cas"]);
+    std::fs::write(repo.join("new.txt"), "new content").unwrap();
+    git_in(&repo, &["add", "."]);
+    git_in(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "advance",
+        ],
+    );
+    let new_tip = branch_tip(&repo, "review/pr-444-cas");
+    git_in(&repo, &["checkout", "main"]);
+    assert_ne!(old_tip, new_tip, "branch must have advanced");
+
+    let result = reconcile_terminal_review_intents(&home, false);
+
+    assert_eq!(result.settled, 0, "stale CAS must not delete: {result:?}");
+    assert!(
+        branch_exists(&repo, "review/pr-444-cas"),
+        "branch with new head must survive stale CAS"
+    );
+    assert_eq!(
+        branch_tip(&repo, "review/pr-444-cas"),
+        new_tip,
+        "new head must be preserved"
+    );
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn reconcile_merged_subject_tasks_replays_missed_auto_close() {
+    let home = tmp_dir("replay-merged-subject");
+    let repo = tmp_repo("replay-merged-subject-repo");
+    git_in(
+        &repo,
+        &[
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/example/repo.git",
+        ],
+    );
+    let subject_branch = "fix/merged-subject";
+    let subject_tip = make_branch(&repo, subject_branch);
+    let review_branch = "review/pr-999-replay";
+    let review_tip = make_branch(&repo, review_branch);
+    let task_id = "t-replay-merged-subject";
+    seed_open_task(&home, task_id, subject_branch);
+    persist_intent(
+        &home,
+        &repo.display().to_string(),
+        review_branch,
+        &review_tip,
+        task_id,
+        Some("example/repo"),
+        Some(999),
+    )
+    .expect("persist review intent");
+    let provider = crate::scm::MockScmProvider::with_pr_list(crate::scm::MockPrList::MergedHead {
+        base: "main".into(),
+        head_oid: subject_tip,
+    });
+    let _provider_guard = crate::scm::set_test_scm_provider(provider);
+
+    reconcile_merged_subject_tasks(&home);
+
+    let task = crate::tasks::list_all(&home)
+        .into_iter()
+        .find(|task| task.id.as_str() == task_id)
+        .expect("task present");
+    assert_eq!(task.status, crate::task_events::TaskStatus::Done);
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn reconcile_production_entry_wired() {
+    let source = include_str!("../worktree_cleanup.rs");
+    assert!(
+        source.contains("reconcile_terminal_review_intents"),
+        "worktree_cleanup.rs must call reconcile_terminal_review_intents \
+         — if this fails, the reconciler was unwired from the periodic sweep"
+    );
+    assert!(
+        source.contains("reconcile_merged_subject_tasks"),
+        "worktree_cleanup.rs must replay missed merged-task auto-close"
+    );
+}
+
+// ── t-20260901084057482124-43938-5 B3/B4 (d-20260901132326253721-16):
+//    the owner's answer as the SECOND settlement authority ───────────
+
+fn obligation_id(tag: &str) -> String {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    format!(
+        "t-retention-{}-{}-{}",
+        std::process::id(),
+        tag,
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
+}
+
+fn seed_obligation(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    head: &str,
+    owner: Option<&str>,
+) -> String {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    if matches!(
+        crate::tasks::load_routed(home, "t-origin"),
+        Err(crate::tasks::TaskRouteError::NotFound)
+    ) {
+        crate::task_events::append(
+            home,
+            &InstanceName::from("test"),
+            TaskEvent::Created {
+                task_id: TaskId("t-origin".into()),
+                title: "origin".into(),
+                description: String::new(),
+                priority: "normal".into(),
+                owner: owner.map(|o| InstanceName(o.to_string())),
+                due_at: None,
+                depends_on: Vec::new(),
+                routed_to: None,
+                branch: Some(branch.to_string()),
+                bind: None,
+                eta_secs: None,
+                tags: Vec::new(),
+                parent_id: None,
+                governing_decision_id: None,
+                review_class: None,
+            },
+        )
+        .expect("seed origin");
+    }
+    let id = obligation_id("seed");
+    crate::task_events::append(
+        home,
+        &InstanceName::from("test"),
+        TaskEvent::Created {
+            task_id: TaskId(id.clone()),
+            title: format!("branch-retention: confirm '{branch}' is still needed"),
+            description: format!("repo: {repo}\nbranch: {branch}\nhead: {head}"),
+            priority: "normal".into(),
+            tags: vec![
+                crate::worktree_pool::RETENTION_TAG.to_string(),
+                crate::worktree_pool::retention_key(repo, branch, head),
+                crate::worktree_pool::retention_lane_key(repo, branch),
+            ],
+            owner: owner.map(|o| InstanceName(o.to_string())),
+            due_at: Some((chrono::Utc::now() + chrono::Duration::days(14)).to_rfc3339()),
+            depends_on: Vec::new(),
+            parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
+            branch: None,
+            routed_to: None,
+            bind: None,
+            eta_secs: None,
+        },
+    )
+    .expect("seed obligation");
+    id
+}
+
+/// The exact shape `task action=done result=…` produces: an
+/// `OperatorManual` done source carrying the owner's answer.
+fn answer(home: &Path, task_id: &str, by: &str, result: &str) {
+    use crate::task_events::{DoneSource, InstanceName, TaskEvent, TaskId};
+    crate::task_events::append(
+        home,
+        &InstanceName::from(by),
+        TaskEvent::Done {
+            task_id: TaskId(task_id.to_string()),
+            by: InstanceName::from(by),
+            source: DoneSource::OperatorManual {
+                authored_at: chrono::Utc::now().to_rfc3339(),
+                result: Some(result.to_string()),
+            },
+        },
+    )
+    .expect("answer obligation");
+}
+
+fn obligation(home: &Path, task_id: &str) -> crate::task_events::TaskRecord {
+    let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+    crate::task_events::projected_state_at(&board)
+        .expect("board state")
+        .tasks
+        .get(&crate::task_events::TaskId(task_id.to_string()))
+        .expect("obligation present")
+        .clone()
+}
+
+fn retention_row_count(home: &Path) -> usize {
+    let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+    crate::task_events::projected_state_at(&board)
+        .expect("board state")
+        .tasks
+        .values()
+        .filter(|t| {
+            t.tags
+                .iter()
+                .any(|tag| tag == crate::worktree_pool::RETENTION_TAG)
+        })
+        .count()
+}
+
+fn intent_of(repo: &Path, branch: &str, head: &str, task_id: &str) -> CleanupIntent {
+    CleanupIntent {
+        repo: repo.display().to_string(),
+        branch: branch.to_string(),
+        expected_head: head.to_string(),
+        task_id: task_id.to_string(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        scm_slug: None,
+        pr_number: None,
+    }
+}
+
+fn recovery_refs(repo: &Path, branch: &str) -> Vec<(String, String)> {
+    let safe: String = branch
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let pattern = format!("refs/agend/recovery/branch/{safe}");
+    crate::git_helpers::git_cmd(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(refname) %(objectname)",
+            &pattern,
+        ],
+    )
+    .unwrap_or_default()
+    .lines()
+    .filter_map(|line| line.split_once(' '))
+    .map(|(r, o)| (r.to_string(), o.to_string()))
+    .collect()
+}
+
+/// The whole point: a branch no merge can ever settle is reaped once its
+/// accountable owner says so — through the same expected-head CAS and
+/// archive-before-delete the merge path uses.
+#[test]
+fn owner_attested_delete_reaps_the_branch_with_an_archive_and_a_head_cas() {
+    let home = tmp_dir("attest-delete");
+    let repo = tmp_repo("attest-delete-repo");
+    let branch = "feat/attested-delete";
+    let tip = make_branch(&repo, branch);
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+    let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+    answer(
+        &home,
+        &id,
+        "agent-owner",
+        "delete: superseded, nothing to keep",
+    );
+
+    sweep_settle_merged(&home);
+
+    assert!(!branch_exists(&repo, branch), "branch must be reaped");
+    assert!(!has_intent(&home, &rs, branch), "intent must be settled");
+    let archived = recovery_refs(&repo, branch);
+    assert_eq!(
+        archived.len(),
+        1,
+        "exactly one recovery ref must survive the delete: {archived:?}"
+    );
+    assert_eq!(archived[0].1, tip, "recovery ref must hold the exact head");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// `can_mutate_record` (tasks/acl.rs:112-139) returns true for ANY caller
+/// when the owner is None — an unassigned obligation is answerable by
+/// anybody, so it can never authorize a deletion.
+#[test]
+fn an_unassigned_obligation_cannot_authorize_a_deletion() {
+    let home = tmp_dir("attest-orphan");
+    let repo = tmp_repo("attest-orphan-repo");
+    let branch = "feat/attested-orphan";
+    let tip = make_branch(&repo, branch);
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+    let id = seed_obligation(&home, &rs, branch, &tip, None);
+    answer(&home, &id, "passer-by", "delete: not mine but sure");
+
+    sweep_settle_merged(&home);
+
+    assert!(
+        branch_exists(&repo, branch),
+        "unowned answer must not delete"
+    );
+    assert!(has_intent(&home, &rs, branch));
+    assert!(recovery_refs(&repo, branch).is_empty(), "no archive either");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn a_keep_answer_never_authorizes_a_deletion() {
+    let home = tmp_dir("attest-keep");
+    let repo = tmp_repo("attest-keep-repo");
+    let branch = "feat/attested-keep";
+    let tip = make_branch(&repo, branch);
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+    let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+    answer(&home, &id, "agent-owner", "keep: still under review");
+
+    sweep_settle_merged(&home);
+
+    assert!(branch_exists(&repo, branch));
+    assert!(has_intent(&home, &rs, branch));
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// A `delete:` the owner has not yet COMMITTED to — the obligation is still
+/// open — is not an answer.
+#[test]
+fn a_delete_on_a_non_terminal_obligation_authorizes_nothing() {
+    let home = tmp_dir("attest-open");
+    let repo = tmp_repo("attest-open-repo");
+    let branch = "feat/attested-open";
+    let tip = make_branch(&repo, branch);
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+    let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+    crate::task_events::append(
+        &home,
+        &crate::task_events::InstanceName::from("agent-owner"),
+        crate::task_events::TaskEvent::ResultSet {
+            task_id: crate::task_events::TaskId(id.clone()),
+            by: crate::task_events::InstanceName::from("agent-owner"),
+            result: "delete: drafting my answer".into(),
+        },
+    )
+    .expect("result set");
+
+    sweep_settle_merged(&home);
+
+    assert_eq!(
+        obligation(&home, &id).status,
+        crate::task_events::TaskStatus::Open
+    );
+    assert!(branch_exists(&repo, branch));
+    assert!(has_intent(&home, &rs, branch));
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// The key binds the answer to the EXACT head it was given about. An
+/// obligation raised at an older head cannot authorize deleting newer work.
+#[test]
+fn an_answer_about_a_different_head_cannot_authorize_this_deletion() {
+    let home = tmp_dir("attest-otherhead");
+    let repo = tmp_repo("attest-otherhead-repo");
+    let branch = "feat/attested-otherhead";
+    let tip = make_branch(&repo, branch);
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+    let stale_head = "0000000000000000000000000000000000000000";
+    let id = seed_obligation(&home, &rs, branch, stale_head, Some("agent-owner"));
+    answer(&home, &id, "agent-owner", "delete: done with the old head");
+
+    sweep_settle_merged(&home);
+
+    assert!(branch_exists(&repo, branch));
+    assert!(has_intent(&home, &rs, branch));
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Work landed after the owner answered: the CAS must refuse.
+#[test]
+fn head_drift_after_the_answer_preserves_the_branch() {
+    let home = tmp_dir("attest-drift");
+    let repo = tmp_repo("attest-drift-repo");
+    let branch = "feat/attested-drift";
+    let answered_head = make_branch(&repo, branch);
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, branch, &answered_head, "t-origin", None, None).expect("persist");
+    let id = seed_obligation(&home, &rs, branch, &answered_head, Some("agent-owner"));
+    answer(&home, &id, "agent-owner", "delete: finished with it");
+    // New work arrives on the branch after the answer.
+    git_in(&repo, &["checkout", branch]);
+    std::fs::write(repo.join("late.txt"), "late").ok();
+    git_in(&repo, &["add", "."]);
+    git_in(
+        &repo,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-m",
+            "late work",
+        ],
+    );
+    git_in(&repo, &["checkout", "main"]);
+
+    sweep_settle_merged(&home);
+
+    assert!(
+        branch_exists(&repo, branch),
+        "drifted head must be preserved"
+    );
+    assert!(has_intent(&home, &rs, branch));
+    assert!(
+        recovery_refs(&repo, branch).is_empty(),
+        "a branch that is never deleted must never be archived either"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Prefix AND case are exact. An answer the contract does not define is not
+/// an authorization to delete anything.
+#[test]
+fn a_malformed_answer_authorizes_nothing() {
+    let home = tmp_dir("attest-malformed");
+    let repo = tmp_repo("attest-malformed-repo");
+    let rs = repo.display().to_string();
+    let cases = [
+        ("feat/attested-capitalized", "Delete: obsolete"),
+        ("feat/attested-unknown-verb", "cleaned it up already"),
+    ];
+    for (branch, malformed) in cases {
+        let tip = make_branch(&repo, branch);
+        persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+        let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+        answer(&home, &id, "agent-owner", malformed);
+    }
+
+    sweep_settle_merged(&home);
+
+    for (branch, malformed) in cases {
+        assert!(
+            branch_exists(&repo, branch),
+            "'{malformed}' must authorize nothing"
+        );
+        assert!(has_intent(&home, &rs, branch));
+        assert!(recovery_refs(&repo, branch).is_empty());
+    }
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Two rows carrying one exact key cannot say which one the owner attested
+/// to — ambiguity is never an answer.
+#[test]
+fn two_obligations_sharing_one_key_authorize_nothing() {
+    let home = tmp_dir("attest-ambiguous");
+    let repo = tmp_repo("attest-ambiguous-repo");
+    let branch = "feat/attested-ambiguous";
+    let tip = make_branch(&repo, branch);
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+    let first = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+    let second = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+    answer(&home, &first, "agent-owner", "delete: obsolete");
+    answer(&home, &second, "agent-owner", "delete: obsolete");
+
+    sweep_settle_merged(&home);
+
+    assert!(branch_exists(&repo, branch));
+    assert!(has_intent(&home, &rs, branch));
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Archive BEFORE delete: if the recovery ref cannot be written, nothing is
+/// deleted. A ref already occupying the recovery namespace as a leaf makes
+/// `update-ref` fail for real (D/F conflict) — no mocking involved.
+#[test]
+fn a_failed_archive_preserves_the_branch_the_intent_and_the_answer() {
+    let home = tmp_dir("attest-archivefail");
+    let repo = tmp_repo("attest-archivefail-repo");
+    let branch = "feat/attested-archivefail";
+    let tip = make_branch(&repo, branch);
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+    let safe: String = branch
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    // Occupy the directory the recovery ref needs with a ref of its own.
+    git_in(
+        &repo,
+        &[
+            "update-ref",
+            &format!("refs/agend/recovery/branch/{safe}"),
+            &tip,
+        ],
+    );
+    let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+    answer(&home, &id, "agent-owner", "delete: obsolete");
+
+    sweep_settle_merged(&home);
+
+    assert!(
+        branch_exists(&repo, branch),
+        "an unarchivable branch must never be deleted"
+    );
+    assert!(has_intent(&home, &rs, branch));
+    assert_eq!(
+        obligation(&home, &id).status,
+        crate::task_events::TaskStatus::Done,
+        "the answer itself must be preserved for the retry"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// A branch some worktree still holds is never deleted out from under it.
+#[test]
+fn a_branch_still_checked_out_is_never_deleted() {
+    let home = tmp_dir("attest-checkedout");
+    let repo = tmp_repo("attest-checkedout-repo");
+    let branch = "feat/attested-checkedout";
+    let tip = make_branch(&repo, branch);
+    let rs = repo.display().to_string();
+    git_in(&repo, &["checkout", branch]);
+    persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+    let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+    answer(&home, &id, "agent-owner", "delete: obsolete");
+
+    sweep_settle_merged(&home);
+
+    assert!(branch_exists(&repo, branch));
+    assert!(has_intent(&home, &rs, branch));
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// B4: keep is renewable but never permanent. At expiry the SAME row is
+/// reopened — no second obligation — and its due date is already past, so
+/// it surfaces overdue.
+#[test]
+fn an_expired_keep_reopens_the_same_obligation_overdue() {
+    let home = tmp_dir("attest-ttl");
+    let repo = tmp_repo("attest-ttl-repo");
+    let branch = "feat/attested-ttl";
+    let tip = make_branch(&repo, branch);
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+    let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+    answer(&home, &id, "agent-owner", "keep: still needed");
+    let intent = intent_of(&repo, branch, &tip, "t-origin");
+
+    let expired = chrono::Utc::now() + chrono::Duration::days(KEEP_TTL_DAYS + 1);
+    settle_by_owner_attestation(
+        &home,
+        &intent,
+        expired,
+        &retention_obligations(&home, &retention_project(&home, &intent.repo)),
+    );
+
+    let reopened = obligation(&home, &id);
+    assert_eq!(reopened.status, crate::task_events::TaskStatus::Open);
+    assert_eq!(
+        reopened.owner.as_ref().map(|o| o.0.as_str()),
+        Some("agent-owner"),
+        "reopen must keep the same accountable owner"
+    );
+    assert_eq!(retention_row_count(&home), 1, "no duplicate obligation");
+    let due = reopened.due_at.as_deref().expect("due_at");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(due).expect("rfc3339") < expired,
+        "an expired keep must surface overdue, due_at was {due}"
+    );
+    assert!(branch_exists(&repo, branch), "expiry asks, never deletes");
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn a_keep_inside_its_ttl_is_left_alone() {
+    let home = tmp_dir("attest-ttl-inside");
+    let repo = tmp_repo("attest-ttl-inside-repo");
+    let branch = "feat/attested-ttl-inside";
+    let tip = make_branch(&repo, branch);
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+    let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+    answer(&home, &id, "agent-owner", "keep: still needed");
+    let intent = intent_of(&repo, branch, &tip, "t-origin");
+
+    let inside = chrono::Utc::now() + chrono::Duration::days(KEEP_TTL_DAYS - 1);
+    settle_by_owner_attestation(
+        &home,
+        &intent,
+        inside,
+        &retention_obligations(&home, &retention_project(&home, &intent.repo)),
+    );
+
+    assert_eq!(
+        obligation(&home, &id).status,
+        crate::task_events::TaskStatus::Done,
+        "the TTL has not expired yet"
+    );
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// A renewed keep starts a NEW term — the TTL runs from the latest answer,
+/// not the first one.
+#[test]
+fn a_renewed_keep_restarts_the_ttl_from_the_new_answer() {
+    let home = tmp_dir("attest-ttl-renew");
+    let repo = tmp_repo("attest-ttl-renew-repo");
+    let branch = "feat/attested-ttl-renew";
+    let tip = make_branch(&repo, branch);
+    let rs = repo.display().to_string();
+    persist_intent(&home, &rs, branch, &tip, "t-origin", None, None).expect("persist");
+    let id = seed_obligation(&home, &rs, branch, &tip, Some("agent-owner"));
+    answer(&home, &id, "agent-owner", "keep: still needed");
+    let intent = intent_of(&repo, branch, &tip, "t-origin");
+
+    let expired = chrono::Utc::now() + chrono::Duration::days(KEEP_TTL_DAYS + 1);
+    settle_by_owner_attestation(
+        &home,
+        &intent,
+        expired,
+        &retention_obligations(&home, &retention_project(&home, &intent.repo)),
+    );
+    assert_eq!(
+        obligation(&home, &id).status,
+        crate::task_events::TaskStatus::Open
+    );
+    // The owner renews: a fresh terminal answer, so a fresh term.
+    answer(&home, &id, "agent-owner", "keep: still needed, renewed");
+
+    // Ask again at EXACTLY the first term's deadline — past for the
+    // original answer, still inside the term the renewal bought. Event
+    // timestamps are strictly monotonic (catalog::next_commit_timestamp),
+    // so the two deadlines can never coincide.
+    let answered_at: Vec<chrono::DateTime<chrono::Utc>> = obligation(&home, &id)
+        .history
+        .iter()
+        .filter(|entry| entry.kind == "done")
+        .map(|entry| {
+            chrono::DateTime::parse_from_rfc3339(&entry.timestamp)
+                .expect("rfc3339")
+                .with_timezone(&chrono::Utc)
+        })
+        .collect();
+    assert_eq!(answered_at.len(), 2, "original answer plus its renewal");
+    let old_deadline = answered_at[0] + chrono::Duration::days(KEEP_TTL_DAYS);
+    assert!(old_deadline < answered_at[1] + chrono::Duration::days(KEEP_TTL_DAYS));
+
+    settle_by_owner_attestation(
+        &home,
+        &intent,
+        old_deadline,
+        &retention_obligations(&home, &retention_project(&home, &intent.repo)),
+    );
+
+    assert_eq!(
+        obligation(&home, &id).status,
+        crate::task_events::TaskStatus::Done,
+        "the renewed term must not expire at the old deadline"
+    );
+    assert_eq!(retention_row_count(&home), 1);
+
+    std::fs::remove_dir_all(&home).ok();
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+#[test]
+fn owner_attested_settlement_is_wired_into_the_sweep() {
+    let source = include_str!("../cleanup_intents.rs");
+    let seam = source
+        .split("pub(crate) fn sweep_settle_merged")
+        .nth(1)
+        .expect("sweep_settle_merged present");
+    assert!(
+        seam.contains("settle_by_owner_attestation"),
+        "the owner-attested authority must run at the seam where merge \
+         evidence is absent — if this fails, the second authority was unwired"
+    );
+}
+
+#[path = "tests/head_drift_reraise_3517_tests.rs"]
+mod head_drift_reraise_3517;
+
+/// repo 路徑不存在、但 intent 檔刪不掉（cleanup-intents/ 唯讀）：解除並未發生，
+/// 不得回報 settled，必須維持 preserved 並給出可區分的 reason。
+#[cfg(unix)]
+#[test]
+fn reconcile_repo_missing_intent_unlink_denied_stays_preserved() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tmp_dir("repo-missing-unlink-denied");
+    let repo = home.join("missing-repo");
+    persist_intent(
+        &home,
+        &repo.display().to_string(),
+        "review/unlink-denied",
+        "deadbeef",
+        "t-unlink-denied",
+        None,
+        None,
+    )
+    .expect("persist intent");
+    seed_terminal_task(&home, "t-unlink-denied");
+    let dir = intents_dir(&home);
+    let intent = std::fs::read_dir(&dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = reconcile_terminal_review_intents(&home, false);
+    let survived = intent.exists();
+    // 先還原權限再斷言，失敗時也不留下清不掉的暫存目錄。
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let outcome = result.candidates[0].outcome.clone();
+    std::fs::remove_dir_all(&home).ok();
+
+    // root 不受目錄權限限制，此時 unlink 會成功，無法製造情境。
+    if !survived {
+        return;
+    }
+    assert_eq!(result.settled, 0, "unlink 失敗不得計為 settled: {outcome}");
+    assert_eq!(result.preserved, 1, "必須維持 preserved: {outcome}");
+    assert!(
+        outcome.starts_with("preserved:intent_unlink_failed:"),
+        "reason 必須可區分 unlink 失敗: {outcome}"
+    );
+}
