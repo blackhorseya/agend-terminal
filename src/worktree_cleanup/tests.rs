@@ -2052,3 +2052,155 @@ fn hygiene_episode_survives_when_the_path_cannot_be_stat_ed_241() {
          this machine cannot exercise the guard"
     );
 }
+
+// ---------------------------------------------------------------------------
+// 刪除前保留可追溯資訊：squash-merged 建 recovery ref；merged 只記 tip SHA。
+// ---------------------------------------------------------------------------
+
+fn recovery_ref_tips(repo: &Path) -> Vec<String> {
+    crate::git_helpers::git_cmd(
+        repo,
+        &[
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/agend/recovery/branch/",
+        ],
+    )
+    .expect("list recovery refs")
+    .lines()
+    .map(str::to_string)
+    .collect()
+}
+
+fn event_log_text(home: &Path) -> String {
+    std::fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default()
+}
+
+/// squash-merged 刪除前必須建 recovery ref（指向原 tip），並寫 event-log。
+#[test]
+fn squash_merged_prune_creates_recovery_ref_and_event() {
+    let _lock = ENV_LOCK.lock();
+    let repo = setup_test_repo("squash-recovery-ref");
+    let home = tmp_home("squash-recovery-ref");
+    let branch = "feat/squash-recover";
+    make_squash_orphan(&repo, branch, "2024-01-01T00:00:00 +0000");
+    let tip = branch_tip_info(&repo, branch).expect("tip").0;
+
+    let pruned = prune_orphaned_branches_with_home(Some(&home), &repo, false);
+
+    assert!(
+        pruned
+            .iter()
+            .any(|(b, r)| b == branch && *r == "squash-merged"),
+        "squash-merged branch must be pruned: {pruned:?}"
+    );
+    assert!(!branch_exists_for_recovery(&repo, branch));
+    assert!(
+        recovery_ref_tips(&repo).contains(&tip),
+        "recovery ref must point at the original tip {tip}"
+    );
+    let log = event_log_text(&home);
+    assert!(log.contains("branch_cleanup_prepared"), "event: {log}");
+    assert!(log.contains("reason=squash-merged"), "event: {log}");
+    assert!(log.contains(&format!("source_sha={tip}")), "event: {log}");
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// recovery ref 建立失敗 → branch 必須保留，並留下 residue-recovery-failed。
+#[test]
+fn squash_merged_prune_keeps_branch_when_recovery_ref_fails() {
+    let _lock = ENV_LOCK.lock();
+    let repo = setup_test_repo("squash-recovery-fail");
+    let home = tmp_home("squash-recovery-fail");
+    let branch = "feat/squash-fail";
+    make_squash_orphan(&repo, branch, "2024-01-01T00:00:00 +0000");
+    let tip = branch_tip_info(&repo, branch).expect("tip").0;
+    // 在 ref 目錄的位置先放一個同名 ref，讓 `update-ref` 發生 file/dir 衝突。
+    git_in(
+        &repo,
+        &[
+            "update-ref",
+            "refs/agend/recovery/branch/feat_squash_fail",
+            &tip,
+        ],
+    );
+
+    let pruned = prune_orphaned_branches_with_home(Some(&home), &repo, false);
+
+    assert!(
+        pruned.iter().all(|(b, _)| b != branch),
+        "must not report pruned when the recovery ref failed: {pruned:?}"
+    );
+    assert!(
+        branch_exists_for_recovery(&repo, branch),
+        "branch must survive when its recovery ref cannot be created"
+    );
+    let key = format!("residue-recovery-failed:{}:{branch}", repo.display());
+    assert!(
+        hygiene_tasks(&home).iter().any(|(k, _)| k == &key),
+        "failure must be observable: {:?}",
+        hygiene_tasks(&home)
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// merged 不建 recovery ref（內容已在 base 上），但 event-log 必須帶 tip SHA。
+#[test]
+fn merged_prune_records_tip_sha_without_recovery_ref() {
+    let _lock = ENV_LOCK.lock();
+    let repo = setup_test_repo("merged-tip-sha");
+    let home = tmp_home("merged-tip-sha");
+    let branch = "feat/merged-sha";
+    make_old_dated_branch(&repo, branch, "2024-01-01T00:00:00 +0000");
+    git_in(&repo, &["merge", branch]);
+    let tip = branch_tip_info(&repo, branch).expect("tip").0;
+
+    let pruned = prune_orphaned_branches_with_home(Some(&home), &repo, false);
+
+    assert!(
+        pruned.iter().any(|(b, r)| b == branch && *r == "merged"),
+        "merged branch must be pruned: {pruned:?}"
+    );
+    assert!(!branch_exists_for_recovery(&repo, branch));
+    assert!(
+        recovery_ref_tips(&repo).is_empty(),
+        "merged branches must not get a recovery ref"
+    );
+    let log = event_log_text(&home);
+    assert!(log.contains("branch_cleanup_merged"), "event: {log}");
+    assert!(log.contains(&format!("tip_sha={tip}")), "event: {log}");
+
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// 負向對照：CAS 不符（tip 在取值後被改）時，不得刪除。
+#[test]
+fn delete_branch_ref_cas_refuses_moved_tip() {
+    let _lock = ENV_LOCK.lock();
+    let repo = setup_test_repo("cas-moved-tip");
+    let branch = "feat/cas-moved";
+    make_old_dated_branch(&repo, branch, "2024-01-01T00:00:00 +0000");
+    let stale_tip = branch_tip_info(&repo, branch).expect("tip").0;
+    git_in(&repo, &["checkout", branch]);
+    std::fs::write(repo.join("late.txt"), "late").ok();
+    git_in(&repo, &["add", "."]);
+    git_in(&repo, &["commit", "-m", "late commit"]);
+    git_in(&repo, &["checkout", "main"]);
+
+    assert!(delete_branch_ref_cas(&repo, branch, &stale_tip).is_err());
+    assert!(branch_exists_for_recovery(&repo, branch));
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+fn branch_exists_for_recovery(repo: &Path, branch: &str) -> bool {
+    crate::git_helpers::git_ok(
+        repo,
+        &["show-ref", "--verify", &format!("refs/heads/{branch}")],
+    )
+}

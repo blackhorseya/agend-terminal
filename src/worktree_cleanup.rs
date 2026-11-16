@@ -938,6 +938,16 @@ fn is_stale_idle_branch(repo_root: &Path, branch: &str) -> bool {
 }
 
 fn delete_branch_ref_cas(repo_root: &Path, branch: &str, expected_tip: &str) -> Result<(), String> {
+    // `git branch -D` refuses a branch registered in any worktree; `update-ref -d`
+    // does not. Keep that guard now that merged/squash deletes go through CAS too.
+    if let Ok(list) = crate::git_helpers::git_cmd(repo_root, &["worktree", "list", "--porcelain"]) {
+        let needle = format!("branch refs/heads/{branch}");
+        if list.lines().any(|line| line == needle) {
+            return Err(format!(
+                "delete branch ref '{branch}' failed: branch is used by worktree"
+            ));
+        }
+    }
     let full_ref = format!("refs/heads/{branch}");
     let output =
         crate::git_helpers::git_bypass(repo_root, &["update-ref", "-d", &full_ref, expected_tip])
@@ -1308,15 +1318,41 @@ fn prune_orphaned_branches_with_home(
         if !reap_eligible || !lifecycle_delete {
             continue;
         }
-        // TTL paths never merged, so protect their exact tip before deleting
-        // the ordinary branch ref.
-        let recoverable_tip = if scaffold || stale_idle {
-            branch_tip_info(repo_root, branch).map(|(sha, _)| sha)
-        } else {
-            None
-        };
-        if (scaffold || stale_idle) && !dry_run {
-            if let Some(tip) = recoverable_tip.as_deref() {
+        // Every delete path resolves the exact tip first and deletes by CAS, so the
+        // log/event always carry the SHA that was removed. TTL and squash-merged
+        // branches additionally get a recovery ref (their tip is not an ancestor of
+        // the default branch); merged branches already live on the default branch,
+        // so only the SHA is recorded.
+        let needs_recovery_ref = scaffold || stale_idle || (squash && !merged);
+        let recoverable_tip = branch_tip_info(repo_root, branch).map(|(sha, _)| sha);
+        if !dry_run {
+            let Some(tip) = recoverable_tip.as_deref() else {
+                if let Some(home) = home {
+                    let (prefix, title) = if needs_recovery_ref {
+                        (
+                            "residue-recovery-failed",
+                            format!("[hygiene] branch recovery preparation failed: {branch}"),
+                        )
+                    } else {
+                        (
+                            "residue-delete-failed",
+                            format!("[hygiene] branch ref deletion failed: {branch}"),
+                        )
+                    };
+                    upsert_hygiene(
+                        home,
+                        format!("{prefix}:{}:{branch}", repo_root.display()),
+                        title,
+                        serde_json::json!({
+                            "repo": repo_root.display().to_string(),
+                            "branch": branch,
+                            "reason": "branch tip unresolved; preserved",
+                        }),
+                    );
+                }
+                continue;
+            };
+            if needs_recovery_ref {
                 if let Err(error) = crate::branch_sweep::prepare_branch_recovery(
                     home,
                     repo_root,
@@ -1324,8 +1360,10 @@ fn prune_orphaned_branches_with_home(
                     tip,
                     if scaffold {
                         "review-scaffold-ttl"
-                    } else {
+                    } else if stale_idle {
                         "stale-idle-ttl"
+                    } else {
+                        "squash-merged"
                     },
                 ) {
                     if let Some(home) = home {
@@ -1343,18 +1381,13 @@ fn prune_orphaned_branches_with_home(
                     }
                     continue;
                 }
-            } else {
-                continue;
             }
         }
-        let deletion = if dry_run {
-            Ok(())
-        } else if let Some(tip) = recoverable_tip.as_deref() {
-            delete_branch_ref_cas(repo_root, branch, tip)
-        } else {
-            crate::git_helpers::git_cmd(repo_root, &["branch", "-D", branch])
-                .map(|_| ())
-                .map_err(|error| format!("delete branch '{branch}' failed: {error}"))
+        let deletion = match (dry_run, recoverable_tip.as_deref()) {
+            (true, _) => Ok(()),
+            (false, Some(tip)) => delete_branch_ref_cas(repo_root, branch, tip),
+            // Unreachable: a missing tip `continue`s above when not dry-run.
+            (false, None) => Err(format!("delete branch '{branch}' failed: tip unresolved")),
         };
         let ok = deletion.is_ok();
         if let Err(error) = deletion {
@@ -1386,6 +1419,19 @@ fn prune_orphaned_branches_with_home(
                 tracing::info!(branch, reason, tip_sha = ?recoverable_tip, "would prune orphaned branch (dry-run)");
             } else {
                 tracing::info!(branch, reason, tip_sha = ?recoverable_tip, "pruned orphaned branch");
+                // squash/TTL already logged `branch_cleanup_prepared` with the SHA;
+                // merged has no recovery ref, so record the removed tip here.
+                if let (true, Some(home), Some(tip)) = (merged, home, recoverable_tip.as_deref()) {
+                    crate::event_log::log(
+                        home,
+                        "branch_cleanup_merged",
+                        "system:branch_lifecycle",
+                        &format!(
+                            "repo={} branch={branch} tip_sha={tip} reason=merged",
+                            repo_root.display()
+                        ),
+                    );
+                }
             }
             pruned.push((branch.clone(), reason));
         }
