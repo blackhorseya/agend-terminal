@@ -30,10 +30,10 @@ jobs:
   # Where the PR wall clock goes (windows 1/2, warm cache): Tests ~10-12 min of
   # which ~4-5 min is compiling the test profile before nextest starts, then the
   # nextest run itself (~6-8 min). The levers in this file, in order of effect:
-  # one feature set for Build/Tests so dependencies compile once (see "Build
-  # (debug, PR smoke)"), PR runs restore the cache but never save it (see the
-  # rust-cache step), and nextest starts the serial `git-subprocess` group first
-  # (.config/nextest.toml `priority`).
+  # PRs smoke the debug binary the Tests step already builds instead of running
+  # a standalone `cargo build` (see the "Build" step comment), PR runs restore
+  # the cache but never save it (see the rust-cache step), and nextest starts the
+  # serial `git-subprocess` group first (.config/nextest.toml `priority`).
   check:
     name: Check (${{ matrix.os }}${{ matrix.shards > 1 && format(', {0}/{1}', matrix.shard, matrix.shards) || '' }})
     runs-on: ${{ matrix.os }}
@@ -196,42 +196,24 @@ jobs:
 
       # The release binary is only consumed by the CLI smoke and the artifact
       # upload below (release.yml rebuilds its own), and on Windows it was
-      # ~5.5 min of shard 1. PRs smoke a debug build instead; pushes to main keep
-      # the release build and upload (default features, as released).
+      # ~5.5 min of shard 1. Pushes to main keep the release build and upload
+      # (default features, as released).
       #
-      # The PR debug build uses the SAME feature set as the Tests step
-      # (`tray,discord`). A default-feature debug build is a different cargo
-      # feature unification from the one nextest compiles, so every dependency
-      # that differs (tray-icon/tao, twilight ×3, ...) was compiled twice — and the
-      # default-feature debug artifacts were never in the cache main saves (main
-      # builds release + the tray,discord test profile), so on Windows this step
-      # recompiled ~120 crates (~2.9 min) on every PR despite an exact cache hit.
-      # With one feature set the dev-profile dependencies compiled here are exactly
-      # what Tests reuses, and what main's cache already holds. The smoke below
-      # only runs `--version` / `start --agents`; the tray UI is the separate `tray`
-      # subcommand and discord only connects when a discord channel is configured,
-      # so neither is initialised on a headless runner.
+      # PRs have NO separate build step: the CLI smoke and the TUI smoke run the
+      # debug binary that the Tests step (`cargo nextest run --features
+      # tray,discord`) already builds as part of compiling the package's
+      # integration tests (target/debug/agend-terminal). A standalone
+      # `cargo build --bin agend-terminal` is a different cargo feature
+      # unification from the test build — it does not see dev-dependency
+      # features — so even with an exact cache hit and the same `--features` it
+      # recompiled ~120 dependency crates on Windows (measured: 121 crates,
+      # ~2.6 min) that the Tests step then had to share nothing with. Each smoke
+      # step fails loudly if the binary is missing instead of falling back to a
+      # silent rebuild.
       - name: Build
         if: matrix.shard == 1 && github.event_name != 'pull_request'
         timeout-minutes: 20
         run: cargo build --release
-
-      - name: Build (debug, PR smoke)
-        if: matrix.shard == 1 && github.event_name == 'pull_request'
-        timeout-minutes: 20
-        run: cargo build --locked --bin agend-terminal --features tray,discord
-
-      # #3661: the attached TUI must survive its daemon disappearing and
-      # reconnect to a successor without lifecycle respawn or log/CPU churn.
-      # Keep this in the required Linux CI check so the real-PTY regression is
-      # gated on every app event-stream change.
-      - name: TUI event-stream reconnect smoke (#3661)
-        if: runner.os == 'Linux'
-        timeout-minutes: 10
-        shell: bash
-        run: |
-          cargo build --locked --bin agend-terminal --features tray,discord --quiet
-          scripts/e2e/event-stream-reconnect.sh
 
       # #1478: the discord feature is not in the default/tray build, so nothing
       # else type-checks it — the twilight version-split that broke
@@ -330,6 +312,19 @@ jobs:
           if-no-files-found: warn
           retention-days: 7
 
+      # #3661: the attached TUI must survive its daemon disappearing and
+      # reconnect to a successor without lifecycle respawn or log/CPU churn.
+      # Keep this in the required Linux CI check so the real-PTY regression is
+      # gated on every app event-stream change. It runs the debug binary the Tests
+      # step above built (the script fails with "binary not found" if it is
+      # missing), so it sits AFTER the Tests step instead of building its own.
+      - name: TUI event-stream reconnect smoke (#3661)
+        if: runner.os == 'Linux'
+        timeout-minutes: 10
+        shell: bash
+        run: |
+          scripts/e2e/event-stream-reconnect.sh
+
       - name: CLI smoke (Phase C.5)
         if: matrix.shard == 1
         timeout-minutes: 10
@@ -346,6 +341,10 @@ jobs:
             BIN="./target/$BIN_PROFILE/agend-terminal"
             SHELL_CMD="/bin/bash"
           fi
+
+          # PRs smoke the debug binary the Tests step built; main smokes the
+          # release build above. A missing binary is a pipeline error, not a skip.
+          [ -x "$BIN" ] || { echo "::error::$BIN not found — the Tests step should have built it"; exit 1; }
 
           rm -rf "$AGEND_HOME"
           mkdir -p "$AGEND_HOME"
