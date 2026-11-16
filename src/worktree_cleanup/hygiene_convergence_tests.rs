@@ -392,3 +392,75 @@ fn intent_blocked_again_after_close_reopens_new_episode() {
     std::fs::remove_dir_all(&repo).ok();
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── (d) upsert log 降噪 ─────────────────────────────────────────────
+
+/// 取出某個 key 的 "hygiene task upserted" 在 INFO 等級的行數。
+fn info_upsert_lines(lines: &[&str], key: &str) -> usize {
+    lines
+        .iter()
+        .filter(|l| l.contains("hygiene task upserted") && l.contains(key) && l.contains("INFO"))
+        .count()
+}
+
+fn upsert(home: &Path, key: &str, reason: &str) {
+    super::upsert_hygiene(
+        home,
+        key.to_string(),
+        "[hygiene] fixture".to_string(),
+        serde_json::json!({"reason": reason}),
+    );
+}
+
+/// RED：新建一張單要記 info（有人要知道開了新單）。
+#[tracing_test::traced_test]
+#[test]
+fn upsert_logs_info_when_episode_is_created() {
+    let home = tmp_home("hyg-log-create");
+    upsert(&home, "residue-fetch-degraded:/log-create", "r1");
+    logs_assert(|lines| {
+        let n = info_upsert_lines(lines, "/log-create");
+        (n == 1)
+            .then_some(())
+            .ok_or_else(|| format!("新建應記 1 行 info，實際 {n}: {lines:?}"))
+    });
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED：evidence 沒有變更的重複觀察不得記 info（一天兩萬多行的來源），
+/// 降到 debug。
+#[tracing_test::traced_test]
+#[test]
+fn upsert_with_unchanged_evidence_does_not_log_info() {
+    let home = tmp_home("hyg-log-unchanged");
+    let key = "residue-fetch-degraded:/log-unchanged";
+    upsert(&home, key, "same"); // 新建 → info
+    for _ in 0..5 {
+        upsert(&home, key, "same"); // 同樣 evidence → 不得 info
+    }
+    logs_assert(|lines| {
+        let n = info_upsert_lines(lines, "/log-unchanged");
+        (n == 1)
+            .then_some(())
+            .ok_or_else(|| format!("只有新建那一次可以是 info，實際 {n} 行"))
+    });
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// 負向對照：evidence 真的變更時仍要記 info。
+#[tracing_test::traced_test]
+#[test]
+fn upsert_logs_info_when_evidence_changes() {
+    let home = tmp_home("hyg-log-changed");
+    let key = "residue-fetch-degraded:/log-changed";
+    upsert(&home, key, "before"); // 新建 → info
+    upsert(&home, key, "before"); // 不變 → 不 info
+    upsert(&home, key, "after"); // 變更 → info
+    logs_assert(|lines| {
+        let n = info_upsert_lines(lines, "/log-changed");
+        (n == 2)
+            .then_some(())
+            .ok_or_else(|| format!("新建 + 變更各 1 行 info，實際 {n}"))
+    });
+    std::fs::remove_dir_all(&home).ok();
+}
