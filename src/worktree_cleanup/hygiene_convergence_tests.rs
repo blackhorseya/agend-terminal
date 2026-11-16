@@ -180,3 +180,215 @@ fn fetch_failure_after_recovery_reopens_new_episode() {
     std::fs::remove_dir_all(&bare).ok();
     std::fs::remove_dir_all(&home).ok();
 }
+
+// ── cleanup-intent-preserved:<candidate_id> ─────────────────────────
+
+const INTENT_KEY_PREFIX: &str = "cleanup-intent-preserved:";
+
+/// 寫入一個超過 24h 的 review intent（aged → sweep 會為 preserved 的 intent 開單）。
+fn persist_aged_intent(home: &Path, repo: &Path, branch: &str, task_id: &str) {
+    crate::cleanup_intents::persist_intent(
+        home,
+        &repo.display().to_string(),
+        branch,
+        "0000000000000000000000000000000000000000",
+        task_id,
+        None,
+        None,
+    )
+    .expect("persist intent");
+    let path = intent_files(home).into_iter().next().expect("intent file");
+    let mut intent: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+    intent["created_at"] =
+        serde_json::Value::String((chrono::Utc::now() - chrono::Duration::hours(25)).to_rfc3339());
+    std::fs::write(&path, serde_json::to_vec_pretty(&intent).unwrap()).unwrap();
+}
+
+fn intent_files(home: &Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(home.join("cleanup-intents"))
+        .map(|rd| rd.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default()
+}
+
+fn intent_episode_ids(home: &Path) -> Vec<(crate::task_events::TaskId, String)> {
+    crate::daemon::hygiene_task::active_episodes(home)
+        .unwrap()
+        .into_iter()
+        .filter(|(_, k)| k.starts_with(INTENT_KEY_PREFIX))
+        .collect()
+}
+
+/// 讓 review task 變成 terminal（Created + Done）。
+fn seed_done_task(home: &Path, task_id: &str) {
+    use crate::task_events::{InstanceName, TaskEvent, TaskId};
+    let tid = TaskId(task_id.to_string());
+    let board = crate::task_events::board_root(home, crate::task_events::DEFAULT_PROJECT);
+    std::fs::create_dir_all(&board).unwrap();
+    let emitter = InstanceName::from("test");
+    crate::task_events::append(
+        &board,
+        &emitter,
+        TaskEvent::Created {
+            task_id: tid.clone(),
+            title: "review subject".into(),
+            description: String::new(),
+            priority: "normal".into(),
+            tags: Vec::new(),
+            owner: None,
+            depends_on: Vec::new(),
+            parent_id: None,
+            governing_decision_id: None,
+            review_class: None,
+            branch: None,
+            due_at: None,
+            routed_to: None,
+            bind: None,
+            eta_secs: None,
+        },
+    )
+    .unwrap();
+    crate::task_events::append(
+        &board,
+        &emitter,
+        TaskEvent::Done {
+            task_id: tid,
+            by: emitter.clone(),
+            source: crate::task_events::DoneSource::ReportAutoClose {
+                report_summary: "test done".into(),
+                closed_at: chrono::Utc::now().to_rfc3339(),
+            },
+        },
+    )
+    .unwrap();
+}
+
+/// RED：intent 檔已不存在（已處理／已刪除）→ 對應 episode 必須收掉。
+#[test]
+fn intent_gone_closes_preserved_episode() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-intent-gone");
+    let repo = setup_test_repo("hyg-intent-gone");
+    persist_aged_intent(&home, &repo, "review/gone-1", "t-intent-gone");
+
+    run_sweep(&home); // intent 仍 preserved → 開單
+    let episodes = intent_episode_ids(&home);
+    assert_eq!(
+        episodes.len(),
+        1,
+        "前置：preserved 的 aged intent 要有一張 episode"
+    );
+
+    for f in intent_files(&home) {
+        std::fs::remove_file(f).unwrap();
+    }
+    run_sweep(&home);
+
+    assert!(
+        !episode_is_open(&home, &episodes[0].0),
+        "intent 已不存在，episode 必須收掉"
+    );
+    let line = cancel_event_line(&home, &episodes[0].0);
+    assert!(
+        line.contains("cleanup intent") && line.contains("no longer"),
+        "close reason 必須寫明 intent 已解除: {line:?}"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED：reconcile 結果不再是 `preserved:*`（task 變 terminal、branch 不存在 →
+/// settled）→ episode 必須在同一個 tick 收掉。
+#[test]
+fn intent_settled_by_reconcile_closes_preserved_episode() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-intent-settled");
+    let repo = setup_test_repo("hyg-intent-settled");
+    persist_aged_intent(&home, &repo, "review/settled-1", "t-intent-settled");
+
+    run_sweep(&home); // task 不存在 → preserved:task_not_terminal → 開單
+    let episodes = intent_episode_ids(&home);
+    assert_eq!(episodes.len(), 1, "前置：應有一張 episode");
+
+    seed_done_task(&home, "t-intent-settled"); // 解除條件成立：task terminal，branch 本就不存在
+    run_sweep(&home);
+
+    assert!(
+        !episode_is_open(&home, &episodes[0].0),
+        "reconcile 已 settled，episode 必須收掉"
+    );
+    let line = cancel_event_line(&home, &episodes[0].0);
+    assert!(
+        line.contains("settled"),
+        "close reason 必須帶上 reconcile 結果: {line:?}"
+    );
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// 負向對照：intent 仍然 preserved → episode 保持 open，且沿用同一張單。
+#[test]
+fn still_preserved_intent_keeps_episode_open() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-intent-still");
+    let repo = setup_test_repo("hyg-intent-still");
+    persist_aged_intent(&home, &repo, "review/still-1", "t-intent-still");
+
+    run_sweep(&home);
+    let first = intent_episode_ids(&home);
+    run_sweep(&home);
+    let second = intent_episode_ids(&home);
+
+    assert_eq!(first.len(), 1, "前置：應有一張 episode");
+    assert_eq!(first, second, "仍 preserved 時不得收單，也不得換單");
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// 負向對照（判斷不了就不動）：intent 目錄裡有一個讀不懂的檔案，無法證明
+/// 「某個 intent 已經不在」，所以 episode 不得被收。
+#[test]
+fn unreadable_intent_state_keeps_episode_open() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-intent-ambiguous");
+    std::fs::create_dir_all(home.join("cleanup-intents")).unwrap();
+    std::fs::write(home.join("cleanup-intents/corrupt.json"), b"{ not json").unwrap();
+    let task = seed_episode(&home, &format!("{INTENT_KEY_PREFIX}0123456789abcdef"));
+
+    run_sweep(&home);
+
+    assert!(
+        episode_is_open(&home, &task),
+        "intent 狀態無法判讀時不得收單（寧可漏收不可誤收）"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// 沿用既有行為：收單之後同樣的 intent 再次卡住 → 重新開一張新單。
+#[test]
+fn intent_blocked_again_after_close_reopens_new_episode() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-intent-reopen");
+    let repo = setup_test_repo("hyg-intent-reopen");
+    persist_aged_intent(&home, &repo, "review/reopen-1", "t-intent-reopen");
+    run_sweep(&home);
+    let first = intent_episode_ids(&home);
+    assert_eq!(first.len(), 1, "前置：應有一張 episode");
+    for f in intent_files(&home) {
+        std::fs::remove_file(f).unwrap();
+    }
+    run_sweep(&home);
+    assert!(
+        intent_episode_ids(&home).is_empty(),
+        "前置：episode 應已收掉"
+    );
+
+    persist_aged_intent(&home, &repo, "review/reopen-1", "t-intent-reopen");
+    run_sweep(&home);
+
+    let again = intent_episode_ids(&home);
+    assert_eq!(again.len(), 1, "再次卡住必須重新開單: {again:?}");
+    assert_ne!(again[0].0, first[0].0, "必須是新單，不是復活舊單");
+    std::fs::remove_dir_all(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
