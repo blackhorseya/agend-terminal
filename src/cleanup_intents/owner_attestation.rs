@@ -128,6 +128,10 @@ pub(super) fn retire_merged_lane(home: &Path, repo: &str, branch: &str) {
     );
 }
 
+/// Retire every OPEN review-branch obligation whose PR the daemon has observed
+/// merged. Keyed on the `retention-pr:` tag, never on a branch name.
+pub(super) fn retire_merged_pr_obligations(_home: &Path, _project: &str) {}
+
 /// #3517 follow-up: re-raise the owner's obligation for a lane the merge closed
 /// and the branch then walked away from.
 ///

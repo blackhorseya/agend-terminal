@@ -12,8 +12,13 @@
 use super::{cleanup_merged_branch, task_active_for_branch, ReleaseOutcome};
 use std::path::Path;
 
+mod retention_pr;
+pub(super) use retention_pr::raise_retention_for_release;
+pub(crate) use retention_pr::retention_pr_tag;
 #[cfg(test)]
 mod retention_notify_tests;
+#[cfg(test)]
+mod retention_pr_tests;
 
 fn disposable_review_provisioned_head(
     binding: &serde_json::Value,
@@ -106,6 +111,20 @@ pub(crate) fn record_retention_obligation(
     origin_task_id: &str,
     owner: Option<&str>,
 ) {
+    record_retention_obligation_with_pr(home, repo, branch, head, origin_task_id, owner, None);
+}
+
+/// [`record_retention_obligation`], optionally carrying the `retention-pr:` tag
+/// that ties a review branch's obligation to the PR it reviewed.
+pub(crate) fn record_retention_obligation_with_pr(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    head: &str,
+    origin_task_id: &str,
+    owner: Option<&str>,
+    pr_tag: Option<String>,
+) {
     // `Some("")` keeps the release path's contract — a binding that names
     // nobody raises nothing. `None` is a different statement: the caller knows
     // the lane's row is ownerless, and an unowned lane still has to be asked
@@ -151,6 +170,7 @@ pub(crate) fn record_retention_obligation(
     if assignee.is_none() {
         tags.push(RETENTION_ORPHAN_TAG.to_string());
     }
+    tags.extend(pr_tag);
 
     use std::sync::atomic::{AtomicU64, Ordering};
     static RETENTION_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -419,14 +439,7 @@ pub(super) fn resolve_branch_cleanup(
                 let head = crate::git_helpers::git_cmd(Path::new(sr_str), &["rev-parse", branch])
                     .map(|tip| tip.trim().to_string())
                     .unwrap_or_default();
-                record_retention_obligation(
-                    home,
-                    sr_str,
-                    branch,
-                    &head,
-                    task_id,
-                    Some(binding["agent"].as_str().unwrap_or("")),
-                );
+                raise_retention_for_release(home, sr_str, branch, &head, task_id, binding);
             } else {
                 tracing::info!(
                     %branch, ?open_pr_status,
