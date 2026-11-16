@@ -21,7 +21,9 @@ jobs:
   # (8.1k+ tests, no single test over ~70s), which made them the PR wall-clock
   # bottleneck at 27/32 min. Shard 1 keeps every lint/build/smoke step; the
   # coverage wrapper contract (~6 min on Windows) runs in its own
-  # `coverage-wrapper` job so it is parallel to the build. ubuntu stays a
+  # `coverage-wrapper` job (ubuntu/windows) so it is parallel to the build.
+  # macOS runs it as a step of the last `check` shard instead, so a PR needs
+  # one fewer macOS runner (see the step comment). ubuntu stays a
   # single shard — it is not on the critical path. Re-measured at cb963452:
   # ubuntu 14-18 min vs windows 1/2 19-21 min and macos 1/2 19-21 min, so a
   # second ubuntu shard would not shorten the PR wall clock (the slowest job
@@ -140,9 +142,23 @@ jobs:
         shell: bash
         run: scripts/test_windows_native_symlink_canary.sh
 
-      # The Coverage wrapper contract test no longer runs here: it moved to the
-      # standalone `coverage-wrapper` job below (it needs no build, so it was only
-      # lengthening the last shard — ~5-6 min on windows 2/2 — in series).
+      # The Coverage wrapper contract test runs in the standalone
+      # `coverage-wrapper` job below on ubuntu/windows (it needs no build, so it
+      # was only lengthening the last shard — ~5-6 min on windows 2/2 — in
+      # series). macOS keeps it here, in the last shard: the standalone job cost
+      # every PR an extra macOS runner, and macOS arm64 runner capacity was short
+      # enough that jobs were cancelled with "not acquired by Runner" and needed
+      # a `rerun --failed` after the whole run ended. On macOS the wrapper only
+      # costs ~2 min in series, so the capacity saving outweighs it. Same
+      # script and budget as the standalone job; still exactly once per OS. The
+      # native-symlink premise variable is deliberately not set here: the script
+      # defaults it to off, and tests/windows_native_symlink_failclosed_invariant.rs
+      # pins it (by name, file-wide) to the Windows standalone step only.
+      - name: Coverage wrapper contract test (macOS)
+        if: runner.os == 'macOS' && matrix.shard == matrix.shards
+        timeout-minutes: 10
+        shell: bash
+        run: scripts/test_coverage_run.sh
 
       # The former standalone repository CI now runs from the monorepo checkout.
       # Keep the same Unix test/clippy/package coverage and Windows advisory
@@ -439,12 +455,14 @@ jobs:
   # room without hiding it: if the step approaches this budget again, split the
   # suite instead of raising the number a second time.
   #
-  # Standalone job (was the last `check` shard's step): scripts/test_coverage_run.sh
-  # stubs cargo/git/llvm tooling in its own sandbox, so it needs no Rust
-  # toolchain, no cache and no build — verified by running it with a PATH that
-  # has no cargo/rustc (116 passed, 0 failed). Running it in parallel instead of
-  # in series with the Windows test build takes ~5 min off windows 2/2, ~2 min
-  # off macos 2/2 and ~1.4 min off ubuntu. Runs exactly once per OS, as before.
+  # Standalone job for ubuntu/windows (was the last `check` shard's step):
+  # scripts/test_coverage_run.sh stubs cargo/git/llvm tooling in its own sandbox,
+  # so it needs no Rust toolchain, no cache and no build — verified by running it
+  # with a PATH that has no cargo/rustc (Windows: 110 passed, 6 skipped, 0
+  # failed). Running it in parallel instead of in series with the Windows test
+  # build takes ~5 min off windows 2/2 and ~1.4 min off ubuntu. macOS is not in
+  # this matrix: it runs the same script as a step of `check` macOS 2/2 (runner
+  # capacity, see above). Runs exactly once per OS, as before.
   coverage-wrapper:
     name: Coverage wrapper contract (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -452,7 +470,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
       - name: Coverage wrapper contract test
