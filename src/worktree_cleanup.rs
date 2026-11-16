@@ -611,6 +611,23 @@ pub fn sweep_from_registry(
             }
             Ok(_) => None,
         };
+        if fetch_fail.is_none() {
+            // -160 (c): a SUCCESSFUL `fetch --prune` is proof the degradation
+            // is gone. Close the repo's fetch-degraded episode so it stops
+            // lingering; a later failure re-opens a fresh task.
+            let key = format!("residue-fetch-degraded:{}", repo.display());
+            match crate::daemon::hygiene_task::close_episode_by_key(
+                home,
+                &key,
+                "fetch --prune succeeded: fetch degradation resolved",
+            ) {
+                Ok(true) => tracing::info!(key = %key, "hygiene episode closed: fetch recovered"),
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(key = %key, %error, "hygiene episode close failed")
+                }
+            }
+        }
         if let Some(reason) = fetch_fail {
             upsert_hygiene(
                 home,

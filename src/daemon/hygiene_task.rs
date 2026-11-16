@@ -142,6 +142,22 @@ pub fn close_episode(home: &Path, task_id: &TaskId, reason: &str) -> anyhow::Res
     }
 }
 
+/// Close the ACTIVE episode carrying exactly `key`, if there is one. Returns
+/// whether an episode was closed. The resolver calls this once it has PROVEN the
+/// condition is gone (e.g. `fetch --prune` just succeeded); no active episode is
+/// the normal steady state and is not an error. A recurrence re-opens a fresh
+/// task, per the episode contract above.
+pub fn close_episode_by_key(home: &Path, key: &str, reason: &str) -> anyhow::Result<bool> {
+    let mut closed = false;
+    for (task_id, active_key) in active_episodes(home)? {
+        if active_key == key {
+            close_episode(home, &task_id, reason)?;
+            closed = true;
+        }
+    }
+    Ok(closed)
+}
+
 /// r2 (§3.20 deterministic RED): test-only rendezvous at the stale-probe
 /// window — between capturing `(tid, n)` from a rejected create and issuing
 /// the update append. Lets a test hold N writers at the SAME probed `n`
