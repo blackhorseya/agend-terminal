@@ -1821,7 +1821,7 @@ pub(crate) fn tombstone_terminal_matches(home: &Path, repo: &str, branch: &str) 
 
 /// A6/A10b — DERIVE the RESERVED set for `prstate` from the active assignment
 /// records of its `(repo,branch)`: every active record whose stored `pr_number`
-/// equals `prstate.pr_number` AND whose evidence is NOT `SatisfiedExactHead`
+/// equals `prstate.pr_number` AND whose evidence is `Unengaged` (no receipt yet)
 /// (plan §1/I16). FULL-TYPED (`target`/`review_author`/`assignment_id`), generation-
 /// matched, Satisfied-excluded. Reads records LOCK-FREE ([`list_active_checked`]), so
 /// it is safe to call while the caller already holds the branch lock (the A6 drain
@@ -1837,7 +1837,10 @@ pub(crate) fn derive_reserved_for_prstate(
     Ok(list_active_checked(home, repo, branch)?
         .into_iter()
         .filter(|r| r.pr_number == prstate.pr_number)
-        .filter(|r| classify_assignment(r, Some(prstate)) != AssignmentEvidence::SatisfiedExactHead)
+        // 只有 Unengaged 才是 reservation：已有 receipt 的 assignment（VERIFIED 或
+        // REJECTED / UNVERIFIED）不再保留，非 VERIFIED 由 receipt 本身擋 merge，
+        // 否則下一次推導會把剛釋放的 reservation 加回來。
+        .filter(|r| classify_assignment(r, Some(prstate)) == AssignmentEvidence::Unengaged)
         .map(|r| ReservedAssignment {
             target: r.target,
             review_author: r.review_author,

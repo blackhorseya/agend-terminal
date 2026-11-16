@@ -1786,15 +1786,27 @@ fn apply_receipt_to_state(
     // Containment (not task68's append-only/worst-verdict ledger): keep one
     // current authoritative receipt per assignment. Slot is routing metadata,
     // not a uniqueness key; independent reviewers may share a slot.
-    state
-        .validated_review_receipts
-        .retain(|old| old.assignment_id != receipt.assignment_id);
+    // 同一位 reviewer 在同一 subject（repo/PR/branch/class/head）重審時，新
+    // assignment 的 receipt 取代舊 receipt，以抵達順序為準；不同 reviewer 的
+    // receipt 互不影響，dual 的 N-of-M 計數不變。
+    state.validated_review_receipts.retain(|old| {
+        old.assignment_id != receipt.assignment_id
+            && !(old.reviewer_instance_id == receipt.reviewer_instance_id
+                && old.repo == receipt.repo
+                && old.pr_number == receipt.pr_number
+                && old.branch == receipt.branch
+                && old.review_class == receipt.review_class
+                && old.reviewed_head == receipt.reviewed_head)
+    });
+    // 任何 verdict 的 receipt 落地都釋放 reservation：該 assignment 本身，以及同一
+    // reviewer 被這次重審取代的舊 assignment（authority 每個 target 只留一筆 record）。
+    // REJECTED / UNVERIFIED 仍由 receipt 本身擋 merge（NonVerifiedReceipt），直到被
+    // 同一位 reviewer 的新 receipt 取代。
+    let reviewer_name = receipt.reviewer_name.clone();
     state.validated_review_receipts.push(receipt);
-    if matches!(verdict, crate::review_receipt::ReviewVerdict::Verified) {
-        state
-            .reserved_assignments
-            .retain(|reserved| reserved.assignment_id != assignment_id);
-    }
+    state.reserved_assignments.retain(|reserved| {
+        reserved.assignment_id != assignment_id && reserved.target != reviewer_name
+    });
     let kind = match verdict {
         crate::review_receipt::ReviewVerdict::Verified => VerdictKind::Verified,
         crate::review_receipt::ReviewVerdict::Rejected => VerdictKind::Rejected { reason: None },
