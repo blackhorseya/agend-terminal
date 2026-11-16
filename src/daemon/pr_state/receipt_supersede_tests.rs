@@ -573,11 +573,20 @@ fn dual_supersede_and_missing_receipt_fail_closed() {
             verdict,
         }
     };
-    apply_receipt_to_state(
+    // 裸 state 沒有 record：每張 receipt 明確給派發序號（reviewer one 的第二張較晚派）。
+    let mut next_seq = 0u64;
+    let mut apply_with_seq = |state: &mut PrState, receipt: ReviewReceiptSummary| {
+        next_seq += 1;
+        state
+            .receipt_dispatch_seq
+            .insert(receipt.assignment_id, next_seq);
+        apply_receipt_to_state(state, receipt);
+    };
+    apply_with_seq(
         &mut state,
         make("one", reviewer_one, ReviewVerdict::Rejected),
     );
-    apply_receipt_to_state(
+    apply_with_seq(
         &mut state,
         make("two", reviewer_two, ReviewVerdict::Verified),
     );
@@ -585,7 +594,7 @@ fn dual_supersede_and_missing_receipt_fail_closed() {
         merge_readiness(&state),
         Err(MergeDeficit::NonVerifiedReceipt { .. })
     ));
-    apply_receipt_to_state(
+    apply_with_seq(
         &mut state,
         make("one", reviewer_one, ReviewVerdict::Verified),
     );
@@ -1048,5 +1057,81 @@ fn dispatch_seq_is_monotonic_across_record_removal() {
         store::probe_branch_authority(&home, REPO, BRANCH),
         store::BranchAuthority::Unreadable
     ));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ───────── 兩邊都缺 dispatch_seq（升級前的舊資料）：fail closed，不依抵達順序取代 ─────────
+//
+// 在 main 上實測，「依抵達順序取代」本身就是 fail-open（晚到的舊 VERIFIED 會推翻較新的
+// REJECTED）；缺序號的舊資料正好走這條路，所以兩邊都缺序號時也要視為順序無法證明。
+
+/// 晚到的舊 VERIFIED：A1、A2 都是舊資料（缺 seq）。A2 REJECTED 先落地，A1 VERIFIED
+/// 晚到：兩張都保留、什麼都不退役，gate 保持關閉。
+#[test]
+fn legacy_both_missing_seq_late_old_verified_keeps_gate_closed() {
+    let home = home("legacy-late-old");
+    let head = "d".repeat(40);
+    seed_state(&home, &head);
+    let reviewer = crate::types::InstanceId::new();
+    let a1 = assign(&home, "old-reviewer-name", reviewer, &head, "t-review-1");
+    let a2 = assign(&home, "new-reviewer-name", reviewer, &head, "t-review-2");
+    set_dispatch_seq(&home, "old-reviewer-name", None);
+    set_dispatch_seq(&home, "new-reviewer-name", None);
+    submit(&home, &a2, ReviewVerdict::Rejected);
+    submit(&home, &a1, ReviewVerdict::Verified);
+    store::redrive_reserved(&home, REPO, BRANCH);
+
+    assert_eq!(
+        load(&home, REPO, BRANCH)
+            .unwrap()
+            .validated_review_receipts
+            .len(),
+        2,
+        "順序無法證明時不得取代"
+    );
+    assert!(record_exists(&home, "old-reviewer-name"));
+    assert!(record_exists(&home, "new-reviewer-name"));
+    assert!(
+        matches!(
+            readiness(&home),
+            Err(MergeDeficit::NonVerifiedReceipt { .. })
+        ),
+        "實際 {:?}",
+        readiness(&home)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// 同名重審 REJECTED → VERIFIED，兩邊都缺 seq：保持擋住（升級前就派出的重審需要重新
+/// 派審一次，不需要 force）。
+#[test]
+fn legacy_both_missing_seq_same_name_re_review_stays_blocked() {
+    let home = home("legacy-same-name");
+    let head = "e".repeat(40);
+    seed_state(&home, &head);
+    let reviewer = crate::types::InstanceId::new();
+    let r1 = assign(&home, "reviewer", reviewer, &head, "t-review-1");
+    set_dispatch_seq(&home, "reviewer", None);
+    submit(&home, &r1, ReviewVerdict::Rejected);
+    let r2 = assign(&home, "reviewer", reviewer, &head, "t-review-2");
+    set_dispatch_seq(&home, "reviewer", None);
+    submit(&home, &r2, ReviewVerdict::Verified);
+    store::redrive_reserved(&home, REPO, BRANCH);
+
+    assert_eq!(
+        load(&home, REPO, BRANCH)
+            .unwrap()
+            .validated_review_receipts
+            .len(),
+        2
+    );
+    assert!(
+        matches!(
+            readiness(&home),
+            Err(MergeDeficit::NonVerifiedReceipt { .. })
+        ),
+        "實際 {:?}",
+        readiness(&home)
+    );
     let _ = std::fs::remove_dir_all(&home);
 }
