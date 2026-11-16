@@ -782,9 +782,10 @@ fn buffered_older_verified_does_not_replace_newer_rejected() {
     let _ = std::fs::remove_dir_all(&home);
 }
 
-/// 對稱情形：緩衝的舊 REJECTED 不得推翻 state 裡較新的 VERIFIED。
+/// 緩衝的舊 REJECTED 重放時，state 已有較新的 VERIFIED：非 VERIFIED 永遠不丟掉（過時的
+/// 非 VERIFIED 保留、繼續擋 merge；最壞只是多擋、需要重新派審），不放行。
 #[test]
-fn buffered_older_rejected_does_not_replace_newer_verified() {
+fn buffered_older_rejected_is_kept_and_blocks_next_to_newer_verified() {
     let home = home("buffered-late-old-rejected");
     let head = "6".repeat(40);
     let reviewer = crate::types::InstanceId::new();
@@ -796,15 +797,27 @@ fn buffered_older_rejected_does_not_replace_newer_verified() {
     ci_tick_green(&home, &head);
 
     let state = load(&home, REPO, BRANCH).unwrap();
-    assert_eq!(state.validated_review_receipts.len(), 1);
     assert_eq!(
-        state.validated_review_receipts[0].assignment_id,
-        a2.assignment_id
+        state.validated_review_receipts.len(),
+        2,
+        "過時的非 VERIFIED 必須保留（不取代也不被取代）"
     );
+    assert!(
+        matches!(
+            readiness(&home),
+            Err(MergeDeficit::NonVerifiedReceipt { .. })
+        ),
+        "保留的 REJECTED 必須擋住，實際 {:?}",
+        readiness(&home)
+    );
+    // 之後同 reviewer 重新審查（序號更大）一次 VERIFIED 就能放行，不需要 force。
+    let a3 = assign(&home, "third-reviewer-name", reviewer, &head, "t-review-3");
+    submit(&home, &a3, ReviewVerdict::Verified);
+    store::redrive_reserved(&home, REPO, BRANCH);
     assert_eq!(
         readiness(&home),
         Ok(()),
-        "reconcile 後舊名 record 不得復活成 reservation: {:?}",
+        "重新審查後仍被擋: {:?}",
         reserved_targets(&home)
     );
     let _ = std::fs::remove_dir_all(&home);
@@ -1124,6 +1137,183 @@ fn legacy_both_missing_seq_same_name_re_review_stays_blocked() {
             .validated_review_receipts
             .len(),
         2
+    );
+    assert!(
+        matches!(
+            readiness(&home),
+            Err(MergeDeficit::NonVerifiedReceipt { .. })
+        ),
+        "實際 {:?}",
+        readiness(&home)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+// ───────── 計數器遺失／回退：序號不得小於 PR state 已記錄的序號（PR #35 r2 P1）─────────
+//
+// PR state 裡的 `receipt_dispatch_seq` 是比較的另一半。就算 active record 都被 cleanup
+// 移除、計數器檔也不見了，新配發的序號仍必須大於 PR state 已記錄的任何序號；否則較新派發
+// 的 REJECTED 會被當成「過時」而忽略，gate 因此打開。
+
+fn rejected_receipt_for(
+    assignment: &ActiveAssignment,
+    reviewer: crate::types::InstanceId,
+    head: &str,
+) -> crate::review_receipt::ValidatedCodeReviewReceipt {
+    let source_id = format!("m-{}", uuid::Uuid::new_v4());
+    crate::review_receipt::ValidatedCodeReviewReceipt::for_test(ReviewReceiptSummary {
+        receipt_id: format!("review-receipt:{source_id}"),
+        source_id,
+        evidence_digest: "a".repeat(64),
+        assignment_id: assignment.assignment_id,
+        reviewer_instance_id: reviewer,
+        reviewer_name: assignment.target.clone(),
+        repo: REPO.into(),
+        pr_number: PR,
+        branch: BRANCH.into(),
+        task_id: assignment.task_id.clone(),
+        reviewed_head: head.to_string(),
+        review_class: ReviewClass::Single,
+        slot: ReviewSlot::Primary,
+        verdict: ReviewVerdict::Rejected,
+    })
+}
+
+/// reviewer 的 missing_counter probe：舊 VERIFIED 已在 state（序號 2），record 全被 cleanup
+/// 移除，計數器檔遺失，之後新派的 assignment 序號必須大於 2，它的 REJECTED 必須生效。
+#[test]
+fn missing_counter_after_record_cleanup_does_not_ignore_newer_rejection() {
+    let home = home("missing-counter");
+    let head = "f".repeat(40);
+    seed_state(&home, &head);
+    let reviewer = crate::types::InstanceId::new();
+    let _dummy = assign(
+        &home,
+        "dummy",
+        crate::types::InstanceId::new(),
+        &head,
+        "t-dummy",
+    );
+    let old = assign(&home, "old-reviewer-name", reviewer, &head, "t-old");
+    let old_seq = dispatch_seq_of(&home, "old-reviewer-name").unwrap();
+    submit(&home, &old, ReviewVerdict::Verified);
+    for target in ["dummy", "old-reviewer-name"] {
+        std::fs::remove_file(store::record_path_for_test(&home, REPO, BRANCH, target)).unwrap();
+    }
+    std::fs::remove_file(store::branch_dir(&home, REPO, BRANCH).join("dispatch-seq.counter"))
+        .unwrap();
+
+    let newer = assign(&home, "new-reviewer-name", reviewer, &head, "t-new");
+    let new_seq = dispatch_seq_of(&home, "new-reviewer-name").unwrap();
+    assert!(
+        new_seq > old_seq,
+        "計數器遺失後序號倒退: old={old_seq} new={new_seq}"
+    );
+    let _ = record_validated_receipt(&home, &rejected_receipt_for(&newer, reviewer, &head), None);
+    store::redrive_reserved(&home, REPO, BRANCH);
+    assert!(
+        matches!(
+            readiness(&home),
+            Err(MergeDeficit::NonVerifiedReceipt { .. })
+        ),
+        "較新派發的 REJECTED 必須擋住 merge，實際 {:?}",
+        readiness(&home)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// 計數器被改小（回退）同樣不得讓序號倒退。
+#[test]
+fn lowered_counter_does_not_regress_dispatch_seq() {
+    let home = home("lowered-counter");
+    let head = "f".repeat(40);
+    seed_state(&home, &head);
+    let reviewer = crate::types::InstanceId::new();
+    let old = assign(&home, "old-reviewer-name", reviewer, &head, "t-old");
+    let old_seq = dispatch_seq_of(&home, "old-reviewer-name").unwrap();
+    submit(&home, &old, ReviewVerdict::Verified);
+    let _ = std::fs::remove_file(store::record_path_for_test(
+        &home,
+        REPO,
+        BRANCH,
+        "old-reviewer-name",
+    ));
+    std::fs::write(
+        store::branch_dir(&home, REPO, BRANCH).join("dispatch-seq.counter"),
+        "0",
+    )
+    .unwrap();
+
+    let _newer = assign(&home, "new-reviewer-name", reviewer, &head, "t-new");
+    let new_seq = dispatch_seq_of(&home, "new-reviewer-name").unwrap();
+    assert!(
+        new_seq > old_seq,
+        "計數器回退後序號倒退: old={old_seq} new={new_seq}"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// PR state 檔存在但讀不出來時，無法確認序號下限：persist 必須失敗（fail closed），
+/// 不得在不知道下限的情況下配發序號。
+#[test]
+fn unreadable_pr_state_makes_persist_fail_closed() {
+    let home = home("unreadable-state");
+    let head = "f".repeat(40);
+    seed_state(&home, &head);
+    let state_path = pr_state_dir(&home).join(pr_state_filename(REPO, BRANCH));
+    std::fs::write(&state_path, "{ not json").unwrap();
+    let record = ActiveAssignment::new_pending_typed(
+        REPO,
+        BRANCH,
+        "reviewer",
+        crate::types::InstanceId::new(),
+        PR,
+        &head,
+        ReviewSlot::Primary,
+        "lead",
+        "t-review",
+        ReviewClass::Single,
+        ReviewAuthor::External("octocat".into()),
+        "review",
+        None,
+        None,
+        "2026-11-16T00:00:00Z",
+    );
+    assert!(
+        store::persist(&home, &record).is_err(),
+        "PR state 讀不出來時不得配發序號"
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// 不對稱規則：不論 seq 為什麼出錯（計數器遺失、被改、舊資料……），「過時」的非 VERIFIED
+/// receipt 都不能被丟掉，也不能因此放行。這裡直接把新派發 A2 的序號改成比舊 VERIFIED
+/// 還小，模擬序號錯誤：A2 的 REJECTED 必須保留並擋住 merge。
+#[test]
+fn stale_non_verified_receipt_is_never_dropped_even_with_broken_seq() {
+    let home = home("broken-seq-rejected");
+    let head = "f".repeat(40);
+    seed_state(&home, &head);
+    let reviewer = crate::types::InstanceId::new();
+    let old = assign(&home, "old-reviewer-name", reviewer, &head, "t-old");
+    set_dispatch_seq(&home, "old-reviewer-name", Some(100));
+    submit(&home, &old, ReviewVerdict::Verified);
+    let newer = assign(&home, "new-reviewer-name", reviewer, &head, "t-new");
+    set_dispatch_seq(&home, "new-reviewer-name", Some(1));
+    let _ = record_validated_receipt(&home, &rejected_receipt_for(&newer, reviewer, &head), None);
+    store::redrive_reserved(&home, REPO, BRANCH);
+
+    assert_eq!(
+        load(&home, REPO, BRANCH)
+            .unwrap()
+            .validated_review_receipts
+            .len(),
+        2,
+        "序號看起來過時的 REJECTED 也必須保留"
+    );
+    assert!(
+        record_exists(&home, "new-reviewer-name"),
+        "不得因此退役它自己的 record"
     );
     assert!(
         matches!(
