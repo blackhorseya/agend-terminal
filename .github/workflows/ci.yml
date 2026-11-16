@@ -150,13 +150,14 @@ jobs:
       # enough that jobs were cancelled with "not acquired by Runner" and needed
       # a `rerun --failed` after the whole run ended. On macOS the wrapper only
       # costs ~2 min in series, so the capacity saving outweighs it. Same
-      # command and budget as the standalone job; still exactly once per OS.
+      # script and budget as the standalone job; still exactly once per OS. The
+      # native-symlink premise variable is deliberately not set here: the script
+      # defaults it to off, and tests/windows_native_symlink_failclosed_invariant.rs
+      # pins it (by name, file-wide) to the Windows standalone step only.
       - name: Coverage wrapper contract test (macOS)
         if: runner.os == 'macOS' && matrix.shard == matrix.shards
         timeout-minutes: 10
         shell: bash
-        env:
-          COVERAGE_REQUIRE_NATIVE_SYMLINKS: "0"
         run: scripts/test_coverage_run.sh
 
       # The former standalone repository CI now runs from the monorepo checkout.
