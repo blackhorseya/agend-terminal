@@ -599,3 +599,73 @@ fn dual_supersede_and_missing_receipt_fail_closed() {
         Err(MergeDeficit::InsufficientVerified { have: 1, need: 2 })
     ));
 }
+
+/// verdict_buffer 重放路徑：PR state 尚不存在時，A1（舊名）與 A2（新名，同 InstanceId）
+/// 的 receipt 都先被緩衝；state 建立後由 `record_ci_result`（持有 assignment lock）
+/// 重放，同 instance 的後一張取代前一張。回傳重放並 redrive 之後的 home。
+/// 緩衝目錄的讀取順序不是抵達順序，所以呼叫端的斷言不得依賴誰贏。
+fn buffered_rename_replay(
+    tag: &str,
+    first: ReviewVerdict,
+    second: ReviewVerdict,
+) -> std::path::PathBuf {
+    let home = home(tag);
+    let head = "2".repeat(40);
+    let reviewer = crate::types::InstanceId::new();
+
+    let r1 = assign(&home, "old-reviewer-name", reviewer, &head, "t-review-1");
+    let r2 = assign(&home, "new-reviewer-name", reviewer, &head, "t-review-2");
+    // subject 不存在：兩張 receipt 都進 typed buffer。
+    submit(&home, &r1, first);
+    submit(&home, &r2, second);
+    assert!(load(&home, REPO, BRANCH).is_none(), "state 尚未建立");
+
+    with_pr_state_or_create(
+        &home,
+        REPO,
+        BRANCH,
+        || {
+            let mut state = new_for_branch(REPO, BRANCH, &head, ReviewClass::Single);
+            state.pr_number = PR;
+            state.draft_state = DraftState::Ready;
+            state
+        },
+        |_| {},
+    )
+    .unwrap();
+    record_ci_result(
+        &home,
+        REPO,
+        BRANCH,
+        &head,
+        CiConclusion::Green,
+        vec!["lead".into()],
+        ReviewClass::Single,
+    );
+    store::redrive_reserved(&home, REPO, BRANCH);
+    home
+}
+
+/// 兩張都是 VERIFIED：無論哪一張被取代，被取代那張的舊 record 必須一併退役，
+/// reconcile 後不得被重新推導成 reservation。
+#[test]
+fn buffered_replay_retires_superseded_old_name_record() {
+    let home = buffered_rename_replay(
+        "buffered-replay",
+        ReviewVerdict::Verified,
+        ReviewVerdict::Verified,
+    );
+    let state = load(&home, REPO, BRANCH).unwrap();
+    assert_eq!(
+        state.validated_review_receipts.len(),
+        1,
+        "重放後同 instance 只留一張 receipt"
+    );
+    assert_eq!(
+        readiness(&home),
+        Ok(()),
+        "重放取代後被取代的 record 被重新推導成 reservation: {:?}",
+        reserved_targets(&home)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
