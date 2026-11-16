@@ -58,6 +58,7 @@ pub(super) fn new_state(head: &str, class: ReviewClass) -> PrState {
         ci_state: CiState::Pending,
         verdict_state: VerdictState::None,
         validated_review_receipts: Vec::new(),
+        receipt_dispatch_seq: std::collections::BTreeMap::new(),
         merge_state: MergeState::NotReady,
         draft_state: DraftState::Ready,
         review_class: class,

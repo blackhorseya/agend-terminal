@@ -110,6 +110,12 @@ pub(crate) struct ActiveAssignment {
     pub repo: String,
     pub branch: String,
     pub target: String,
+    /// 派發順序：同一個 `(repo,branch)` 內、在 assignment lock 內由持久計數器配發的
+    /// 單調序號（[`persist`] 配發，之後不變）。取代／退役同 reviewer 的舊 assignment
+    /// 只能依這個序號判斷，不得使用 wall-clock `created_at`。`None` ＝ 舊資料，順序無法
+    /// 證明，一律視為無法排序。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dispatch_seq: Option<u64>,
 }
 
 impl ActiveAssignment {
@@ -169,6 +175,7 @@ impl ActiveAssignment {
             repo: repo.into(),
             branch: branch.into(),
             target: target.into(),
+            dispatch_seq: None,
         }
     }
 
@@ -1040,6 +1047,64 @@ pub(crate) fn terminal_markers(home: &Path, repo: &str, branch: &str) -> Termina
 
 // ─────────────────────────── operations ───────────────────────────
 
+/// PR state 裡 `receipt_dispatch_seq` 的最大值；檔案不存在 → 0；讀不出來或解析失敗 → `Err`。
+fn max_state_dispatch_seq(home: &Path, repo: &str, branch: &str) -> anyhow::Result<u64> {
+    let path = crate::daemon::pr_state::pr_state_dir(home)
+        .join(crate::daemon::pr_state::pr_state_filename(repo, branch));
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => anyhow::bail!("unreadable pr-state {}: {e}", path.display()),
+    };
+    let state: crate::daemon::pr_state::PrState = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("unparseable pr-state {}: {e}", path.display()))?;
+    Ok(state
+        .receipt_dispatch_seq
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(0))
+}
+
+/// 單調的派發序號計數器：每個 `(repo,branch)` 一個檔案，與 record 分開存放，所以
+/// record 全部退役後也不會歸零。副檔名不是 `.json`，不會被 record 掃描讀成 record。
+/// 呼叫端必須持有該 branch 的 assignment lock。配發值 ＝ max(計數器, 現存 record
+/// 的最大序號) + 1，所以即使計數器檔被刪也不會小於現存 record；計數器存在但無法讀成
+/// 數字時回 `Err`（fail closed）。
+fn allocate_dispatch_seq(home: &Path, repo: &str, branch: &str) -> anyhow::Result<u64> {
+    let counter_path = branch_dir(home, repo, branch).join("dispatch-seq.counter");
+    let stored = match std::fs::read_to_string(&counter_path) {
+        Ok(text) => text.trim().parse::<u64>().map_err(|e| {
+            anyhow::anyhow!(
+                "corrupt dispatch seq counter {}: {e}",
+                counter_path.display()
+            )
+        })?,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(e) => anyhow::bail!(
+            "unreadable dispatch seq counter {}: {e}",
+            counter_path.display()
+        ),
+    };
+    let max_record = list_active_checked(home, repo, branch)?
+        .iter()
+        .filter_map(|r| r.dispatch_seq)
+        .max()
+        .unwrap_or(0);
+    // PR state 裡已記錄的 receipt 序號也是下限：record 全被 cleanup、計數器遺失或被改小
+    // 時，新序號仍不得小於 state 已記錄的序號（否則序號就不再反映派發順序）。PR state
+    // 存在但讀不出來時無法確認下限，回 `Err`（fail closed）；不存在（第一次、或從沒有
+    // receipt）則下限為 0，正常派發。
+    let max_state = max_state_dispatch_seq(home, repo, branch)?;
+    let next = stored
+        .max(max_record)
+        .max(max_state)
+        .checked_add(1)
+        .ok_or_else(|| anyhow::anyhow!("dispatch seq counter overflow"))?;
+    atomic_write_json(&counter_path, &next)?;
+    Ok(next)
+}
+
 /// A1 — persist a fresh record (`row = Pending`). Writes ONLY the record (never a
 /// `PrState` or an inbox row — I9). Rejects `pr_number == 0` as a caller error
 /// (defense-in-depth; the dispatch gate already enforces nonzero).
@@ -1091,7 +1156,22 @@ pub(crate) fn persist(home: &Path, record: &ActiveAssignment) -> anyhow::Result<
                 }
             }
         }
-        atomic_write_json(&path, record)?;
+        // 派發序號：同 id 的重複 persist 沿用磁碟上的序號（舊資料缺序號就維持缺）；
+        // 新 assignment 在這把 lock 內配發。計數器讀不出來就讓 persist 失敗，絕不從頭
+        // 開始（序號倒退會讓較舊的 assignment 看起來比較新）。
+        let mut to_write = record.clone();
+        match read_record(&path)? {
+            Some(old) if old.assignment_id == record.assignment_id => {
+                to_write.dispatch_seq = old.dispatch_seq;
+            }
+            _ => {
+                if to_write.dispatch_seq.is_none() {
+                    to_write.dispatch_seq =
+                        Some(allocate_dispatch_seq(home, &record.repo, &record.branch)?);
+                }
+            }
+        }
+        atomic_write_json(&path, &to_write)?;
         Ok(())
     })();
     if let Some(task_id) = cleanup_task {
@@ -1320,6 +1400,76 @@ fn retire_delivery_under_lock(
     }
 
     remove_if_assignment_matches_strict(&path, expected_id)
+}
+
+/// 退役「派發順序比 `bound_seq` 更早」的同 reviewer instance assignment record
+/// （reviewer 改名後 record key 不同，不會被新名 `persist` 取代）。用在兩種情形：
+/// 新 receipt 取代了舊 receipt（`ids` ＝ 被取代 receipt 的 assignment，`bound_seq` ＝
+/// 新 receipt 的 assignment 序號）；以及晚到的舊 receipt 被判定過時（`ids` ＝ 它自己的
+/// assignment，`bound_seq` ＝ 已在 state 裡、較新 receipt 的序號）。
+///
+/// 呼叫端必須已持有該 branch 的 assignment lock。只退役同時符合下列條件的 record：
+/// assignment_id 在 `ids` 內、同 repo/branch/PR/InstanceId，且 record 與 `bound_seq`
+/// 都有序號、record 的序號嚴格小於 `bound_seq`。任一邊缺序號或相等就什麼都不退役；
+/// 整個判斷不使用 wall-clock `created_at`。任何失敗都保留 record（fail closed）。
+/// 回傳需在鎖外執行 terminal cleanup 的 task id。
+pub(crate) fn retire_older_assignments(
+    home: &Path,
+    receipt: &crate::review_receipt::ReviewReceiptSummary,
+    ids: &[uuid::Uuid],
+    bound_seq: Option<u64>,
+) -> Vec<String> {
+    let mut cleanup_tasks = Vec::new();
+    let Some(bound_seq) = bound_seq else {
+        return cleanup_tasks;
+    };
+    if ids.is_empty() {
+        return cleanup_tasks;
+    }
+    let records = match list_active_checked(home, &receipt.repo, &receipt.branch) {
+        Ok(records) => records,
+        Err(e) => {
+            tracing::warn!(
+                repo = %receipt.repo, branch = %receipt.branch, error = %e,
+                "older assignment retirement skipped (authority unreadable); keeping records"
+            );
+            return cleanup_tasks;
+        }
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    for record in records {
+        if !ids.contains(&record.assignment_id)
+            || record.pr_number != receipt.pr_number
+            || record.target_instance_id != Some(receipt.reviewer_instance_id)
+            || record.dispatch_seq.is_none_or(|seq| seq >= bound_seq)
+        {
+            continue;
+        }
+        if let Err(e) = retire_under_lock(
+            home,
+            &receipt.repo,
+            &receipt.branch,
+            &record.target,
+            record.assignment_id,
+            &now,
+            &mut cleanup_tasks,
+        ) {
+            tracing::warn!(
+                repo = %receipt.repo, branch = %receipt.branch, target = %record.target,
+                error = %e,
+                "older assignment retirement failed; keeping record (fail closed)"
+            );
+        }
+    }
+    cleanup_tasks
+}
+
+/// 讀出某個 assignment 在磁碟上的派發序號（receipt 落地時在 assignment lock 內蓋進
+/// PR state；序號來源只能是磁碟上的 record，不能是 receipt 的 payload）。
+pub(crate) fn dispatch_seq_of_assignment(home: &Path, assignment_id: uuid::Uuid) -> Option<u64> {
+    lookup_by_assignment_id_strict(home, assignment_id)
+        .ok()
+        .and_then(|record| record.dispatch_seq)
 }
 
 pub(crate) fn retire_if_id_matches(
