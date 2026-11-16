@@ -196,6 +196,13 @@ pub struct FleetConfig {
     /// (`~` expanded). Checked before team derivation — see `crate::gh_identity`.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub gh_identities: HashMap<String, String>,
+    /// -160: SSH host aliases (ssh-config `Host` names, matched exactly) the
+    /// operator declares to be github.com, e.g. `github_ssh_aliases:
+    /// [github-work]`. Remotes like `git@github-work:owner/repo.git` are then
+    /// treated as GitHub for open-PR lookups; any alias not listed is NOT, no
+    /// matter its name or what `~/.ssh/config` says. Empty/absent = none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub github_ssh_aliases: Vec<String>,
     /// #1440: fleet-wide env keys to pass through to every agent backend when
     /// `AGEND_ENV_ISOLATION` is on (additive with per-instance
     /// `passthrough_env`). Still gated by `is_sensitive_env_key`, so listing

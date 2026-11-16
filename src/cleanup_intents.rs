@@ -17,6 +17,36 @@ fn intent_key(repo: &str, branch: &str) -> String {
     format!("{:016x}", h.finish())
 }
 
+/// Candidate ids of every intent that is still on disk, or `None` when the
+/// intent store cannot be read completely (unreadable dir/entry/file, or a file
+/// that does not parse). A missing directory is a fact — no intents — but an
+/// unreadable one is not, and `None` tells the caller it may NOT conclude that
+/// an intent is gone (-160 c: absence is only proven by a complete listing).
+pub(crate) fn live_intent_ids(home: &Path) -> Option<std::collections::HashSet<String>> {
+    let entries = match std::fs::read_dir(intents_dir(home)) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Some(std::collections::HashSet::new())
+        }
+        Err(_) => return None,
+    };
+    let mut ids = std::collections::HashSet::new();
+    for entry in entries {
+        let path = entry.ok()?.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("json") {
+            continue;
+        }
+        // An unreadable/unparseable file makes the listing incomplete, so the
+        // whole answer becomes "unknown" (`None`) — deliberately NOT `continue`.
+        let Ok(body) = std::fs::read_to_string(&path) else {
+            return None;
+        };
+        let intent: CleanupIntent = serde_json::from_str(&body).ok()?;
+        ids.insert(intent_key(&intent.repo, &intent.branch));
+    }
+    Some(ids)
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub(crate) struct CleanupIntent {
     pub repo: String,

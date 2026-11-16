@@ -51,13 +51,20 @@ const EMITTER: &str = "system:hygiene";
 #[derive(Debug, PartialEq, Eq)]
 pub enum HygieneUpsert {
     Created(TaskId),
+    /// The active episode's EVIDENCE changed and was rewritten.
     Updated(TaskId),
+    /// Re-observation of an episode whose evidence is identical; at most
+    /// `last_seen`/`occurrences` bookkeeping was written. Callers should not
+    /// treat this as news (-160 d: it was ~20k log lines a day at info).
+    Unchanged(TaskId),
 }
 
 impl HygieneUpsert {
     pub fn task_id(&self) -> &TaskId {
         match self {
-            HygieneUpsert::Created(t) | HygieneUpsert::Updated(t) => t,
+            HygieneUpsert::Created(t) | HygieneUpsert::Updated(t) | HygieneUpsert::Unchanged(t) => {
+                t
+            }
         }
     }
 }
@@ -140,6 +147,22 @@ pub fn close_episode(home: &Path, task_id: &TaskId, reason: &str) -> anyhow::Res
         Ok(_) => Ok(()),
         Err(e) => anyhow::bail!("hygiene episode close skipped: {e}"),
     }
+}
+
+/// Close the ACTIVE episode carrying exactly `key`, if there is one. Returns
+/// whether an episode was closed. The resolver calls this once it has PROVEN the
+/// condition is gone (e.g. `fetch --prune` just succeeded); no active episode is
+/// the normal steady state and is not an error. A recurrence re-opens a fresh
+/// task, per the episode contract above.
+pub fn close_episode_by_key(home: &Path, key: &str, reason: &str) -> anyhow::Result<bool> {
+    let mut closed = false;
+    for (task_id, active_key) in active_episodes(home)? {
+        if active_key == key {
+            close_episode(home, &task_id, reason)?;
+            closed = true;
+        }
+    }
+    Ok(closed)
 }
 
 /// r2 (§3.20 deterministic RED): test-only rendezvous at the stale-probe
@@ -353,7 +376,7 @@ pub fn upsert_system_hygiene_task(
                     });
                 if !evidence_changed && !last_seen_due {
                     // Nothing a reader would learn from — append nothing.
-                    return Ok(HygieneUpsert::Updated(tid));
+                    return Ok(HygieneUpsert::Unchanged(tid));
                 }
                 let mut update = Vec::with_capacity(4);
                 if evidence_changed {
@@ -392,7 +415,13 @@ pub fn upsert_system_hygiene_task(
                         }
                     }
                 })? {
-                    Ok(_) => return Ok(HygieneUpsert::Updated(tid)),
+                    Ok(_) => {
+                        return Ok(if evidence_changed {
+                            HygieneUpsert::Updated(tid)
+                        } else {
+                            HygieneUpsert::Unchanged(tid)
+                        })
+                    }
                     // Fresh episode state → CAS-retry; None (closed) → create path.
                     Err(_) => {
                         probe = seen;

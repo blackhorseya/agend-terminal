@@ -129,6 +129,7 @@ mod tests {
             instances: Default::default(),
             teams: Default::default(),
             gh_identities: Default::default(),
+            github_ssh_aliases: Vec::new(),
             passthrough_env: Vec::new(),
             channel: Some(ChannelConfig::Telegram {
                 bot_token_env: "TG_TOKEN".into(),

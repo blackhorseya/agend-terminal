@@ -13,7 +13,7 @@ use parking_lot::Mutex;
 
 pub(super) static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-fn setup_test_repo(tag: &str) -> PathBuf {
+pub(super) fn setup_test_repo(tag: &str) -> PathBuf {
     setup_test_repo_with_default(tag, "main")
 }
 
@@ -1474,7 +1474,7 @@ fn is_squash_gc_eligible_positive_cache_survives_default_advance_p3() {
 // ── V1 (d-20260712065632138568-7): cleanup-failure hygiene producers ──
 
 /// Board-side view of the hygiene tasks the sweep produced under `home`.
-fn hygiene_tasks(home: &Path) -> Vec<(String, serde_json::Value)> {
+pub(super) fn hygiene_tasks(home: &Path) -> Vec<(String, serde_json::Value)> {
     crate::task_events::replay(home)
         .map(|s| {
             s.tasks
@@ -1900,7 +1900,7 @@ fn hygiene_key_for(repo: &Path, branch: &str) -> String {
     format!("residue-lifecycle-blocked:{}:{branch}", repo.display())
 }
 
-fn seed_episode(home: &Path, key: &str) -> crate::task_events::TaskId {
+pub(super) fn seed_episode(home: &Path, key: &str) -> crate::task_events::TaskId {
     crate::daemon::hygiene_task::upsert_system_hygiene_task(
         home,
         key,
@@ -1912,7 +1912,7 @@ fn seed_episode(home: &Path, key: &str) -> crate::task_events::TaskId {
     .clone()
 }
 
-fn episode_is_open(home: &Path, task_id: &crate::task_events::TaskId) -> bool {
+pub(super) fn episode_is_open(home: &Path, task_id: &crate::task_events::TaskId) -> bool {
     !crate::task_events::projected_state(home)
         .unwrap()
         .tasks
@@ -1922,7 +1922,7 @@ fn episode_is_open(home: &Path, task_id: &crate::task_events::TaskId) -> bool {
         .is_terminal()
 }
 
-fn run_sweep(home: &Path) {
+pub(super) fn run_sweep(home: &Path) {
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
     sweep_from_registry(home, &HashMap::new(), &[]);
     std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
