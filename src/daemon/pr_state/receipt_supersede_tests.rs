@@ -35,6 +35,16 @@ fn seed_state(home: &Path, head: &str) {
     save(home, &state).unwrap();
 }
 
+/// 每張 assignment 的建立時間嚴格遞增（跨測試共用單調計數），模擬「後派的比較新」。
+fn next_created_at() -> String {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static TICK: AtomicI64 = AtomicI64::new(0);
+    let tick = TICK.fetch_add(1, Ordering::Relaxed);
+    chrono::DateTime::from_timestamp(1_800_000_000 + tick, 0)
+        .unwrap()
+        .to_rfc3339()
+}
+
 /// 派一張新的 assignment；同一 target 的舊 record 會被 `persist` 取代。
 fn assign(
     home: &Path,
@@ -42,6 +52,18 @@ fn assign(
     reviewer: crate::types::InstanceId,
     head: &str,
     task: &str,
+) -> ActiveAssignment {
+    assign_at(home, target, reviewer, head, task, &next_created_at())
+}
+
+/// 同 [`assign`]，但可注入 `created_at`（例如模擬系統時鐘倒退）。
+fn assign_at(
+    home: &Path,
+    target: &str,
+    reviewer: crate::types::InstanceId,
+    head: &str,
+    task: &str,
+    created_at: &str,
 ) -> ActiveAssignment {
     let assignment = ActiveAssignment::new_pending_typed(
         REPO,
@@ -58,7 +80,7 @@ fn assign(
         "review",
         None,
         None,
-        "2026-11-16T00:00:00Z",
+        created_at,
     );
     store::persist(home, &assignment).unwrap();
     assignment
@@ -257,6 +279,179 @@ fn negative_other_reviewers_rejected_still_blocks() {
             .validated_review_receipts
             .len(),
         2
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// reviewer 改名：同一個 instance（穩定的 InstanceId）先以舊名 REJECTED，再以新名
+/// VERIFIED。authority record 以 target 名稱為鍵，所以舊名的 record 仍在。
+/// 「同 reviewer」必須以 instance id 判斷：舊 receipt 被取代後，舊名 record 不得在
+/// 下一次 reconcile 被當成 Unengaged 而重新 reservation。
+#[test]
+#[ignore = "follow-up t-20261116042747935842-99036-248"]
+fn renamed_instance_old_record_is_not_re_reserved() {
+    let home = home("renamed");
+    let head = "f".repeat(40);
+    seed_state(&home, &head);
+    let reviewer = crate::types::InstanceId::new();
+
+    let r1 = assign(&home, "old-reviewer-name", reviewer, &head, "t-review-old");
+    store::redrive_reserved(&home, REPO, BRANCH);
+    submit(&home, &r1, ReviewVerdict::Rejected);
+    store::redrive_reserved(&home, REPO, BRANCH);
+    assert!(
+        matches!(
+            readiness(&home),
+            Err(MergeDeficit::NonVerifiedReceipt { .. })
+        ),
+        "REJECTED 必須擋: {:?}",
+        readiness(&home)
+    );
+
+    let r2 = assign(&home, "new-reviewer-name", reviewer, &head, "t-review-new");
+    submit(&home, &r2, ReviewVerdict::Verified);
+    let state = load(&home, REPO, BRANCH).unwrap();
+    assert_eq!(
+        state.validated_review_receipts.len(),
+        1,
+        "同 instance 的新 receipt 取代舊的"
+    );
+    assert_ready_now_and_after_reconcile(&home);
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// 負向對照：另一個 instance 的 assignment 尚無 receipt（Unengaged）時，
+/// 即使有別位 reviewer VERIFIED，reservation 仍須擋住——沒有 receipt、也沒有被
+/// 同 instance 取代的 assignment 仍算 reservation。
+#[test]
+fn negative_unengaged_assignment_of_other_instance_still_reserved() {
+    let home = home("neg-unengaged");
+    let head = "9".repeat(40);
+    seed_state(&home, &head);
+
+    let _pending = assign(
+        &home,
+        "reviewer-one",
+        crate::types::InstanceId::new(),
+        &head,
+        "t-review-1",
+    );
+    let approver = assign(
+        &home,
+        "reviewer-two",
+        crate::types::InstanceId::new(),
+        &head,
+        "t-review-2",
+    );
+    submit(&home, &approver, ReviewVerdict::Verified);
+    store::redrive_reserved(&home, REPO, BRANCH);
+    assert!(
+        matches!(
+            readiness(&home),
+            Err(MergeDeficit::ReservedAssignments { count: 1 })
+        ),
+        "尚未回覆的另一位 reviewer 仍須擋住: {:?}",
+        readiness(&home)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// 較新的 assignment 不得被較舊 assignment 的 receipt 當成「已被取代」：同一個
+/// reviewer 對同一個 head 先 VERIFIED（A1），之後 lead 再派 A2（例如 PR 描述改了）
+/// 但尚未交件。A1 的舊 receipt 不能頂掉之後才派的 A2；A2 仍須保留 reservation 擋住
+/// merge，否則會在新審查完成前放行。
+#[test]
+fn newer_pending_assignment_same_name_is_not_bypassed_by_older_verified() {
+    let home = home("newer-same-name");
+    let head = "1".repeat(40);
+    seed_state(&home, &head);
+    let reviewer = crate::types::InstanceId::new();
+
+    let a1 = assign(&home, "reviewer", reviewer, &head, "t-review-1");
+    submit(&home, &a1, ReviewVerdict::Verified);
+    assert_eq!(readiness(&home), Ok(()), "A1 VERIFIED 後可 merge");
+
+    let _a2 = assign(&home, "reviewer", reviewer, &head, "t-review-2");
+    store::redrive_reserved(&home, REPO, BRANCH);
+    assert!(
+        matches!(
+            readiness(&home),
+            Err(MergeDeficit::ReservedAssignments { count: 1 })
+        ),
+        "尚未交件的較新 assignment 必須擋 merge: {:?}",
+        readiness(&home)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// 同上，但較新的 assignment 用另一個 target 名稱（reviewer 改名）：舊名的 receipt
+/// 同樣不能頂掉新名、尚未交件的 assignment。
+#[test]
+fn newer_pending_assignment_renamed_is_not_bypassed_by_older_verified() {
+    let home = home("newer-renamed");
+    let head = "2".repeat(40);
+    seed_state(&home, &head);
+    let reviewer = crate::types::InstanceId::new();
+
+    let a1 = assign(&home, "old-reviewer-name", reviewer, &head, "t-review-old");
+    submit(&home, &a1, ReviewVerdict::Verified);
+    assert_eq!(readiness(&home), Ok(()), "A1 VERIFIED 後可 merge");
+
+    let _a2 = assign(&home, "new-reviewer-name", reviewer, &head, "t-review-new");
+    store::redrive_reserved(&home, REPO, BRANCH);
+    assert!(
+        matches!(
+            readiness(&home),
+            Err(MergeDeficit::ReservedAssignments { count: 1 })
+        ),
+        "改名後尚未交件的較新 assignment 必須擋 merge: {:?}",
+        readiness(&home)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// 時鐘倒退 guard：同一個 instance 改名後，A1（舊名）以較晚的時鐘值 VERIFIED，
+/// 邏輯上較新的 A2（新名、尚未交件）卻帶著較早的 `created_at`（兩次派工之間系統時鐘
+/// 往回調）。兩筆 record 因 target 名稱不同而同時 active。A1 的舊 receipt 不得因為
+/// 時間戳排序而頂掉 A2：A2 必須仍保留 reservation 擋住 merge。
+#[test]
+fn clock_rollback_does_not_let_older_verified_bypass_newer_pending() {
+    let home = home("clock-rollback");
+    let head = "3".repeat(40);
+    seed_state(&home, &head);
+    let reviewer = crate::types::InstanceId::new();
+
+    let a1 = assign_at(
+        &home,
+        "old-reviewer-name",
+        reviewer,
+        &head,
+        "t-review-1",
+        "2030-01-01T00:00:00Z",
+    );
+    submit(&home, &a1, ReviewVerdict::Verified);
+    assert_eq!(readiness(&home), Ok(()), "A1 VERIFIED 後可 merge");
+
+    let a2 = assign_at(
+        &home,
+        "new-reviewer-name",
+        reviewer,
+        &head,
+        "t-review-2",
+        "2029-01-01T00:00:00Z",
+    );
+    assert!(
+        a2.created_at < a1.created_at,
+        "fixture 必須模擬時鐘倒退（邏輯上 A2 較新、時間戳卻較早）"
+    );
+    store::redrive_reserved(&home, REPO, BRANCH);
+    assert!(
+        matches!(
+            readiness(&home),
+            Err(MergeDeficit::ReservedAssignments { count: 1 })
+        ),
+        "時鐘倒退時尚未交件的較新 assignment 仍須擋 merge: {:?}",
+        readiness(&home)
     );
     let _ = std::fs::remove_dir_all(&home);
 }
