@@ -1575,3 +1575,50 @@ fn owner_attested_settlement_is_wired_into_the_sweep() {
 
 #[path = "tests/head_drift_reraise_3517_tests.rs"]
 mod head_drift_reraise_3517;
+
+/// repo 路徑不存在、但 intent 檔刪不掉（cleanup-intents/ 唯讀）：解除並未發生，
+/// 不得回報 settled，必須維持 preserved 並給出可區分的 reason。
+#[cfg(unix)]
+#[test]
+fn reconcile_repo_missing_intent_unlink_denied_stays_preserved() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tmp_dir("repo-missing-unlink-denied");
+    let repo = home.join("missing-repo");
+    persist_intent(
+        &home,
+        &repo.display().to_string(),
+        "review/unlink-denied",
+        "deadbeef",
+        "t-unlink-denied",
+        None,
+        None,
+    )
+    .expect("persist intent");
+    seed_terminal_task(&home, "t-unlink-denied");
+    let dir = intents_dir(&home);
+    let intent = std::fs::read_dir(&dir)
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+    let result = reconcile_terminal_review_intents(&home, false);
+    let survived = intent.exists();
+    // 先還原權限再斷言，失敗時也不留下清不掉的暫存目錄。
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let outcome = result.candidates[0].outcome.clone();
+    std::fs::remove_dir_all(&home).ok();
+
+    // root 不受目錄權限限制，此時 unlink 會成功，無法製造情境。
+    if !survived {
+        return;
+    }
+    assert_eq!(result.settled, 0, "unlink 失敗不得計為 settled: {outcome}");
+    assert_eq!(result.preserved, 1, "必須維持 preserved: {outcome}");
+    assert!(
+        outcome.starts_with("preserved:intent_unlink_failed:"),
+        "reason 必須可區分 unlink 失敗: {outcome}"
+    );
+}
