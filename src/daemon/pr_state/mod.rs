@@ -1744,8 +1744,21 @@ pub fn record_ci_result(
                     state.pr_number,
                     head_sha,
                 );
-                // 緩衝目錄的讀取順序不是抵達順序，所以誰取代誰只看派發序號：不論套用順序，
-                // 同 instance 的結果都是「派發較晚的那張」。
+                // 緩衝目錄的讀取順序不是抵達順序，所以誰取代誰只看派發序號。依序號由小到大
+                // 套用（序號缺漏的排在最後，同序號以 receipt_id 排序讓結果可重現），較晚派發
+                // 的 receipt 才會取代較早的；不使用 wall-clock。
+                let mut selections = selections;
+                selections.sort_by_key(|selection| {
+                    let receipt = selection.receipt();
+                    (
+                        crate::daemon::assignment_authority::dispatch_seq_of_assignment(
+                            home,
+                            receipt.assignment_id,
+                        )
+                        .unwrap_or(u64::MAX),
+                        receipt.receipt_id.clone(),
+                    )
+                });
                 for selection in &selections {
                     let receipt = selection.receipt();
                     if !crate::review_receipt::assignment_still_authorizes(home, receipt)
@@ -1855,7 +1868,8 @@ fn apply_receipt_to_state(
     // 取代誰只依「派發序號」（`receipt_dispatch_seq`，落地時由 assignment lock 內讀到的
     // record 蓋入）：
     //   - 兩邊都有序號、舊 < 新：新 receipt 取代舊的；
-    //   - 兩邊都有序號、舊 > 新：這張是過時的，不套用（回傳 Stale）；
+    //   - 兩邊都有序號、舊 > 新：這張是過時的。過時的 VERIFIED 不套用（回傳 Stale）；過時
+    //     的非 VERIFIED（REJECTED／UNVERIFIED）一律保留、與較新的並存、繼續擋 merge；
     //   - 缺序號（任一邊或兩邊，例如升級前的舊資料）或序號相等：順序無法證明，兩張都保留、
     //     什麼都不取代（非 VERIFIED 仍擋 merge；VERIFIED 依 instance 去重，不會被算成
     //     兩位）。「依抵達順序取代」本身就是 fail-open（晚到的舊 receipt 會推翻較新的），
@@ -1885,7 +1899,13 @@ fn apply_receipt_to_state(
             (Some(old_seq), Some(new_seq)) if old_seq < new_seq => {
                 replace_ids.push(old.assignment_id)
             }
-            (Some(old_seq), Some(new_seq)) if old_seq > new_seq => {
+            // 看起來過時：只有 VERIFIED 可以被丟掉（最壞只是多擋）。非 VERIFIED 永遠
+            // 保留、與較新的 receipt 並存，繼續擋 merge——不論序號是因為什麼原因出錯，
+            // 「判定過時就丟掉」都不能成為放行的路徑。
+            (Some(old_seq), Some(new_seq))
+                if old_seq > new_seq
+                    && matches!(verdict, crate::review_receipt::ReviewVerdict::Verified) =>
+            {
                 return ReceiptApplication::Stale { newer_seq: old_seq }
             }
             _ => {}

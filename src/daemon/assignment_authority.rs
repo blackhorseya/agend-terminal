@@ -1047,6 +1047,25 @@ pub(crate) fn terminal_markers(home: &Path, repo: &str, branch: &str) -> Termina
 
 // ─────────────────────────── operations ───────────────────────────
 
+/// PR state 裡 `receipt_dispatch_seq` 的最大值；檔案不存在 → 0；讀不出來或解析失敗 → `Err`。
+fn max_state_dispatch_seq(home: &Path, repo: &str, branch: &str) -> anyhow::Result<u64> {
+    let path = crate::daemon::pr_state::pr_state_dir(home)
+        .join(crate::daemon::pr_state::pr_state_filename(repo, branch));
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => anyhow::bail!("unreadable pr-state {}: {e}", path.display()),
+    };
+    let state: crate::daemon::pr_state::PrState = serde_json::from_slice(&bytes)
+        .map_err(|e| anyhow::anyhow!("unparseable pr-state {}: {e}", path.display()))?;
+    Ok(state
+        .receipt_dispatch_seq
+        .values()
+        .copied()
+        .max()
+        .unwrap_or(0))
+}
+
 /// 單調的派發序號計數器：每個 `(repo,branch)` 一個檔案，與 record 分開存放，所以
 /// record 全部退役後也不會歸零。副檔名不是 `.json`，不會被 record 掃描讀成 record。
 /// 呼叫端必須持有該 branch 的 assignment lock。配發值 ＝ max(計數器, 現存 record
@@ -1072,8 +1091,14 @@ fn allocate_dispatch_seq(home: &Path, repo: &str, branch: &str) -> anyhow::Resul
         .filter_map(|r| r.dispatch_seq)
         .max()
         .unwrap_or(0);
+    // PR state 裡已記錄的 receipt 序號也是下限：record 全被 cleanup、計數器遺失或被改小
+    // 時，新序號仍不得小於 state 已記錄的序號（否則序號就不再反映派發順序）。PR state
+    // 存在但讀不出來時無法確認下限，回 `Err`（fail closed）；不存在（第一次、或從沒有
+    // receipt）則下限為 0，正常派發。
+    let max_state = max_state_dispatch_seq(home, repo, branch)?;
     let next = stored
         .max(max_record)
+        .max(max_state)
         .checked_add(1)
         .ok_or_else(|| anyhow::anyhow!("dispatch seq counter overflow"))?;
     atomic_write_json(&counter_path, &next)?;
