@@ -794,8 +794,21 @@ pub(crate) fn merged_pr_number(repo: &Path, base: &str, branch: &str) -> Option<
 /// deletion evidence, so nothing is inferred — not from the name, not from
 /// `~/.ssh/config`. Missing/unreadable fleet.yaml or an empty list means no
 /// alias is GitHub (fail-closed → open-PR lookups stay `Unknown`).
+///
+/// Read straight from the file on EVERY call — no `FleetConfig::load_arc`: its
+/// (path, mtime, size) cache never compares content, so a same-size edit with an
+/// unchanged mtime would keep a REMOVED alias alive as deletion evidence. It also
+/// avoids `load`'s normalize/ID-backfill side effects. (Same approach as
+/// `gh_identity::resolve`.) fleet.yaml is small and this runs per repo / delete
+/// candidate, so the extra read+parse is negligible.
 fn github_ssh_aliases_in(home: &Path) -> Vec<String> {
-    match crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(home)) {
+    let path = crate::fleet::fleet_yaml_path(home);
+    let parsed = std::fs::read_to_string(&path)
+        .map_err(anyhow::Error::from)
+        .and_then(|yaml| {
+            serde_yaml_ng::from_str::<crate::fleet::FleetConfig>(&yaml).map_err(anyhow::Error::from)
+        });
+    match parsed {
         Ok(cfg) => cfg
             .github_ssh_aliases
             .iter()
