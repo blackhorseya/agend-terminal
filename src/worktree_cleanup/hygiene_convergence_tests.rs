@@ -345,6 +345,116 @@ fn still_preserved_intent_keeps_episode_open() {
     std::fs::remove_dir_all(&home).ok();
 }
 
+/// RED：repo 路徑確定不存在（NotFound）→ intent 解除、episode 收單，
+/// close reason 寫明 repo 不存在並帶路徑。
+#[test]
+fn intent_repo_not_found_closes_preserved_episode() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-intent-repo-gone");
+    let repo = setup_test_repo("hyg-intent-repo-gone");
+    persist_aged_intent(&home, &repo, "review/repo-gone-1", "t-repo-gone");
+
+    run_sweep(&home); // task 未 terminal → preserved → 開單
+    let episodes = intent_episode_ids(&home);
+    assert_eq!(episodes.len(), 1, "前置：應有一張 episode");
+
+    seed_done_task(&home, "t-repo-gone");
+    std::fs::remove_dir_all(&repo).unwrap(); // 拋棄式 clone 被刪
+    run_sweep(&home);
+
+    assert!(
+        !episode_is_open(&home, &episodes[0].0),
+        "repo 路徑確定不存在，episode 必須收掉"
+    );
+    assert!(
+        intent_files(&home).is_empty(),
+        "repo 不存在即可證明解除，intent 必須移除"
+    );
+    let line = cancel_event_line(&home, &episodes[0].0);
+    assert!(
+        line.contains("repository path no longer exists")
+            && line.contains(&repo.display().to_string()),
+        "close reason 必須寫明 repo 不存在並含路徑: {line:?}"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// 負向對照：repo 路徑存在但不是目錄（檔案）→ 不是「不存在」，維持 preserved，
+/// outcome 與 repo_missing 可區分，episode 不收。
+#[test]
+fn intent_repo_path_is_file_keeps_episode_open() {
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-intent-repo-file");
+    let repo = setup_test_repo("hyg-intent-repo-file");
+    persist_aged_intent(&home, &repo, "review/repo-file-1", "t-repo-file");
+    run_sweep(&home);
+    let episodes = intent_episode_ids(&home);
+    assert_eq!(episodes.len(), 1, "前置：應有一張 episode");
+
+    seed_done_task(&home, "t-repo-file");
+    std::fs::remove_dir_all(&repo).unwrap();
+    std::fs::write(&repo, b"not a directory").unwrap();
+    let result = crate::cleanup_intents::reconcile_terminal_review_intents(&home, true);
+    let outcome = result
+        .candidates
+        .iter()
+        .map(|c| c.outcome.as_str())
+        .next()
+        .expect("candidate");
+    assert!(
+        outcome.starts_with("preserved:repo_unreadable:") && !outcome.contains("repo_missing"),
+        "非目錄必須是可區分的 preserved reason: {outcome:?}"
+    );
+
+    run_sweep(&home);
+    assert!(
+        episode_is_open(&home, &episodes[0].0),
+        "路徑存在但不是目錄，不得收單"
+    );
+    assert_eq!(intent_files(&home).len(), 1, "intent 必須保留");
+    std::fs::remove_file(&repo).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// 負向對照（unix）：父目錄權限 000 → 讀不到（EACCES）≠ 不存在，維持 preserved。
+#[cfg(unix)]
+#[test]
+fn intent_repo_unreadable_parent_keeps_episode_open() {
+    use std::os::unix::fs::PermissionsExt;
+    let _lock = ENV_LOCK.lock();
+    let home = tmp_home("hyg-intent-repo-eacces");
+    let parent = tmp_home("hyg-intent-repo-eacces-parent");
+    let repo = parent.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    persist_aged_intent(&home, &repo, "review/repo-eacces-1", "t-repo-eacces");
+    run_sweep(&home);
+    let episodes = intent_episode_ids(&home);
+    assert_eq!(episodes.len(), 1, "前置：應有一張 episode");
+    seed_done_task(&home, "t-repo-eacces");
+
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000)).unwrap();
+    // root 不受權限限制，此時無法製造 EACCES，直接略過。
+    if std::fs::metadata(&repo).is_ok() {
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        return;
+    }
+    let result = crate::cleanup_intents::reconcile_terminal_review_intents(&home, true);
+    let outcome = result.candidates[0].outcome.clone();
+    run_sweep(&home);
+    let still_open = episode_is_open(&home, &episodes[0].0);
+    let intents = intent_files(&home).len();
+    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    assert!(
+        outcome.starts_with("preserved:repo_unreadable:") && !outcome.contains("repo_missing"),
+        "權限錯誤必須是可區分的 preserved reason: {outcome:?}"
+    );
+    assert!(still_open, "讀不到 repo 不得收單");
+    assert_eq!(intents, 1, "intent 必須保留");
+    std::fs::remove_dir_all(&parent).ok();
+    std::fs::remove_dir_all(&home).ok();
+}
+
 /// 負向對照（判斷不了就不動）：intent 目錄裡有一個讀不懂的檔案，無法證明
 /// 「某個 intent 已經不在」，所以 episode 不得被收。
 #[test]
