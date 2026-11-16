@@ -1,3 +1,8 @@
+# `priority` (test-priorities) needs nextest >= 0.9.91; fail with a clear message on an
+# older local nextest instead of an "unknown key" parse error. CI installs the latest
+# release via taiki-e/install-action.
+nextest-version = "0.9.91"
+
 # #1784: instrument the fleet-wide CI hang hunt.
 #
 # A real `Command::new("git")` test (worktree_cleanup / branch_sweep build real
@@ -51,6 +56,14 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 #     [#2117 P2: builds 2 real git repos for the per-board sweep enumeration],
 #     mcp::handlers::tests checkout_repo_*) — targeted by name so the ~200
 #     pure-logic tests around them stay parallel.
+# Priority: `git-subprocess` has max-threads = 1, so its ~1.3k tests (~170s of CPU) run
+# strictly one at a time. Scheduled in default (alphabetical) order they are spread
+# through the run and, once the parallel tests finish, the serial group is still
+# draining alone on one core (measured ~2.5 min tail on a 4-vCPU shard with every
+# other test already done). `priority = 100` (max) starts the group first so the
+# serial chain overlaps with the parallel tests instead of trailing them. It only
+# reorders scheduling: the same tests run, group serialization and retries are
+# unchanged. Mirrored on every override that joins the group.
 [test-groups]
 git-subprocess = { max-threads = 1 }
 
@@ -84,12 +97,14 @@ git-subprocess = { max-threads = 1 }
 [[profile.ci.overrides]]
 filter = 'test(/_stress_50_iter_/)'
 test-group = 'git-subprocess'
+priority = 100
 slow-timeout = { period = "120s", terminate-after = 3 }
 retries = 2
 
 [[profile.ci.overrides]]
 filter = 'test(/(^(worktree|worktree_pool|worktree_cleanup|admin|mcp::handlers::(ci|dispatch_hook|force_release|worktree|p0b_tests)|daemon::(retention::worktrees|pr_state|auto_release|conflict_notify|per_tick::tmp_review_gc)|bootstrap::(agent_resolve|canonical_hygiene))::|checkout_repo_|dispatch_branch_skips_metadata_stub|send_with_branch_checkout_failure|task_done_cleans_post_lease|closes_markers_extract_cleanly_from_actual_main|resolve_sweep_boards_pairs_each_project_with_its_own_repo_2117_p2|shim_denies_agent_bypass_canonical_provisioning_2234|denylist_[a-z_]+_(2379|2390)|tracked_tree_[a-z_]+_2379|resolve_default_branch_base_[a-z_]+_2390)/)'
 test-group = 'git-subprocess'
+priority = 100
 retries = 2
 
 # Local `default` profile has no terminate-after, so no false-kill risk — just
@@ -97,3 +112,4 @@ retries = 2
 [[profile.default.overrides]]
 filter = 'test(/(^(worktree|worktree_pool|worktree_cleanup|admin|mcp::handlers::(ci|dispatch_hook|force_release|worktree|p0b_tests)|daemon::(retention::worktrees|pr_state|auto_release|conflict_notify|per_tick::tmp_review_gc)|bootstrap::(agent_resolve|canonical_hygiene))::|checkout_repo_|dispatch_branch_skips_metadata_stub|send_with_branch_checkout_failure|task_done_cleans_post_lease|closes_markers_extract_cleanly_from_actual_main|resolve_sweep_boards_pairs_each_project_with_its_own_repo_2117_p2|shim_denies_agent_bypass_canonical_provisioning_2234|denylist_[a-z_]+_(2379|2390)|tracked_tree_[a-z_]+_2379|resolve_default_branch_base_[a-z_]+_2390)/)'
 test-group = 'git-subprocess'
+priority = 100
