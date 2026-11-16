@@ -168,7 +168,7 @@ pub(crate) fn record_retention_obligation(
              Answer with `task action=done` and a `result` beginning `keep:` or `delete:`."
         ),
         priority: "normal".to_string(),
-        owner: assignee.map(crate::task_events::InstanceName),
+        owner: assignee.clone().map(crate::task_events::InstanceName),
         due_at: Some(
             (chrono::Utc::now() + chrono::Duration::days(RETENTION_DUE_DAYS)).to_rfc3339(),
         ),
@@ -215,7 +215,39 @@ pub(crate) fn record_retention_obligation(
             %repo, %branch, %reason,
             "branch-retention obligation was refused"
         ),
+        // Only a non-empty commit means THIS call wrote the obligation; an empty
+        // one is the key/lane dedup refusing a duplicate, which must not re-notify.
+        Ok(Ok(written)) if !written.is_empty() => {
+            if let Some(assignee) = assignee.as_deref() {
+                notify_retention_assignee(home, assignee, &successor_id.0, repo, branch);
+            }
+        }
         Ok(Ok(_)) => {}
+    }
+}
+
+/// Tell the assignee an obligation now waits on them. Reviewers on the codex
+/// backend never poll the board, so without this the `keep:`/`delete:` answer is
+/// never given. Best effort: the obligation is already durable, so a failed
+/// enqueue only logs.
+fn notify_retention_assignee(home: &Path, assignee: &str, task_id: &str, repo: &str, branch: &str) {
+    let msg = crate::inbox::InboxMessage {
+        from: crate::inbox::NotifySource::System("branch-retention").to_string(),
+        text: format!(
+            "[branch-retention] 請確認分支 '{branch}' 是否仍需保留。\n\
+             task: {task_id}\nrepo: {repo}\nbranch: {branch}\n\
+             請以 `task action=done id={task_id}` 回覆，`result` 以 `keep:` 或 `delete:` 開頭。"
+        ),
+        kind: Some("task".to_string()),
+        task_id: Some(task_id.to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        ..Default::default()
+    };
+    if let Err(error) = crate::inbox::storage::enqueue(home, assignee, msg) {
+        tracing::warn!(
+            %assignee, %task_id, %error,
+            "branch-retention obligation recorded but the assignee could not be notified"
+        );
     }
 }
 
