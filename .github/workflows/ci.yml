@@ -70,10 +70,19 @@ jobs:
       # logic v2 attempted to maintain.
       # Only shard 1 saves: it builds the superset (release + clippy + tests),
       # so a later shard can never overwrite the shared key with a partial cache.
+      #
+      # Only non-PR runs (push to main / workflow_dispatch) save. A PR run only
+      # restores: GitHub lets a PR read the default branch's caches, so the
+      # cache main saved (same job/OS/rustc/Cargo.lock key) is what PRs start
+      # from. A PR that changes Cargo.lock misses the exact key, restores main's
+      # closest key, and used to spend ~2 min in the "Post rust-cache" step
+      # (Windows) saving a cache that only that PR's branch scope could read —
+      # no other PR or main ever hit it. A PR whose lockfile equals main's already
+      # skipped the save (exact key hit), so this changes nothing for them.
       - uses: Swatinem/rust-cache@v2
         with:
           cache-bin: false
-          save-if: ${{ matrix.shard == 1 }}
+          save-if: ${{ matrix.shard == 1 && github.event_name != 'pull_request' }}
 
       # tray-icon / tao on Linux link against GTK3 + the ayatana app-
       # indicator — these come from `libgtk-3-dev` (provides glib-2.0.pc,
