@@ -95,6 +95,11 @@ pub struct PrState {
     /// `verdict_state` remains display-compatible but cannot unlock the gate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) validated_review_receipts: Vec<crate::review_receipt::ReviewReceiptSummary>,
+    /// receipt 對應 assignment 的派發序號（`assignment_id` → seq）。receipt 落地時在
+    /// assignment lock 內從磁碟上的 record 蓋入，所以 record 之後被 cleanup 移除也還在。
+    /// 同 reviewer instance 的新舊 receipt 只能依這個序號判斷誰取代誰，不使用 wall-clock。
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub(crate) receipt_dispatch_seq: std::collections::BTreeMap<uuid::Uuid, u64>,
     pub merge_state: MergeState,
     pub draft_state: DraftState,
     pub review_class: ReviewClass,
@@ -1472,6 +1477,7 @@ pub fn new_for_branch(
         ci_state: CiState::Pending,
         verdict_state: VerdictState::None,
         validated_review_receipts: Vec::new(),
+        receipt_dispatch_seq: std::collections::BTreeMap::new(),
         merge_state: MergeState::NotReady,
         draft_state: DraftState::Ready,
         review_class,
@@ -1641,8 +1647,12 @@ pub fn record_ci_result(
         initial_authority
     };
     let mut selected_receipts = Vec::new();
-    let mut replay_superseded: Vec<(crate::review_receipt::ReviewReceiptSummary, Vec<uuid::Uuid>)> =
-        Vec::new();
+    // (receipt, 要退役的 assignment id, 退役的序號上限)
+    let mut replay_retire: Vec<(
+        crate::review_receipt::ReviewReceiptSummary,
+        Vec<uuid::Uuid>,
+        Option<u64>,
+    )> = Vec::new();
     let save_result = with_pr_state_or_create(
         home,
         repo,
@@ -1727,24 +1737,15 @@ pub fn record_ci_result(
                     crate::daemon::assignment_authority::BranchAuthority::Unreadable
                 )
             {
-                let mut selections = verdict_buffer::select_validated_for_subject(
+                let selections = verdict_buffer::select_validated_for_subject(
                     home,
                     repo,
                     branch,
                     state.pr_number,
                     head_sha,
                 );
-                // 緩衝目錄的讀取順序不是抵達順序，同一 instance 的多張 receipt 誰取代誰
-                // 無法證明。為了不讓順序決定 gate：VERIFIED 先套用、非 VERIFIED 後套用，
-                // 同批有衝突時結果固定是非 VERIFIED（fail closed）；再以 receipt_id 排序
-                // 讓結果可重現。不使用 buffered_at 等 wall-clock 排序。
-                selections.sort_by_key(|selection| {
-                    let r = selection.receipt();
-                    (
-                        !matches!(r.verdict, crate::review_receipt::ReviewVerdict::Verified),
-                        r.receipt_id.clone(),
-                    )
-                });
+                // 緩衝目錄的讀取順序不是抵達順序，所以誰取代誰只看派發序號：不論套用順序，
+                // 同 instance 的結果都是「派發較晚的那張」。
                 for selection in &selections {
                     let receipt = selection.receipt();
                     if !crate::review_receipt::assignment_still_authorizes(home, receipt)
@@ -1761,9 +1762,33 @@ pub fn record_ci_result(
                         receipt_id = %receipt.receipt_id,
                         "task66 verdict_buffer: replaying validated receipt onto exact subject"
                     );
-                    let superseded = apply_receipt_to_state(state, receipt.clone());
-                    if !superseded.is_empty() {
-                        replay_superseded.push((receipt.clone(), superseded));
+                    if let Some(seq) =
+                        crate::daemon::assignment_authority::dispatch_seq_of_assignment(
+                            home,
+                            receipt.assignment_id,
+                        )
+                    {
+                        state
+                            .receipt_dispatch_seq
+                            .insert(receipt.assignment_id, seq);
+                    }
+                    match apply_receipt_to_state(state, receipt.clone()) {
+                        ReceiptApplication::Applied { superseded } => {
+                            if !superseded.is_empty() {
+                                let bound = state
+                                    .receipt_dispatch_seq
+                                    .get(&receipt.assignment_id)
+                                    .copied();
+                                replay_retire.push((receipt.clone(), superseded, bound));
+                            }
+                        }
+                        ReceiptApplication::Stale { newer_seq } => {
+                            replay_retire.push((
+                                receipt.clone(),
+                                vec![receipt.assignment_id],
+                                Some(newer_seq),
+                            ));
+                        }
                     }
                 }
                 selected_receipts = selections;
@@ -1774,10 +1799,10 @@ pub fn record_ci_result(
     // 舊 record（只在 lock_acquired 時才會有重放，鎖順序與 record_validated_receipt 相同）。
     let mut replay_cleanup_tasks = Vec::new();
     if save_result.is_ok() {
-        for (receipt, superseded) in &replay_superseded {
+        for (receipt, ids, bound) in &replay_retire {
             replay_cleanup_tasks.extend(
-                crate::daemon::assignment_authority::retire_superseded_by_receipt(
-                    home, receipt, superseded,
+                crate::daemon::assignment_authority::retire_older_assignments(
+                    home, receipt, ids, *bound,
                 ),
             );
         }
@@ -1806,37 +1831,76 @@ fn receipt_seen(state: &PrState, receipt: &crate::review_receipt::ReviewReceiptS
     })
 }
 
+/// [`apply_receipt_to_state`] 的結果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReceiptApplication {
+    /// 已套用；`superseded` ＝ 被這張 receipt 取代的舊 receipt 的 assignment id。
+    Applied { superseded: Vec<uuid::Uuid> },
+    /// 同 reviewer instance 在同 subject 已有「派發較晚」的 receipt，這張是過時的：
+    /// 沒有套用、也沒有取代任何東西。`newer_seq` ＝ 那張較新 receipt 的序號。
+    Stale { newer_seq: u64 },
+}
+
 fn apply_receipt_to_state(
     state: &mut PrState,
     receipt: crate::review_receipt::ReviewReceiptSummary,
-) -> Vec<uuid::Uuid> {
+) -> ReceiptApplication {
     let reviewer = receipt.reviewer_name.clone();
     let head = receipt.reviewed_head.clone();
     let verdict = receipt.verdict;
     let assignment_id = receipt.assignment_id;
-    // Containment (not task68's append-only/worst-verdict ledger): keep one
-    // current authoritative receipt per assignment. Slot is routing metadata,
-    // not a uniqueness key; independent reviewers may share a slot.
-    // 同一位 reviewer 在同一 subject（repo/PR/branch/class/head）重審時，新
-    // assignment 的 receipt 取代舊 receipt，以抵達順序為準；不同 reviewer 的
-    // receipt 互不影響，dual 的 N-of-M 計數不變。
-    // 回傳「被這張 receipt 取代」的舊 assignment id：呼叫端在 assignment lock 內
-    // 退役它們的 authority record（同一個 stable InstanceId 改名後，舊名 record
-    // 不會被新名 persist 取代，否則會被推導成永久 reservation）。取代關係在 receipt
-    // 落地當下才成立，不比對 created_at，也不推斷「誰比較新」。
-    let mut superseded = Vec::new();
-    state.validated_review_receipts.retain(|old| {
-        let replaced = old.assignment_id != receipt.assignment_id
+    // 一個 assignment 只留一張 receipt（slot 只是路由資訊，不是唯一鍵）。
+    //
+    // 同一位 reviewer instance 在同一 subject（repo/PR/branch/class/head）重審時，誰
+    // 取代誰只依「派發序號」（`receipt_dispatch_seq`，落地時由 assignment lock 內讀到的
+    // record 蓋入）：
+    //   - 兩邊都有序號、舊 < 新：新 receipt 取代舊的；
+    //   - 兩邊都有序號、舊 > 新：這張是過時的，不套用（回傳 Stale）；
+    //   - 兩邊都沒有序號（舊資料、沒有任何排序資訊）：維持 #31 的行為，後落地的取代；
+    //   - 只有一邊有序號、或序號相等：順序無法證明，兩張都保留、什麼都不取代（非
+    //     VERIFIED 仍擋 merge；VERIFIED 依 instance 去重，不會被算成兩位）。
+    // 不同 reviewer 的 receipt 互不影響，dual 的 N-of-M 計數不變。
+    let new_seq = state
+        .receipt_dispatch_seq
+        .get(&receipt.assignment_id)
+        .copied();
+    let conflicts = |old: &crate::review_receipt::ReviewReceiptSummary| {
+        old.assignment_id != receipt.assignment_id
             && old.reviewer_instance_id == receipt.reviewer_instance_id
             && old.repo == receipt.repo
             && old.pr_number == receipt.pr_number
             && old.branch == receipt.branch
             && old.review_class == receipt.review_class
-            && old.reviewed_head == receipt.reviewed_head;
-        if replaced {
-            superseded.push(old.assignment_id);
+            && old.reviewed_head == receipt.reviewed_head
+    };
+    let mut replace_ids = Vec::new();
+    for old in state
+        .validated_review_receipts
+        .iter()
+        .filter(|old| conflicts(old))
+    {
+        let old_seq = state.receipt_dispatch_seq.get(&old.assignment_id).copied();
+        match (old_seq, new_seq) {
+            (Some(old_seq), Some(new_seq)) if old_seq < new_seq => {
+                replace_ids.push(old.assignment_id)
+            }
+            (Some(old_seq), Some(new_seq)) if old_seq > new_seq => {
+                return ReceiptApplication::Stale { newer_seq: old_seq }
+            }
+            (None, None) => replace_ids.push(old.assignment_id),
+            _ => {}
         }
-        old.assignment_id != receipt.assignment_id && !replaced
+    }
+    state.validated_review_receipts.retain(|old| {
+        old.assignment_id != receipt.assignment_id && !replace_ids.contains(&old.assignment_id)
+    });
+    let superseded = replace_ids;
+    state.receipt_dispatch_seq.retain(|id, _| {
+        *id == assignment_id
+            || state
+                .validated_review_receipts
+                .iter()
+                .any(|r| r.assignment_id == *id)
     });
     // 任何 verdict 的 receipt 落地都釋放 reservation：該 assignment 本身，以及同一
     // reviewer 被這次重審取代的舊 assignment（authority 每個 target 只留一筆 record）。
@@ -1862,7 +1926,7 @@ fn apply_receipt_to_state(
             kind,
         },
     );
-    superseded
+    ReceiptApplication::Applied { superseded }
 }
 
 /// Typed verdict ingestion entry. Exact repo/branch/PR/full-head selection comes
@@ -1904,12 +1968,42 @@ pub(crate) fn record_validated_receipt(
     let mut subject_found = false;
     let mut pending_notify: Option<(String, crate::inbox::InboxMessage)> = None;
     let mut superseded_assignments: Vec<uuid::Uuid> = Vec::new();
+    let mut retire_bound: Option<u64> = None;
+    let mut stale_newer_seq: Option<u64> = None;
     match with_pr_state(home, &summary.repo, &summary.branch, |state| {
         subject_found = true;
         if !summary.matches_state(state) || receipt_seen(state, summary) {
             return;
         }
-        superseded_assignments = apply_receipt_to_state(state, summary.clone());
+        // 序號只從磁碟上的 record 讀（仍持有 assignment lock），蓋進 PR state，
+        // 之後 record 被 cleanup 移除也還能比較。
+        if let Some(seq) = crate::daemon::assignment_authority::dispatch_seq_of_assignment(
+            home,
+            summary.assignment_id,
+        ) {
+            state
+                .receipt_dispatch_seq
+                .insert(summary.assignment_id, seq);
+        }
+        match apply_receipt_to_state(state, summary.clone()) {
+            ReceiptApplication::Applied { superseded } => {
+                superseded_assignments = superseded;
+                retire_bound = state
+                    .receipt_dispatch_seq
+                    .get(&summary.assignment_id)
+                    .copied();
+            }
+            ReceiptApplication::Stale { newer_seq } => {
+                tracing::warn!(
+                    repo = %summary.repo,
+                    branch = %summary.branch,
+                    reviewer = %summary.reviewer_name,
+                    "stale validated receipt ignored: same reviewer already has a later-dispatched receipt"
+                );
+                stale_newer_seq = Some(newer_seq);
+                return;
+            }
+        }
         let label = match summary.verdict {
             crate::review_receipt::ReviewVerdict::Verified => "VERIFIED",
             crate::review_receipt::ReviewVerdict::Rejected => "REJECTED",
@@ -1961,12 +2055,23 @@ pub(crate) fn record_validated_receipt(
     if !subject_found {
         return verdict_buffer::buffer_validated(home, summary);
     }
-    // 仍持有 assignment lock：退役被這張 receipt 取代的同 instance 舊 record。
-    let cleanup_tasks = crate::daemon::assignment_authority::retire_superseded_by_receipt(
+    // 仍持有 assignment lock：退役派發順序較早、且已被取代／被判定過時的同 instance record。
+    let mut cleanup_tasks = crate::daemon::assignment_authority::retire_older_assignments(
         home,
         summary,
         &superseded_assignments,
+        retire_bound,
     );
+    if let Some(newer_seq) = stale_newer_seq {
+        cleanup_tasks.extend(
+            crate::daemon::assignment_authority::retire_older_assignments(
+                home,
+                summary,
+                &[summary.assignment_id],
+                Some(newer_seq),
+            ),
+        );
+    }
     drop(_assignment_lock);
     for task_id in cleanup_tasks {
         crate::tasks::task_terminal_cleanup(home, &task_id);
