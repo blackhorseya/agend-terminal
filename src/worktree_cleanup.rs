@@ -380,6 +380,38 @@ fn vanished_target_reason(key: &str) -> Option<String> {
     }
 }
 
+/// -160 (c): is this `cleanup-intent-preserved:<candidate_id>` episode provably
+/// resolved? Same asymmetry as [`vanished_target_reason`]: `None` for every
+/// reason that is not proof.
+///
+/// Proof is either (1) this tick's reconcile reported the candidate with an
+/// outcome that is no longer `preserved:*` (it settled), or (2) the candidate
+/// was not reconciled this tick AND a COMPLETE listing of the intent store does
+/// not contain it (already handled / deleted). A candidate still reported as
+/// `preserved:*` stays open, and an unreadable store (`live == None`) proves
+/// nothing.
+fn resolved_intent_reason(
+    key: &str,
+    review_reconcile: &crate::cleanup_intents::ReconcileResult,
+    live: Option<&HashSet<String>>,
+) -> Option<String> {
+    let candidate_id = key.strip_prefix("cleanup-intent-preserved:")?;
+    if let Some(candidate) = review_reconcile
+        .candidates
+        .iter()
+        .find(|c| c.candidate_id == candidate_id)
+    {
+        return (!candidate.outcome.starts_with("preserved:")).then(|| {
+            format!(
+                "cleanup intent no longer preserved: {} ({})",
+                candidate.branch, candidate.outcome
+            )
+        });
+    }
+    live.filter(|ids| !ids.contains(candidate_id))
+        .map(|_| format!("cleanup intent no longer exists: {candidate_id}"))
+}
+
 /// t-…-241: close episodes whose subject is provably gone, so they stop being
 /// re-observed forever. Measured before this ran: 335 live episodes, 59 of
 /// them pointing at a repo or branch that no longer existed.
@@ -391,7 +423,10 @@ fn vanished_target_reason(key: &str) -> Option<String> {
 /// key family that records a ONE-SHOT event would not have that property, and
 /// must not be added to `vanished_target_reason` without a different rule
 /// (R2, archfix-opus-3).
-fn close_hygiene_episodes_with_vanished_targets(home: &Path) -> usize {
+fn close_hygiene_episodes_with_vanished_targets(
+    home: &Path,
+    review_reconcile: &crate::cleanup_intents::ReconcileResult,
+) -> usize {
     let episodes = match crate::daemon::hygiene_task::active_episodes(home) {
         Ok(episodes) => episodes,
         Err(error) => {
@@ -399,9 +434,14 @@ fn close_hygiene_episodes_with_vanished_targets(home: &Path) -> usize {
             return 0;
         }
     };
+    // Read once per pass, AFTER this tick's reconcile has removed whatever it
+    // settled, so "not on disk" means "not on disk now".
+    let live_intents = crate::cleanup_intents::live_intent_ids(home);
     let mut closed = 0;
     for (task_id, key) in episodes {
-        let Some(reason) = vanished_target_reason(&key) else {
+        let Some(reason) = vanished_target_reason(&key)
+            .or_else(|| resolved_intent_reason(&key, review_reconcile, live_intents.as_ref()))
+        else {
             continue;
         };
         match crate::daemon::hygiene_task::close_episode(home, &task_id, &reason) {
@@ -545,7 +585,7 @@ pub fn sweep_from_registry(
 
     // t-…-241: revalidate BEFORE observing, so a subject that vanished since
     // the last tick is closed in the same tick that would have re-counted it.
-    close_hygiene_episodes_with_vanished_targets(home);
+    close_hygiene_episodes_with_vanished_targets(home, &review_reconcile);
 
     let mut removed = Vec::new();
 
