@@ -1727,13 +1727,24 @@ pub fn record_ci_result(
                     crate::daemon::assignment_authority::BranchAuthority::Unreadable
                 )
             {
-                let selections = verdict_buffer::select_validated_for_subject(
+                let mut selections = verdict_buffer::select_validated_for_subject(
                     home,
                     repo,
                     branch,
                     state.pr_number,
                     head_sha,
                 );
+                // 緩衝目錄的讀取順序不是抵達順序，同一 instance 的多張 receipt 誰取代誰
+                // 無法證明。為了不讓順序決定 gate：VERIFIED 先套用、非 VERIFIED 後套用，
+                // 同批有衝突時結果固定是非 VERIFIED（fail closed）；再以 receipt_id 排序
+                // 讓結果可重現。不使用 buffered_at 等 wall-clock 排序。
+                selections.sort_by_key(|selection| {
+                    let r = selection.receipt();
+                    (
+                        !matches!(r.verdict, crate::review_receipt::ReviewVerdict::Verified),
+                        r.receipt_id.clone(),
+                    )
+                });
                 for selection in &selections {
                     let receipt = selection.receipt();
                     if !crate::review_receipt::assignment_still_authorizes(home, receipt)
