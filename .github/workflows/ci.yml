@@ -22,7 +22,18 @@ jobs:
   # bottleneck at 27/32 min. Shard 1 keeps every lint/build/smoke step; the
   # last shard also carries the coverage wrapper contract (~6 min on Windows)
   # so it runs in parallel instead of in series with the build. ubuntu stays a
-  # single shard — it is not on the critical path.
+  # single shard — it is not on the critical path. Re-measured at cb963452:
+  # ubuntu 14-18 min vs windows 1/2 19-21 min and macos 1/2 19-21 min, so a
+  # second ubuntu shard would not shorten the PR wall clock (the slowest job
+  # decides it). Revisit only if ubuntu becomes the slowest job.
+  #
+  # Where the PR wall clock goes (windows 1/2, warm cache): Tests ~10-12 min of
+  # which ~4-5 min is compiling the test profile before nextest starts, then the
+  # nextest run itself (~6-8 min). The levers in this file, in order of effect:
+  # one feature set for Build/Tests so dependencies compile once (see "Build
+  # (debug, PR smoke)"), PR runs restore the cache but never save it (see the
+  # rust-cache step), and nextest starts the serial `git-subprocess` group first
+  # (.config/nextest.toml `priority`).
   check:
     name: Check (${{ matrix.os }}${{ matrix.shards > 1 && format(', {0}/{1}', matrix.shard, matrix.shards) || '' }})
     runs-on: ${{ matrix.os }}
