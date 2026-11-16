@@ -1465,3 +1465,74 @@ fn missing_or_unreadable_fleet_config_yields_no_aliases() {
         std::fs::remove_dir_all(&home).ok();
     }
 }
+
+// ── -160 (a) r5：移除 alias 必須在「下一次呼叫」就生效 ───────────────────
+//
+// reviewer r4 P1：`FleetConfig::load_arc` 以 (path, mtime, size) 當快取鍵、不比對
+// 內容。把 `[github-work]` 改成同長度的 `[gitlab-work]` 且保留 mtime（粗粒度時間戳或
+// 保留 metadata 的更新）時，仍讀到舊清單 → 已移除的 alias 還是 Some(slug) → 刪除依據。
+// allowlist 是權威來源，必須每次依檔案「內容」判斷，不得被 metadata 快取蓋過。
+
+fn rewrite_preserving_mtime(path: &std::path::Path, new_yaml: &str) {
+    let mtime = std::fs::metadata(path).unwrap().modified().unwrap();
+    std::fs::write(path, new_yaml).unwrap();
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    assert_eq!(std::fs::metadata(path).unwrap().modified().unwrap(), mtime);
+}
+
+/// RED：同長度、同 mtime 的內容改動（移除 alias）下一次呼叫就要看到。
+#[test]
+fn removed_alias_takes_effect_even_when_size_and_mtime_are_unchanged() {
+    let home = fleet_home("stale-meta", Some("github_ssh_aliases: [github-work]\n"));
+    let path = crate::fleet::fleet_yaml_path(&home);
+    assert_eq!(github_ssh_aliases_in(&home), aliases(&["github-work"]));
+
+    let replacement = "github_ssh_aliases: [gitlab-work]\n";
+    assert_eq!(
+        replacement.len(),
+        "github_ssh_aliases: [github-work]\n".len()
+    );
+    rewrite_preserving_mtime(&path, replacement);
+
+    let current = github_ssh_aliases_in(&home);
+    assert_eq!(
+        current,
+        aliases(&["gitlab-work"]),
+        "必須依內容重讀，不得沿用舊清單"
+    );
+    assert_eq!(
+        extract_github_repo_with("git@github-work:acme/app.git", &current),
+        None,
+        "已從 allowlist 移除的 alias 不得再被當成 GitHub"
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// 對照（綠）：大小不同的修改本來就會重讀；移除後 alias 立即失效。
+#[test]
+fn removed_alias_takes_effect_when_the_file_changes_size() {
+    let home = fleet_home("size-change", Some("github_ssh_aliases: [github-work]\n"));
+    assert_eq!(github_ssh_aliases_in(&home), aliases(&["github-work"]));
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        "github_ssh_aliases: []\n",
+    )
+    .unwrap();
+    assert!(github_ssh_aliases_in(&home).is_empty());
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// RED：fleet.yaml 被刪掉 → 下一次呼叫就是空清單（不得殘留快取的舊清單）。
+#[test]
+fn deleting_fleet_yaml_clears_the_allowlist_immediately() {
+    let home = fleet_home("deleted", Some("github_ssh_aliases: [github-work]\n"));
+    assert_eq!(github_ssh_aliases_in(&home), aliases(&["github-work"]));
+    std::fs::remove_file(crate::fleet::fleet_yaml_path(&home)).unwrap();
+    assert!(github_ssh_aliases_in(&home).is_empty());
+    std::fs::remove_dir_all(&home).ok();
+}
