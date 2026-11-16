@@ -1641,6 +1641,8 @@ pub fn record_ci_result(
         initial_authority
     };
     let mut selected_receipts = Vec::new();
+    let mut replay_superseded: Vec<(crate::review_receipt::ReviewReceiptSummary, Vec<uuid::Uuid>)> =
+        Vec::new();
     let save_result = with_pr_state_or_create(
         home,
         repo,
@@ -1748,12 +1750,27 @@ pub fn record_ci_result(
                         receipt_id = %receipt.receipt_id,
                         "task66 verdict_buffer: replaying validated receipt onto exact subject"
                     );
-                    let _ = apply_receipt_to_state(state, receipt.clone());
+                    let superseded = apply_receipt_to_state(state, receipt.clone());
+                    if !superseded.is_empty() {
+                        replay_superseded.push((receipt.clone(), superseded));
+                    }
                 }
                 selected_receipts = selections;
             }
         },
     );
+    // 重放取代了舊 receipt：state 已存檔後，仍在 assignment lock（外層）內退役被取代的
+    // 舊 record（只在 lock_acquired 時才會有重放，鎖順序與 record_validated_receipt 相同）。
+    let mut replay_cleanup_tasks = Vec::new();
+    if save_result.is_ok() {
+        for (receipt, superseded) in &replay_superseded {
+            replay_cleanup_tasks.extend(
+                crate::daemon::assignment_authority::retire_superseded_by_receipt(
+                    home, receipt, superseded,
+                ),
+            );
+        }
+    }
     match save_result {
         Ok(()) => verdict_buffer::commit_validated_selections(&selected_receipts),
         Err(e) => {
@@ -1767,6 +1784,9 @@ pub fn record_ci_result(
     }
     // Keep assignment-OUTER held through the post-save exact-content commit.
     drop(_assignment_lock);
+    for task_id in replay_cleanup_tasks {
+        crate::tasks::task_terminal_cleanup(home, &task_id);
+    }
 }
 
 fn receipt_seen(state: &PrState, receipt: &crate::review_receipt::ReviewReceiptSummary) -> bool {
