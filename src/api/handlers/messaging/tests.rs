@@ -3196,6 +3196,7 @@ fn verified_disposable_review_receipt_closes_exact_task_when_review_branch_diffe
             false,
             Some(crate::binding::BindingProvenance::DaemonProvisionedReview {
                 provisioned_head: &head,
+                pr: None,
             }),
             false, // #3546: this fixture makes no claim about the base's freshness
         )

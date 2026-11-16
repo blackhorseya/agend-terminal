@@ -14,6 +14,7 @@ use std::path::Path;
 
 mod retention_pr;
 pub(super) use retention_pr::raise_retention_for_release;
+#[cfg(test)]
 pub(crate) use retention_pr::retention_pr_tag;
 #[cfg(test)]
 mod retention_notify_tests;

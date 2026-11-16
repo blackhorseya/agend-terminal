@@ -225,7 +225,12 @@ pub(crate) fn branch_has_active_task(home: &Path, branch: &str) -> bool {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum BindingProvenance<'a> {
-    DaemonProvisionedReview { provisioned_head: &'a str },
+    DaemonProvisionedReview {
+        provisioned_head: &'a str,
+        /// The `(repository slug, PR number)` this review was provisioned for,
+        /// persisted so a later release can tie the review branch back to its PR.
+        pr: Option<(&'a str, u64)>,
+    },
 }
 
 /// Write a full binding including worktree + source-repo paths.
@@ -399,10 +404,18 @@ pub(crate) fn bind_full_with_provenance(
     if base_from_stale_view {
         binding["base_from_stale_view"] = json!(true);
     }
-    if let Some(BindingProvenance::DaemonProvisionedReview { provisioned_head }) = provenance {
+    if let Some(BindingProvenance::DaemonProvisionedReview {
+        provisioned_head,
+        pr,
+    }) = provenance
+    {
         binding["checkout_purpose"] = json!("disposable_review");
         binding["provenance"] = json!("DaemonProvisionedReview");
         binding["provisioned_head"] = json!(provisioned_head);
+        if let Some((repo, pr_number)) = pr.filter(|(repo, n)| !repo.is_empty() && *n > 0) {
+            binding["review_pr_repo"] = json!(repo);
+            binding["review_pr_number"] = json!(pr_number);
+        }
     }
     let body = serde_json::to_string_pretty(&binding).unwrap_or_default();
     crate::store::atomic_write(&path, body.as_bytes())

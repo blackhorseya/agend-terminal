@@ -16,6 +16,7 @@ const ATTESTED_KEEP: &str = "keep:";
 /// ceremony. The term runs from the answer, not from the release.
 pub(super) const KEEP_TTL_DAYS: i64 = 14;
 const RETENTION_ACTOR: &str = "system:branch-retention";
+const RETENTION_PR_PREFIX: &str = "retention-pr:";
 
 /// t-20260901084057482124-43938-5 B3/B4 (d-20260901132326253721-16): the
 /// recorded owner's answer, the SECOND settlement authority for a cleanup
@@ -130,7 +131,53 @@ pub(super) fn retire_merged_lane(home: &Path, repo: &str, branch: &str) {
 
 /// Retire every OPEN review-branch obligation whose PR the daemon has observed
 /// merged. Keyed on the `retention-pr:` tag, never on a branch name.
-pub(super) fn retire_merged_pr_obligations(_home: &Path, _project: &str) {}
+///
+/// Complements [`retire_merged_lane`], which only ever sees the PR's head
+/// branch: a review branch's name matches neither the head nor any merged ref.
+pub(super) fn retire_merged_pr_obligations(home: &Path, project: &str) {
+    let board = crate::task_events::board_root(home, project);
+    let actor = crate::task_events::InstanceName(RETENTION_ACTOR.to_string());
+    for task in retention_obligations(home, project)
+        .into_iter()
+        .filter(|task| !task.status.is_terminal())
+    {
+        let merged_pr = task
+            .tags
+            .iter()
+            .filter_map(|tag| tag.strip_prefix(RETENTION_PR_PREFIX))
+            .filter_map(|rest| rest.rsplit_once('#'))
+            .find_map(|(repo, number)| {
+                let state = crate::daemon::pr_state::by_number::find_by_number(
+                    home,
+                    repo,
+                    number.parse().ok()?,
+                )?;
+                crate::daemon::pr_state::by_number::is_merged(&state)
+                    .then(|| format!("{repo}#{number}"))
+            });
+        let Some(pr) = merged_pr else {
+            continue;
+        };
+        let event = crate::task_events::TaskEvent::Done {
+            task_id: task.id.clone(),
+            by: actor.clone(),
+            source: crate::task_events::DoneSource::AutoCloseOnPrMerge {
+                branch: pr.clone(),
+                merged_at: chrono::Utc::now().to_rfc3339(),
+            },
+        };
+        match crate::task_events::append_done_if_legal_at(&board, &actor, &task.id.0, vec![event]) {
+            Ok(_) => tracing::info!(
+                task_id = %task.id.0, %pr,
+                "review-branch retention obligation retired by its PR's merge"
+            ),
+            Err(error) => tracing::warn!(
+                task_id = %task.id.0, %pr, %error,
+                "review-branch retention obligation retire failed — will retry next sweep"
+            ),
+        }
+    }
+}
 
 /// #3517 follow-up: re-raise the owner's obligation for a lane the merge closed
 /// and the branch then walked away from.

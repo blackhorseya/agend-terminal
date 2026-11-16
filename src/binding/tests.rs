@@ -2126,3 +2126,44 @@ fn ps1_hook_withholds_when_git_dir_head_is_missing_3545() {
     assert!(out.contains("Agend-Agent: trailer-agent"), "{out}");
     assert!(!out.contains("Agend-Task:") && !out.contains("Agend-Branch:"));
 }
+
+/// 審查分支的 binding 必須帶著它審查的 PR（repo slug + 號），release 時才能把
+/// retention 單綁回 PR；沒有 PR 識別的 provenance 不得憑空寫出這兩欄。
+#[test]
+fn disposable_review_binding_records_the_pr_it_was_provisioned_for() {
+    let home = tmp_home("review-pr-identity");
+    let repo = tmp_home("review-pr-identity-repo");
+    let head = "a".repeat(40);
+    for (agent, pr, expect) in [
+        ("rev-with-pr", Some(("acme/neutral-repo", 7u64)), true),
+        ("rev-without-pr", None, false),
+        ("rev-zero-pr", Some(("acme/neutral-repo", 0u64)), false),
+    ] {
+        bind_full_with_provenance(
+            &home,
+            agent,
+            "t-neutral-review",
+            "review/neutral-r1",
+            &repo,
+            &repo,
+            false,
+            Some(BindingProvenance::DaemonProvisionedReview {
+                provisioned_head: &head,
+                pr,
+            }),
+            false,
+        )
+        .expect("bind");
+        let body = std::fs::read_to_string(crate::paths::binding_path(&home, agent)).expect("read");
+        let binding: serde_json::Value = serde_json::from_str(&body).expect("json");
+        assert_eq!(
+            binding.get("review_pr_number").is_some() && binding.get("review_pr_repo").is_some(),
+            expect,
+            "{agent}: {binding}"
+        );
+        if expect {
+            assert_eq!(binding["review_pr_number"], 7);
+            assert_eq!(binding["review_pr_repo"], "acme/neutral-repo");
+        }
+    }
+}

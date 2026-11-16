@@ -148,3 +148,54 @@ fn an_obligation_without_a_pr_tag_is_left_alone() {
     retire(&home);
     assert!(!status_of(&home, &row.id).is_terminal());
 }
+
+/// 同一支 PR 會先後綁多個 review 分支，head 各是不同的中間 commit：
+/// PR 合併後每一張都要退役，不能只退役 head 等於最終 head 的那張。
+#[test]
+fn every_review_branch_of_one_merged_pr_is_retired_whatever_its_head() {
+    let home = tmp_home("many-branches");
+    plant_pr(&home, SLUG, 66, GhPrState::Closed);
+    let tag = crate::worktree_pool::retention_pr_tag(SLUG, 66);
+    let rows: Vec<_> = [
+        "review/neutral-r1",
+        "review/neutral-red",
+        "review/neutral-r2",
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, branch)| {
+        let head = format!("{i:040x}");
+        crate::worktree_pool::record_retention_obligation_with_pr(
+            &home,
+            REPO_PATH,
+            branch,
+            &head,
+            "",
+            Some("rev-1"),
+            Some(tag.clone()),
+        );
+        let lane = crate::worktree_pool::retention_lane_key(REPO_PATH, branch);
+        retention_obligations(&home, &retention_project(&home, REPO_PATH))
+            .into_iter()
+            .find(|t| t.tags.contains(&lane))
+            .expect("raised")
+    })
+    .collect();
+    assert_eq!(rows.len(), 3, "pre: one obligation per review branch");
+
+    retire(&home);
+    assert!(
+        rows.iter().all(|r| !status_of(&home, &r.id).is_terminal()),
+        "pre: nothing retires while the PR is not merged"
+    );
+
+    plant_pr(&home, SLUG, 66, GhPrState::Merged);
+    retire(&home);
+    for row in &rows {
+        assert!(
+            status_of(&home, &row.id).is_terminal(),
+            "obligation {} must retire with the PR's merge",
+            row.id.0
+        );
+    }
+}

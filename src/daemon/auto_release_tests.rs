@@ -1393,6 +1393,7 @@ fn auto_close_on_report_enqueues_release_recompute() {
         false,
         Some(crate::binding::BindingProvenance::DaemonProvisionedReview {
             provisioned_head: &provisioned_head,
+            pr: None,
         }),
         false, // #3546: this fixture makes no claim about the base's freshness
     )
