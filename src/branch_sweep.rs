@@ -787,23 +787,62 @@ pub(crate) fn merged_pr_number(repo: &Path, base: &str, branch: &str) -> Option<
         .map(|pr| pr.number)
 }
 
-/// SCAFFOLD for the test commit (-160 a): the allowlist seam exists so tests can
-/// compile and fail against the pre-fix behaviour. It consults nothing yet; the
-/// fix commit reads fleet.yaml  and gates alias remotes.
-#[allow(dead_code)]
-fn github_ssh_aliases_in(_home: &Path) -> Vec<String> {
-    Vec::new()
+/// SSH host aliases the OPERATOR has declared to be github.com: fleet.yaml
+/// top-level `github_ssh_aliases` (e.g. `[github-work]`). An alias NAME says
+/// nothing about where the connection goes (`Host github-work` may map to
+/// gitlab.com, behind a `ProxyCommand`, …) and a GitHub verdict here becomes
+/// deletion evidence, so nothing is inferred — not from the name, not from
+/// `~/.ssh/config`. Missing/unreadable fleet.yaml or an empty list means no
+/// alias is GitHub (fail-closed → open-PR lookups stay `Unknown`).
+fn github_ssh_aliases_in(home: &Path) -> Vec<String> {
+    match crate::fleet::FleetConfig::load_arc(&crate::fleet::fleet_yaml_path(home)) {
+        Ok(cfg) => cfg
+            .github_ssh_aliases
+            .iter()
+            .map(|alias| alias.trim().to_string())
+            .filter(|alias| !alias.is_empty())
+            .collect(),
+        Err(error) => {
+            tracing::debug!(%error, "github_ssh_aliases unavailable; no SSH alias is treated as GitHub");
+            Vec::new()
+        }
+    }
 }
 
-#[allow(dead_code)]
-fn extract_github_repo_with(url: &str, _github_ssh_aliases: &[String]) -> Option<String> {
-    extract_github_repo(url)
+/// `(host, path)` of an scp-style (`git@<host>:<path>`) or `ssh://git@<host>/<path>`
+/// remote.
+fn ssh_remote_host_and_path(url: &str) -> Option<(&str, &str)> {
+    match url.strip_prefix("ssh://git@") {
+        Some(rest) => rest.split_once('/'),
+        None => url.strip_prefix("git@")?.split_once(':'),
+    }
 }
 
-/// Extract "owner/repo" from a GitHub remote URL.
-fn extract_github_repo(url: &str) -> Option<String> {
-    // Handles: https://github.com/owner/repo.git, git@github.com:owner/repo.git
+fn extract_github_repo_with(url: &str, github_ssh_aliases: &[String]) -> Option<String> {
     let stripped = url.trim().trim_end_matches('/').trim_end_matches(".git");
+    if let Some(repo) = extract_literal_github_repo(stripped) {
+        return Some(repo);
+    }
+    // Alias-form remote: GitHub only if the alias appears, exactly, in the
+    // operator's allowlist.
+    let (host, path) = ssh_remote_host_and_path(stripped)?;
+    if !github_ssh_aliases.iter().any(|alias| alias == host) {
+        return None;
+    }
+    let (owner, name) = path.split_once('/')?;
+    let well_formed =
+        !owner.is_empty() && !name.is_empty() && !name.contains('/') && !path.contains([':', '@']);
+    well_formed.then(|| path.to_string())
+}
+
+/// Extract "owner/repo" from a GitHub remote URL. Literal `github.com` forms
+/// need no configuration; alias remotes need `github_ssh_aliases`.
+fn extract_github_repo(url: &str) -> Option<String> {
+    extract_github_repo_with(url, &github_ssh_aliases_in(&crate::home_dir()))
+}
+
+/// The literal `github.com` forms (https / `git@github.com:`); no host lookup.
+fn extract_literal_github_repo(stripped: &str) -> Option<String> {
     if stripped.contains("github.com") {
         if let Some(path) = stripped.strip_prefix("git@github.com:") {
             return Some(path.to_string());
