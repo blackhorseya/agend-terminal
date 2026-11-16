@@ -288,7 +288,6 @@ fn negative_other_reviewers_rejected_still_blocks() {
 /// 「同 reviewer」必須以 instance id 判斷：舊 receipt 被取代後，舊名 record 不得在
 /// 下一次 reconcile 被當成 Unengaged 而重新 reservation。
 #[test]
-#[ignore = "follow-up t-20261116042747935842-99036-248"]
 fn renamed_instance_old_record_is_not_re_reserved() {
     let home = home("renamed");
     let head = "f".repeat(40);
@@ -454,4 +453,149 @@ fn clock_rollback_does_not_let_older_verified_bypass_newer_pending() {
         readiness(&home)
     );
     let _ = std::fs::remove_dir_all(&home);
+}
+
+// ───────── reviewer 改名後的舊名 record（-248）─────────
+//
+// authority record 的 key 是 target 名稱，同一個 stable InstanceId 改名後，
+// 舊名 record 不會被新名 `persist` 取代。以下測試涵蓋：舊名 record 在新 receipt
+// 取代舊 receipt 後必須一併退役（不得被 reconcile 重新推導成 reservation），
+// 以及所有「不可放寬」的 guard。任何能打開 merge gate 的判斷都不得依賴
+// wall-clock `created_at`。
+
+fn reserved_targets(home: &Path) -> Vec<String> {
+    let mut targets: Vec<String> = load(home, REPO, BRANCH)
+        .unwrap()
+        .reserved_assignments
+        .iter()
+        .map(|r| r.target.clone())
+        .collect();
+    targets.sort();
+    targets
+}
+
+fn record_exists(home: &Path, target: &str) -> bool {
+    store::record_path_for_test(home, REPO, BRANCH, target).exists()
+}
+
+/// 新名 record（A2）之後照常退役（task terminal 清理）時，舊名 A1 不得復活成
+/// reservation。r3 P2：退役新 record 後舊 record 被重新 reservation。
+#[test]
+fn renamed_instance_new_record_retirement_does_not_restore_old_reservation() {
+    let home = home("renamed-a2-retired");
+    let head = "c".repeat(40);
+    seed_state(&home, &head);
+    let reviewer = crate::types::InstanceId::new();
+
+    let r1 = assign(&home, "old-reviewer-name", reviewer, &head, "t-review-1");
+    store::redrive_reserved(&home, REPO, BRANCH);
+    submit(&home, &r1, ReviewVerdict::Rejected);
+    let r2 = assign(&home, "new-reviewer-name", reviewer, &head, "t-review-2");
+    submit(&home, &r2, ReviewVerdict::Verified);
+    assert_eq!(readiness(&home), Ok(()));
+
+    // 模擬 A2 的 terminal-task 清理；A1 的清理先前失敗或尚未完成。
+    let _ = std::fs::remove_file(store::record_path_for_test(
+        &home,
+        REPO,
+        BRANCH,
+        "new-reviewer-name",
+    ));
+    store::redrive_reserved(&home, REPO, BRANCH);
+    assert_eq!(
+        readiness(&home),
+        Ok(()),
+        "退役 A2 後舊名 record 復活成 reservation: {:?}",
+        reserved_targets(&home)
+    );
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Guard：只退役「被這張 receipt 取代」的同 InstanceId record。另一位 reviewer
+/// 仍 pending 的 record 不受影響，仍須 reserved。
+#[test]
+fn other_reviewers_pending_record_is_not_retired() {
+    let home = home("other-reviewer-pending");
+    let head = "1".repeat(40);
+    seed_state(&home, &head);
+    let reviewer = crate::types::InstanceId::new();
+    let other = crate::types::InstanceId::new();
+
+    let r1 = assign(&home, "old-reviewer-name", reviewer, &head, "t-review-1");
+    submit(&home, &r1, ReviewVerdict::Rejected);
+    let _pending = assign(&home, "other-reviewer", other, &head, "t-review-other");
+    let r2 = assign(&home, "new-reviewer-name", reviewer, &head, "t-review-2");
+    submit(&home, &r2, ReviewVerdict::Verified);
+
+    store::redrive_reserved(&home, REPO, BRANCH);
+    assert_eq!(reserved_targets(&home), vec!["other-reviewer".to_string()]);
+    assert!(record_exists(&home, "other-reviewer"));
+    assert!(matches!(
+        readiness(&home),
+        Err(MergeDeficit::ReservedAssignments { count: 1 })
+    ));
+    let _ = std::fs::remove_dir_all(&home);
+}
+
+/// Guard：dual 的 N-of-M 計數與 fail-closed。同一位 reviewer 的新 receipt 取代
+/// 舊 receipt；另一位 reviewer 的 receipt 缺漏時仍不足額。
+#[test]
+fn dual_supersede_and_missing_receipt_fail_closed() {
+    let head = "f".repeat(40);
+    let mut state = tests::new_state(&head, ReviewClass::Dual);
+    state.ci_state = CiState::Green {
+        sha: head.clone(),
+        observed_at: chrono::Utc::now().to_rfc3339(),
+    };
+    assert!(matches!(
+        merge_readiness(&state),
+        Err(MergeDeficit::InsufficientVerified { have: 0, need: 2 })
+    ));
+
+    let reviewer_one = crate::types::InstanceId::new();
+    let reviewer_two = crate::types::InstanceId::new();
+    let make = |name: &str, instance: crate::types::InstanceId, verdict: ReviewVerdict| {
+        let source_id = format!("m-{}", uuid::Uuid::new_v4());
+        ReviewReceiptSummary {
+            receipt_id: format!("review-receipt:{source_id}"),
+            source_id,
+            evidence_digest: "a".repeat(64),
+            assignment_id: uuid::Uuid::new_v4(),
+            reviewer_instance_id: instance,
+            reviewer_name: name.into(),
+            repo: REPO.into(),
+            pr_number: PR,
+            branch: BRANCH.into(),
+            task_id: format!("t-{name}"),
+            reviewed_head: head.clone(),
+            review_class: ReviewClass::Dual,
+            slot: ReviewSlot::Primary,
+            verdict,
+        }
+    };
+    apply_receipt_to_state(
+        &mut state,
+        make("one", reviewer_one, ReviewVerdict::Rejected),
+    );
+    apply_receipt_to_state(
+        &mut state,
+        make("two", reviewer_two, ReviewVerdict::Verified),
+    );
+    assert!(matches!(
+        merge_readiness(&state),
+        Err(MergeDeficit::NonVerifiedReceipt { .. })
+    ));
+    apply_receipt_to_state(
+        &mut state,
+        make("one", reviewer_one, ReviewVerdict::Verified),
+    );
+    assert_eq!(state.validated_review_receipts.len(), 2);
+    assert_eq!(merge_readiness(&state), Ok(()));
+    state
+        .validated_review_receipts
+        .retain(|r| r.reviewer_instance_id == reviewer_one);
+    assert!(matches!(
+        merge_readiness(&state),
+        Err(MergeDeficit::InsufficientVerified { have: 1, need: 2 })
+    ));
 }
