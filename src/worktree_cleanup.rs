@@ -1452,4 +1452,5 @@ mod windows_cleanup_diagnostics_tests;
 mod review_repro_worktree_git;
 
 #[cfg(test)]
+#[allow(clippy::unwrap_used, clippy::expect_used)]
 mod hygiene_convergence_tests;
