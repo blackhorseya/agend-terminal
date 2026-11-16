@@ -20,8 +20,8 @@ jobs:
   # count:<shard>/<shards>`): their Tests step was ~14 min of pure throughput
   # (8.1k+ tests, no single test over ~70s), which made them the PR wall-clock
   # bottleneck at 27/32 min. Shard 1 keeps every lint/build/smoke step; the
-  # last shard also carries the coverage wrapper contract (~6 min on Windows)
-  # so it runs in parallel instead of in series with the build. ubuntu stays a
+  # coverage wrapper contract (~6 min on Windows) runs in its own
+  # `coverage-wrapper` job so it is parallel to the build. ubuntu stays a
   # single shard — it is not on the critical path. Re-measured at cb963452:
   # ubuntu 14-18 min vs windows 1/2 19-21 min and macos 1/2 19-21 min, so a
   # second ubuntu shard would not shorten the PR wall clock (the slowest job
@@ -140,25 +140,9 @@ jobs:
         shell: bash
         run: scripts/test_windows_native_symlink_canary.sh
 
-      # #3236: the coverage wrapper's failure semantics (real-failure precedence,
-      # truthful cleanup, attempt isolation, bounded diagnostics). Runs here
-      # rather than in the coverage job so a semantics regression is caught in
-      # seconds on every platform instead of after a 30-minute producer run.
-      # #3249: raised from 5. windows-latest sets this budget — the suite is
-      # dominated by full wrapper invocations and every one is a process spawn,
-      # the operation MSYS is slowest at. The step had already grown 3m57s →
-      # 4m18s → 4m51s over three main commits before #3249's contracts crossed
-      # 5m, so the headroom was nine seconds, not a cliff this PR built. 10
-      # gives the curve room without hiding it: if the step approaches this
-      # budget again, split the suite instead of raising the number a second
-      # time.
-      - name: Coverage wrapper contract test
-        if: matrix.shard == matrix.shards
-        timeout-minutes: 10
-        shell: bash
-        env:
-          COVERAGE_REQUIRE_NATIVE_SYMLINKS: ${{ runner.os == 'Windows' && '1' || '0' }}
-        run: scripts/test_coverage_run.sh
+      # The Coverage wrapper contract test no longer runs here: it moved to the
+      # standalone `coverage-wrapper` job below (it needs no build, so it was only
+      # lengthening the last shard — ~5-6 min on windows 2/2 — in series).
 
       # The former standalone repository CI now runs from the monorepo checkout.
       # Keep the same Unix test/clippy/package coverage and Windows advisory
@@ -443,6 +427,41 @@ jobs:
   # `check` matrix). NO path-filter: a required check that path-skips stays
   # permanently `pending` and blocks merge. release.yml's MSRV step is unchanged —
   # the two gates are independent and the release gate stays the final backstop.
+  # #3236: the coverage wrapper's failure semantics (real-failure precedence,
+  # truthful cleanup, attempt isolation, bounded diagnostics). Runs rather than
+  # in the coverage job so a semantics regression is caught in seconds on every
+  # platform instead of after a 30-minute producer run.
+  # #3249: timeout raised from 5. windows-latest sets this budget — the suite is
+  # dominated by full wrapper invocations and every one is a process spawn, the
+  # operation MSYS is slowest at. The step had already grown 3m57s -> 4m18s ->
+  # 4m51s over three main commits before #3249's contracts crossed 5m, so the
+  # headroom was nine seconds, not a cliff this PR built. 10 gives the curve
+  # room without hiding it: if the step approaches this budget again, split the
+  # suite instead of raising the number a second time.
+  #
+  # Standalone job (was the last `check` shard's step): scripts/test_coverage_run.sh
+  # stubs cargo/git/llvm tooling in its own sandbox, so it needs no Rust
+  # toolchain, no cache and no build — verified by running it with a PATH that
+  # has no cargo/rustc (116 passed, 0 failed). Running it in parallel instead of
+  # in series with the Windows test build takes ~5 min off windows 2/2, ~2 min
+  # off macos 2/2 and ~1.4 min off ubuntu. Runs exactly once per OS, as before.
+  coverage-wrapper:
+    name: Coverage wrapper contract (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v5
+      - name: Coverage wrapper contract test
+        timeout-minutes: 10
+        shell: bash
+        env:
+          COVERAGE_REQUIRE_NATIVE_SYMLINKS: ${{ runner.os == 'Windows' && '1' || '0' }}
+        run: scripts/test_coverage_run.sh
+
   msrv:
     name: MSRV check (1.88)
     runs-on: ubuntu-latest
