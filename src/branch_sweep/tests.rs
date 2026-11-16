@@ -1287,3 +1287,181 @@ fn dry_run_observability_skips_absent_reviewer_branch() {
 
     std::fs::remove_dir_all(repo.parent().unwrap()).ok();
 }
+
+// ── -160 (a)：SSH host alias remote（運維者明確 allowlist）────────────
+//
+// 只有 fleet.yaml 頂層 `github_ssh_aliases` 明列、且完全相等的 alias 才算 GitHub。
+// alias 名稱（`github-*`）與 ~/.ssh/config（HostName／ProxyCommand／ProxyJump／
+// HostKeyAlias）都不構成證明——GitHub 判定會變成刪除依據，推斷一律 fail-closed。
+
+fn aliases(list: &[&str]) -> Vec<String> {
+    list.iter().map(|a| a.to_string()).collect()
+}
+
+/// 正向：allowlist 內、完全相等的 alias → slug（alias 名稱不需要 github- 前綴）。
+#[test]
+fn allowlisted_ssh_alias_resolves_to_github_slug() {
+    let allow = aliases(&["github-work", "work-gh", "github.com-team"]);
+    for url in [
+        "git@github-work:acme/app.git",
+        "git@github-work:acme/app",
+        "git@work-gh:acme/app.git",
+        "git@github.com-team:acme/app.git",
+        "ssh://git@github-work/acme/app.git",
+        "  git@github-work:acme/app.git\n",
+    ] {
+        assert_eq!(
+            extract_github_repo_with(url, &allow).as_deref(),
+            Some("acme/app"),
+            "allowlist 內的 alias 必須解析出 slug: {url:?}"
+        );
+    }
+}
+
+/// 負向：名稱像 GitHub 但不在 allowlist → None（Unknown）。空清單＝沒有 alias 是 GitHub。
+#[test]
+fn github_looking_alias_outside_the_allowlist_is_not_github() {
+    for allow in [
+        vec![],
+        aliases(&["github-other"]),
+        aliases(&["GITHUB-WORK", "github-work2", "github"]),
+    ] {
+        for url in [
+            "git@github-work:acme/app.git",
+            "git@github.com-work:acme/app.git",
+            "ssh://git@github-work/acme/app.git",
+        ] {
+            assert_eq!(
+                extract_github_repo_with(url, &allow),
+                None,
+                "未列入 allowlist（需完全相等）的 alias 不得當成 GitHub: {url:?} allow={allow:?}"
+            );
+        }
+    }
+}
+
+/// reviewer 的 ProxyCommand／HostName 重導情境：ssh config 可以讓 `Host github-work`
+/// 寫 `HostName github.com`、再 `ProxyCommand nc gitlab.com 22` 連到別的 forge。
+/// 不讀 ssh config，所以只要運維者沒把這個 alias 列進 allowlist，就是 None。
+#[test]
+fn alias_that_ssh_config_could_reroute_is_unknown_unless_operator_vouches() {
+    let url = "git@github-work:acme/app.git";
+    assert_eq!(extract_github_repo_with(url, &[]), None);
+    assert_eq!(
+        extract_github_repo_with(url, &aliases(&["github-elsewhere"])),
+        None
+    );
+    assert_eq!(
+        extract_github_repo_with(url, &aliases(&["github-work"])).as_deref(),
+        Some("acme/app"),
+        "運維者明確列入才採信（責任在運維者）"
+    );
+}
+
+/// 字面 github.com／https 形式不需要設定，行為不變（回歸對照）。
+#[test]
+fn literal_github_forms_need_no_configuration() {
+    for url in [
+        "git@github.com:acme/app.git",
+        "https://github.com/acme/app.git",
+        "https://github.com/acme/app/",
+        "http://github.com/acme/app",
+    ] {
+        assert_eq!(
+            extract_github_repo_with(url, &[]).as_deref(),
+            Some("acme/app"),
+            "{url:?}"
+        );
+    }
+}
+
+/// 非 GitHub host 不受 allowlist 影響，仍為 None（fail-closed 不變）。
+#[test]
+fn non_github_hosts_stay_none_regardless_of_the_allowlist() {
+    let allow = aliases(&["github-work"]);
+    for url in [
+        "git@gitlab.com:acme/app.git",
+        "git@gitlab-work:acme/app.git",
+        "git@bitbucket.org:acme/app.git",
+        "git@git.corp.example.com:acme/app.git",
+        "git@github.com.evil.example:acme/app.git",
+        "git@evil-github-work:acme/app.git",
+        "https://gitlab.com/acme/app.git",
+        "/srv/git/app.git",
+        "",
+    ] {
+        assert_eq!(extract_github_repo_with(url, &allow), None, "{url:?}");
+    }
+}
+
+/// allowlist 內的 alias 但路徑不是 `owner/repo` → None（不產生怪 slug 餵給 gh）。
+#[test]
+fn allowlisted_alias_with_malformed_path_is_not_a_slug() {
+    let allow = aliases(&["github-work"]);
+    for url in [
+        "git@github-work:acme",
+        "git@github-work:acme/app/extra",
+        "git@github-work:/app",
+        "git@github-work:acme/",
+        "git@github-work:",
+        "ssh://git@github-work/acme",
+    ] {
+        assert_eq!(extract_github_repo_with(url, &allow), None, "{url:?}");
+    }
+}
+
+fn fleet_home(tag: &str, yaml: Option<&str>) -> PathBuf {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let home = std::env::temp_dir().join(format!(
+        "agend-160-aliases-{}-{tag}-{}",
+        std::process::id(),
+        N.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir_all(&home).unwrap();
+    if let Some(yaml) = yaml {
+        std::fs::write(crate::fleet::fleet_yaml_path(&home), yaml).unwrap();
+    }
+    home
+}
+
+/// 設定來源：fleet.yaml 頂層 `github_ssh_aliases`（去空白、丟掉空字串）。
+#[test]
+fn github_ssh_aliases_are_read_from_fleet_yaml_top_level() {
+    let home = fleet_home(
+        "read",
+        Some("github_ssh_aliases:\n  - github-work\n  - \" work-gh \"\n  - \"\"\n"),
+    );
+    assert_eq!(
+        github_ssh_aliases_in(&home),
+        aliases(&["github-work", "work-gh"])
+    );
+    // 設定與解析串起來：列入的 alias → Some，沒列入的 → None。
+    let configured = github_ssh_aliases_in(&home);
+    assert_eq!(
+        extract_github_repo_with("git@work-gh:acme/app.git", &configured).as_deref(),
+        Some("acme/app")
+    );
+    assert_eq!(
+        extract_github_repo_with("git@github-other:acme/app.git", &configured),
+        None
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// 沒設定／沒檔案／讀不懂 → 空清單（沒有 alias 被當成 GitHub），不 panic。
+#[test]
+fn missing_or_unreadable_fleet_config_yields_no_aliases() {
+    let absent_key = fleet_home("nokey", Some("instances: {}\n"));
+    assert!(github_ssh_aliases_in(&absent_key).is_empty());
+    let no_file = fleet_home("nofile", None);
+    assert!(github_ssh_aliases_in(&no_file).is_empty());
+    let garbage = fleet_home(
+        "garbage",
+        Some("github_ssh_aliases: [unterminated\n  : : :\n"),
+    );
+    assert!(github_ssh_aliases_in(&garbage).is_empty());
+    for home in [absent_key, no_file, garbage] {
+        std::fs::remove_dir_all(&home).ok();
+    }
+}

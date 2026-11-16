@@ -787,6 +787,19 @@ pub(crate) fn merged_pr_number(repo: &Path, base: &str, branch: &str) -> Option<
         .map(|pr| pr.number)
 }
 
+/// SCAFFOLD for the test commit (-160 a): the allowlist seam exists so tests can
+/// compile and fail against the pre-fix behaviour. It consults nothing yet; the
+/// fix commit reads fleet.yaml  and gates alias remotes.
+#[allow(dead_code)]
+fn github_ssh_aliases_in(_home: &Path) -> Vec<String> {
+    Vec::new()
+}
+
+#[allow(dead_code)]
+fn extract_github_repo_with(url: &str, _github_ssh_aliases: &[String]) -> Option<String> {
+    extract_github_repo(url)
+}
+
 /// Extract "owner/repo" from a GitHub remote URL.
 fn extract_github_repo(url: &str) -> Option<String> {
     // Handles: https://github.com/owner/repo.git, git@github.com:owner/repo.git
