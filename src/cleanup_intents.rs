@@ -558,49 +558,37 @@ pub(crate) fn reconcile_terminal_review_intents(home: &Path, dry_run: bool) -> R
         let repo_path = Path::new(&intent.repo);
         // `is_dir()` 會把任何 I/O 錯誤吞成 false，無法區分「確定不存在」與
         // 「讀不到」。只有 NotFound 才是可證明的解除；其餘一律 fail-closed。
-        match std::fs::metadata(repo_path) {
-            Ok(m) if m.is_dir() => {}
-            Ok(_) => {
-                result.preserved += 1;
-                result.candidates.push(ReconcileCandidate {
-                    candidate_id: cid,
-                    branch: intent.branch.clone(),
-                    expected_head: intent.expected_head.clone(),
-                    task_id: intent.task_id.clone(),
-                    outcome: "preserved:repo_unreadable:not_a_directory".into(),
-                });
-                continue;
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                // repo 路徑確定不存在：branch 與 intent 都已無對象，移除 intent，
-                // 讓 hygiene 收單器（outcome 不再是 preserved:*）收掉 episode。
+        let repo_gate = match std::fs::metadata(repo_path) {
+            Ok(m) if m.is_dir() => None,
+            Ok(_) => Some((false, "preserved:repo_unreadable:not_dir".into())),
+            // repo 路徑確定不存在：移除 intent，outcome 不再是 preserved:*，
+            // hygiene 收單器據此收掉 episode。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some((
+                true,
+                format!(
+                    "settled:repo_missing: repository path no longer exists: {}",
+                    intent.repo
+                ),
+            )),
+            Err(e) => Some((false, format!("preserved:repo_unreadable:{:?}", e.kind()))),
+        };
+        if let Some((settled, outcome)) = repo_gate {
+            if settled {
                 if !dry_run {
                     let _ = std::fs::remove_file(&p);
                 }
                 result.settled += 1;
-                result.candidates.push(ReconcileCandidate {
-                    candidate_id: cid,
-                    branch: intent.branch.clone(),
-                    expected_head: intent.expected_head.clone(),
-                    task_id: intent.task_id.clone(),
-                    outcome: format!(
-                        "settled:repo_missing: repository path no longer exists: {}",
-                        intent.repo
-                    ),
-                });
-                continue;
-            }
-            Err(e) => {
+            } else {
                 result.preserved += 1;
-                result.candidates.push(ReconcileCandidate {
-                    candidate_id: cid,
-                    branch: intent.branch.clone(),
-                    expected_head: intent.expected_head.clone(),
-                    task_id: intent.task_id.clone(),
-                    outcome: format!("preserved:repo_unreadable:{:?}", e.kind()),
-                });
-                continue;
             }
+            result.candidates.push(ReconcileCandidate {
+                candidate_id: cid,
+                branch: intent.branch.clone(),
+                expected_head: intent.expected_head.clone(),
+                task_id: intent.task_id.clone(),
+                outcome,
+            });
+            continue;
         }
 
         if crate::worktree_cleanup::branch_has_other_active_binding(
