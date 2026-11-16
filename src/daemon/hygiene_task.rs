@@ -51,13 +51,20 @@ const EMITTER: &str = "system:hygiene";
 #[derive(Debug, PartialEq, Eq)]
 pub enum HygieneUpsert {
     Created(TaskId),
+    /// The active episode's EVIDENCE changed and was rewritten.
     Updated(TaskId),
+    /// Re-observation of an episode whose evidence is identical; at most
+    /// `last_seen`/`occurrences` bookkeeping was written. Callers should not
+    /// treat this as news (-160 d: it was ~20k log lines a day at info).
+    Unchanged(TaskId),
 }
 
 impl HygieneUpsert {
     pub fn task_id(&self) -> &TaskId {
         match self {
-            HygieneUpsert::Created(t) | HygieneUpsert::Updated(t) => t,
+            HygieneUpsert::Created(t) | HygieneUpsert::Updated(t) | HygieneUpsert::Unchanged(t) => {
+                t
+            }
         }
     }
 }
@@ -369,7 +376,7 @@ pub fn upsert_system_hygiene_task(
                     });
                 if !evidence_changed && !last_seen_due {
                     // Nothing a reader would learn from — append nothing.
-                    return Ok(HygieneUpsert::Updated(tid));
+                    return Ok(HygieneUpsert::Unchanged(tid));
                 }
                 let mut update = Vec::with_capacity(4);
                 if evidence_changed {
@@ -408,7 +415,13 @@ pub fn upsert_system_hygiene_task(
                         }
                     }
                 })? {
-                    Ok(_) => return Ok(HygieneUpsert::Updated(tid)),
+                    Ok(_) => {
+                        return Ok(if evidence_changed {
+                            HygieneUpsert::Updated(tid)
+                        } else {
+                            HygieneUpsert::Unchanged(tid)
+                        })
+                    }
                     // Fresh episode state → CAS-retry; None (closed) → create path.
                     Err(_) => {
                         probe = seen;

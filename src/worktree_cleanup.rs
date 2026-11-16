@@ -321,6 +321,12 @@ fn remove_worktree(
 /// write failure must never abort the sweep itself.
 fn upsert_hygiene(home: &Path, key: String, title: String, evidence: serde_json::Value) {
     match crate::daemon::hygiene_task::upsert_system_hygiene_task(home, &key, &title, evidence) {
+        // -160 (d): only news is info — a new episode, or evidence that really
+        // changed. An unchanged re-observation happens every sweep tick for as
+        // long as the problem lasts and belongs at debug.
+        Ok(outcome @ crate::daemon::hygiene_task::HygieneUpsert::Unchanged(_)) => {
+            tracing::debug!(key = %key, task = %outcome.task_id().0, "hygiene task upserted");
+        }
         Ok(outcome) => {
             tracing::info!(key = %key, task = %outcome.task_id().0, "hygiene task upserted");
         }
