@@ -12,6 +12,9 @@
 use super::{cleanup_merged_branch, task_active_for_branch, ReleaseOutcome};
 use std::path::Path;
 
+#[cfg(test)]
+mod retention_notify_tests;
+
 fn disposable_review_provisioned_head(
     binding: &serde_json::Value,
 ) -> Result<Option<&str>, &'static str> {
