@@ -1748,7 +1748,7 @@ pub fn record_ci_result(
                         receipt_id = %receipt.receipt_id,
                         "task66 verdict_buffer: replaying validated receipt onto exact subject"
                     );
-                    apply_receipt_to_state(state, receipt.clone());
+                    let _ = apply_receipt_to_state(state, receipt.clone());
                 }
                 selected_receipts = selections;
             }
@@ -1778,7 +1778,7 @@ fn receipt_seen(state: &PrState, receipt: &crate::review_receipt::ReviewReceiptS
 fn apply_receipt_to_state(
     state: &mut PrState,
     receipt: crate::review_receipt::ReviewReceiptSummary,
-) {
+) -> Vec<uuid::Uuid> {
     let reviewer = receipt.reviewer_name.clone();
     let head = receipt.reviewed_head.clone();
     let verdict = receipt.verdict;
@@ -1789,14 +1789,23 @@ fn apply_receipt_to_state(
     // 同一位 reviewer 在同一 subject（repo/PR/branch/class/head）重審時，新
     // assignment 的 receipt 取代舊 receipt，以抵達順序為準；不同 reviewer 的
     // receipt 互不影響，dual 的 N-of-M 計數不變。
+    // 回傳「被這張 receipt 取代」的舊 assignment id：呼叫端在 assignment lock 內
+    // 退役它們的 authority record（同一個 stable InstanceId 改名後，舊名 record
+    // 不會被新名 persist 取代，否則會被推導成永久 reservation）。取代關係在 receipt
+    // 落地當下才成立，不比對 created_at，也不推斷「誰比較新」。
+    let mut superseded = Vec::new();
     state.validated_review_receipts.retain(|old| {
-        old.assignment_id != receipt.assignment_id
-            && !(old.reviewer_instance_id == receipt.reviewer_instance_id
-                && old.repo == receipt.repo
-                && old.pr_number == receipt.pr_number
-                && old.branch == receipt.branch
-                && old.review_class == receipt.review_class
-                && old.reviewed_head == receipt.reviewed_head)
+        let replaced = old.assignment_id != receipt.assignment_id
+            && old.reviewer_instance_id == receipt.reviewer_instance_id
+            && old.repo == receipt.repo
+            && old.pr_number == receipt.pr_number
+            && old.branch == receipt.branch
+            && old.review_class == receipt.review_class
+            && old.reviewed_head == receipt.reviewed_head;
+        if replaced {
+            superseded.push(old.assignment_id);
+        }
+        old.assignment_id != receipt.assignment_id && !replaced
     });
     // 任何 verdict 的 receipt 落地都釋放 reservation：該 assignment 本身，以及同一
     // reviewer 被這次重審取代的舊 assignment（authority 每個 target 只留一筆 record）。
@@ -1822,6 +1831,7 @@ fn apply_receipt_to_state(
             kind,
         },
     );
+    superseded
 }
 
 /// Typed verdict ingestion entry. Exact repo/branch/PR/full-head selection comes
@@ -1862,12 +1872,13 @@ pub(crate) fn record_validated_receipt(
     let mut applied = false;
     let mut subject_found = false;
     let mut pending_notify: Option<(String, crate::inbox::InboxMessage)> = None;
+    let mut superseded_assignments: Vec<uuid::Uuid> = Vec::new();
     match with_pr_state(home, &summary.repo, &summary.branch, |state| {
         subject_found = true;
         if !summary.matches_state(state) || receipt_seen(state, summary) {
             return;
         }
-        apply_receipt_to_state(state, summary.clone());
+        superseded_assignments = apply_receipt_to_state(state, summary.clone());
         let label = match summary.verdict {
             crate::review_receipt::ReviewVerdict::Verified => "VERIFIED",
             crate::review_receipt::ReviewVerdict::Rejected => "REJECTED",
@@ -1919,7 +1930,16 @@ pub(crate) fn record_validated_receipt(
     if !subject_found {
         return verdict_buffer::buffer_validated(home, summary);
     }
+    // 仍持有 assignment lock：退役被這張 receipt 取代的同 instance 舊 record。
+    let cleanup_tasks = crate::daemon::assignment_authority::retire_superseded_by_receipt(
+        home,
+        summary,
+        &superseded_assignments,
+    );
     drop(_assignment_lock);
+    for task_id in cleanup_tasks {
+        crate::tasks::task_terminal_cleanup(home, &task_id);
+    }
     if let Some((recipient, msg)) = pending_notify {
         if let Err(e) = crate::inbox::enqueue_with_idle_hint(home, &recipient, msg) {
             tracing::warn!(recipient, error = %e, "task66 review-verdict notify enqueue failed");

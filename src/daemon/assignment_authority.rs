@@ -1322,6 +1322,62 @@ fn retire_delivery_under_lock(
     remove_if_assignment_matches_strict(&path, expected_id)
 }
 
+/// 一張新 receipt 取代同 reviewer instance 的舊 receipt 時，退役舊 receipt 所屬的
+/// authority record（reviewer 改名後 record key 不同，不會被新名 `persist` 取代）。
+///
+/// 呼叫端必須已持有該 branch 的 assignment lock（`record_validated_receipt`）。
+/// 只退役同時符合下列條件的 record：assignment_id 是被取代 receipt 的 id、
+/// 同 repo/branch/PR、同 stable InstanceId、且不是這張新 receipt 自己的 assignment。
+/// 沒有 receipt 的 pending record（例如之後才派的 assignment）不在被取代清單內，
+/// 所以不會被動到；整個判斷不使用 wall-clock `created_at`。任何失敗都保留 record
+/// （fail closed：頂多維持 reserved）。回傳需在鎖外執行 terminal cleanup 的 task id。
+pub(crate) fn retire_superseded_by_receipt(
+    home: &Path,
+    receipt: &crate::review_receipt::ReviewReceiptSummary,
+    superseded: &[uuid::Uuid],
+) -> Vec<String> {
+    let mut cleanup_tasks = Vec::new();
+    if superseded.is_empty() {
+        return cleanup_tasks;
+    }
+    let records = match list_active_checked(home, &receipt.repo, &receipt.branch) {
+        Ok(records) => records,
+        Err(e) => {
+            tracing::warn!(
+                repo = %receipt.repo, branch = %receipt.branch, error = %e,
+                "superseded assignment retirement skipped (authority unreadable); keeping records"
+            );
+            return cleanup_tasks;
+        }
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    for record in records {
+        if record.assignment_id == receipt.assignment_id
+            || !superseded.contains(&record.assignment_id)
+            || record.pr_number != receipt.pr_number
+            || record.target_instance_id != Some(receipt.reviewer_instance_id)
+        {
+            continue;
+        }
+        if let Err(e) = retire_under_lock(
+            home,
+            &receipt.repo,
+            &receipt.branch,
+            &record.target,
+            record.assignment_id,
+            &now,
+            &mut cleanup_tasks,
+        ) {
+            tracing::warn!(
+                repo = %receipt.repo, branch = %receipt.branch, target = %record.target,
+                error = %e,
+                "superseded assignment retirement failed; keeping record (fail closed)"
+            );
+        }
+    }
+    cleanup_tasks
+}
+
 pub(crate) fn retire_if_id_matches(
     home: &Path,
     repo: &str,
