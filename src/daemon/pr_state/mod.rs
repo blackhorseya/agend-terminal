@@ -1856,9 +1856,10 @@ fn apply_receipt_to_state(
     // record 蓋入）：
     //   - 兩邊都有序號、舊 < 新：新 receipt 取代舊的；
     //   - 兩邊都有序號、舊 > 新：這張是過時的，不套用（回傳 Stale）；
-    //   - 兩邊都沒有序號（舊資料、沒有任何排序資訊）：維持 #31 的行為，後落地的取代；
-    //   - 只有一邊有序號、或序號相等：順序無法證明，兩張都保留、什麼都不取代（非
-    //     VERIFIED 仍擋 merge；VERIFIED 依 instance 去重，不會被算成兩位）。
+    //   - 缺序號（任一邊或兩邊，例如升級前的舊資料）或序號相等：順序無法證明，兩張都保留、
+    //     什麼都不取代（非 VERIFIED 仍擋 merge；VERIFIED 依 instance 去重，不會被算成
+    //     兩位）。「依抵達順序取代」本身就是 fail-open（晚到的舊 receipt 會推翻較新的），
+    //     所以不拿它當缺序號時的退路；代價是升級前就派出、仍在進行的重審需重新派審一次。
     // 不同 reviewer 的 receipt 互不影響，dual 的 N-of-M 計數不變。
     let new_seq = state
         .receipt_dispatch_seq
@@ -1887,7 +1888,6 @@ fn apply_receipt_to_state(
             (Some(old_seq), Some(new_seq)) if old_seq > new_seq => {
                 return ReceiptApplication::Stale { newer_seq: old_seq }
             }
-            (None, None) => replace_ids.push(old.assignment_id),
             _ => {}
         }
     }
