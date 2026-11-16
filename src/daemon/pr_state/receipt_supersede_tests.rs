@@ -669,3 +669,26 @@ fn buffered_replay_retires_superseded_old_name_record() {
     );
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// 同一批緩衝裡有非 VERIFIED（順序無法證明）：結果必須固定為 fail-closed，
+/// 不得因目錄讀取順序而偶爾放行。多跑幾輪，讓讀取順序有機會不同。
+#[test]
+fn buffered_replay_mixed_verdicts_always_fail_closed() {
+    for round in 0..24 {
+        let (first, second) = if round % 2 == 0 {
+            (ReviewVerdict::Rejected, ReviewVerdict::Verified)
+        } else {
+            (ReviewVerdict::Verified, ReviewVerdict::Rejected)
+        };
+        let home = buffered_rename_replay("buffered-mixed", first, second);
+        assert!(
+            matches!(
+                readiness(&home),
+                Err(MergeDeficit::NonVerifiedReceipt { .. })
+            ),
+            "round {round}: 順序不明時必須擋住，實際 {:?}",
+            readiness(&home)
+        );
+        let _ = std::fs::remove_dir_all(&home);
+    }
+}
