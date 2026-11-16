@@ -185,8 +185,21 @@ jobs:
 
       # The release binary is only consumed by the CLI smoke and the artifact
       # upload below (release.yml rebuilds its own), and on Windows it was
-      # ~5.5 min of shard 1. PRs smoke a debug build of the same default-feature
-      # binary instead; pushes to main keep the release build and upload.
+      # ~5.5 min of shard 1. PRs smoke a debug build instead; pushes to main keep
+      # the release build and upload (default features, as released).
+      #
+      # The PR debug build uses the SAME feature set as the Tests step
+      # (`tray,discord`). A default-feature debug build is a different cargo
+      # feature unification from the one nextest compiles, so every dependency
+      # that differs (tray-icon/tao, twilight ×3, ...) was compiled twice — and the
+      # default-feature debug artifacts were never in the cache main saves (main
+      # builds release + the tray,discord test profile), so on Windows this step
+      # recompiled ~120 crates (~2.9 min) on every PR despite an exact cache hit.
+      # With one feature set the dev-profile dependencies compiled here are exactly
+      # what Tests reuses, and what main's cache already holds. The smoke below
+      # only runs `--version` / `start --agents`; the tray UI is the separate `tray`
+      # subcommand and discord only connects when a discord channel is configured,
+      # so neither is initialised on a headless runner.
       - name: Build
         if: matrix.shard == 1 && github.event_name != 'pull_request'
         timeout-minutes: 20
@@ -195,7 +208,7 @@ jobs:
       - name: Build (debug, PR smoke)
         if: matrix.shard == 1 && github.event_name == 'pull_request'
         timeout-minutes: 20
-        run: cargo build --locked --bin agend-terminal
+        run: cargo build --locked --bin agend-terminal --features tray,discord
 
       # #3661: the attached TUI must survive its daemon disappearing and
       # reconnect to a successor without lifecycle respawn or log/CPU churn.
@@ -206,7 +219,7 @@ jobs:
         timeout-minutes: 10
         shell: bash
         run: |
-          cargo build --locked --bin agend-terminal --quiet
+          cargo build --locked --bin agend-terminal --features tray,discord --quiet
           scripts/e2e/event-stream-reconnect.sh
 
       # #1478: the discord feature is not in the default/tray build, so nothing
