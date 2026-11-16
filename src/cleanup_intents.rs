@@ -562,21 +562,33 @@ pub(crate) fn reconcile_terminal_review_intents(home: &Path, dry_run: bool) -> R
             Ok(m) if m.is_dir() => None,
             Ok(_) => Some((false, "preserved:repo_unreadable:not_dir".into())),
             // repo 路徑確定不存在：移除 intent，outcome 不再是 preserved:*，
-            // hygiene 收單器據此收掉 episode。
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some((
-                true,
-                format!(
-                    "settled:repo_missing: repository path no longer exists: {}",
-                    intent.repo
-                ),
-            )),
+            // hygiene 收單器據此收掉 episode。intent 必須真的移除（或本來就不在）
+            // 才算解除，否則收單會回報沒發生的事。
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                let unlink = if dry_run {
+                    Ok(())
+                } else {
+                    std::fs::remove_file(&p)
+                };
+                match unlink {
+                    // 已被別人刪掉（NotFound）也算 intent 不在了。
+                    Err(u) if u.kind() != std::io::ErrorKind::NotFound => Some((
+                        false,
+                        format!("preserved:intent_unlink_failed:{:?}", u.kind()),
+                    )),
+                    _ => Some((
+                        true,
+                        format!(
+                            "settled:repo_missing: repository path no longer exists: {}",
+                            intent.repo
+                        ),
+                    )),
+                }
+            }
             Err(e) => Some((false, format!("preserved:repo_unreadable:{:?}", e.kind()))),
         };
         if let Some((settled, outcome)) = repo_gate {
             if settled {
-                if !dry_run {
-                    let _ = std::fs::remove_file(&p);
-                }
                 result.settled += 1;
             } else {
                 result.preserved += 1;
