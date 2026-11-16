@@ -1387,3 +1387,6 @@ mod windows_cleanup_diagnostics_tests;
 
 #[cfg(test)]
 mod review_repro_worktree_git;
+
+#[cfg(test)]
+mod hygiene_convergence_tests;
