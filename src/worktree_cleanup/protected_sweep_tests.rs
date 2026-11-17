@@ -39,7 +39,7 @@ fn default_dev_is_never_reported_as_merged_2830_red() {
     git_in(&repo, &["add", "."]);
     git_commit_dated(&repo, "old default tip", "2024-01-01T00:00:00 +0000");
     assert!(
-        !is_branch_merged(&repo, "dev"),
+        !is_branch_merged(&repo, "dev", None),
         "the actual default branch must never be considered merged into itself"
     );
     std::fs::remove_dir_all(&repo).ok();
