@@ -79,6 +79,8 @@ fn setup_repo() -> PathBuf {
         "agent=other-agent\nbranch=feat/done\n",
     )
     .expect("managed marker");
+    // The age gate reads the worktree's creation time; make it ≥24h old.
+    super::tests::backdate_dot_git(&repo.join("wt-done"), 48);
     repo
 }
 
