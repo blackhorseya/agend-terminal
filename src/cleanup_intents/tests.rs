@@ -1576,6 +1576,9 @@ fn owner_attested_settlement_is_wired_into_the_sweep() {
 #[path = "tests/head_drift_reraise_3517_tests.rs"]
 mod head_drift_reraise_3517;
 
+#[path = "tests/retention_pr_retire_tests.rs"]
+mod retention_pr_retire;
+
 /// repo 路徑不存在、但 intent 檔刪不掉（cleanup-intents/ 唯讀）：解除並未發生，
 /// 不得回報 settled，必須維持 preserved 並給出可區分的 reason。
 #[cfg(unix)]

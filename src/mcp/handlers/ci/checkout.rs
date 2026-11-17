@@ -548,12 +548,15 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
                     .as_str()
                     .filter(|s| !s.is_empty())
                     .unwrap_or("");
-                let provenance =
-                    checkout_purpose.map(|purpose| {
-                        purpose.provenance(args["expected_head"].as_str().expect(
+                let provenance = checkout_purpose.map(|purpose| {
+                    let pr = args["repository"].as_str().zip(args["pr_number"].as_u64());
+                    purpose.provenance(
+                        args["expected_head"].as_str().expect(
                             "disposable_review validates expected_head before provisioning",
-                        ))
-                    });
+                        ),
+                        pr,
+                    )
+                });
                 if let Err(e) = crate::binding::bind_full_with_provenance(
                     home,
                     instance_name,

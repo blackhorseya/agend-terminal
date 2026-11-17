@@ -45,6 +45,7 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod author_authority;
 pub mod auto_arm;
+pub(crate) mod by_number;
 mod freshness_populator;
 pub mod gh_poll;
 pub mod ready_gate;

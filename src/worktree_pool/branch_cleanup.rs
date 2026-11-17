@@ -12,6 +12,15 @@
 use super::{cleanup_merged_branch, task_active_for_branch, ReleaseOutcome};
 use std::path::Path;
 
+mod retention_pr;
+pub(super) use retention_pr::raise_retention_for_release;
+#[cfg(test)]
+pub(crate) use retention_pr::retention_pr_tag;
+#[cfg(test)]
+mod retention_notify_tests;
+#[cfg(test)]
+mod retention_pr_tests;
+
 fn disposable_review_provisioned_head(
     binding: &serde_json::Value,
 ) -> Result<Option<&str>, &'static str> {
@@ -103,6 +112,20 @@ pub(crate) fn record_retention_obligation(
     origin_task_id: &str,
     owner: Option<&str>,
 ) {
+    record_retention_obligation_with_pr(home, repo, branch, head, origin_task_id, owner, None);
+}
+
+/// [`record_retention_obligation`], optionally carrying the `retention-pr:` tag
+/// that ties a review branch's obligation to the PR it reviewed.
+pub(crate) fn record_retention_obligation_with_pr(
+    home: &Path,
+    repo: &str,
+    branch: &str,
+    head: &str,
+    origin_task_id: &str,
+    owner: Option<&str>,
+    pr_tag: Option<String>,
+) {
     // `Some("")` keeps the release path's contract — a binding that names
     // nobody raises nothing. `None` is a different statement: the caller knows
     // the lane's row is ownerless, and an unowned lane still has to be asked
@@ -148,6 +171,7 @@ pub(crate) fn record_retention_obligation(
     if assignee.is_none() {
         tags.push(RETENTION_ORPHAN_TAG.to_string());
     }
+    tags.extend(pr_tag);
 
     use std::sync::atomic::{AtomicU64, Ordering};
     static RETENTION_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -165,7 +189,7 @@ pub(crate) fn record_retention_obligation(
              Answer with `task action=done` and a `result` beginning `keep:` or `delete:`."
         ),
         priority: "normal".to_string(),
-        owner: assignee.map(crate::task_events::InstanceName),
+        owner: assignee.clone().map(crate::task_events::InstanceName),
         due_at: Some(
             (chrono::Utc::now() + chrono::Duration::days(RETENTION_DUE_DAYS)).to_rfc3339(),
         ),
@@ -212,7 +236,39 @@ pub(crate) fn record_retention_obligation(
             %repo, %branch, %reason,
             "branch-retention obligation was refused"
         ),
+        // Only a non-empty commit means THIS call wrote the obligation; an empty
+        // one is the key/lane dedup refusing a duplicate, which must not re-notify.
+        Ok(Ok(written)) if !written.is_empty() => {
+            if let Some(assignee) = assignee.as_deref() {
+                notify_retention_assignee(home, assignee, &successor_id.0, repo, branch);
+            }
+        }
         Ok(Ok(_)) => {}
+    }
+}
+
+/// Tell the assignee an obligation now waits on them. Reviewers on the codex
+/// backend never poll the board, so without this the `keep:`/`delete:` answer is
+/// never given. Best effort: the obligation is already durable, so a failed
+/// enqueue only logs.
+fn notify_retention_assignee(home: &Path, assignee: &str, task_id: &str, repo: &str, branch: &str) {
+    let msg = crate::inbox::InboxMessage {
+        from: crate::inbox::NotifySource::System("branch-retention").to_string(),
+        text: format!(
+            "[branch-retention] 請確認分支 '{branch}' 是否仍需保留。\n\
+             task: {task_id}\nrepo: {repo}\nbranch: {branch}\n\
+             請以 `task action=done id={task_id}` 回覆，`result` 以 `keep:` 或 `delete:` 開頭。"
+        ),
+        kind: Some("task".to_string()),
+        task_id: Some(task_id.to_string()),
+        timestamp: chrono::Utc::now().to_rfc3339(),
+        ..Default::default()
+    };
+    if let Err(error) = crate::inbox::storage::enqueue(home, assignee, msg) {
+        tracing::warn!(
+            %assignee, %task_id, %error,
+            "branch-retention obligation recorded but the assignee could not be notified"
+        );
     }
 }
 
@@ -384,14 +440,7 @@ pub(super) fn resolve_branch_cleanup(
                 let head = crate::git_helpers::git_cmd(Path::new(sr_str), &["rev-parse", branch])
                     .map(|tip| tip.trim().to_string())
                     .unwrap_or_default();
-                record_retention_obligation(
-                    home,
-                    sr_str,
-                    branch,
-                    &head,
-                    task_id,
-                    Some(binding["agent"].as_str().unwrap_or("")),
-                );
+                raise_retention_for_release(home, sr_str, branch, &head, task_id, binding);
             } else {
                 tracing::info!(
                     %branch, ?open_pr_status,

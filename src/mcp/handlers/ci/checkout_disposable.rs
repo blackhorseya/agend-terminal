@@ -7,14 +7,16 @@ pub(super) enum CheckoutPurpose {
 }
 
 impl CheckoutPurpose {
-    pub(super) fn provenance(
+    pub(super) fn provenance<'a>(
         self,
-        provisioned_head: &str,
-    ) -> crate::binding::BindingProvenance<'_> {
+        provisioned_head: &'a str,
+        pr: Option<(&'a str, u64)>,
+    ) -> crate::binding::BindingProvenance<'a> {
         match self {
-            Self::DisposableReview => {
-                crate::binding::BindingProvenance::DaemonProvisionedReview { provisioned_head }
-            }
+            Self::DisposableReview => crate::binding::BindingProvenance::DaemonProvisionedReview {
+                provisioned_head,
+                pr,
+            },
         }
     }
 }

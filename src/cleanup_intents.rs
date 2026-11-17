@@ -329,6 +329,7 @@ pub(crate) fn sweep_settle_merged(home: &Path) {
     let now = chrono::Utc::now();
     let mut obligations_by_project =
         std::collections::HashMap::<String, Vec<crate::task_events::TaskRecord>>::new();
+    let mut swept_pr_projects = std::collections::HashSet::<String>::new();
     let entries = match std::fs::read_dir(&dir) {
         Ok(e) => e,
         Err(_) => return,
@@ -349,6 +350,13 @@ pub(crate) fn sweep_settle_merged(home: &Path) {
         let repo_path = Path::new(&intent.repo);
         if !repo_path.is_dir() {
             continue;
+        }
+        // A review branch's obligation is tied to the PR it reviewed, not to
+        // any branch the merge ledger can see: retire those whose PR merged,
+        // once per board per sweep.
+        let project = retention_project(home, &intent.repo);
+        if swept_pr_projects.insert(project.clone()) {
+            owner_attestation::retire_merged_pr_obligations(home, &project);
         }
         // #3517 follow-up: re-evaluate the residue BEFORE asking the merge
         // ledger anything. A lane the merge already retired can have moved on

@@ -16,6 +16,8 @@ use branch_cleanup::resolve_branch_cleanup;
 pub(crate) use branch_cleanup::{
     record_retention_obligation, retention_key, retention_lane_key, RETENTION_TAG,
 };
+#[cfg(test)]
+pub(crate) use branch_cleanup::{record_retention_obligation_with_pr, retention_pr_tag};
 
 // #3694: the pre-removal ignored-cache sweep is deadline-bounded (extracted to
 // keep this anti-monolith file under its 2500-LOC ceiling).

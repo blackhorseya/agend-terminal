@@ -2343,8 +2343,11 @@ pub(crate) fn ack(home: &Path, sender_target: &str, task_id: &str, now: &str) ->
 /// `target`/`task_id` match. Lock-free — atomic whole-record writes make torn reads
 /// impossible. Cheap on the common path: an empty store means the base dir does not
 /// exist, so `read_dir` yields nothing and no record files are opened.
-#[cfg(test)]
-fn list_active_by_target_task(home: &Path, target: &str, task_id: &str) -> Vec<ActiveAssignment> {
+pub(crate) fn list_active_by_target_task(
+    home: &Path,
+    target: &str,
+    task_id: &str,
+) -> Vec<ActiveAssignment> {
     let mut out = Vec::new();
     for branch_entry in std::fs::read_dir(base_dir(home))
         .into_iter()
