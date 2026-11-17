@@ -17,8 +17,8 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use super::tests::{
-    git_commit_dated, git_in, setup_test_repo_with_default, tmp_home, write_managed_marker,
-    write_source_repo_binding, ENV_LOCK,
+    backdate_dot_git, git_commit_dated, git_in, setup_test_repo_with_default, tmp_home,
+    write_managed_marker, write_source_repo_binding, ENV_LOCK,
 };
 use super::*;
 use std::os::unix::fs::PermissionsExt;
@@ -49,6 +49,8 @@ fn setup(tag: &str, land_binding: bool) -> BindRace {
     let wt = repo.join("wt-fresh");
     git_in(&repo, &["worktree", "add", wt.to_str().unwrap(), BRANCH]);
     write_managed_marker(&wt, AGENT, BRANCH);
+    // The age gate reads the worktree's creation time; make it ≥24h old.
+    backdate_dot_git(&wt, 48);
 
     let remote = repo.with_extension("remote.git");
     git_in(

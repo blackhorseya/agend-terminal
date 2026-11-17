@@ -291,6 +291,7 @@ fn sweep_ignores_retired_prune_live_and_runs_live_d6() {
     );
     git_in(&repo, &["merge", "feat/done"]);
     write_managed_marker(&wt, "done-agent", "feat/done");
+    backdate_dot_git(&wt, 48); // age gate reads worktree creation time
 
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
     // Retired var set to its old "dry-run" value — must have NO effect now.
@@ -364,6 +365,7 @@ fn test_v2_merged_worktree_removed() {
     );
     git_in(&repo, &["merge", "feat/done"]);
     write_managed_marker(&wt, "done-agent", "feat/done");
+    backdate_dot_git(&wt, 48); // age gate reads worktree creation time
 
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
     std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1"); // exercise real deletion
@@ -613,6 +615,8 @@ fn sweep_still_removes_when_no_binding_json_exists_at_all() {
     );
     git_in(&repo, &["merge", "feat/done"]);
     write_managed_marker(&wt, "done-agent", "feat/done");
+    // The age gate reads the worktree's creation time, so backfill ≥24h.
+    backdate_dot_git(&wt, 48);
 
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
     std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
@@ -711,7 +715,7 @@ fn is_branch_merged_rejects_zero_commit_branch_tip_equals_default() {
     git_in(&repo, &["branch", "feat/never-touched"]);
 
     assert!(
-        !is_branch_merged(&repo, "feat/never-touched"),
+        !is_branch_merged(&repo, "feat/never-touched", None),
         "a branch whose tip is IDENTICAL to main (zero commits, nothing ever \
              diverged) must not be classified as merged — there is nothing to merge"
     );
@@ -880,7 +884,7 @@ fn test_v2_remote_gone_worktree_removed() {
 
     // Branch is NOT merged (different commit hash) but remote is gone
     assert!(
-        !is_branch_merged(&repo, "feat/squashed"),
+        !is_branch_merged(&repo, "feat/squashed", None),
         "branch should NOT be detected as merged"
     );
     assert!(
@@ -1003,7 +1007,7 @@ fn prune_squash_merged_old_branch_1750_b3() {
     make_squash_orphan(&repo, "feat/squash-old", "2024-01-01T00:00:00 +0000");
     // Precondition: the squash-blind signals MISS it (the #1750 bug).
     assert!(
-        !is_branch_merged(&repo, "feat/squash-old"),
+        !is_branch_merged(&repo, "feat/squash-old", None),
         "not a --merged ancestor"
     );
     assert!(
@@ -1141,7 +1145,7 @@ fn prune_deletes_aged_unoccupied_review_scaffold_p1() {
     make_unmerged_dated_branch(&repo, "review/2342-r0", "2024-01-01T00:00:00 +0000");
     // Precondition: neither of the existing reap signals fires.
     assert!(
-        !is_branch_merged(&repo, "review/2342-r0"),
+        !is_branch_merged(&repo, "review/2342-r0", None),
         "not a --merged ancestor"
     );
     assert!(
@@ -1564,8 +1568,9 @@ fn remove_failure_upserts_hygiene_task_v1() {
     );
     git_in(&repo, &["merge", "feat/done"]);
     write_managed_marker(&wt, "done-agent", "feat/done");
-    // Sabotage: strip write permission so the eligible worktree cannot be
-    // removed (children can't be unlinked from a non-writable dir).
+    backdate_dot_git(&wt, 48); // age gate reads worktree creation time
+                               // Sabotage: strip write permission so the eligible worktree cannot be
+                               // removed (children can't be unlinked from a non-writable dir).
     std::fs::set_permissions(&wt, std::fs::Permissions::from_mode(0o555)).unwrap();
 
     std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
@@ -2203,4 +2208,179 @@ fn branch_exists_for_recovery(repo: &Path, branch: &str) -> bool {
         repo,
         &["show-ref", "--verify", &format!("refs/heads/{branch}")],
     )
+}
+
+// ---------------------------------------------------------------------------
+// worktree-age gate for the tip == default-tip case (decision
+// d-20261024223558687194-1): a zero-commit branch's tip IS the default tip, so
+// the tip's committer date says nothing about how long the worktree has
+// existed. The age that matters is the worktree's own creation time.
+// ---------------------------------------------------------------------------
+
+/// Add one OLD-dated commit on the default branch so its tip looks quiet for
+/// well over 24h (the repo's `init` commit is dated "now").
+fn age_default_tip(repo: &Path) {
+    std::fs::write(repo.join("quiet.txt"), "quiet").unwrap();
+    git_in(repo, &["add", "."]);
+    git_commit_dated(repo, "quiet main tip", "2024-01-01T00:00:00 +0000");
+}
+
+/// Zero-commit branch + worktree: branch tip == default tip, no binding.
+fn add_zero_commit_worktree(repo: &Path, branch: &str, dir: &str) -> PathBuf {
+    let wt = repo.join(dir);
+    git_in(
+        repo,
+        &["worktree", "add", "-b", branch, wt.to_str().unwrap()],
+    );
+    write_managed_marker(&wt, "agent-x", branch);
+    wt
+}
+
+/// Rewind the mtime of the worktree's `.git` file by `hours`.
+pub(super) fn backdate_dot_git(wt: &Path, hours: u64) {
+    let when = std::time::SystemTime::now() - std::time::Duration::from_secs(hours * 3600);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(wt.join(".git"))
+        .unwrap()
+        .set_modified(when)
+        .unwrap();
+}
+
+/// Overwrite the marker with an explicit `leased_at` `hours` ago.
+fn write_marker_leased_at(wt: &Path, branch: &str, hours: i64) {
+    let leased = (chrono::Utc::now() - chrono::Duration::hours(hours)).to_rfc3339();
+    std::fs::write(
+        wt.join(crate::worktree_pool::MANAGED_MARKER),
+        format!("agent=agent-x\nbranch={branch}\nleased_at={leased}\n"),
+    )
+    .unwrap();
+}
+
+/// Run one prune-live sweep over `repo` and return the removed branch names.
+fn sweep_once(repo: &Path, tag: &str) -> Vec<String> {
+    std::env::set_var("AGEND_WORKTREE_AUTO_CLEANUP", "1");
+    std::env::set_var("AGEND_WORKTREE_PRUNE_LIVE", "1");
+    let home = tmp_home(tag);
+    let configs: HashMap<String, Option<PathBuf>> = HashMap::new();
+    write_source_repo_binding(&home, "other-agent", repo);
+    let removed = sweep_from_registry(&home, &configs, &[]);
+    std::env::remove_var("AGEND_WORKTREE_AUTO_CLEANUP");
+    std::env::remove_var("AGEND_WORKTREE_PRUNE_LIVE");
+    std::fs::remove_dir_all(&home).ok();
+    removed.into_iter().map(|(b, _, _)| b).collect()
+}
+
+/// RED on the tip-date gate: default tip quiet >24h, fresh zero-commit
+/// worktree, no binding → must be KEPT (the tip's age is not the worktree's).
+#[test]
+fn sweep_keeps_fresh_zero_commit_worktree_when_default_tip_is_old() {
+    let _lock = ENV_LOCK.lock();
+    let repo = setup_test_repo("zero-commit-fresh");
+    age_default_tip(&repo);
+    let wt = add_zero_commit_worktree(&repo, "feat/fresh", "wt-fresh");
+
+    let removed = sweep_once(&repo, "zero-commit-fresh");
+    assert!(
+        !removed.iter().any(|b| b == "feat/fresh"),
+        "a just-created zero-commit worktree must not be reaped because the \
+         default tip is old: {removed:?}"
+    );
+    assert!(wt.exists(), "fresh worktree dir must survive");
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Positive control: same shape but the worktree itself is ≥24h old → reaped.
+#[test]
+fn sweep_removes_old_zero_commit_worktree_when_tip_equals_default() {
+    let _lock = ENV_LOCK.lock();
+    let repo = setup_test_repo("zero-commit-old");
+    age_default_tip(&repo);
+    let wt = add_zero_commit_worktree(&repo, "feat/stale", "wt-stale");
+    backdate_dot_git(&wt, 48);
+
+    let removed = sweep_once(&repo, "zero-commit-old");
+    assert!(
+        removed.iter().any(|b| b == "feat/stale"),
+        "a ≥24h-old worktree whose tip == default tip is merged and must \
+         still be reaped: {removed:?}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// The marker's `leased_at` outranks the `.git` mtime: fresh lease + old
+/// `.git` mtime → still too young to trust.
+#[test]
+fn sweep_prefers_marker_leased_at_over_dot_git_mtime() {
+    let _lock = ENV_LOCK.lock();
+    let repo = setup_test_repo("marker-wins-fresh");
+    age_default_tip(&repo);
+    let wt = add_zero_commit_worktree(&repo, "feat/leased-now", "wt-leased-now");
+    backdate_dot_git(&wt, 48);
+    write_marker_leased_at(&wt, "feat/leased-now", 1);
+
+    let removed = sweep_once(&repo, "marker-wins-fresh");
+    assert!(
+        !removed.iter().any(|b| b == "feat/leased-now"),
+        "marker leased_at (1h) must win over an old .git mtime: {removed:?}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Marker says the lease is ≥24h old (the `.git` mtime is fresh) → reaped.
+#[test]
+fn sweep_uses_marker_leased_at_when_old() {
+    let _lock = ENV_LOCK.lock();
+    let repo = setup_test_repo("marker-wins-old");
+    age_default_tip(&repo);
+    let wt = add_zero_commit_worktree(&repo, "feat/leased-old", "wt-leased-old");
+    write_marker_leased_at(&wt, "feat/leased-old", 48);
+
+    let removed = sweep_once(&repo, "marker-wins-old");
+    assert!(
+        removed.iter().any(|b| b == "feat/leased-old"),
+        "marker leased_at (48h) must make the worktree old enough: {removed:?}"
+    );
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// Negative control: neither marker `leased_at` nor `.git` readable → no age →
+/// fail closed (not merged), even though the tip == default tip is ancient.
+#[test]
+fn is_branch_merged_keeps_when_worktree_age_unreadable() {
+    let repo = setup_test_repo("age-unreadable");
+    age_default_tip(&repo);
+    git_in(&repo, &["branch", "feat/ghost"]);
+    let bare_dir = repo.join("not-a-worktree");
+    std::fs::create_dir_all(&bare_dir).unwrap();
+
+    assert!(worktree_age(&bare_dir).is_none());
+    assert!(
+        !is_branch_merged(&repo, "feat/ghost", Some(&bare_dir)),
+        "unreadable worktree age must fail closed"
+    );
+    // Control: without a worktree the old tip-date rule still says merged.
+    assert!(is_branch_merged(&repo, "feat/ghost", None));
+
+    std::fs::remove_dir_all(&repo).ok();
+}
+
+/// An unparsable `leased_at` falls through to the `.git` mtime.
+#[test]
+fn worktree_age_falls_back_to_dot_git_when_leased_at_garbled() {
+    let dir = tmp_home("age-garbled");
+    std::fs::write(dir.join(".git"), "gitdir: x").unwrap();
+    std::fs::write(
+        dir.join(crate::worktree_pool::MANAGED_MARKER),
+        "agent=a\nleased_at=not-a-date\n",
+    )
+    .unwrap();
+    backdate_dot_git(&dir, 48);
+    let age = worktree_age(&dir).expect(".git mtime fallback");
+    assert!(age >= SQUASH_GC_MIN_TIP_AGE, "{age:?}");
+    std::fs::remove_dir_all(&dir).ok();
 }

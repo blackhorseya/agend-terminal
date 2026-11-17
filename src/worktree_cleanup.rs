@@ -137,8 +137,34 @@ fn list_worktrees(repo_root: &Path) -> Result<Vec<WorktreeEntry>, ()> {
     )
 }
 
+/// How long ago `worktree` was created, or `None` when neither source is
+/// readable (callers must then fail closed — treat it as too young).
+///
+/// Preference order: the `.agend-managed` marker's `leased_at` (RFC 3339, written
+/// at lease time), then the mtime of the worktree's `<wt>/.git` file (written
+/// once by `git worktree add`). A future timestamp counts as age zero.
+fn worktree_age(worktree: &Path) -> Option<Duration> {
+    let now = std::time::SystemTime::now();
+    let leased = std::fs::read_to_string(worktree.join(crate::worktree_pool::MANAGED_MARKER))
+        .ok()
+        .and_then(|body| {
+            body.lines()
+                .find_map(|l| l.strip_prefix("leased_at="))
+                .and_then(|v| chrono::DateTime::parse_from_rfc3339(v.trim()).ok())
+        })
+        .map(std::time::SystemTime::from);
+    let created = leased.or_else(|| {
+        std::fs::metadata(worktree.join(".git"))
+            .and_then(|m| m.modified())
+            .ok()
+    })?;
+    Some(now.duration_since(created).unwrap_or(Duration::ZERO))
+}
+
 /// Check if a branch is merged into the default branch (local check, no API needed).
-fn is_branch_merged(repo_root: &Path, branch: &str) -> bool {
+///
+/// `worktree` is the branch's checked-out worktree, when the caller has one.
+fn is_branch_merged(repo_root: &Path, branch: &str, worktree: Option<&Path>) -> bool {
     let default = crate::git_helpers::default_branch(repo_root);
     if branch == default {
         return false;
@@ -154,21 +180,33 @@ fn is_branch_merged(repo_root: &Path, branch: &str) -> bool {
     // #t-…81457-1: is-ancestor is trivially TRUE when `branch`'s tip IS
     // `default`'s tip — indistinguishable, from git state alone, between a
     // brand-new zero-commit branch (nothing ever merged — dev3's PRUNE_LIVE
-    // incident) and a genuinely fast-forward-merged branch (whose tip
-    // legitimately became identical to default's). There is no git-content
-    // signal that tells these apart. Reuse the SAME `SQUASH_GC_MIN_TIP_AGE`
-    // floor the squash path already relies on for the identical reason: only
-    // trust "merged" once the shared tip has sat for a while, giving a
-    // just-created branch's binding-registry entry (fix #1, the primary
-    // defense) time to be observed even if that check somehow lagged.
-    let Some((_, tip_ts)) = branch_tip_info(repo_root, branch) else {
-        return false;
+    // incident) and a genuinely fast-forward-merged branch. Only trust "merged"
+    // once enough time has passed, using the same `SQUASH_GC_MIN_TIP_AGE` floor
+    // as the squash path.
+    //
+    // Which clock: with a worktree, its CREATION time (decision
+    // d-20261024223558687194-1). The tip's committer date is the wrong clock —
+    // a zero-commit branch inherits the default tip's date, so once the default
+    // branch sat quiet for 24h every brand-new worktree looked old enough.
+    // Unreadable creation time → fail closed (not merged). Without a worktree
+    // (orphan-branch pruning) there is no creation time; keep the tip date.
+    let age = match worktree {
+        Some(wt) => match worktree_age(wt) {
+            Some(age) => age,
+            None => return false,
+        },
+        None => {
+            let Some((_, tip_ts)) = branch_tip_info(repo_root, branch) else {
+                return false;
+            };
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            Duration::from_secs(now.saturating_sub(tip_ts))
+        }
     };
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    Duration::from_secs(now.saturating_sub(tip_ts)) >= SQUASH_GC_MIN_TIP_AGE
+    age >= SQUASH_GC_MIN_TIP_AGE
 }
 
 /// Check if a branch's remote tracking ref has been deleted (i.e. the PR was
@@ -766,7 +804,7 @@ pub fn sweep_from_registry(
                 continue;
             }
 
-            let merged = is_branch_merged(repo, &entry.branch);
+            let merged = is_branch_merged(repo, &entry.branch, Some(wt_path));
             let gone = is_remote_gone(repo, &entry.branch);
             if !merged && !gone {
                 continue;
@@ -1198,7 +1236,7 @@ fn prune_orphaned_branches_with_home(
         if registered_worktree_branches.contains(branch) {
             continue;
         }
-        let merged = is_branch_merged(repo_root, branch);
+        let merged = is_branch_merged(repo_root, branch, None);
         // #1750-B3: also reap squash-merge orphans (the 95/99 case the
         // squash-blind `--merged` missed) — gated on tip-age for the heuristic
         // squash detection only.
