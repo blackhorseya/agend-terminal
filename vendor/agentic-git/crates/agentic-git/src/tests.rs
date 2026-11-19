@@ -5401,3 +5401,112 @@ fn chdir_target_rejects_nested_repo_at_the_mapped_subdir() {
         "a mapped subdir that is its own repository must be DENIED, got {denied:?}"
     );
 }
+
+// ── readonly plumbing behind leading globals — RED phase ────────────────
+// `git -c k=v cat-file …` (any leading global) used to be refused by the #27
+// fail-closed gate because these read-only plumbing tokens were missing from
+// `KNOWN_SUBCOMMANDS`, while the bare `git cat-file …` passed. These tests fail
+// at baseline b5c13bef and pass once the tokens are recognized.
+
+/// Read-only plumbing tokens judged safe to recognize behind a leading global.
+/// None is in `is_mutating_local`, none writes to the repo or to a caller-named
+/// output path, so a surviving `-C` behaves exactly like the already-known
+/// read-only `log` / `show` / `rev-parse`.
+const READONLY_PLUMBING_TOKENS: &[&str] = &[
+    "cat-file",
+    "rev-list",
+    "show-ref",
+    "for-each-ref",
+    "merge-base",
+    "name-rev",
+    "ls-remote",
+    "grep",
+    "check-ignore",
+    "check-attr",
+    "diff-tree",
+    "diff-index",
+    "diff-files",
+    "count-objects",
+    "verify-commit",
+    "verify-tag",
+    "whatchanged",
+    "cherry",
+    "range-diff",
+    "var",
+];
+
+/// Tokens that can write (object store, `.git`, or a caller-named output path)
+/// and must stay fail-closed behind a leading global.
+const WRITE_CAPABLE_EXCLUDED_TOKENS: &[&str] = &[
+    "fsck",         // --lost-found writes into .git
+    "format-patch", // -o / --output-directory writes files
+    "merge-tree",   // --write-tree writes objects
+    "hash-object",  // -w writes objects
+    "gc",
+];
+
+fn globals_plumbing_bindings() -> Vec<Binding> {
+    vec![
+        Binding::default(),
+        bound_binding("feat/x", "/tmp/.worktrees/dev"),
+    ]
+}
+
+#[test]
+fn readonly_plumbing_with_c_global_matches_bare_form() {
+    for binding in globals_plumbing_bindings() {
+        for tok in READONLY_PLUMBING_TOKENS {
+            let bare = classify_argv(&s(&[tok, "x"]), &binding, false, false, true);
+            let with_c = classify_argv(&s(&["-c", "k=v", tok, "x"]), &binding, false, false, true);
+            assert!(
+                !matches!(&with_c, Action::Deny(r) if r.contains("unrecognized subcommand")),
+                "`-c k=v {tok}` must not fail closed: {with_c:?}"
+            );
+            assert_eq!(with_c, bare, "`-c k=v {tok}` must classify like bare `{tok}`");
+        }
+    }
+}
+
+#[test]
+fn readonly_plumbing_with_other_repo_c_matches_bare_form() {
+    for binding in globals_plumbing_bindings() {
+        for tok in READONLY_PLUMBING_TOKENS {
+            let bare = classify_argv(&s(&[tok, "x"]), &binding, false, false, true);
+            let with_big_c = classify_argv(&s(&["-C", "/other/repo", tok, "x"]), &binding, false, false, true);
+            assert_eq!(with_big_c, bare, "`-C <other> {tok}` must classify like bare `{tok}`");
+        }
+    }
+}
+
+/// Safety pin for the `-C` analysis: these tokens are NOT mutating-local, so
+/// `strip_target_overrides` leaves `-C` intact — identical to known read-only
+/// `log`. A read aimed at another repo reads that repo (cross-agent / foreign
+/// guards run upstream of this); it cannot write anywhere. A token that joined
+/// `is_mutating_local` would instead have `-C` stripped and be re-aimed.
+#[test]
+fn readonly_plumbing_c_handling_equals_known_readonly_log() {
+    let log_args = s(&["-C", "/other/repo", "log"]);
+    assert_eq!(strip_target_overrides(&log_args), log_args);
+    for tok in READONLY_PLUMBING_TOKENS {
+        assert!(!is_mutating_local(tok), "{tok} must stay out of is_mutating_local");
+        let args = s(&["-C", "/other/repo", tok, "x"]);
+        assert_eq!(strip_target_overrides(&args), args, "{tok}: -C handling must equal `log`");
+    }
+}
+
+#[test]
+fn write_capable_plumbing_behind_global_still_fails_closed() {
+    for binding in globals_plumbing_bindings() {
+        for tok in WRITE_CAPABLE_EXCLUDED_TOKENS {
+            for globals in [&["-c", "k=v"][..], &["-C", "/x"][..]] {
+                let mut argv = globals.to_vec();
+                argv.push(tok);
+                let action = classify_argv(&s(&argv), &binding, false, false, true);
+                assert!(
+                    matches!(&action, Action::Deny(r) if r.contains("unrecognized subcommand")),
+                    "`{argv:?}` must fail closed, got {action:?}"
+                );
+            }
+        }
+    }
+}
