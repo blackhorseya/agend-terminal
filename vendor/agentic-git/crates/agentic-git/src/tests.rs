@@ -4120,6 +4120,150 @@ fn known_subcommands_mirror_classify_arms_27() {
     );
 }
 
+/// Go toolchain regression: `go mod download` runs
+/// `git -c core.autocrlf=input -c core.eol=lf archive --format=zip --prefix=prefix/
+/// --end-of-options <sha>` read-only. Behind the `-c` globals the token
+/// `archive` was missing from `KNOWN_SUBCOMMANDS`, so the fail-closed gate denied
+/// it ("unrecognized subcommand 'archive' …") although the bare form is allowed.
+/// Behind `-c` globals it must classify exactly like the bare form, for both an
+/// unbound and a bound caller.
+#[test]
+fn leading_c_globals_archive_classifies_like_bare_archive() {
+    let globals_archive = s(&[
+        "-c",
+        "core.autocrlf=input",
+        "-c",
+        "core.eol=lf",
+        "archive",
+        "--format=zip",
+        "--prefix=prefix/",
+        "--end-of-options",
+        "0123456789abcdef0123456789abcdef01234567",
+    ]);
+    let bare_archive = s(&[
+        "archive",
+        "--format=zip",
+        "--prefix=prefix/",
+        "--end-of-options",
+        "0123456789abcdef0123456789abcdef01234567",
+    ]);
+    for binding in [
+        Binding::default(),
+        bound_binding("feat/x", "/tmp/.worktrees/dev"),
+    ] {
+        let with_globals = classify_argv(&globals_archive, &binding, false, false, true);
+        let bare = classify_argv(&bare_archive, &binding, false, false, true);
+        assert!(
+            !matches!(&with_globals, Action::Deny(r) if r.contains("unrecognized subcommand")),
+            "`git -c … archive` must not hit the fail-closed gate: {with_globals:?}"
+        );
+        assert_eq!(
+            with_globals, bare,
+            "`git -c … archive` must classify like bare `git archive`"
+        );
+    }
+}
+
+/// Go toolchain regression, full pipeline: its cwd is a bare repo under
+/// GOMODCACHE (a foreign store, outside every worktree). For a bound agent the
+/// `-c … archive` invocation must end up `Passthrough` (run where the caller is),
+/// not Deny — `apply_foreign_policy` already allowlists `archive` for foreign repos.
+#[test]
+fn leading_c_globals_archive_in_foreign_repo_passes_through() {
+    let args = s(&[
+        "-c",
+        "core.autocrlf=input",
+        "-c",
+        "core.eol=lf",
+        "archive",
+        "--format=zip",
+        "--prefix=prefix/",
+        "--end-of-options",
+        "0123456789abcdef0123456789abcdef01234567",
+    ]);
+    let binding = bound_binding("feat/x", "/tmp/.worktrees/dev");
+    let classified = classify_argv(&args, &binding, false, false, true);
+    let action = apply_foreign_policy(classified, &args, true, false);
+    assert_eq!(
+        action,
+        Action::Passthrough,
+        "bound `-c … archive` in a foreign bare repo must Passthrough, got {action:?}"
+    );
+}
+
+/// Drift guard (both directions of the #27 allowlist contract):
+/// (1) every token `is_readonly_local` names (an explicit `classify` read arm)
+///     must be in `KNOWN_SUBCOMMANDS`;
+/// (2) probe a pool of real git subcommand names: any token for which `classify`
+///     behaves differently from its `_` default arm (unbound or bound) has an
+///     explicit policy and so must be in `KNOWN_SUBCOMMANDS` — otherwise it is
+///     denied behind leading globals while the bare form is allowed;
+/// (3) the fail-closed direction stays: a genuinely unknown token behind `-c`
+///     is still denied.
+/// Limit: a read arm that routes exactly like the default arm cannot be told apart
+/// by probing, which is why (1) pins `is_readonly_local` explicitly.
+#[test]
+fn known_subcommands_cover_every_classify_policy_token() {
+    use crate::classify::is_readonly_local;
+    const POOL: &[&str] = &[
+        "status", "log", "diff", "show", "blame", "ls-files", "ls-tree", "rev-parse", "fetch",
+        "remote", "branch", "tag", "describe", "shortlog", "reflog", "config", "help", "version",
+        "init", "clone", "push", "commit", "pull", "reset", "revert", "cherry-pick", "stash",
+        "merge", "rebase", "am", "add", "rm", "mv", "read-tree", "update-index", "apply",
+        "checkout", "switch", "worktree", "restore", "update-ref", "symbolic-ref", "submodule",
+        "submodule--helper", "archive", "cat-file", "rev-list", "show-ref", "for-each-ref",
+        "merge-base", "merge-tree", "name-rev", "ls-remote", "grep", "check-ignore",
+        "check-attr", "diff-tree", "diff-index", "diff-files", "count-objects", "fsck",
+        "verify-commit", "verify-tag", "whatchanged", "cherry", "range-diff", "format-patch",
+        "var", "hash-object", "write-tree", "commit-tree", "mktree", "mktag", "unpack-file",
+        "pack-refs", "notes", "replace", "clean", "gc", "prune", "repack", "maintenance",
+        "bisect", "sparse-checkout", "bundle", "gitk", "send-email", "difftool", "mergetool",
+        "filter-branch", "fast-import", "fast-export", "index-pack", "pack-objects",
+        "unpack-objects", "prune-packed", "multi-pack-index", "commit-graph", "fsmonitor--daemon",
+        "scalar", "credential", "daemon", "http-backend", "instaweb", "request-pull", "svn",
+        "rerere", "stripspace", "interpret-trailers", "mailinfo", "mailsplit",
+        "patch-id", "quiltimport", "shell", "show-branch", "verify-pack", "web--browse",
+    ];
+    for tok in [
+        "status", "log", "diff", "show", "blame", "ls-files", "ls-tree", "rev-parse", "fetch",
+        "remote", "branch", "tag", "describe", "shortlog", "reflog",
+    ] {
+        assert!(is_readonly_local(tok), "{tok:?} should be a readonly token");
+        assert!(
+            KNOWN_SUBCOMMANDS.contains(&tok),
+            "readonly classify arm {tok:?} missing from KNOWN_SUBCOMMANDS"
+        );
+    }
+    let bindings = [
+        Binding::default(),
+        bound_binding("feat/x", "/tmp/.worktrees/dev"),
+    ];
+    let probe = |tok: &str, b: &Binding| classify(tok, &s(&[tok]), b, false, false, true);
+    for tok in POOL {
+        let has_explicit_policy = bindings
+            .iter()
+            .any(|b| probe(tok, b) != probe("zz-no-such-git-subcommand", b));
+        if has_explicit_policy && *tok != "sparse-checkout" {
+            assert!(
+                KNOWN_SUBCOMMANDS.contains(tok),
+                "classify has an explicit policy for {tok:?} but KNOWN_SUBCOMMANDS lacks it"
+            );
+        }
+    }
+    // Fail-closed direction is unchanged: an unknown token behind a global is denied.
+    let action = classify_argv(
+        &s(&["-c", "k=v", "zz-no-such-git-subcommand"]),
+        &Binding::default(),
+        false,
+        false,
+        true,
+    );
+    assert!(
+        matches!(&action, Action::Deny(r) if r.contains("unrecognized subcommand")),
+        "unknown token behind -c must stay fail-closed, got {action:?}"
+    );
+}
+
 // ── #34: submodule policy — RED phase ───────────────────────────────────
 // These tests prove the current fail-open gaps. They must all FAIL at
 // baseline 5306c85 and PASS after the GREEN commit.
