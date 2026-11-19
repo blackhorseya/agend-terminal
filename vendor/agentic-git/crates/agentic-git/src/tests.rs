@@ -4325,6 +4325,69 @@ fn archive_behind_config_only_globals_is_still_recognised() {
     }
 }
 
+/// PR #42 r2 finding: behind `-c` only a SAFE KEY allowlist (the Go toolchain's
+/// `core.autocrlf` / `core.eol`) may reach `archive`. Any other command-line
+/// config can change what `git archive` executes: `tar.<fmt>.command` runs a
+/// shell command for `--format=<fmt>`, and `include.path` loads an arbitrary
+/// config file that can supply the same key. Every such form (separate, glued,
+/// `--config-env`, any case) must stay fail-closed for unbound and bound callers.
+#[test]
+fn archive_behind_unsafe_config_keys_stays_denied() {
+    let unsafe_globals: &[&[&str]] = &[
+        &["-c", "tar.probe.command=cat"],
+        &["-ctar.probe.command=cat"],
+        &["-c", "TAR.probe.Command=cat"],
+        &["--config-env", "tar.probe.command=SOME_ENV"],
+        &["--config-env=tar.probe.command=SOME_ENV"],
+        &["-c", "include.path=/tmp/extra.cfg"],
+        &["-c", "includeIf.gitdir:/x.path=/tmp/extra.cfg"],
+        &["-c", "core.pager=cat"],
+        &["-c", "core.eol=lf", "-c", "tar.probe.command=cat"],
+    ];
+    for binding in [
+        Binding::default(),
+        bound_binding("feat/x", "/tmp/.worktrees/dev"),
+    ] {
+        for g in unsafe_globals {
+            let mut argv: Vec<&str> = g.to_vec();
+            argv.extend_from_slice(&["archive", "--format=probe", "HEAD"]);
+            let action = classify_argv(&s(&argv), &binding, false, false, true);
+            assert!(
+                matches!(&action, Action::Deny(r) if r.contains("unrecognized subcommand")),
+                "{argv:?} must fail closed, got {action:?}"
+            );
+        }
+    }
+}
+
+/// Counterpart: the safe keys are accepted in any letter case, repeated, mixed
+/// with `--config-env`, and still classify like bare `archive`.
+#[test]
+fn archive_behind_safe_config_keys_is_recognised() {
+    let tail = ["archive", "--format=zip", "HEAD"];
+    let safe: &[&[&str]] = &[
+        &["-c", "core.autocrlf=input"],
+        &["-c", "Core.AutoCRLF=input"],
+        &["-c", "core.autocrlf"],
+        &["-c", "Core.EOL=lf"],
+        &["-c", "CORE.AutoCRLF=false", "-c", "core.eol=lf"],
+        &["-ccore.eol=lf"],
+        &["--config-env", "core.eol=SOME_ENV"],
+    ];
+    for binding in [
+        Binding::default(),
+        bound_binding("feat/x", "/tmp/.worktrees/dev"),
+    ] {
+        let bare = classify_argv(&s(&tail), &binding, false, false, true);
+        for g in safe {
+            let mut argv: Vec<&str> = g.to_vec();
+            argv.extend_from_slice(&tail);
+            let action = classify_argv(&s(&argv), &binding, false, false, true);
+            assert_eq!(action, bare, "{argv:?} must classify like bare archive");
+        }
+    }
+}
+
 // ── #34: submodule policy — RED phase ───────────────────────────────────
 // These tests prove the current fail-open gaps. They must all FAIL at
 // baseline 5306c85 and PASS after the GREEN commit.
