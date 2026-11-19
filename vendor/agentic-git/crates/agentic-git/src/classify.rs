@@ -1056,19 +1056,15 @@ pub(crate) fn classify(
 /// global — `git gc`, an alias — is unaffected; there is no global redirecting it.)
 // Groups (in `classify` order): read-only (status..reflog); config/help/passthrough
 // (config..clone); push; mutating (commit..apply); checkout/switch/worktree;
-// flag-discriminated (restore/update-ref/symbolic-ref); then read-only plumbing
-// that `classify` routes via its `_` default arm but that `foreign_local_op_allowed`
-// names explicitly: `archive` only (Go toolchain runs `git -c … archive` against
-// bare repos under GOMODCACHE; without it the gate denied the read-only form).
-// Do NOT add a token here unless its policy is already defined in `classify` /
-// `foreign_local_op_allowed`; drift is guarded by
-// `known_subcommands_cover_every_classify_policy_token`.
+// flag-discriminated (restore/update-ref/symbolic-ref).
 // `sparse-checkout` is DELIBERATELY absent (#2950 primary review): it is
 // outside `is_mutating_local`, so recognizing it here would let the caller's
 // `-C` survive `strip_target_overrides` on a bound `ChdirPass` and redirect
 // the write to any non-foreign target — including the canonical source repo.
 // The `-C` form therefore fails closed; the foreign-cwd incident shape is
 // handled by `apply_foreign_repo_passthrough` on the bare form.
+// `archive` is ALSO absent, for the same reason in a narrower form: see
+// `READONLY_BEHIND_CONFIG_GLOBALS`.
 pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "status",
     "log",
@@ -1114,11 +1110,72 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "symbolic-ref",
     "submodule",
     "submodule--helper",
-    "archive",
 ];
+
+/// Read-only subcommands that `classify` routes via its `_` default arm (and that
+/// `foreign_local_op_allowed` names) but that are recognised behind leading
+/// globals ONLY when EVERY leading global just sets a config value
+/// (`-c k=v`, `-ck=v`, `--config-env k=ENV`; see
+/// `leading_globals_are_config_only`). Today: `archive` — the Go toolchain runs
+/// `git -c core.autocrlf=input -c core.eol=lf archive … <sha>` against bare repos
+/// under GOMODCACHE. Behind `-C` / `--git-dir` / `--work-tree` / `--namespace` /
+/// `-c core.worktree=…` it stays fail-closed: `archive` is not in
+/// `is_mutating_local`, so for a bound agent `strip_target_overrides` would keep
+/// the caller's target override and `git -C <canonical> archive --output=x`
+/// would write into canonical (PR #42 r1). Do NOT add a token here unless its
+/// policy already exists in `classify` / `foreign_local_op_allowed`.
+///
+/// Drift note: `known_subcommands_cover_every_classify_policy_token` CANNOT
+/// notice `archive` going missing (it shares the `_` arm with unknown tokens and
+/// is not in `is_readonly_local`); the archive regression tests
+/// (`leading_c_globals_archive_*`, `archive_behind_*`) are what pin it.
+pub(crate) const READONLY_BEHIND_CONFIG_GLOBALS: &[&str] = &["archive"];
+
+/// Whether every global in `args[..sub_idx]` only sets a config value and cannot
+/// retarget git: `-c <k=v>` / `--config-env <k=ENV>` (separate or `=` form) or
+/// glued `-c<k=v>`, and NOT a retarget key (`core.worktree` / `core.bare`).
+/// Anything else (`-C`, `--git-dir`, `--work-tree`, `--namespace`, `--bare`, …)
+/// returns false — an allowlist, so unknown globals fail closed.
+fn leading_globals_are_config_only(args: &[String], sub_idx: usize) -> bool {
+    let end = sub_idx.min(args.len());
+    let key_ok = |kv: &str| !is_retarget_config_key(kv.split('=').next().unwrap_or(""));
+    let mut i = 0;
+    while i < end {
+        let a = args[i].as_str();
+        if a == "-c" || a == "--config-env" {
+            match args.get(i + 1).filter(|_| i + 1 < end) {
+                Some(kv) if key_ok(kv) => i += 2,
+                _ => return false,
+            }
+        } else if let Some(kv) = a.strip_prefix("--config-env=") {
+            if !key_ok(kv) {
+                return false;
+            }
+            i += 1;
+        } else if let Some(kv) = a.strip_prefix("-c").filter(|kv| !kv.is_empty()) {
+            // glued `-ck=v` (a bare `-c` is handled above; `-C…` is uppercase)
+            if !key_ok(kv) {
+                return false;
+            }
+            i += 1;
+        } else {
+            return false;
+        }
+    }
+    true
+}
 
 pub(crate) fn is_known_git_subcommand(s: &str) -> bool {
     KNOWN_SUBCOMMANDS.contains(&s)
+}
+
+/// Whether `subcmd`, resolved at `sub_idx > 0` behind `args[..sub_idx]` globals,
+/// is a recognised subcommand: in `KNOWN_SUBCOMMANDS`, or in
+/// `READONLY_BEHIND_CONFIG_GLOBALS` with config-only leading globals.
+fn is_known_behind_globals(subcmd: &str, args: &[String], sub_idx: usize) -> bool {
+    is_known_git_subcommand(subcmd)
+        || (READONLY_BEHIND_CONFIG_GLOBALS.contains(&subcmd)
+            && leading_globals_are_config_only(args, sub_idx))
 }
 
 /// #27: classify from a RAW argv, NORMALIZING leading git globals first. The deny
@@ -1163,7 +1220,7 @@ pub(crate) fn classify_argv(
     // subcommand → fail closed. `sub_idx == Some(0)` (no leading global) and
     // `None` (globals-only / empty) never trip this — their unknown subcommands
     // keep the pre-#27 Passthrough.
-    if sub_idx.is_some_and(|i| i > 0) && !is_known_git_subcommand(subcmd) {
+    if sub_idx.is_some_and(|i| i > 0 && !is_known_behind_globals(subcmd, args, i)) {
         return Action::Deny(format!(
             "unrecognized subcommand '{subcmd}' resolved from behind leading git \
              global options — refusing, since a global may be hiding the real \
