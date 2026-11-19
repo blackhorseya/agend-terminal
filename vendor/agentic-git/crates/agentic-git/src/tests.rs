@@ -5467,30 +5467,50 @@ fn readonly_plumbing_with_c_global_matches_bare_form() {
     }
 }
 
+/// `--output=<file>` (diff family, `archive`) writes where the caller says, and a
+/// surviving `-C`/`--git-dir`/`--work-tree` would aim that write at another repo
+/// (canonical included; `strip_target_overrides` only strips for mutating-local
+/// tokens). So these tokens are recognized ONLY behind value-setting globals
+/// (`-c`/`--config-env`); any target-changing global keeps the fail-closed Deny.
 #[test]
-fn readonly_plumbing_with_other_repo_c_matches_bare_form() {
+fn readonly_plumbing_behind_target_changing_global_fails_closed() {
+    let unrecognized = |a: &Action| matches!(a, Action::Deny(r) if r.contains("unrecognized subcommand"));
+    let target_globals: &[&[&str]] = &[
+        &["-C", "/other/repo"],
+        &["--git-dir=/other/.git"],
+        &["--git-dir", "/other/.git"],
+        &["--work-tree=/other"],
+        &["--work-tree", "/other"],
+        &["-c", "k=v", "-C", "/other/repo"],
+        &["-C", "/other/repo", "-c", "k=v"],
+    ];
     for binding in globals_plumbing_bindings() {
         for tok in READONLY_PLUMBING_TOKENS {
-            let bare = classify_argv(&s(&[tok, "x"]), &binding, false, false, true);
-            let with_big_c = classify_argv(&s(&["-C", "/other/repo", tok, "x"]), &binding, false, false, true);
-            assert_eq!(with_big_c, bare, "`-C <other> {tok}` must classify like bare `{tok}`");
+            for globals in target_globals {
+                let mut argv: Vec<&str> = globals.to_vec();
+                argv.extend([*tok, "--output=x.out"]);
+                let action = classify_argv(&s(&argv), &binding, false, false, true);
+                assert!(unrecognized(&action), "`{argv:?}` must fail closed, got {action:?}");
+            }
         }
     }
 }
 
-/// Safety pin for the `-C` analysis: these tokens are NOT mutating-local, so
-/// `strip_target_overrides` leaves `-C` intact — identical to known read-only
-/// `log`. A read aimed at another repo reads that repo (cross-agent / foreign
-/// guards run upstream of this); it cannot write anywhere. A token that joined
-/// `is_mutating_local` would instead have `-C` stripped and be re-aimed.
 #[test]
-fn readonly_plumbing_c_handling_equals_known_readonly_log() {
-    let log_args = s(&["-C", "/other/repo", "log"]);
-    assert_eq!(strip_target_overrides(&log_args), log_args);
-    for tok in READONLY_PLUMBING_TOKENS {
-        assert!(!is_mutating_local(tok), "{tok} must stay out of is_mutating_local");
-        let args = s(&["-C", "/other/repo", tok, "x"]);
-        assert_eq!(strip_target_overrides(&args), args, "{tok}: -C handling must equal `log`");
+fn readonly_plumbing_behind_value_only_globals_still_allowed() {
+    for binding in globals_plumbing_bindings() {
+        for tok in READONLY_PLUMBING_TOKENS {
+            let bare = classify_argv(&s(&[tok, "x"]), &binding, false, false, true);
+            for globals in [
+                &["-c", "a=b", "-c", "c=d"][..],
+                &["--config-env", "a=ENVVAR"][..],
+                &["-c", "k=v", "--no-pager"][..],
+            ] {
+                let mut argv: Vec<&str> = globals.to_vec();
+                argv.extend([*tok, "x"]);
+                assert_eq!(classify_argv(&s(&argv), &binding, false, false, true), bare, "{argv:?}");
+            }
+        }
     }
 }
 
