@@ -1065,6 +1065,20 @@ pub(crate) fn classify(
 // handled by `apply_foreign_repo_passthrough` on the bare form.
 // `archive` is ALSO absent, for the same reason in a narrower form: see
 // `READONLY_BEHIND_CONFIG_GLOBALS`.
+//
+// SCOPE of this gate (measured in task -184): it is a seatbelt against
+// accidents and against widening what a bare invocation could already do, NOT a
+// sandbox. It does not try to stop what the bare form can do anyway:
+// - writing files, e.g. `git log --output=<absolute path>`;
+// - making git run external programs through `git config` / repo config or
+//   env vars such as `GIT_EXTERNAL_DIFF`.
+// The same holds for the tokens listed below behind `-C` / `-c`: a leading `-C`
+// survives `strip_target_overrides` for non-mutating tokens (log/diff/show/…),
+// and any `-c k=v` is accepted. That is NOT an expansion caused by this gate, so
+// it is left as is (end-to-end results in task -184).
+// `archive` is the exception that must stay restricted
+// (`READONLY_BEHIND_CONFIG_GLOBALS`): the gate used to deny it behind globals,
+// so letting it through unrestricted WOULD widen what is allowed (#42).
 pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "status",
     "log",
