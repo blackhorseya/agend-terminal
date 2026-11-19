@@ -1108,6 +1108,34 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "symbolic-ref",
     "submodule",
     "submodule--helper",
+    // Read-only plumbing (all in `foreign_local_op_allowed`, none in
+    // `is_mutating_local`): they fall to classify's `_` arm, so a leading global
+    // gets the same routing as the bare form. A surviving `-C` is NOT stripped
+    // (non-mutating), exactly like the already-known `log`/`show`/`rev-parse`:
+    // it only aims a READ elsewhere, after the cross-agent sibling guard and the
+    // foreign-repo policy. Write-capable plumbing stays OUT on purpose:
+    // `fsck` (--lost-found), `format-patch` (-o), `merge-tree` (--write-tree),
+    // `hash-object` (-w), `archive` (--output).
+    "cat-file",
+    "rev-list",
+    "show-ref",
+    "for-each-ref",
+    "merge-base",
+    "name-rev",
+    "ls-remote",
+    "grep",
+    "check-ignore",
+    "check-attr",
+    "diff-tree",
+    "diff-index",
+    "diff-files",
+    "count-objects",
+    "verify-commit",
+    "verify-tag",
+    "whatchanged",
+    "cherry",
+    "range-diff",
+    "var",
 ];
 
 pub(crate) fn is_known_git_subcommand(s: &str) -> bool {
