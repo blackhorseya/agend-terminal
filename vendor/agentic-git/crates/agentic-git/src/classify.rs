@@ -1056,7 +1056,13 @@ pub(crate) fn classify(
 /// global — `git gc`, an alias — is unaffected; there is no global redirecting it.)
 // Groups (in `classify` order): read-only (status..reflog); config/help/passthrough
 // (config..clone); push; mutating (commit..apply); checkout/switch/worktree;
-// flag-discriminated (restore/update-ref/symbolic-ref).
+// flag-discriminated (restore/update-ref/symbolic-ref); then read-only plumbing
+// that `classify` routes via its `_` default arm but that `foreign_local_op_allowed`
+// names explicitly: `archive` only (Go toolchain runs `git -c … archive` against
+// bare repos under GOMODCACHE; without it the gate denied the read-only form).
+// Do NOT add a token here unless its policy is already defined in `classify` /
+// `foreign_local_op_allowed`; drift is guarded by
+// `known_subcommands_cover_every_classify_policy_token`.
 // `sparse-checkout` is DELIBERATELY absent (#2950 primary review): it is
 // outside `is_mutating_local`, so recognizing it here would let the caller's
 // `-C` survive `strip_target_overrides` on a bound `ChdirPass` and redirect
@@ -1108,6 +1114,7 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "symbolic-ref",
     "submodule",
     "submodule--helper",
+    "archive",
 ];
 
 pub(crate) fn is_known_git_subcommand(s: &str) -> bool {
