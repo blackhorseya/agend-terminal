@@ -1108,14 +1108,20 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "symbolic-ref",
     "submodule",
     "submodule--helper",
-    // Read-only plumbing (all in `foreign_local_op_allowed`, none in
-    // `is_mutating_local`): they fall to classify's `_` arm, so a leading global
-    // gets the same routing as the bare form. A surviving `-C` is NOT stripped
-    // (non-mutating), exactly like the already-known `log`/`show`/`rev-parse`:
-    // it only aims a READ elsewhere, after the cross-agent sibling guard and the
-    // foreign-repo policy. Write-capable plumbing stays OUT on purpose:
-    // `fsck` (--lost-found), `format-patch` (-o), `merge-tree` (--write-tree),
-    // `hash-object` (-w), `archive` (--output).
+];
+
+/// Read-only plumbing recognized behind leading globals ONLY when every leading
+/// global merely SETS A VALUE (`-c k=v`, `--config-env`, `--no-pager`; see
+/// `leading_globals_are_value_only`). These tokens are in
+/// `foreign_local_op_allowed` and outside `is_mutating_local`, so
+/// `strip_target_overrides` leaves a caller's `-C`/`--git-dir`/`--work-tree` in
+/// place — and several accept `--output=<file>` (diff family: diff-tree,
+/// diff-index, diff-files, range-diff, whatchanged, …), so a surviving target
+/// override would write into another repo, canonical included. Behind a
+/// target-changing global they therefore stay fail-closed. Write-capable plumbing
+/// stays out entirely: `fsck` (--lost-found), `format-patch` (-o), `merge-tree`
+/// (--write-tree), `hash-object` (-w), `archive` (--output).
+pub(crate) const VALUE_GLOBAL_ONLY_SUBCOMMANDS: &[&str] = &[
     "cat-file",
     "rev-list",
     "show-ref",
@@ -1137,6 +1143,23 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "range-diff",
     "var",
 ];
+
+/// True when `args[..sub_idx]` holds only globals that set a value and cannot
+/// change which repo/dir git acts on: `-c <k=v>`, `--config-env <k=ENV>` /
+/// `--config-env=<k=ENV>`, `--no-pager`. Anything else (`-C`, `--git-dir`,
+/// `--work-tree`, unknown flags) → false.
+pub(crate) fn leading_globals_are_value_only(args: &[String], sub_idx: usize) -> bool {
+    let mut i = 0;
+    while i < sub_idx {
+        match args[i].as_str() {
+            "-c" | "--config-env" => i += 2,
+            "--no-pager" => i += 1,
+            a if a.starts_with("--config-env=") => i += 1,
+            _ => return false,
+        }
+    }
+    true
+}
 
 pub(crate) fn is_known_git_subcommand(s: &str) -> bool {
     KNOWN_SUBCOMMANDS.contains(&s)
@@ -1184,7 +1207,10 @@ pub(crate) fn classify_argv(
     // subcommand → fail closed. `sub_idx == Some(0)` (no leading global) and
     // `None` (globals-only / empty) never trip this — their unknown subcommands
     // keep the pre-#27 Passthrough.
-    if sub_idx.is_some_and(|i| i > 0) && !is_known_git_subcommand(subcmd) {
+    let value_only_plumbing = sub_idx.is_some_and(|i| {
+        VALUE_GLOBAL_ONLY_SUBCOMMANDS.contains(&subcmd) && leading_globals_are_value_only(args, i)
+    });
+    if sub_idx.is_some_and(|i| i > 0) && !is_known_git_subcommand(subcmd) && !value_only_plumbing {
         return Action::Deny(format!(
             "unrecognized subcommand '{subcmd}' resolved from behind leading git \
              global options — refusing, since a global may be hiding the real \
