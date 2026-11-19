@@ -4264,6 +4264,67 @@ fn known_subcommands_cover_every_classify_policy_token() {
     );
 }
 
+/// Review finding on PR #42: behind a leading TARGET-changing global, `archive`
+/// must stay fail-closed. `archive` is not in `is_mutating_local`, so for a bound
+/// agent `strip_target_overrides` keeps the caller's `-C` / `--git-dir`, and
+/// `git -C <canonical> archive --output=a.zip HEAD` would write the zip into
+/// canonical (the same mechanism that keeps `sparse-checkout` out of the list).
+/// Before archive was recognised the whole form was denied; it must be again.
+#[test]
+fn archive_behind_target_changing_global_stays_denied() {
+    let sha = "0123456789abcdef0123456789abcdef01234567";
+    let globals: &[&[&str]] = &[
+        &["-C", "/x"],
+        &["--git-dir=/x"],
+        &["--git-dir", "/x"],
+        &["--work-tree=/x"],
+        &["--namespace", "ns"],
+        &["-c", "core.worktree=/x"],
+        &["-c", "core.eol=lf", "-C", "/x"],
+        &["-C", "/x", "-c", "core.eol=lf"],
+    ];
+    for binding in [
+        Binding::default(),
+        bound_binding("feat/x", "/tmp/.worktrees/dev"),
+    ] {
+        for g in globals {
+            let mut argv: Vec<&str> = g.to_vec();
+            argv.extend_from_slice(&["archive", "--output=a.zip", "HEAD", sha]);
+            let action = classify_argv(&s(&argv), &binding, false, false, true);
+            assert!(
+                matches!(&action, Action::Deny(r) if r.contains("unrecognized subcommand")),
+                "{argv:?} must fail closed, got {action:?}"
+            );
+        }
+    }
+}
+
+/// Counterpart: behind config-only globals (`-c k=v`, glued `-ck=v`,
+/// `--config-env`) `archive` is still recognised — the Go toolchain form — and
+/// classifies exactly like the bare form.
+#[test]
+fn archive_behind_config_only_globals_is_still_recognised() {
+    let tail = ["archive", "--format=zip", "--prefix=prefix/", "--end-of-options", "HEAD"];
+    let globals: &[&[&str]] = &[
+        &["-c", "core.autocrlf=input", "-c", "core.eol=lf"],
+        &["-ccore.eol=lf"],
+        &["--config-env", "core.eol=SOME_ENV"],
+        &["--config-env=core.eol=SOME_ENV"],
+    ];
+    for binding in [
+        Binding::default(),
+        bound_binding("feat/x", "/tmp/.worktrees/dev"),
+    ] {
+        let bare = classify_argv(&s(&tail), &binding, false, false, true);
+        for g in globals {
+            let mut argv: Vec<&str> = g.to_vec();
+            argv.extend_from_slice(&tail);
+            let action = classify_argv(&s(&argv), &binding, false, false, true);
+            assert_eq!(action, bare, "{argv:?} must classify like bare archive");
+        }
+    }
+}
+
 // ── #34: submodule policy — RED phase ───────────────────────────────────
 // These tests prove the current fail-open gaps. They must all FAIL at
 // baseline 5306c85 and PASS after the GREEN commit.
