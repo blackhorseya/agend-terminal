@@ -421,6 +421,15 @@ pub(super) fn acquire_bind_lifecycle_permit(
     if !bind {
         return Ok(None);
     }
+    // Binding a worktree to an instance that is mid-delete would resurrect
+    // residue the delete is about to orphan; refuse before any permit/side
+    // effect. Inspection-only (bind:false) checkouts claim nothing and pass.
+    if crate::agent::deleting::is_deleting(home, instance_name) {
+        return Err(json!({
+            "error": format!("checkout bind refused: '{instance_name}' is being deleted"),
+            "code": "target_deleting",
+        }));
+    }
     match crate::mcp::handlers::dispatch_hook::LifecyclePermit::acquire(
         home,
         instance_name,

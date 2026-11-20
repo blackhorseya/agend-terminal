@@ -34,7 +34,8 @@ pub(crate) use lifecycle_permit::{
 pub(crate) use provider_neutral_slug::canonical_repo_slug_for_source;
 pub(crate) use source_repo_resolution::resolve_team_source_repo;
 pub(crate) use types::{
-    CiWatchOutcome, DispatchError, DispatchOutcome, ErrorCode, SourceRepoTier, Stage,
+    deleting_target_refusal, CiWatchOutcome, DispatchError, DispatchOutcome, ErrorCode,
+    SourceRepoTier, Stage,
 };
 
 #[allow(dead_code)]
@@ -247,6 +248,15 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     arm_ci_watch: bool,
 ) -> Result<DispatchOutcome, DispatchError> {
     let (preheld_guard, rebase_continuation) = rebase_dispatch::take_preheld_dispatch();
+    // Fail closed BEFORE the first side effect (branch create, worktree lease,
+    // binding, ci-watch): a target in the deleting set is about to lose its
+    // registry entry and workspace, so anything bound to it now becomes orphaned
+    // residue. Mirrors the spawn and delivery gates. Only the deleting window is
+    // refused; a target that is merely absent from the registry (offline
+    // dispatch) stays valid.
+    if let Some(refusal) = deleting_target_refusal(home, target) {
+        return Err(refusal);
+    }
     let _guard = match preheld_guard {
         Some(guard) => guard,
         None => BindGuard::try_acquire(home, target).map_err(|msg| DispatchError {

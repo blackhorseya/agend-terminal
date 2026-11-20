@@ -5973,3 +5973,48 @@ fn merge_force_refuses_while_audit_lock_is_held() {
     fs4::FileExt::unlock(&holder).ok();
     let _ = std::fs::remove_dir_all(&home);
 }
+
+/// `repo checkout bind:true` claims a worktree and writes a binding for the
+/// caller. While the caller is mid-delete that would resurrect residue the
+/// delete is about to (or already did) clean, so it must be refused with the
+/// typed `target_deleting` code before any worktree/binding is created.
+#[test]
+#[cfg(unix)]
+fn checkout_bind_true_rejected_while_instance_is_deleting() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = p778_tmp_home("deleting");
+    let parent = p778_tmp_home("deleting-src-parent");
+    let source = p778_setup_source_repo(&parent, "feat/p778-del");
+    let agent = "p778-agent-deleting";
+
+    let deleting = crate::agent::deleting::mark_deleting(&home, agent);
+    let args = serde_json::json!({
+        "repository_path": source.display().to_string(),
+        "branch": "feat/p778-del",
+        "bind": true,
+    });
+    let resp = super::handle_checkout_repo(&home, &args, agent);
+    assert_eq!(resp["code"], "target_deleting", "{resp}");
+    assert!(resp["error"].is_string(), "{resp}");
+    assert!(
+        crate::binding::read(&home, agent).is_none(),
+        "no binding may be written"
+    );
+    assert!(
+        !crate::paths::runtime_dir(&home)
+            .join(agent)
+            .join("binding.json")
+            .exists(),
+        "no binding.json may exist"
+    );
+    assert!(
+        !home.join("worktrees").exists() && !home.join("workspace").join(agent).exists(),
+        "no worktree directory may be provisioned"
+    );
+
+    // Positive control: the same bind succeeds once the delete window closes.
+    drop(deleting);
+    let ok = super::handle_checkout_repo(&home, &args, agent);
+    assert!(ok.get("error").is_none(), "bind after delete window: {ok}");
+    assert_eq!(ok["bound"].as_bool(), Some(true), "{ok}");
+}

@@ -178,6 +178,7 @@ pub(crate) fn handle_bind_self(home: &Path, args: &Value, sender: &Option<Sender
                 ErrorCode::LeaseConflict => "cross_agent_conflict",
                 ErrorCode::StaleWorktreeDir => "stale_worktree_dir",
                 ErrorCode::EnvSourceMissing => "env_source_missing",
+                ErrorCode::TargetDeleting => "target_deleting",
                 _ => "lease_failed",
             };
             let mut response = json!({"error": err.message, "code": code});

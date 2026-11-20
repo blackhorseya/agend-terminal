@@ -226,7 +226,10 @@ fn maybe_auto_bind_lease(
             }
             return result;
         }
-        if e.code == dispatch_hook::ErrorCode::EnvSourceMissing {
+        if matches!(
+            e.code,
+            dispatch_hook::ErrorCode::EnvSourceMissing | dispatch_hook::ErrorCode::TargetDeleting
+        ) {
             result["code"] = serde_json::to_value(e.code).unwrap_or(Value::Null);
             result["stage"] = serde_json::to_value(e.stage).unwrap_or(Value::Null);
         }
@@ -446,6 +449,27 @@ fn track_delegate_success(ctx: &DeliveryCtx<'_>, mut result: Value) -> Value {
     result
 }
 
+/// `target_deleting` refusal for a branch dispatch that would bind a worktree
+/// to an instance that is mid-delete. Scope is exactly the binding branch
+/// dispatch: `bind:false` (watch-only), branchless and review-assignment
+/// dispatches (own checkout gate) are untouched.
+fn refuse_deleting_branch_dispatch(home: &Path, args: &Value, target: &str) -> Option<Value> {
+    if dispatch_should_skip_auto_bind(args)
+        || args["review_assignment"].as_bool() == Some(true)
+        || args["branch"].as_str().is_none_or(|b| b.is_empty())
+    {
+        return None;
+    }
+    dispatch_hook::deleting_target_refusal(home, target).map(|refusal| {
+        json!({
+            "ok": false,
+            "error": format!("dispatch rejected: {refusal}"),
+            "code": "target_deleting",
+            "stage": serde_json::to_value(refusal.stage).unwrap_or(Value::Null),
+        })
+    })
+}
+
 /// Ordered choreography for MCP `delegate_task` / unified send kind=task.
 pub(crate) fn handle_delegate_task(
     home: &Path,
@@ -460,6 +484,13 @@ pub(crate) fn handle_delegate_task(
     let target = resolved.resolved_target.as_str();
     let sender = resolved.sender;
     let task = resolved.task;
+
+    // Refuse a deleting target BEFORE any durable write: the busy gate below
+    // parks (park file + pending tracking) and the auto-create writes a board
+    // task, either of which a later bind-hook refusal would leave behind.
+    if let Some(refusal) = refuse_deleting_branch_dispatch(home, args, target) {
+        return refusal;
+    }
 
     // Phase 2 — pre-send gates (busy / branch-dedup / enrich / second-reviewer / …)
     let checks = match comms_gates::run_dispatch_pre_checks(home, sender, args, target, task) {
