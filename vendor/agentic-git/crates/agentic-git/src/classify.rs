@@ -1095,6 +1095,32 @@ pub(crate) const KNOWN_SUBCOMMANDS: &[&str] = &[
     "describe",
     "shortlog",
     "reflog",
+    // Read-only plumbing (task -52463-1). Their policy is the shared `_` arm plus
+    // `foreign_local_op_allowed`; deliberately NOT in `is_readonly_local`, which
+    // would also change the non-repo-cwd route (#3142). Safety: none is in
+    // `is_mutating_local`, so a leading `-C` survives and can only READ the
+    // target; none has a flag the already-listed `log`/`diff`/`show` lack
+    // (`--output`, `--textconv` and friends are the accepted "bare form can do
+    // it anyway" surface, task -184). Pinned by `READONLY_PLUMBING_BEHIND_GLOBALS`
+    // in tests.rs. Writers (`hash-object`, `notes`, `merge-tree`, `format-patch`,
+    // `fsck`, `gc`, `clean`, …) and program runners (`grep -O`, `ls-remote
+    // --upload-pack`, `verify-commit` via gpg.program) stay OUT.
+    "cat-file",
+    "rev-list",
+    "show-ref",
+    "for-each-ref",
+    "merge-base",
+    "name-rev",
+    "check-ignore",
+    "check-attr",
+    "diff-tree",
+    "diff-index",
+    "diff-files",
+    "count-objects",
+    "whatchanged",
+    "cherry",
+    "range-diff",
+    "var",
     "config",
     "help",
     "version",

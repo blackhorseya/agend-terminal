@@ -4234,6 +4234,14 @@ fn known_subcommands_cover_every_classify_policy_token() {
             "readonly classify arm {tok:?} missing from KNOWN_SUBCOMMANDS"
         );
     }
+    // Read-only plumbing shares the `_` arm (probing cannot see it), so it is
+    // pinned explicitly, like `archive`.
+    for tok in READONLY_PLUMBING_BEHIND_GLOBALS {
+        assert!(
+            KNOWN_SUBCOMMANDS.contains(tok),
+            "read-only plumbing {tok:?} missing from KNOWN_SUBCOMMANDS"
+        );
+    }
     let bindings = [
         Binding::default(),
         bound_binding("feat/x", "/tmp/.worktrees/dev"),
