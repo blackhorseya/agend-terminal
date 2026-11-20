@@ -1876,14 +1876,12 @@ impl SseStream {
     /// poll slice, on a keepalive/blank line between events, or when
     /// `should_abort` is set, so the caller regains control (to check its stop
     /// flag) at least every `SSE_POLL_SLICE`. A silent peer is dropped with an
-    /// error once `idle_timeout` passes without any byte.
+    /// error once `idle_timeout` passes without any byte (checked when a read
+    /// finds nothing, never ahead of already-available data).
     fn next(&mut self, should_abort: &dyn Fn() -> bool) -> anyhow::Result<Option<SseItem>> {
         loop {
             if should_abort() {
                 return Ok(Some(SseItem::Idle));
-            }
-            if self.last_activity.elapsed() >= self.idle_timeout {
-                anyhow::bail!("Claude ChannelBridge SSE idle timed out");
             }
             let available = match self.reader.fill_buf() {
                 Ok(available) => available,
@@ -1893,6 +1891,14 @@ impl SseStream {
                         std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                     ) =>
                 {
+                    // Idle means no byte arrived for the whole window. It is
+                    // judged only here, after the socket really had nothing:
+                    // data already buffered, or readable, is consumed first and
+                    // refreshes `last_activity`, so a caller that was slow
+                    // between two calls is never mistaken for a silent peer.
+                    if self.last_activity.elapsed() >= self.idle_timeout {
+                        anyhow::bail!("Claude ChannelBridge SSE idle timed out");
+                    }
                     return Ok(Some(SseItem::Idle));
                 }
                 Err(error) => return Err(error.into()),
