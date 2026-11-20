@@ -325,3 +325,93 @@ fn c9_ack_ambiguity_fails_closed_end_to_end_t15() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// Minimal dispatch target: a git repo with an `origin/main` ref (so branch
+/// provisioning needs no network) wired into fleet.yaml next to a `lead`
+/// sender.
+fn deleting_dispatch_home(tag: &str, target: &str) -> std::path::PathBuf {
+    let home = std::env::temp_dir().join(format!("agend-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    let repo = crate::paths::workspace_dir(&home).join(target);
+    std::fs::create_dir_all(&repo).unwrap();
+    let git = |args: &[&str]| {
+        std::process::Command::new("git")
+            .args(args)
+            .current_dir(&repo)
+            .env("AGEND_GIT_BYPASS", "1")
+            .output()
+            .expect("git")
+    };
+    git(&["init", "-b", "main"]);
+    git(&[
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "--allow-empty",
+        "-m",
+        "init",
+    ]);
+    git(&["remote", "add", "origin", "file:///dev/null/agend-fixture"]);
+    let sha = String::from_utf8(git(&["rev-parse", "HEAD"]).stdout).unwrap();
+    git(&["update-ref", "refs/remotes/origin/main", sha.trim()]);
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!(
+            "instances:\n  lead:\n    backend: claude\n  {target}:\n    backend: claude\n    working_directory: {}\n",
+            repo.display()
+        ),
+    )
+    .unwrap();
+    home
+}
+
+fn board_tasks(home: &std::path::Path) -> Vec<serde_json::Value> {
+    crate::tasks::handle(home, "lead", &json!({"action": "list"}))["tasks"]
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+}
+
+/// A single-target branch dispatch WITHOUT `task_id` auto-creates a board task
+/// before the bind hook runs. If the target is mid-delete the refusal must come
+/// BEFORE that auto-create: otherwise the caller gets `target_deleting` but an
+/// Open task is left behind, and an identical retry is then blocked by the
+/// branch-dedup gate. Once the delete window closes the same call must succeed.
+#[test]
+fn deleting_target_branch_dispatch_without_task_id_leaves_no_task() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = deleting_dispatch_home("deleting-autocreate", "doomed-worker");
+    let sender = Some(crate::identity::Sender::new("lead").unwrap());
+    let rt = minimal_runtime();
+    let args = json!({
+        "instance": "doomed-worker",
+        "task": "implement the thing",
+        "branch": "feat/deleting-autocreate",
+        "review_class": "single",
+    });
+
+    let deleting = crate::agent::deleting::mark_deleting(&home, "doomed-worker");
+    let out = super::handle_delegate_task(&home, &args, &sender, Some(&rt));
+    assert_eq!(out["code"], "target_deleting", "{out}");
+    assert!(
+        board_tasks(&home).is_empty(),
+        "a refused dispatch must not leave an auto-created task: {:?}",
+        board_tasks(&home)
+    );
+
+    drop(deleting);
+    let retry = super::handle_delegate_task(&home, &args, &sender, Some(&rt));
+    assert!(
+        retry.get("error").is_none() && retry["code"] != "target_deleting",
+        "identical retry after the delete window must not be refused or deduped: {retry}"
+    );
+    assert_eq!(
+        board_tasks(&home).len(),
+        1,
+        "the retry creates exactly one task: {:?}",
+        board_tasks(&home)
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
