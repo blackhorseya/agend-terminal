@@ -418,3 +418,63 @@ fn deleting_target_branch_dispatch_without_task_id_leaves_no_task() {
     );
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// A deleting target that ALSO owns a Claimed task trips the busy gate first.
+/// The busy branch parks the dispatch (durable park + pending tracking) and
+/// tells the dispatcher it will be redriven, which for a doomed target is a
+/// lie and leaves state behind. The deleting refusal must precede the busy
+/// prechecks, so nothing is parked, tracked or created.
+#[test]
+fn deleting_busy_target_branch_dispatch_parks_nothing() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = deleting_dispatch_home("busy", "doomed-worker");
+    let sender = Some(crate::identity::Sender::new("lead").unwrap());
+    let rt = minimal_runtime();
+
+    let blocker = crate::tasks::handle(
+        &home,
+        "lead",
+        &json!({"action": "create", "title": "in-flight work", "assignee": "doomed-worker"}),
+    );
+    let blocker_id = blocker["id"].as_str().expect("blocker id").to_string();
+    let claim = crate::tasks::handle(
+        &home,
+        "doomed-worker",
+        &json!({"action": "claim", "id": &blocker_id}),
+    );
+    assert_eq!(
+        claim["status"], "claimed",
+        "fixture must make the target busy: {claim}"
+    );
+
+    let args = json!({
+        "instance": "doomed-worker",
+        "task": "implement the thing",
+        "branch": "feat/deleting-busy",
+        "review_class": "single",
+    });
+    let _deleting = crate::agent::deleting::mark_deleting(&home, "doomed-worker");
+    let out = super::handle_delegate_task(&home, &args, &sender, Some(&rt));
+
+    assert_eq!(out["code"], "target_deleting", "{out}");
+    assert!(
+        out.get("parked").is_none() && out.get("busy").is_none(),
+        "a deleting target must not be reported as busy/parked: {out}"
+    );
+    assert!(
+        crate::mcp::handlers::comms_gates::busy_park::list_parked(&home).is_empty(),
+        "no durable park may be written"
+    );
+    assert!(
+        !crate::dispatch_tracking::has_for_instance(&home, "doomed-worker"),
+        "no pending dispatch tracking may be written"
+    );
+    let tasks = board_tasks(&home);
+    assert_eq!(
+        tasks.len(),
+        1,
+        "only the original blocker remains: {tasks:?}"
+    );
+    assert_eq!(tasks[0]["id"], blocker_id.as_str());
+    std::fs::remove_dir_all(&home).ok();
+}
