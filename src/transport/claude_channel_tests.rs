@@ -3055,3 +3055,40 @@ fn sse_stream_next_returns_idle_at_once_when_aborted() {
     assert!(matches!(item, Some(SseItem::Idle)));
     assert!(started.elapsed() < Duration::from_millis(100));
 }
+
+/// Events already buffered must be delivered even when the caller was away for
+/// longer than the idle window between two `next` calls (the resident worker
+/// does synchronous receipt work between events). Idle means "no byte arrived",
+/// not "the caller was slow".
+#[test]
+fn sse_stream_next_delivers_a_buffered_event_after_a_slow_caller() {
+    let (mut stream, mut server) = sse_stream_pair(Duration::from_millis(20));
+    let first = sample_reply_event();
+    let mut second = sample_reply_event();
+    second.reply_id = "reply-2".to_string();
+    let wire = format!(
+        "data: {}\n\ndata: {}\n\n",
+        serde_json::to_string(&first).expect("json"),
+        serde_json::to_string(&second).expect("json")
+    );
+    // One write so both events land in the BufReader with the first read.
+    server.write_all(wire.as_bytes()).expect("two events");
+
+    let got = match stream.next(&|| false).expect("first event") {
+        Some(SseItem::Event(event)) => event,
+        other => panic!("expected the first event, got {other:?}"),
+    };
+    assert_eq!(got, first);
+    assert!(
+        !stream.reader.buffer().is_empty(),
+        "fixture: the second event must already be buffered"
+    );
+
+    // The caller is busy (receipt persistence, scheduling) for longer than the
+    // idle window before asking for the next event.
+    thread::sleep(Duration::from_millis(80));
+    match stream.next(&|| false) {
+        Ok(Some(SseItem::Event(event))) => assert_eq!(event, second),
+        other => panic!("a buffered event must not be lost to the idle check: {other:?}"),
+    }
+}
