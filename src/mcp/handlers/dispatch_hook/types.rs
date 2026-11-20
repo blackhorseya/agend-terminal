@@ -132,6 +132,8 @@ pub enum Stage {
     ResolveSourceRepo,
     /// `bind_full` write failed after worktree was leased.
     Bind,
+    /// The target instance is mid-delete; refused before any side effect.
+    ValidateTarget,
     /// Bound worktree HEAD differed from `expected_head`.
     VerifyExpectedHead,
 }
@@ -179,4 +181,9 @@ pub enum ErrorCode {
     StubRejected,
     /// `bind_full` failed — worktree was rolled back.
     BindFailed,
+    /// The target instance is in the deleting set (an in-flight or unfinished
+    /// delete): binding a worktree to it would leave residue the delete is about
+    /// to orphan. Refused before any branch / worktree / binding / watch side
+    /// effect.
+    TargetDeleting,
 }

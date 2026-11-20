@@ -226,7 +226,10 @@ fn maybe_auto_bind_lease(
             }
             return result;
         }
-        if e.code == dispatch_hook::ErrorCode::EnvSourceMissing {
+        if matches!(
+            e.code,
+            dispatch_hook::ErrorCode::EnvSourceMissing | dispatch_hook::ErrorCode::TargetDeleting
+        ) {
             result["code"] = serde_json::to_value(e.code).unwrap_or(Value::Null);
             result["stage"] = serde_json::to_value(e.stage).unwrap_or(Value::Null);
         }

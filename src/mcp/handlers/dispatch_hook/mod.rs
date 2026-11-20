@@ -247,6 +247,21 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     arm_ci_watch: bool,
 ) -> Result<DispatchOutcome, DispatchError> {
     let (preheld_guard, rebase_continuation) = rebase_dispatch::take_preheld_dispatch();
+    // Fail closed BEFORE the first side effect (branch create, worktree lease,
+    // binding, ci-watch): a target in the deleting set is about to lose its
+    // registry entry and workspace, so anything bound to it now becomes orphaned
+    // residue. Mirrors the spawn and delivery gates. Only the deleting window is
+    // refused; a target that is merely absent from the registry (offline
+    // dispatch) stays valid.
+    if crate::agent::deleting::is_deleting(home, target) {
+        return Err(DispatchError {
+            message: format!("target '{target}' is being deleted; refusing to bind a worktree"),
+            code: ErrorCode::TargetDeleting,
+            stage: Stage::ValidateTarget,
+            fetch_attempted: false,
+            raw: None,
+        });
+    }
     let _guard = match preheld_guard {
         Some(guard) => guard,
         None => BindGuard::try_acquire(home, target).map_err(|msg| DispatchError {
