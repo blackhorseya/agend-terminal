@@ -1722,10 +1722,20 @@ enum SseItem {
 }
 
 impl SseStream {
-    fn connect(locator: &SessionLocator, last_event_id: Option<&str>) -> anyhow::Result<Self> {
+    /// Connect and complete the HTTP handshake. `publish` receives the socket
+    /// right after it is established and BEFORE any blocking handshake I/O, so a
+    /// caller can register it for `shutdown` and a stop request wakes even a
+    /// handshake that is blocked on a silent bridge. An `Err` from `publish`
+    /// aborts the connect.
+    fn connect(
+        locator: &SessionLocator,
+        last_event_id: Option<&str>,
+        publish: &dyn Fn(&TcpStream) -> anyhow::Result<()>,
+    ) -> anyhow::Result<Self> {
         ensure_claude_bridge_owned(locator)?;
         let address = endpoint_address(locator)?;
         let mut stream = TcpStream::connect_timeout(&address.parse()?, HTTP_TIMEOUT)?;
+        publish(&stream)?;
         stream.set_read_timeout(Some(SSE_READ_TIMEOUT))?;
         stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
         let token = token(locator)?;
@@ -1745,18 +1755,17 @@ impl SseStream {
         }
         loop {
             let mut header = String::new();
-            reader.read_line(&mut header)?;
+            // `Ok(0)` is EOF: the bridge closed before the headers ended. It
+            // returns instantly, so the socket read timeout can never end a
+            // loop that ignores it.
+            if reader.read_line(&mut header)? == 0 {
+                anyhow::bail!("Claude ChannelBridge SSE closed during the HTTP headers");
+            }
             if header == "\r\n" || header == "\n" {
                 break;
             }
         }
         Ok(Self { reader })
-    }
-
-    /// A second handle on the socket, so [`EventWorker`] can `shutdown` it and
-    /// wake a read that is blocked waiting for the next keepalive.
-    fn try_clone_socket(&self) -> io::Result<TcpStream> {
-        self.reader.get_ref().try_clone()
     }
 
     fn next(&mut self) -> anyhow::Result<Option<SseItem>> {
@@ -1862,15 +1871,18 @@ fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
         .name("claude-channel-events".to_string())
         .spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
-                match SseStream::connect(&worker_locator, last_event_id.as_deref()) {
+                // Publish the socket before the handshake blocks on it. The
+                // flag is checked AFTER publishing (see
+                // `EventWorker::signal_stop`), so a stop is never missed.
+                let publish = |socket: &TcpStream| -> anyhow::Result<()> {
+                    *thread_conn.lock() = Some(socket.try_clone()?);
+                    if thread_stop.load(Ordering::Acquire) {
+                        anyhow::bail!("event worker is stopping");
+                    }
+                    Ok(())
+                };
+                match SseStream::connect(&worker_locator, last_event_id.as_deref(), &publish) {
                     Ok(mut stream) => {
-                        match stream.try_clone_socket() {
-                            Ok(socket) => *thread_conn.lock() = Some(socket),
-                            Err(_) => {
-                                thread::sleep(Duration::from_millis(250));
-                                continue;
-                            }
-                        }
                         loop {
                             // Checked after the socket is published (and after
                             // every keepalive): see `EventWorker::signal_stop`.
@@ -1901,7 +1913,10 @@ fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
                         }
                         *thread_conn.lock() = None;
                     }
-                    Err(_) => thread::sleep(Duration::from_millis(250)),
+                    Err(_) => {
+                        *thread_conn.lock() = None;
+                        thread::sleep(Duration::from_millis(250));
+                    }
                 }
             }
         })
@@ -2191,7 +2206,7 @@ impl AgentDeliveryTransport for ClaudeChannelBridge {
 
     async fn next_event(&mut self) -> anyhow::Result<BackendEvent> {
         let locator = self.locator()?;
-        let mut stream = SseStream::connect(&locator, None)?;
+        let mut stream = SseStream::connect(&locator, None, &|_| Ok(()))?;
         loop {
             match stream.next()? {
                 Some(SseItem::Event(event)) => {
