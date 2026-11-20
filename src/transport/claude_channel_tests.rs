@@ -2295,5 +2295,149 @@ fn shutdown_signals_every_event_worker_before_joining_3515() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// A loopback SSE endpoint that accepts one `/events` connection and then
+/// sends `: keepalive` comment lines forever without disconnecting — exactly
+/// what a live ChannelBridge does between events (every 15s in production,
+/// compressed here so the test is fast).
+struct KeepaliveOnlySse {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    accepted: mpsc::Receiver<()>,
+}
+
+impl KeepaliveOnlySse {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake SSE");
+        let port = listener.local_addr().expect("addr").port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = Arc::clone(&stop);
+        let (accepted_tx, accepted) = mpsc::channel();
+        // fire-and-forget: test-only fake SSE server; it exits on `stop` or when the client disconnects.
+        thread::spawn(move || {
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(conn.try_clone().expect("clone"));
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            if conn
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .is_err()
+            {
+                return;
+            }
+            let _ = accepted_tx.send(());
+            while !thread_stop.load(Ordering::Acquire) {
+                if conn.write_all(b": keepalive\n\n").is_err() || conn.flush().is_err() {
+                    return;
+                }
+                thread::sleep(Duration::from_millis(100));
+            }
+        });
+        Self {
+            port,
+            stop,
+            accepted,
+        }
+    }
+}
+
+impl Drop for KeepaliveOnlySse {
+    fn drop(&mut self) {
+        // Release a worker that an unfixed `stop_instance_state` is still stuck
+        // joining, so a failing run cannot leak the global lock into later tests.
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+fn fake_bridge_locator(port: u16) -> SessionLocator {
+    let mut locator = SessionLocator::claude(
+        format!("http://127.0.0.1:{port}"),
+        "claude-test-session".to_string(),
+        "test-token".to_string(),
+    );
+    locator.managed = true;
+    locator.server_pid = Some(std::process::id());
+    locator.server_start_token = crate::process::process_start_token(std::process::id());
+    locator
+}
+
+/// Run `f` on its own thread and report whether it returned within `limit`.
+/// The verdict comes from `recv_timeout`, so a stuck `f` fails the test
+/// instead of hanging it.
+fn returns_within<F: FnOnce() + Send + 'static>(limit: Duration, f: F) -> bool {
+    let (tx, rx) = mpsc::channel();
+    // fire-and-forget: test-only probe thread; a stuck `f` is reported through the timeout.
+    thread::spawn(move || {
+        f();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(limit).is_ok()
+}
+
+/// A bridge that is alive and only sends keepalives must not keep the event
+/// worker from stopping: `SseStream::next` used to swallow every comment line
+/// in an inner loop, so the worker never re-read its stop flag and
+/// `stop_instance_state` joined it forever.
+#[test]
+fn stop_instance_state_returns_while_bridge_only_sends_keepalives() {
+    let home = home("stop-keepalive");
+    let sse = KeepaliveOnlySse::start();
+    let locator = fake_bridge_locator(sse.port);
+    ensure_event_worker(&home, "keepalive-agent", &locator);
+    sse.accepted
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the event worker must connect to the fake bridge");
+
+    let stop_home = home.clone();
+    let returned = returns_within(Duration::from_secs(5), move || {
+        stop_instance_state(&stop_home, "keepalive-agent");
+    });
+
+    assert!(
+        returned,
+        "stop_instance_state must return within 5s even though the bridge keeps \
+         the SSE stream open with keepalives"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// Joining one instance's worker must not hold the global `event_workers`
+/// lock: a second instance with no worker has nothing to wait for and must
+/// stop immediately, otherwise one stuck join freezes every other
+/// restart/delete in the fleet (DeleteFence is held across this call).
+#[test]
+fn stop_instance_state_does_not_hold_global_lock_while_joining() {
+    let home = home("stop-global-lock");
+    let sse = KeepaliveOnlySse::start();
+    let locator = fake_bridge_locator(sse.port);
+    ensure_event_worker(&home, "slow-agent", &locator);
+    sse.accepted
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the event worker must connect to the fake bridge");
+
+    let slow_home = home.clone();
+    // fire-and-forget: test-only; on unfixed code this thread blocks until the fake SSE server is released by Drop.
+    thread::spawn(move || stop_instance_state(&slow_home, "slow-agent"));
+    // Let the slow stop reach its join.
+    thread::sleep(Duration::from_millis(300));
+
+    let other_home = home.clone();
+    let returned = returns_within(Duration::from_secs(2), move || {
+        stop_instance_state(&other_home, "agent-without-worker");
+    });
+
+    assert!(
+        returned,
+        "stop_instance_state for an instance with no worker must not wait behind \
+         another instance's join"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
 #[path = "claude_channel/tests/self_kick_tests.rs"]
 mod self_kick_tests;
