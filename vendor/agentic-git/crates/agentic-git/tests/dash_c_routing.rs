@@ -346,3 +346,34 @@ fn bound_absolute_dash_c_is_unchanged() {
     );
     std::fs::remove_dir_all(home).unwrap();
 }
+
+/// r2 review P2: git defines an EMPTY `-C ""` as "do not change directory". The
+/// path rewrite must not turn it into a non-empty absolute path (`dir.join("")`),
+/// which, applied after the shim's own `-C <worktree>`, moved a bound agent's
+/// read from its worktree to the cwd's repo (canonical).
+#[test]
+fn bound_empty_dash_c_is_a_no_op() {
+    let home = fixture_home();
+    let worktree = bound_agent_fixture(&home);
+    commit_in_worktree(&worktree);
+    let source = home.join("source");
+
+    // cwd = canonical source: a bound agent's plain `log` is routed to its worktree.
+    let plain = run_shim(&source, &home, &["log", "-1", "--format=%s"]);
+    assert!(plain.status.success());
+    assert_eq!(stdout_trimmed(&plain), "worktree-only");
+    for args in [
+        &["-C", "", "log", "-1", "--format=%s"][..],
+        &["-C", "", "-C", "", "log", "-1", "--format=%s"][..],
+    ] {
+        let out = run_shim(&source, &home, args);
+        assert!(out.status.success(), "{args:?} must exit 0");
+        assert_eq!(
+            stdout_trimmed(&out),
+            "worktree-only",
+            "{args:?} must read like the plain form"
+        );
+    }
+
+    std::fs::remove_dir_all(home).unwrap();
+}

@@ -5860,6 +5860,12 @@ fn absolutize_target_overrides_rewrites_relative_paths_against_caller_cwd() {
             &["-c", "k=v", "--git-dir=/abs/g", "log", "-C", "rel"],
             &["-c", "k=v", "--git-dir=/abs/g", "log", "-C", "rel"],
         ),
+        // an EMPTY -C (git: "do not change directory") stays empty and does not
+        // move the base for later relative paths or --git-dir
+        (
+            &["-C", "", "-C", "a", "--git-dir=", "log"],
+            &["-C", "", "-C", "/caller/cwd/a", "--git-dir=", "log"],
+        ),
         // no globals / no subcommand
         (&["log", "-1"], &["log", "-1"]),
         (&[], &[]),
