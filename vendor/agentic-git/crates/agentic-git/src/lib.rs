@@ -397,7 +397,7 @@ fn shim_main() {
                 (&home, &agent, &binding, subcommand),
             );
             exec_with_conflict_guidance(
-                &strip_target_overrides(&args),
+                &chdir_exec_args(&args),
                 &worktree,
                 &run_dir,
                 &home,
@@ -412,7 +412,7 @@ fn shim_main() {
                 &effective_target,
                 (&home, &agent, &binding, subcommand),
             );
-            exec_real_git(&strip_target_overrides(&args), Some(&run_dir))
+            exec_real_git(&chdir_exec_args(&args), Some(&run_dir))
         }
         Action::CleanupAndChdirPushPass(worktree) => {
             // #2379 ③ denylist-core: refuse a push whose range carries a
@@ -521,7 +521,7 @@ fn shim_main() {
             // through to real `git push` — cleanup MUST NOT block
             // real work from landing.
             cleanup_init_pile_pre_push(&worktree);
-            exec_real_git(&strip_target_overrides(&args), Some(&worktree))
+            exec_real_git(&chdir_exec_args(&args), Some(&worktree))
         }
         Action::SilentExempt {
             target_branch,
@@ -670,6 +670,20 @@ fn read_binding(home: &str, agent: &str) -> Binding {
 
 fn is_bound(binding: &Binding) -> bool {
     binding.task_id.is_some()
+}
+
+/// argv for a ChdirPass exec: `strip_target_overrides` (mutating subcommands lose
+/// the caller's target overrides), then any surviving leading RELATIVE `-C` /
+/// `--git-dir` / `--work-tree` made absolute against the caller's cwd, because
+/// `exec_real_git` prepends its own `-C <run_dir>` and git would otherwise
+/// resolve them from inside the worktree (PR #47 review P2). An unreadable cwd
+/// degrades to the stripped argv, as `chdir_run_dir` does.
+fn chdir_exec_args(args: &[String]) -> Vec<String> {
+    let stripped = strip_target_overrides(args);
+    match env::current_dir() {
+        Ok(cwd) => absolutize_target_overrides(&stripped, &cwd),
+        Err(_) => stripped,
+    }
 }
 
 // ── #30 module split ────────────────────────────────────────────────────

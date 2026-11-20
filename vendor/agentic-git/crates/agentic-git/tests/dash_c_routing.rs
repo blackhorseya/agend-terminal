@@ -40,9 +40,14 @@ fn setup_git(dir: &Path, args: &[&str]) {
 }
 
 fn fixture_home() -> PathBuf {
+    // pid + clock alone collide when tests of this binary run in parallel (the
+    // macOS clock ticks in microseconds), so add a per-process counter.
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let home = PathBuf::from(std::env::var("HOME").expect("HOME set")).join(format!(
-        ".agend-dash-c-routing-{}-{}",
+        ".agend-dash-c-routing-{}-{}-{}",
         std::process::id(),
+        seq,
         std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|duration| duration.as_nanos())
@@ -253,7 +258,10 @@ fn bound_relative_dash_c_reads_the_repo_it_names() {
             &home,
             &["-C", abs.to_str().unwrap(), "log", "-1", "--format=%s"],
         );
-        assert!(abs_log.status.success(), "absolute -C {target} baseline must work");
+        assert!(
+            abs_log.status.success(),
+            "absolute -C {target} baseline must work"
+        );
         assert_eq!(stdout_trimmed(&abs_log), want_subject);
 
         let cat = run_shim(
@@ -287,14 +295,28 @@ fn bound_relative_dash_c_reads_the_repo_it_names() {
         &home,
         &["-C", "../worktree", "log", "-1", "--format=%s"],
     );
-    assert!(up.status.success(), "`-C ../worktree` from source/ must work");
+    assert!(
+        up.status.success(),
+        "`-C ../worktree` from source/ must work"
+    );
     assert_eq!(stdout_trimmed(&up), "worktree-only");
     let cumulative = run_shim(
         &home,
         &home,
-        &["-C", "source", "-C", "../worktree", "log", "-1", "--format=%s"],
+        &[
+            "-C",
+            "source",
+            "-C",
+            "../worktree",
+            "log",
+            "-1",
+            "--format=%s",
+        ],
     );
-    assert!(cumulative.status.success(), "cumulative relative -C must work");
+    assert!(
+        cumulative.status.success(),
+        "cumulative relative -C must work"
+    );
     assert_eq!(stdout_trimmed(&cumulative), "worktree-only");
 
     std::fs::remove_dir_all(home).unwrap();
@@ -310,8 +332,17 @@ fn bound_absolute_dash_c_is_unchanged() {
     let log = run_shim(
         &home,
         &home,
-        &["-C", worktree.to_str().unwrap(), "cat-file", "-e", "HEAD^{commit}"],
+        &[
+            "-C",
+            worktree.to_str().unwrap(),
+            "cat-file",
+            "-e",
+            "HEAD^{commit}",
+        ],
     );
-    assert!(log.status.success(), "absolute -C cat-file must keep working");
+    assert!(
+        log.status.success(),
+        "absolute -C cat-file must keep working"
+    );
     std::fs::remove_dir_all(home).unwrap();
 }

@@ -768,6 +768,91 @@ pub(crate) fn strip_target_overrides(args: &[String]) -> Vec<String> {
     out
 }
 
+/// PR #47 review P2: on a ChdirPass the shim runs real git as
+/// `git -C <run_dir> <caller argv>` (`exec_real_git`), and for NON-mutating
+/// subcommands the caller's leading `-C` / `--git-dir` / `--work-tree` survive
+/// `strip_target_overrides`. git applies the shim's `-C` first, so a RELATIVE
+/// caller path was resolved from `<run_dir>` (inside the worktree) instead of
+/// from the caller's own cwd — the base `effective_cwd_through_globals` used to
+/// route and guard the call. Rewrite those leading relative paths to absolute
+/// ones against `base` (the caller's cwd) so routing and execution agree.
+///
+/// git semantics mirrored: each `-C` chdir's immediately and cumulatively (a
+/// relative `-C` is relative to the previous one), so every `-C` is emitted as
+/// its running absolute path; `--git-dir` / `--work-tree` only set an
+/// environment value that git resolves AFTER all `-C`s, so a relative one is
+/// joined onto the FINAL `-C` directory. Absolute paths, every other token and
+/// everything from the subcommand on are left untouched; with no leading
+/// override (or none relative) the result equals `args`. Glued `-C<path>` is
+/// rejected by git itself and is not rewritten.
+pub(crate) fn absolutize_target_overrides(args: &[String], base: &Path) -> Vec<String> {
+    let sub_idx = subcommand_index(args).unwrap_or(args.len());
+    let abs = |dir: &Path, p: &str| -> String {
+        let p = Path::new(p);
+        if p.is_absolute() {
+            p.to_string_lossy().into_owned()
+        } else {
+            dir.join(p).to_string_lossy().into_owned()
+        }
+    };
+    // Final cwd after every leading `-C` (the base git resolves --git-dir /
+    // --work-tree against).
+    let mut final_dir = base.to_path_buf();
+    let mut i = 0;
+    while i < sub_idx {
+        match args[i].as_str() {
+            "-C" => {
+                if let Some(p) = args.get(i + 1).filter(|_| i + 1 < sub_idx) {
+                    final_dir = PathBuf::from(abs(&final_dir, p));
+                }
+                i += 2;
+            }
+            "-c" | "--git-dir" | "--work-tree" | "--namespace" | "--super-prefix"
+            | "--config-env" | "--exec-path" => i += 2,
+            _ => i += 1,
+        }
+    }
+    let mut out: Vec<String> = Vec::with_capacity(args.len());
+    let mut cur = base.to_path_buf();
+    let mut i = 0;
+    while i < sub_idx {
+        let a = args[i].as_str();
+        let value = args.get(i + 1).filter(|_| i + 1 < sub_idx);
+        match (a, value) {
+            ("-C", Some(p)) => {
+                cur = PathBuf::from(abs(&cur, p));
+                out.push(args[i].clone());
+                out.push(cur.to_string_lossy().into_owned());
+                i += 2;
+            }
+            ("--git-dir" | "--work-tree", Some(p)) => {
+                out.push(args[i].clone());
+                out.push(abs(&final_dir, p));
+                i += 2;
+            }
+            ("-c" | "--namespace" | "--super-prefix" | "--config-env" | "--exec-path", _) => {
+                out.push(args[i].clone());
+                if let Some(v) = value {
+                    out.push(v.clone());
+                }
+                i += 2;
+            }
+            _ => {
+                let eq = ["--git-dir=", "--work-tree="]
+                    .iter()
+                    .find_map(|k| a.strip_prefix(k).map(|v| (*k, v)));
+                match eq {
+                    Some((k, v)) => out.push(format!("{k}{}", abs(&final_dir, v))),
+                    None => out.push(args[i].clone()),
+                }
+                i += 1;
+            }
+        }
+    }
+    out.extend_from_slice(&args[sub_idx.min(args.len())..]);
+    out
+}
+
 /// #34: whether the tokens after `submodule` represent a WRITE operation.
 /// Validates the COMPLETE token sequence against the supported read grammar:
 ///   [--quiet|-q|--cached]* [status|summary]? [--quiet|-q|--cached]*

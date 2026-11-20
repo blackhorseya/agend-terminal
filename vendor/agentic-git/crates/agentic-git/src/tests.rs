@@ -5820,3 +5820,55 @@ fn leading_c_writers_executors_and_unknown_plumbing_stay_fail_closed() {
         }
     }
 }
+
+// ── absolutize_target_overrides (PR #47 P2) ─────────────────────────────
+
+#[test]
+fn absolutize_target_overrides_rewrites_relative_paths_against_caller_cwd() {
+    use crate::classify::absolutize_target_overrides;
+    let base = Path::new("/caller/cwd");
+    let cases: &[(&[&str], &[&str])] = &[
+        // relative -C → absolute against cwd
+        (
+            &["-C", "wt", "cat-file", "-e", "HEAD"],
+            &["-C", "/caller/cwd/wt", "cat-file", "-e", "HEAD"],
+        ),
+        // cumulative: each -C is relative to the previous one
+        (
+            &["-C", "a", "-C", "../b", "log"],
+            &["-C", "/caller/cwd/a", "-C", "/caller/cwd/a/../b", "log"],
+        ),
+        // an absolute -C resets the base and is left as is
+        (
+            &["-C", "a", "-C", "/abs", "-C", "c", "log"],
+            &["-C", "/caller/cwd/a", "-C", "/abs", "-C", "/abs/c", "log"],
+        ),
+        // --git-dir / --work-tree resolve against the FINAL -C directory
+        (
+            &["-C", "a", "--git-dir=g", "--work-tree", "w", "log"],
+            &[
+                "-C",
+                "/caller/cwd/a",
+                "--git-dir=/caller/cwd/a/g",
+                "--work-tree",
+                "/caller/cwd/a/w",
+                "log",
+            ],
+        ),
+        // absolute values, other globals and the post-subcommand region untouched
+        (
+            &["-c", "k=v", "--git-dir=/abs/g", "log", "-C", "rel"],
+            &["-c", "k=v", "--git-dir=/abs/g", "log", "-C", "rel"],
+        ),
+        // no globals / no subcommand
+        (&["log", "-1"], &["log", "-1"]),
+        (&[], &[]),
+    ];
+    for (input, want) in cases {
+        assert_eq!(
+            absolutize_target_overrides(&s(input), base),
+            s(want),
+            "input {input:?}"
+        );
+    }
+}
