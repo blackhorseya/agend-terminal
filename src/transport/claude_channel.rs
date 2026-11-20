@@ -1749,7 +1749,9 @@ impl SseStream {
         stream.flush()?;
         let mut reader = BufReader::new(stream);
         let mut status = String::new();
-        reader.read_line(&mut status)?;
+        if reader.read_line(&mut status)? == 0 {
+            anyhow::bail!("Claude ChannelBridge SSE closed before the HTTP status line");
+        }
         if !status.contains(" 200 ") {
             anyhow::bail!("Claude ChannelBridge SSE returned {status:?}");
         }
