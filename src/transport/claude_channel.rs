@@ -1884,6 +1884,13 @@ impl SseStream {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// When set on the calling thread, [`EventWorker::signal_stop`] only stores
+    /// the stop flag and skips `shutdown` on the socket.
+    static SUPPRESS_SOCKET_SHUTDOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
 struct EventWorker {
     stop: Arc<AtomicBool>,
     /// The worker's live SSE socket, published by the worker after each
@@ -1901,6 +1908,13 @@ impl EventWorker {
     /// published earlier has its socket shut down here.
     fn signal_stop(&self) {
         self.stop.store(true, Ordering::Release);
+        // Test-only: model a platform where `shutdown` from another thread does
+        // not wake a blocked read (observed on Windows), so a test can prove a
+        // stop is noticed by the worker's own polling.
+        #[cfg(test)]
+        if SUPPRESS_SOCKET_SHUTDOWN.with(|flag| flag.get()) {
+            return;
+        }
         if let Some(conn) = self.conn.lock().as_ref() {
             let _ = conn.shutdown(std::net::Shutdown::Both);
         }

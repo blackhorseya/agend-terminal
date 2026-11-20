@@ -2806,3 +2806,117 @@ fn sse_connect_rejects_an_oversized_handshake() {
 
 #[path = "claude_channel/tests/self_kick_tests.rs"]
 mod self_kick_tests;
+
+/// A bridge that completes the SSE handshake and then goes completely silent:
+/// no events, no keepalives, no disconnect — the state a hung or paused
+/// ChannelBridge is in. The connection is held open until the fixture drops.
+struct SilentStreamBridge {
+    port: u16,
+    release: Arc<AtomicBool>,
+    streaming: mpsc::Receiver<()>,
+}
+
+impl SilentStreamBridge {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind silent SSE");
+        let port = listener.local_addr().expect("addr").port();
+        let release = Arc::new(AtomicBool::new(false));
+        let thread_release = Arc::clone(&release);
+        let (streaming_tx, streaming) = mpsc::channel();
+        // fire-and-forget: test-only fake SSE server; it exits when released by Drop.
+        thread::spawn(move || {
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(conn.try_clone().expect("clone"));
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            if conn
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .is_err()
+                || conn.flush().is_err()
+            {
+                return;
+            }
+            let _ = streaming_tx.send(());
+            while !thread_release.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        Self {
+            port,
+            release,
+            streaming,
+        }
+    }
+}
+
+impl Drop for SilentStreamBridge {
+    fn drop(&mut self) {
+        self.release.store(true, Ordering::Release);
+    }
+}
+
+/// Once the SSE stream is established, a silent bridge leaves the worker parked
+/// in a read for the whole `SSE_READ_TIMEOUT` (20s). Where `shutdown` from
+/// another thread cannot wake that read (Windows), `stop_instance_state` — which
+/// fresh restart calls while holding the DeleteFence — then takes that long. The
+/// stop flag alone must be enough, so this test suppresses the socket shutdown
+/// and requires a bounded return.
+///
+/// Fails on the pre-fix code on EVERY platform (the suppression switch models
+/// the Windows behaviour); without the switch the pre-fix code passes on Unix,
+/// where `shutdown` does wake the read — see the control test below.
+#[test]
+fn stop_instance_state_is_bounded_in_stream_phase_without_socket_shutdown() {
+    let home = home("stop-stream-silent");
+    let bridge = SilentStreamBridge::start();
+    let locator = fake_bridge_locator(bridge.port);
+    ensure_event_worker(&home, "silent-agent", &locator);
+    bridge
+        .streaming
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the event worker must reach the SSE stream");
+    // Let the worker leave the handshake and park in the stream read.
+    thread::sleep(Duration::from_millis(600));
+
+    let stop_home = home.clone();
+    let returned = returns_within(Duration::from_secs(2), move || {
+        SUPPRESS_SOCKET_SHUTDOWN.with(|flag| flag.set(true));
+        stop_instance_state(&stop_home, "silent-agent");
+    });
+
+    assert!(
+        returned,
+        "stop_instance_state must return within 2s of a silent SSE stream even when \
+         socket shutdown cannot wake the read (pre-fix: waits out the 20s read timeout)"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// Control for the test above: with `shutdown` working (Unix) a silent stream
+/// already stops promptly, so the bound is not an artefact of the fixture.
+#[test]
+fn stop_instance_state_is_bounded_in_stream_phase_with_socket_shutdown() {
+    let home = home("stop-stream-silent-shutdown");
+    let bridge = SilentStreamBridge::start();
+    let locator = fake_bridge_locator(bridge.port);
+    ensure_event_worker(&home, "silent-agent-2", &locator);
+    bridge
+        .streaming
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the event worker must reach the SSE stream");
+    thread::sleep(Duration::from_millis(600));
+
+    let stop_home = home.clone();
+    let returned = returns_within(Duration::from_secs(2), move || {
+        stop_instance_state(&stop_home, "silent-agent-2");
+    });
+
+    assert!(returned, "stop must return within 2s with shutdown enabled");
+    let _ = fs::remove_dir_all(home);
+}
