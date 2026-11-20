@@ -1710,6 +1710,17 @@ struct SseStream {
     reader: BufReader<TcpStream>,
 }
 
+/// What one pass of [`SseStream::next`] produced.
+enum SseItem {
+    /// A complete reply event.
+    Event(ReplyEvent),
+    /// A keepalive comment or blank line arrived with no event pending. Handing
+    /// this back to the worker loop — instead of swallowing it — is what lets
+    /// the loop re-check its stop flag while a live bridge is only sending
+    /// keepalives.
+    Idle,
+}
+
 impl SseStream {
     fn connect(locator: &SessionLocator, last_event_id: Option<&str>) -> anyhow::Result<Self> {
         ensure_claude_bridge_owned(locator)?;
@@ -1742,7 +1753,13 @@ impl SseStream {
         Ok(Self { reader })
     }
 
-    fn next(&mut self) -> anyhow::Result<Option<ReplyEvent>> {
+    /// A second handle on the socket, so [`EventWorker`] can `shutdown` it and
+    /// wake a read that is blocked waiting for the next keepalive.
+    fn try_clone_socket(&self) -> io::Result<TcpStream> {
+        self.reader.get_ref().try_clone()
+    }
+
+    fn next(&mut self) -> anyhow::Result<Option<SseItem>> {
         let mut data = String::new();
         loop {
             let mut line = String::new();
@@ -1751,9 +1768,18 @@ impl SseStream {
             }
             if line == "\n" || line == "\r\n" {
                 if data.is_empty() {
-                    continue;
+                    return Ok(Some(SseItem::Idle));
                 }
-                return Ok(Some(serde_json::from_str(data.trim())?));
+                return Ok(Some(SseItem::Event(serde_json::from_str(data.trim())?)));
+            }
+            if line.starts_with(':') {
+                // SSE comment (the bridge's `: keepalive`). Mid-event it must
+                // not drop the data gathered so far; between events it is the
+                // worker's chance to look at its stop flag.
+                if data.is_empty() {
+                    return Ok(Some(SseItem::Idle));
+                }
+                continue;
             }
             if let Some(value) = line.strip_prefix("data:") {
                 data.push_str(value.trim_start());
@@ -1764,8 +1790,35 @@ impl SseStream {
 
 struct EventWorker {
     stop: Arc<AtomicBool>,
+    /// The worker's live SSE socket, published by the worker after each
+    /// connect. Stopping shuts it down so a blocked read returns at once
+    /// instead of waiting for the next keepalive.
+    conn: Arc<Mutex<Option<TcpStream>>>,
     join: Option<JoinHandle<()>>,
     locator: SessionLocator,
+}
+
+impl EventWorker {
+    /// Ask the worker to stop without waiting for it. The flag is stored
+    /// BEFORE the socket is looked at: a worker that publishes its socket after
+    /// this call locks `conn` after us and so sees the flag, and one that
+    /// published earlier has its socket shut down here.
+    fn signal_stop(&self) {
+        self.stop.store(true, Ordering::Release);
+        if let Some(conn) = self.conn.lock().as_ref() {
+            let _ = conn.shutdown(std::net::Shutdown::Both);
+        }
+    }
+
+    /// Signal and join. Callers must NOT hold the global `event_workers` lock:
+    /// joining is the slow part, and holding the lock across it freezes every
+    /// other instance's start/stop behind this one.
+    fn stop_and_join(mut self) {
+        self.signal_stop();
+        if let Some(join) = self.join.take() {
+            let _ = join.join();
+        }
+    }
 }
 
 fn event_workers() -> &'static Mutex<HashMap<String, EventWorker>> {
@@ -1779,20 +1832,25 @@ fn worker_key(home: &Path, instance: &str) -> String {
 
 fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
     let key = worker_key(home, instance);
-    let mut workers = event_workers().lock();
-    if let Some(existing) = workers.get(&key) {
-        if existing.locator == *locator {
-            return;
+    let mut workers = loop {
+        let mut workers = event_workers().lock();
+        match workers.get(&key) {
+            Some(existing) if existing.locator == *locator => return,
+            Some(_) => {}
+            None => break workers,
         }
-    }
-    if let Some(mut existing) = workers.remove(&key) {
-        existing.stop.store(true, Ordering::Release);
-        if let Some(join) = existing.join.take() {
-            let _ = join.join();
+        let stale = workers.remove(&key);
+        // Join with the global lock released, then look again: another caller
+        // may have installed a worker meanwhile.
+        drop(workers);
+        if let Some(stale) = stale {
+            stale.stop_and_join();
         }
-    }
+    };
     let stop = Arc::new(AtomicBool::new(false));
     let thread_stop = Arc::clone(&stop);
+    let conn = Arc::new(Mutex::new(None::<TcpStream>));
+    let thread_conn = Arc::clone(&conn);
     let home = home.to_path_buf();
     let instance = instance.to_string();
     let locator = locator.clone();
@@ -1805,30 +1863,44 @@ fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
         .spawn(move || {
             while !thread_stop.load(Ordering::Acquire) {
                 match SseStream::connect(&worker_locator, last_event_id.as_deref()) {
-                    Ok(mut stream) => loop {
-                        if thread_stop.load(Ordering::Acquire) {
-                            return;
-                        }
-                        match stream.next() {
-                            Ok(Some(event)) => {
-                                if seen_reply_ids.contains(&event.reply_id) {
-                                    // This event was reconciled successfully on an
-                                    // earlier connection; it is safe to advance
-                                    // past the duplicate replay.
-                                    last_event_id = Some(event.reply_id);
-                                } else if complete_receipt(&home, &instance, &event).is_ok() {
-                                    // Advance the cursor only after receipt
-                                    // persistence succeeds. A failed write must
-                                    // be replayed after reconnect.
-                                    seen_reply_ids.insert(event.reply_id.clone());
-                                    last_event_id = Some(event.reply_id);
-                                } else {
-                                    break;
-                                }
+                    Ok(mut stream) => {
+                        match stream.try_clone_socket() {
+                            Ok(socket) => *thread_conn.lock() = Some(socket),
+                            Err(_) => {
+                                thread::sleep(Duration::from_millis(250));
+                                continue;
                             }
-                            Ok(None) | Err(_) => break,
                         }
-                    },
+                        loop {
+                            // Checked after the socket is published (and after
+                            // every keepalive): see `EventWorker::signal_stop`.
+                            if thread_stop.load(Ordering::Acquire) {
+                                *thread_conn.lock() = None;
+                                return;
+                            }
+                            match stream.next() {
+                                Ok(Some(SseItem::Idle)) => {}
+                                Ok(Some(SseItem::Event(event))) => {
+                                    if seen_reply_ids.contains(&event.reply_id) {
+                                        // This event was reconciled successfully on an
+                                        // earlier connection; it is safe to advance
+                                        // past the duplicate replay.
+                                        last_event_id = Some(event.reply_id);
+                                    } else if complete_receipt(&home, &instance, &event).is_ok() {
+                                        // Advance the cursor only after receipt
+                                        // persistence succeeds. A failed write must
+                                        // be replayed after reconnect.
+                                        seen_reply_ids.insert(event.reply_id.clone());
+                                        last_event_id = Some(event.reply_id);
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                Ok(None) | Err(_) => break,
+                            }
+                        }
+                        *thread_conn.lock() = None;
+                    }
                     Err(_) => thread::sleep(Duration::from_millis(250)),
                 }
             }
@@ -1838,6 +1910,7 @@ fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
         key,
         EventWorker {
             stop,
+            conn,
             join: Some(join),
             locator: locator.clone(),
         },
@@ -1855,17 +1928,19 @@ fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
 /// `stop_instance_state` still removes and joins it.
 pub(crate) fn signal_instance_stop(home: &Path, instance: &str) {
     if let Some(worker) = event_workers().lock().get(&worker_key(home, instance)) {
-        worker.stop.store(true, Ordering::Release);
+        worker.signal_stop();
     }
 }
 
 pub(crate) fn stop_instance_state(home: &Path, instance: &str) {
     let key = worker_key(home, instance);
-    if let Some(mut worker) = event_workers().lock().remove(&key) {
-        worker.stop.store(true, Ordering::Release);
-        if let Some(join) = worker.join.take() {
-            let _ = join.join();
-        }
+    // Take the worker out under the lock, but join it only after the guard is
+    // gone. `if let Some(..) = lock().remove(..) { .. }` keeps the guard alive
+    // for the whole block (Rust 2021 scrutinee temporaries), which made one
+    // stuck join freeze the global registry for every instance.
+    let worker = event_workers().lock().remove(&key);
+    if let Some(worker) = worker {
+        worker.stop_and_join();
     }
     let _ = std::fs::remove_dir_all(channel_state_dir(home, instance));
     if matches!(
@@ -2117,12 +2192,18 @@ impl AgentDeliveryTransport for ClaudeChannelBridge {
     async fn next_event(&mut self) -> anyhow::Result<BackendEvent> {
         let locator = self.locator()?;
         let mut stream = SseStream::connect(&locator, None)?;
-        match stream.next()? {
-            Some(event) => Ok(BackendEvent::Completed {
-                delivery_id: event.delivery_id,
-                event: "claude_reply".to_string(),
-            }),
-            None => Err(anyhow::anyhow!("Claude ChannelBridge SSE closed")),
+        loop {
+            match stream.next()? {
+                Some(SseItem::Event(event)) => {
+                    return Ok(BackendEvent::Completed {
+                        delivery_id: event.delivery_id,
+                        event: "claude_reply".to_string(),
+                    })
+                }
+                // Keepalives are not events; keep waiting for a real one.
+                Some(SseItem::Idle) => {}
+                None => return Err(anyhow::anyhow!("Claude ChannelBridge SSE closed")),
+            }
         }
     }
 

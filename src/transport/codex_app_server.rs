@@ -1408,11 +1408,15 @@ pub(crate) fn stop_instance_server(home: &Path, instance: &str) -> anyhow::Resul
         .is_some_and(|locator| locator.managed && persisted_server_owned(locator));
     let mut in_memory_owned = false;
     let mut in_memory_identity = None;
-    if let Some(mut server) = managed_servers()
+    // Take the server out under the registry lock and release the lock before
+    // stopping it: stop and wait can block, and an `if let` on the locked
+    // `remove` would keep the guard for the whole block, freezing every other
+    // instance's Codex server operations behind this one.
+    let removed = managed_servers()
         .lock()
         .expect("Codex server registry lock")
-        .remove(&key)
-    {
+        .remove(&key);
+    if let Some(mut server) = removed {
         in_memory_owned = locator.as_ref().is_some_and(|locator| {
             locator.managed
                 && locator.server_pid == Some(server.pid)

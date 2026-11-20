@@ -2260,6 +2260,7 @@ fn shutdown_signals_every_event_worker_before_joining_3515() {
             worker_key(&home, instance),
             EventWorker {
                 stop,
+                conn: Arc::new(Mutex::new(None)),
                 join: Some(join),
                 locator: SessionLocator::claude(
                     "http://127.0.0.1:43123".to_string(),
