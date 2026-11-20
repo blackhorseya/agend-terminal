@@ -5575,3 +5575,143 @@ fn an_unpushed_existing_branch_with_a_reachable_origin_is_not_flagged_3546() {
     assert_eq!(head, origin_sha, "fixture: the branch sits on origin/main");
     std::fs::remove_dir_all(&home).ok();
 }
+
+/// Every `.agend-managed` marker under `root` — i.e. every daemon-provisioned
+/// worktree that exists on disk, wherever the pool placed it.
+fn managed_markers_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.file_name().and_then(|n| n.to_str()) == Some(".git") {
+                continue;
+            }
+            if path.is_dir() {
+                stack.push(path);
+            } else if path.file_name().and_then(|n| n.to_str())
+                == Some(crate::worktree_pool::MANAGED_MARKER)
+            {
+                found.push(path);
+            }
+        }
+    }
+    found
+}
+
+/// A branch dispatch aimed at an instance that is mid-delete must be refused
+/// BEFORE any side effect: no branch created, no worktree provisioned, no
+/// binding written, no ci-watch armed. The rejection carries the typed
+/// `target_deleting` code. Positive control: once the delete finishes (guard
+/// dropped) the very same dispatch succeeds, so the refusal is scoped to the
+/// deleting window and not a blanket failure of the fixture.
+#[test]
+fn dispatch_rejects_deleting_target_before_any_side_effect() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = std::env::temp_dir().join(format!("agend-deleting-dispatch-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    let repo = setup_test_repo(&home, "doomed-agent");
+    let branch = "feat/deleting-dispatch";
+
+    let deleting = crate::agent::deleting::mark_deleting(&home, "doomed-agent");
+    let error = super::dispatch_auto_bind_lease(
+        &home,
+        "doomed-agent",
+        "T-DEL-1",
+        branch,
+        Some("owner/repo"),
+    )
+    .expect_err("dispatch to a deleting target must be refused");
+    assert_eq!(
+        serde_json::to_value(error.code).unwrap(),
+        "target_deleting",
+        "typed code: {error:?}"
+    );
+    assert!(
+        error.message.contains("doomed-agent") && error.message.contains("deleted"),
+        "message must name the target and say it is being deleted: {}",
+        error.message
+    );
+
+    assert!(
+        crate::binding::read(&home, "doomed-agent").is_none(),
+        "no binding may be written for a deleting target"
+    );
+    assert!(
+        !crate::paths::runtime_dir(&home)
+            .join("doomed-agent")
+            .join("binding.json")
+            .exists(),
+        "no binding.json may exist"
+    );
+    assert!(
+        managed_markers_under(&home).is_empty(),
+        "no worktree may be provisioned: {:?}",
+        managed_markers_under(&home)
+    );
+    let ci_dir = crate::daemon::ci_watch::ci_watches_dir(&home);
+    let watches: Vec<_> = std::fs::read_dir(&ci_dir)
+        .ok()
+        .map(|rd| rd.flatten().collect())
+        .unwrap_or_default();
+    assert!(
+        watches.is_empty(),
+        "no ci-watch may be armed: {:?}",
+        watches.iter().map(|e| e.path()).collect::<Vec<_>>()
+    );
+    let branch_ref = std::process::Command::new("git")
+        .args([
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .current_dir(&repo)
+        .env("AGEND_GIT_BYPASS", "1")
+        .output()
+        .expect("git rev-parse");
+    assert!(
+        !branch_ref.status.success(),
+        "dispatch must not create the branch before refusing"
+    );
+
+    drop(deleting);
+    let ok = super::dispatch_auto_bind_lease(
+        &home,
+        "doomed-agent",
+        "T-DEL-2",
+        branch,
+        Some("owner/repo"),
+    );
+    assert!(
+        ok.is_ok(),
+        "after the delete window closes the same dispatch must succeed: {:?}",
+        ok.err()
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
+
+/// The refusal is per-target: another instance being deleted must not block a
+/// healthy target's dispatch (no over-broad validation).
+#[test]
+fn dispatch_only_blocks_the_deleting_target_not_its_siblings() {
+    let _guard = crate::mcp::handlers::fleet_test_guard();
+    let home = std::env::temp_dir().join(format!("agend-deleting-sibling-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&home);
+    std::fs::create_dir_all(&home).ok();
+    setup_test_repo(&home, "healthy-agent");
+
+    let _deleting = crate::agent::deleting::mark_deleting(&home, "some-other-agent");
+    let ok =
+        super::dispatch_auto_bind_lease(&home, "healthy-agent", "T-DEL-3", "feat/sibling-ok", None);
+    assert!(
+        ok.is_ok(),
+        "a different instance being deleted must not block this dispatch: {:?}",
+        ok.err()
+    );
+    std::fs::remove_dir_all(&home).ok();
+}
