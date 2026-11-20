@@ -330,7 +330,10 @@ fn c9_ack_ambiguity_fails_closed_end_to_end_t15() {
 /// provisioning needs no network) wired into fleet.yaml next to a `lead`
 /// sender.
 fn deleting_dispatch_home(tag: &str, target: &str) -> std::path::PathBuf {
-    let home = std::env::temp_dir().join(format!("agend-{tag}-{}", std::process::id()));
+    let home = std::env::temp_dir().join(format!(
+        "agend-p0c-deleting-dispatch-{tag}-{}",
+        std::process::id()
+    ));
     let _ = std::fs::remove_dir_all(&home);
     let repo = crate::paths::workspace_dir(&home).join(target);
     std::fs::create_dir_all(&repo).unwrap();
