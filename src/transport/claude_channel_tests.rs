@@ -2650,5 +2650,115 @@ fn sse_connect_keeps_a_partial_line_across_poll_timeouts() {
     );
 }
 
+/// A bridge that answers the request, then trickles one byte every 100ms of a
+/// header line that never ends — data keeps arriving, so no socket read ever
+/// times out. Stops (and closes the socket) when the returned flag is set.
+fn start_trickling_bridge() -> (u16, Arc<AtomicBool>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    // fire-and-forget: test-only fake bridge; it exits when `stop` is set or the client disconnects.
+    thread::spawn(move || {
+        let Ok((mut conn, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(conn.try_clone().expect("clone"));
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        if conn.write_all(b"HTTP/1.1 200 OK\r\n").is_err() {
+            return;
+        }
+        while !thread_stop.load(Ordering::Acquire) {
+            if conn.write_all(b"x").is_err() || conn.flush().is_err() {
+                return;
+            }
+            thread::sleep(Duration::from_millis(100));
+        }
+    });
+    (port, stop)
+}
+
+/// Run `SseStream::connect` on its own thread and return whether it errored,
+/// or `None` if it had not returned within `limit` (the verdict comes from
+/// `recv_timeout`, so a stuck connect fails the test instead of hanging it).
+fn connect_errors_within(
+    locator: SessionLocator,
+    abort: Arc<AtomicBool>,
+    limit: Duration,
+) -> Option<bool> {
+    let (tx, rx) = mpsc::channel();
+    // fire-and-forget: test-only probe thread; a stuck connect is reported through the timeout.
+    thread::spawn(move || {
+        let result = SseStream::connect(&locator, None, &|_| Ok(()), &|| {
+            abort.load(Ordering::Acquire)
+        });
+        let _ = tx.send(result.is_err());
+    });
+    rx.recv_timeout(limit).ok()
+}
+
+/// A bridge that keeps trickling bytes never lets a socket read time out, so
+/// the handshake deadline must be enforced between reads too: `read_line`
+/// alone keeps refilling its buffer until it sees a newline.
+#[test]
+fn sse_connect_enforces_the_deadline_against_a_trickling_bridge() {
+    let (port, stop) = start_trickling_bridge();
+    let locator = fake_bridge_locator(port);
+
+    let started = Instant::now();
+    let outcome = connect_errors_within(
+        locator,
+        Arc::new(AtomicBool::new(false)),
+        HTTP_TIMEOUT + Duration::from_secs(3),
+    );
+    stop.store(true, Ordering::Release);
+
+    assert_eq!(
+        outcome,
+        Some(true),
+        "a trickling handshake must fail near HTTP_TIMEOUT (took {:?})",
+        started.elapsed()
+    );
+}
+
+/// Same trickling bridge: a stop request must abort the handshake promptly
+/// instead of waiting for a newline that never comes.
+#[test]
+fn sse_connect_aborts_a_trickling_handshake_promptly() {
+    let (port, stop) = start_trickling_bridge();
+    let locator = fake_bridge_locator(port);
+    let abort = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&abort);
+    let raised_at = Arc::new(Mutex::new(None::<Instant>));
+    let raised = Arc::clone(&raised_at);
+    // fire-and-forget: test-only timer that raises the abort flag.
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(500));
+        *raised.lock() = Some(Instant::now());
+        flag.store(true, Ordering::Release);
+    });
+
+    let outcome = connect_errors_within(locator, abort, Duration::from_millis(500 + 1000));
+    let finished = Instant::now();
+    stop.store(true, Ordering::Release);
+
+    assert_eq!(
+        outcome,
+        Some(true),
+        "connect must return an error within 1s of the abort flag"
+    );
+    let raised_at = raised_at.lock().expect("abort flag was raised");
+    assert!(
+        finished.duration_since(raised_at) < Duration::from_secs(1),
+        "connect reacted to abort after {:?}",
+        finished.duration_since(raised_at)
+    );
+}
+
 #[path = "claude_channel/tests/self_kick_tests.rs"]
 mod self_kick_tests;
