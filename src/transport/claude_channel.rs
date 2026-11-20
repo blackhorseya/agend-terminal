@@ -1710,40 +1710,72 @@ fn complete_receipt(home: &Path, instance: &str, event: &ReplyEvent) -> anyhow::
     Ok(())
 }
 
-/// Read one complete line of the SSE handshake into `line`.
+/// Upper bound on the whole SSE handshake (status line plus headers). A real
+/// bridge answers with a few hundred bytes; anything past this is not one.
+const SSE_HANDSHAKE_MAX_BYTES: usize = 16 * 1024;
+
+/// Read one complete line of the SSE handshake.
 ///
-/// The socket has a short read timeout, so a read can return `WouldBlock` /
-/// `TimedOut` with part of the line already appended to `line`; that partial
-/// data is kept and the read resumed. Each timeout checks `should_abort` and
-/// `deadline`. EOF (`Ok(0)` with no newline) is an error: it returns at once,
-/// so a loop that ignored it would spin forever.
+/// This reads the buffer directly (`fill_buf` / `consume`) instead of calling
+/// `read_line`: `read_line` keeps refilling its buffer until it sees a newline,
+/// so a peer that trickles bytes without ever sending one never lets control
+/// come back, and neither the deadline nor `should_abort` could fire. Here
+/// both are checked before every read, so a stop is noticed within one poll
+/// slice and the deadline holds however the bytes arrive. The line is
+/// assembled as bytes (a poll timeout may split a multi-byte character) and
+/// decoded once it is complete. `consumed` counts handshake bytes across
+/// calls against [`SSE_HANDSHAKE_MAX_BYTES`].
+///
+/// EOF is an error: it returns at once, so a loop that ignored it would spin.
 fn read_handshake_line(
     reader: &mut BufReader<TcpStream>,
-    line: &mut String,
+    consumed: &mut usize,
     deadline: Instant,
     should_abort: &dyn Fn() -> bool,
     phase: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<String> {
+    let mut line = Vec::new();
     loop {
-        match reader.read_line(line) {
-            Ok(0) => anyhow::bail!("Claude ChannelBridge SSE closed {phase}"),
-            Ok(_) if line.ends_with('\n') => return Ok(()),
-            // Bytes without the terminating newline: keep reading.
-            Ok(_) => {}
+        if should_abort() {
+            anyhow::bail!("Claude ChannelBridge SSE handshake aborted {phase}");
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!("Claude ChannelBridge SSE handshake timed out {phase}");
+        }
+        let available = match reader.fill_buf() {
+            Ok(available) => available,
             Err(error)
                 if matches!(
                     error.kind(),
                     io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
                 ) =>
             {
-                if should_abort() {
-                    anyhow::bail!("Claude ChannelBridge SSE handshake aborted {phase}");
-                }
-                if Instant::now() >= deadline {
-                    anyhow::bail!("Claude ChannelBridge SSE handshake timed out {phase}");
-                }
+                continue
             }
             Err(error) => return Err(error.into()),
+        };
+        if available.is_empty() {
+            anyhow::bail!("Claude ChannelBridge SSE closed {phase}");
+        }
+        let (take, complete) = match available.iter().position(|byte| *byte == b'\n') {
+            Some(newline) => (newline + 1, true),
+            None => (available.len(), false),
+        };
+        line.extend_from_slice(&available[..take]);
+        reader.consume(take);
+        *consumed += take;
+        if *consumed > SSE_HANDSHAKE_MAX_BYTES {
+            anyhow::bail!(
+                "Claude ChannelBridge SSE handshake exceeded {SSE_HANDSHAKE_MAX_BYTES} bytes {phase}"
+            );
+        }
+        if complete {
+            // A line that arrives in one read still has to fit the budget.
+            if Instant::now() >= deadline {
+                anyhow::bail!("Claude ChannelBridge SSE handshake timed out {phase}");
+            }
+            return String::from_utf8(line)
+                .map_err(|_| anyhow::anyhow!("Claude ChannelBridge SSE sent non-UTF-8 {phase}"));
         }
     }
 }
@@ -1794,10 +1826,10 @@ impl SseStream {
         stream.flush()?;
         let mut reader = BufReader::new(stream);
         let deadline = Instant::now() + HTTP_TIMEOUT;
-        let mut status = String::new();
-        read_handshake_line(
+        let mut consumed = 0;
+        let status = read_handshake_line(
             &mut reader,
-            &mut status,
+            &mut consumed,
             deadline,
             should_abort,
             "before the HTTP status line",
@@ -1806,10 +1838,9 @@ impl SseStream {
             anyhow::bail!("Claude ChannelBridge SSE returned {status:?}");
         }
         loop {
-            let mut header = String::new();
-            read_handshake_line(
+            let header = read_handshake_line(
                 &mut reader,
-                &mut header,
+                &mut consumed,
                 deadline,
                 should_abort,
                 "during the HTTP headers",

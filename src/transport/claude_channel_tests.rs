@@ -2760,5 +2760,49 @@ fn sse_connect_aborts_a_trickling_handshake_promptly() {
     );
 }
 
+/// A bridge that streams an endless header line without a newline must hit the
+/// handshake size cap long before the deadline.
+#[test]
+fn sse_connect_rejects_an_oversized_handshake() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    // fire-and-forget: test-only fake bridge; it exits when the client disconnects.
+    thread::spawn(move || {
+        let Ok((mut conn, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(conn.try_clone().expect("clone"));
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        let _ = conn.write_all(b"HTTP/1.1 200 OK\r\n");
+        let filler = [b'x'; 1024];
+        for _ in 0..64 {
+            if conn.write_all(&filler).is_err() {
+                return;
+            }
+        }
+        thread::sleep(Duration::from_secs(5));
+    });
+    let locator = fake_bridge_locator(port);
+
+    let started = Instant::now();
+    let outcome = connect_errors_within(
+        locator,
+        Arc::new(AtomicBool::new(false)),
+        Duration::from_secs(2),
+    );
+
+    assert_eq!(
+        outcome,
+        Some(true),
+        "an oversized handshake must be rejected quickly (took {:?})",
+        started.elapsed()
+    );
+}
+
 #[path = "claude_channel/tests/self_kick_tests.rs"]
 mod self_kick_tests;
