@@ -4234,6 +4234,14 @@ fn known_subcommands_cover_every_classify_policy_token() {
             "readonly classify arm {tok:?} missing from KNOWN_SUBCOMMANDS"
         );
     }
+    // Read-only plumbing shares the `_` arm (probing cannot see it), so it is
+    // pinned explicitly, like `archive`.
+    for tok in READONLY_PLUMBING_BEHIND_GLOBALS {
+        assert!(
+            KNOWN_SUBCOMMANDS.contains(tok),
+            "read-only plumbing {tok:?} missing from KNOWN_SUBCOMMANDS"
+        );
+    }
     let bindings = [
         Binding::default(),
         bound_binding("feat/x", "/tmp/.worktrees/dev"),
@@ -5668,4 +5676,221 @@ fn chdir_target_rejects_nested_repo_at_the_mapped_subdir() {
         matches!(&denied, Err(m) if m.contains("outside")),
         "a mapped subdir that is its own repository must be DENIED, got {denied:?}"
     );
+}
+
+// ── read-only plumbing behind leading globals (`git -C <repo> cat-file …`) ──
+
+/// Read-only plumbing that `foreign_local_op_allowed` already names, is NOT
+/// mutating, and has no flag that writes a repo file or runs a program beyond
+/// what the already-listed `log`/`diff`/`show` can do. Bare, these were allowed;
+/// behind a leading global they hit the fail-closed gate ("unrecognized
+/// subcommand … behind leading git global options") because they were missing
+/// from `KNOWN_SUBCOMMANDS`.
+const READONLY_PLUMBING_BEHIND_GLOBALS: &[&str] = &[
+    "cat-file",
+    "rev-list",
+    "show-ref",
+    "for-each-ref",
+    "merge-base",
+    "name-rev",
+    "check-ignore",
+    "check-attr",
+    "diff-tree",
+    "diff-index",
+    "diff-files",
+    "count-objects",
+    "whatchanged",
+    "cherry",
+    "range-diff",
+    "var",
+];
+
+fn is_unrecognized_deny(a: &Action) -> bool {
+    matches!(a, Action::Deny(r) if r.contains("unrecognized subcommand"))
+}
+
+/// Reported defect: `git -C <repo> cat-file -e 'HEAD^{commit}'` was denied
+/// (archify `finalize --repo-root` verifies its source this way) while the bare
+/// form is allowed. Behind `-C` it must classify exactly like the bare form, for
+/// an unbound and a bound caller.
+#[test]
+fn leading_c_cat_file_classifies_like_bare_cat_file() {
+    let bare = s(&["cat-file", "-e", "HEAD^{commit}"]);
+    let with_c = s(&["-C", "/some/repo", "cat-file", "-e", "HEAD^{commit}"]);
+    for binding in [
+        Binding::default(),
+        bound_binding("feat/x", "/tmp/.worktrees/dev"),
+    ] {
+        let want = classify_argv(&bare, &binding, false, false, true);
+        let got = classify_argv(&with_c, &binding, false, false, true);
+        assert!(
+            !is_unrecognized_deny(&got),
+            "`git -C … cat-file` must not hit the fail-closed gate: {got:?}"
+        );
+        assert_eq!(got, want, "`git -C … cat-file` must classify like bare");
+    }
+}
+
+/// Every token in `READONLY_PLUMBING_BEHIND_GLOBALS` is recognised behind `-C`
+/// (unbound and bound) and classifies like its bare form; it also already has an
+/// explicit policy (`foreign_local_op_allowed`) and is not mutating, so the
+/// surviving `-C` (see `strip_target_overrides`) can only READ the target.
+#[test]
+fn leading_c_readonly_plumbing_is_recognised_and_stays_non_mutating() {
+    use crate::classify::{foreign_local_op_allowed, is_mutating_local};
+    for tok in READONLY_PLUMBING_BEHIND_GLOBALS {
+        assert!(
+            foreign_local_op_allowed(tok),
+            "{tok:?} needs an existing policy before it may be recognised behind globals"
+        );
+        assert!(!is_mutating_local(tok), "{tok:?} must not be mutating");
+        let with_c = s(&["-C", "/canonical", tok]);
+        assert_eq!(
+            strip_target_overrides(&with_c),
+            with_c,
+            "{tok:?}: non-mutating, so the caller's -C survives and must only read"
+        );
+        for binding in [
+            Binding::default(),
+            bound_binding("feat/x", "/tmp/.worktrees/dev"),
+        ] {
+            let bare = classify_argv(&s(&[tok]), &binding, false, false, true);
+            let got = classify_argv(&with_c, &binding, false, false, true);
+            assert!(
+                !is_unrecognized_deny(&got),
+                "{tok:?} behind -C must not fail closed: {got:?}"
+            );
+            assert_eq!(got, bare, "{tok:?} behind -C must classify like bare");
+        }
+    }
+}
+
+/// Fail-closed direction: tokens that can write repo state or run programs
+/// (object/ref writers, file writers, exec flags) and genuinely unknown tokens
+/// stay denied behind a leading global. Do NOT move these into the list above
+/// without a new safety review.
+#[test]
+fn leading_c_writers_executors_and_unknown_plumbing_stay_fail_closed() {
+    const MUST_STAY_DENIED: &[&str] = &[
+        // object / ref writers
+        "hash-object",
+        "write-tree",
+        "commit-tree",
+        "mktree",
+        "mktag",
+        "unpack-file",
+        "pack-refs",
+        "notes",
+        "replace",
+        // write files or objects
+        "merge-tree",
+        "format-patch",
+        "fsck",
+        "bundle",
+        "mailinfo",
+        "mailsplit",
+        "interpret-trailers",
+        // maintenance / destructive
+        "clean",
+        "gc",
+        "prune",
+        "repack",
+        "bisect",
+        "sparse-checkout",
+        // run programs (pager / gpg / upload-pack / tool)
+        "grep",
+        "ls-remote",
+        "verify-commit",
+        "verify-tag",
+        "difftool",
+        "mergetool",
+        // genuinely unknown
+        "zz-no-such-git-subcommand",
+    ];
+    for binding in [
+        Binding::default(),
+        bound_binding("feat/x", "/tmp/.worktrees/dev"),
+    ] {
+        for tok in MUST_STAY_DENIED {
+            let got = classify_argv(&s(&["-C", "/x", tok]), &binding, false, false, true);
+            assert!(
+                is_unrecognized_deny(&got),
+                "{tok:?} behind -C must stay fail-closed, got {got:?}"
+            );
+        }
+    }
+}
+
+// ── absolutize_target_overrides (PR #47 P2) ─────────────────────────────
+
+#[test]
+fn absolutize_target_overrides_rewrites_relative_paths_against_caller_cwd() {
+    use crate::classify::absolutize_target_overrides;
+    let base = Path::new("/caller/cwd");
+    let cases: &[(&[&str], &[&str])] = &[
+        // relative -C → absolute against cwd
+        (
+            &["-C", "wt", "cat-file", "-e", "HEAD"],
+            &["-C", "/caller/cwd/wt", "cat-file", "-e", "HEAD"],
+        ),
+        // cumulative: each -C is relative to the previous one
+        (
+            &["-C", "a", "-C", "../b", "log"],
+            &["-C", "/caller/cwd/a", "-C", "/caller/cwd/a/../b", "log"],
+        ),
+        // an absolute -C resets the base and is left as is
+        (
+            &["-C", "a", "-C", "/abs", "-C", "c", "log"],
+            &["-C", "/caller/cwd/a", "-C", "/abs", "-C", "/abs/c", "log"],
+        ),
+        // --git-dir / --work-tree resolve against the FINAL -C directory
+        (
+            &["-C", "a", "--git-dir=g", "--work-tree", "w", "log"],
+            &[
+                "-C",
+                "/caller/cwd/a",
+                "--git-dir=/caller/cwd/a/g",
+                "--work-tree",
+                "/caller/cwd/a/w",
+                "log",
+            ],
+        ),
+        // absolute values, other globals and the post-subcommand region untouched
+        (
+            &["-c", "k=v", "--git-dir=/abs/g", "log", "-C", "rel"],
+            &["-c", "k=v", "--git-dir=/abs/g", "log", "-C", "rel"],
+        ),
+        // an EMPTY -C (git: "do not change directory") stays empty and does not
+        // move the base for later relative paths or --git-dir
+        (
+            &["-C", "", "-C", "a", "--git-dir=", "log"],
+            &["-C", "", "-C", "/caller/cwd/a", "--git-dir=", "log"],
+        ),
+        // an empty -C sandwiched between relative ones accumulates like git
+        // (a no-op), and empty --work-tree= / --work-tree "" stay empty
+        (
+            &["-C", "a", "-C", "", "-C", "b", "--work-tree", "", "log"],
+            &[
+                "-C",
+                "/caller/cwd/a",
+                "-C",
+                "",
+                "-C",
+                "/caller/cwd/a/b",
+                "--work-tree",
+                "",
+                "log",
+            ],
+        ),
+        // no globals / no subcommand
+        (&["log", "-1"], &["log", "-1"]),
+        (&[], &[]),
+    ];
+    for (input, want) in cases {
+        assert_eq!(
+            absolutize_target_overrides(&s(input), base),
+            s(want),
+            "input {input:?}"
+        );
+    }
 }
