@@ -40,15 +40,6 @@ fn handle_checkout_repo_inner(home: &Path, args: &Value, instance_name: &str) ->
         Ok(purpose) => purpose,
         Err(error) => return error,
     };
-    // Binding a worktree to an instance that is mid-delete would resurrect
-    // residue the delete is about to orphan; refuse before any permit/side
-    // effect. Inspection-only (bind:false) checkouts claim nothing and pass.
-    if bind && crate::agent::deleting::is_deleting(home, instance_name) {
-        return json!({
-            "error": format!("checkout bind refused: '{instance_name}' is being deleted"),
-            "code": "target_deleting",
-        });
-    }
     let lifecycle_permit = match acquire_bind_lifecycle_permit(home, instance_name, bind) {
         Ok(permit) => permit,
         Err(error) => return error,
