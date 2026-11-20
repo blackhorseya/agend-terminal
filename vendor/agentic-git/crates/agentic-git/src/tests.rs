@@ -5866,6 +5866,22 @@ fn absolutize_target_overrides_rewrites_relative_paths_against_caller_cwd() {
             &["-C", "", "-C", "a", "--git-dir=", "log"],
             &["-C", "", "-C", "/caller/cwd/a", "--git-dir=", "log"],
         ),
+        // an empty -C sandwiched between relative ones accumulates like git
+        // (a no-op), and empty --work-tree= / --work-tree "" stay empty
+        (
+            &["-C", "a", "-C", "", "-C", "b", "--work-tree", "", "log"],
+            &[
+                "-C",
+                "/caller/cwd/a",
+                "-C",
+                "",
+                "-C",
+                "/caller/cwd/a/b",
+                "--work-tree",
+                "",
+                "log",
+            ],
+        ),
         // no globals / no subcommand
         (&["log", "-1"], &["log", "-1"]),
         (&[], &[]),

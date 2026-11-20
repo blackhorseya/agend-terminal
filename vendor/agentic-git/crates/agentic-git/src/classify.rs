@@ -787,7 +787,13 @@ pub(crate) fn strip_target_overrides(args: &[String]) -> Vec<String> {
 /// rejected by git itself and is not rewritten.
 pub(crate) fn absolutize_target_overrides(args: &[String], base: &Path) -> Vec<String> {
     let sub_idx = subcommand_index(args).unwrap_or(args.len());
+    // An EMPTY value is kept empty: git treats `-C ''` as "do not change
+    // directory" (and an empty --git-dir / --work-tree as no value), so joining it
+    // onto a base would turn a no-op into a real, later-winning path.
     let abs = |dir: &Path, p: &str| -> String {
+        if p.is_empty() {
+            return String::new();
+        }
         let p = Path::new(p);
         if p.is_absolute() {
             p.to_string_lossy().into_owned()
@@ -802,7 +808,7 @@ pub(crate) fn absolutize_target_overrides(args: &[String], base: &Path) -> Vec<S
     while i < sub_idx {
         match args[i].as_str() {
             "-C" => {
-                if let Some(p) = args.get(i + 1).filter(|_| i + 1 < sub_idx) {
+                if let Some(p) = args.get(i + 1).filter(|p| i + 1 < sub_idx && !p.is_empty()) {
                     final_dir = PathBuf::from(abs(&final_dir, p));
                 }
                 i += 2;
@@ -820,9 +826,13 @@ pub(crate) fn absolutize_target_overrides(args: &[String], base: &Path) -> Vec<S
         let value = args.get(i + 1).filter(|_| i + 1 < sub_idx);
         match (a, value) {
             ("-C", Some(p)) => {
-                cur = PathBuf::from(abs(&cur, p));
                 out.push(args[i].clone());
-                out.push(cur.to_string_lossy().into_owned());
+                if p.is_empty() {
+                    out.push(String::new());
+                } else {
+                    cur = PathBuf::from(abs(&cur, p));
+                    out.push(cur.to_string_lossy().into_owned());
+                }
                 i += 2;
             }
             ("--git-dir" | "--work-tree", Some(p)) => {
