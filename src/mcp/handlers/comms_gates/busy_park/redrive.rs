@@ -66,6 +66,15 @@ pub(super) fn deliver_parked(home: &Path, park: &ParkedDispatch) -> Result<(), S
         review_class_token = Some(class.as_token());
         resolved_class = Some(class);
     }
+    // Same pre-create refusal as the live path: never auto-create a task for a
+    // dispatch whose bind will be refused.
+    if branch.is_some() && args["bind"].as_bool() != Some(false) {
+        if let Some(refusal) =
+            super::super::super::dispatch_hook::deleting_target_refusal(home, target)
+        {
+            return Err(format!("dispatch rejected: {refusal}"));
+        }
+    }
     // Board task: reuse the parked id, or auto-create (same field shape as the
     // live `maybe_auto_create_task` — keep in sync with it).
     let mut effective_task_id = park.task_id.clone();

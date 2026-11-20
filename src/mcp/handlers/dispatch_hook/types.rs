@@ -187,3 +187,20 @@ pub enum ErrorCode {
     /// effect.
     TargetDeleting,
 }
+
+/// Typed refusal for a target in the deleting set, else `None`. Shared by the
+/// bind hook (the last gate) and by callers that mutate durable state (board
+/// task auto-create) BEFORE reaching the hook, so a doomed dispatch is refused
+/// before it leaves anything behind.
+pub(crate) fn deleting_target_refusal(
+    home: &std::path::Path,
+    target: &str,
+) -> Option<DispatchError> {
+    crate::agent::deleting::is_deleting(home, target).then(|| DispatchError {
+        message: format!("target '{target}' is being deleted; refusing to bind a worktree"),
+        code: ErrorCode::TargetDeleting,
+        stage: Stage::ValidateTarget,
+        fetch_attempted: false,
+        raw: None,
+    })
+}

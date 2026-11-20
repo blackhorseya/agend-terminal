@@ -520,6 +520,22 @@ pub(crate) fn handle_delegate_task(
         );
     }
 
+    // A branch dispatch that will bind must be refused for a deleting target
+    // BEFORE the board task is auto-created; otherwise the bind hook's later
+    // refusal leaves an Open task behind that dedups an identical retry.
+    if !dispatch_should_skip_auto_bind(args)
+        && args["branch"].as_str().is_some_and(|b| !b.is_empty())
+    {
+        if let Some(refusal) = dispatch_hook::deleting_target_refusal(home, target) {
+            return json!({
+                "ok": false,
+                "error": format!("dispatch rejected: {refusal}"),
+                "code": "target_deleting",
+                "stage": serde_json::to_value(refusal.stage).unwrap_or(Value::Null),
+            });
+        }
+    }
+
     let created = if runtime.is_some() {
         match maybe_auto_create_task(home, args, sender, target, composed.plan_ack_required) {
             Ok(created) => created,

@@ -34,7 +34,8 @@ pub(crate) use lifecycle_permit::{
 pub(crate) use provider_neutral_slug::canonical_repo_slug_for_source;
 pub(crate) use source_repo_resolution::resolve_team_source_repo;
 pub(crate) use types::{
-    CiWatchOutcome, DispatchError, DispatchOutcome, ErrorCode, SourceRepoTier, Stage,
+    deleting_target_refusal, CiWatchOutcome, DispatchError, DispatchOutcome, ErrorCode,
+    SourceRepoTier, Stage,
 };
 
 #[allow(dead_code)]
@@ -253,14 +254,8 @@ pub(crate) fn dispatch_auto_bind_lease_with_source_and_chain(
     // residue. Mirrors the spawn and delivery gates. Only the deleting window is
     // refused; a target that is merely absent from the registry (offline
     // dispatch) stays valid.
-    if crate::agent::deleting::is_deleting(home, target) {
-        return Err(DispatchError {
-            message: format!("target '{target}' is being deleted; refusing to bind a worktree"),
-            code: ErrorCode::TargetDeleting,
-            stage: Stage::ValidateTarget,
-            fetch_attempted: false,
-            raw: None,
-        });
+    if let Some(refusal) = deleting_target_refusal(home, target) {
+        return Err(refusal);
     }
     let _guard = match preheld_guard {
         Some(guard) => guard,
