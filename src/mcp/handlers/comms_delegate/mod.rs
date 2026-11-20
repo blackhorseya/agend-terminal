@@ -449,6 +449,27 @@ fn track_delegate_success(ctx: &DeliveryCtx<'_>, mut result: Value) -> Value {
     result
 }
 
+/// `target_deleting` refusal for a branch dispatch that would bind a worktree
+/// to an instance that is mid-delete. Scope is exactly the binding branch
+/// dispatch: `bind:false` (watch-only), branchless and review-assignment
+/// dispatches (own checkout gate) are untouched.
+fn refuse_deleting_branch_dispatch(home: &Path, args: &Value, target: &str) -> Option<Value> {
+    if dispatch_should_skip_auto_bind(args)
+        || args["review_assignment"].as_bool() == Some(true)
+        || args["branch"].as_str().is_none_or(|b| b.is_empty())
+    {
+        return None;
+    }
+    dispatch_hook::deleting_target_refusal(home, target).map(|refusal| {
+        json!({
+            "ok": false,
+            "error": format!("dispatch rejected: {refusal}"),
+            "code": "target_deleting",
+            "stage": serde_json::to_value(refusal.stage).unwrap_or(Value::Null),
+        })
+    })
+}
+
 /// Ordered choreography for MCP `delegate_task` / unified send kind=task.
 pub(crate) fn handle_delegate_task(
     home: &Path,
@@ -463,6 +484,13 @@ pub(crate) fn handle_delegate_task(
     let target = resolved.resolved_target.as_str();
     let sender = resolved.sender;
     let task = resolved.task;
+
+    // Refuse a deleting target BEFORE any durable write: the busy gate below
+    // parks (park file + pending tracking) and the auto-create writes a board
+    // task, either of which a later bind-hook refusal would leave behind.
+    if let Some(refusal) = refuse_deleting_branch_dispatch(home, args, target) {
+        return refusal;
+    }
 
     // Phase 2 — pre-send gates (busy / branch-dedup / enrich / second-reviewer / …)
     let checks = match comms_gates::run_dispatch_pre_checks(home, sender, args, target, task) {
@@ -518,22 +546,6 @@ pub(crate) fn handle_delegate_task(
         return review_assignment::dispatch_review_assignment_with_workspace(
             home, sender, target, task, args, &checks, &composed, &repo_slug,
         );
-    }
-
-    // A branch dispatch that will bind must be refused for a deleting target
-    // BEFORE the board task is auto-created; otherwise the bind hook's later
-    // refusal leaves an Open task behind that dedups an identical retry.
-    if !dispatch_should_skip_auto_bind(args)
-        && args["branch"].as_str().is_some_and(|b| !b.is_empty())
-    {
-        if let Some(refusal) = dispatch_hook::deleting_target_refusal(home, target) {
-            return json!({
-                "ok": false,
-                "error": format!("dispatch rejected: {refusal}"),
-                "code": "target_deleting",
-                "stage": serde_json::to_value(refusal.stage).unwrap_or(Value::Null),
-            });
-        }
     }
 
     let created = if runtime.is_some() {
