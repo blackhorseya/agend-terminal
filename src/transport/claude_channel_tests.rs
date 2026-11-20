@@ -2564,5 +2564,91 @@ fn stop_instance_state_returns_while_handshake_read_is_blocked() {
     assert_stop_returns_despite_handshake_fault("stop-silent-handshake", HandshakeFault::Silent);
 }
 
+/// The handshake must notice a stop request by itself, without relying on
+/// `shutdown` from another thread (which does not reliably wake a blocked read
+/// on Windows): `connect` reads in short slices and polls `should_abort`.
+#[test]
+fn sse_connect_aborts_a_silent_handshake_without_shutdown() {
+    let bridge = FaultyHandshakeBridge::start(HandshakeFault::Silent);
+    let locator = fake_bridge_locator(bridge.port);
+    let abort = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&abort);
+    // fire-and-forget: test-only timer that raises the abort flag.
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(400));
+        flag.store(true, Ordering::Release);
+    });
+
+    let started = Instant::now();
+    let result = SseStream::connect(&locator, None, &|_| Ok(()), &|| {
+        abort.load(Ordering::Acquire)
+    });
+
+    assert!(result.is_err(), "an aborted handshake must be an error");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "connect must notice the abort within a few poll slices, took {:?}",
+        started.elapsed()
+    );
+}
+
+/// With no stop request, a bridge that never answers still ends the handshake
+/// at the overall `HTTP_TIMEOUT` deadline rather than blocking forever.
+#[test]
+fn sse_connect_gives_up_on_a_silent_handshake_at_the_deadline() {
+    let bridge = FaultyHandshakeBridge::start(HandshakeFault::Silent);
+    let locator = fake_bridge_locator(bridge.port);
+
+    let started = Instant::now();
+    let result = SseStream::connect(&locator, None, &|_| Ok(()), &|| false);
+
+    assert!(result.is_err(), "a silent bridge must fail the handshake");
+    assert!(
+        started.elapsed() < HTTP_TIMEOUT + Duration::from_secs(2),
+        "the handshake must end near HTTP_TIMEOUT, took {:?}",
+        started.elapsed()
+    );
+}
+
+/// A slice timeout can fire with half a header line already read. That partial
+/// line must be kept, not dropped: the bridge here pauses mid-status-line for
+/// longer than several poll slices and the handshake must still succeed.
+#[test]
+fn sse_connect_keeps_a_partial_line_across_poll_timeouts() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().expect("addr").port();
+    // fire-and-forget: test-only fake bridge; it serves one connection and exits.
+    thread::spawn(move || {
+        let Ok((mut conn, _)) = listener.accept() else {
+            return;
+        };
+        let mut reader = BufReader::new(conn.try_clone().expect("clone"));
+        loop {
+            let mut line = String::new();
+            if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                break;
+            }
+        }
+        for chunk in [
+            &b"HTTP/1.1 2"[..],
+            b"00 OK\r\nContent-Type: text/ev",
+            b"ent-stream\r\n\r\n",
+        ] {
+            let _ = conn.write_all(chunk);
+            let _ = conn.flush();
+            thread::sleep(Duration::from_millis(600));
+        }
+    });
+    let locator = fake_bridge_locator(port);
+
+    let result = SseStream::connect(&locator, None, &|_| Ok(()), &|| false);
+
+    assert!(
+        result.is_ok(),
+        "a line split across poll timeouts must be reassembled: {:?}",
+        result.err()
+    );
+}
+
 #[path = "claude_channel/tests/self_kick_tests.rs"]
 mod self_kick_tests;

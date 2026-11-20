@@ -46,6 +46,10 @@ const MAX_BODY: usize = 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 const CHANNEL_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SSE_READ_TIMEOUT: Duration = Duration::from_secs(20);
+/// While the SSE handshake is in flight the socket is read in slices this long,
+/// so a stop request is noticed even where `shutdown` from another thread does
+/// not wake a blocked read (observed on Windows CI).
+const SSE_HANDSHAKE_POLL: Duration = Duration::from_millis(250);
 /// A fresh-restart self-kick must prove consumer admission promptly. This is
 /// deliberately a bounded ambiguity window, not a retry timer: accepted
 /// without an exact consumer ack is never resent automatically.
@@ -1706,6 +1710,44 @@ fn complete_receipt(home: &Path, instance: &str, event: &ReplyEvent) -> anyhow::
     Ok(())
 }
 
+/// Read one complete line of the SSE handshake into `line`.
+///
+/// The socket has a short read timeout, so a read can return `WouldBlock` /
+/// `TimedOut` with part of the line already appended to `line`; that partial
+/// data is kept and the read resumed. Each timeout checks `should_abort` and
+/// `deadline`. EOF (`Ok(0)` with no newline) is an error: it returns at once,
+/// so a loop that ignored it would spin forever.
+fn read_handshake_line(
+    reader: &mut BufReader<TcpStream>,
+    line: &mut String,
+    deadline: Instant,
+    should_abort: &dyn Fn() -> bool,
+    phase: &str,
+) -> anyhow::Result<()> {
+    loop {
+        match reader.read_line(line) {
+            Ok(0) => anyhow::bail!("Claude ChannelBridge SSE closed {phase}"),
+            Ok(_) if line.ends_with('\n') => return Ok(()),
+            // Bytes without the terminating newline: keep reading.
+            Ok(_) => {}
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                ) =>
+            {
+                if should_abort() {
+                    anyhow::bail!("Claude ChannelBridge SSE handshake aborted {phase}");
+                }
+                if Instant::now() >= deadline {
+                    anyhow::bail!("Claude ChannelBridge SSE handshake timed out {phase}");
+                }
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
 struct SseStream {
     reader: BufReader<TcpStream>,
 }
@@ -1726,17 +1768,20 @@ impl SseStream {
     /// right after it is established and BEFORE any blocking handshake I/O, so a
     /// caller can register it for `shutdown` and a stop request wakes even a
     /// handshake that is blocked on a silent bridge. An `Err` from `publish`
-    /// aborts the connect.
+    /// aborts the connect. `shutdown` is not a portable wake-up, so the
+    /// handshake also reads in short slices and polls `should_abort` between
+    /// them, bounded overall by `HTTP_TIMEOUT`.
     fn connect(
         locator: &SessionLocator,
         last_event_id: Option<&str>,
         publish: &dyn Fn(&TcpStream) -> anyhow::Result<()>,
+        should_abort: &dyn Fn() -> bool,
     ) -> anyhow::Result<Self> {
         ensure_claude_bridge_owned(locator)?;
         let address = endpoint_address(locator)?;
         let mut stream = TcpStream::connect_timeout(&address.parse()?, HTTP_TIMEOUT)?;
         publish(&stream)?;
-        stream.set_read_timeout(Some(SSE_READ_TIMEOUT))?;
+        stream.set_read_timeout(Some(SSE_HANDSHAKE_POLL))?;
         stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
         let token = token(locator)?;
         let cursor = last_event_id
@@ -1748,25 +1793,34 @@ impl SseStream {
         )?;
         stream.flush()?;
         let mut reader = BufReader::new(stream);
+        let deadline = Instant::now() + HTTP_TIMEOUT;
         let mut status = String::new();
-        if reader.read_line(&mut status)? == 0 {
-            anyhow::bail!("Claude ChannelBridge SSE closed before the HTTP status line");
-        }
+        read_handshake_line(
+            &mut reader,
+            &mut status,
+            deadline,
+            should_abort,
+            "before the HTTP status line",
+        )?;
         if !status.contains(" 200 ") {
             anyhow::bail!("Claude ChannelBridge SSE returned {status:?}");
         }
         loop {
             let mut header = String::new();
-            // `Ok(0)` is EOF: the bridge closed before the headers ended. It
-            // returns instantly, so the socket read timeout can never end a
-            // loop that ignores it.
-            if reader.read_line(&mut header)? == 0 {
-                anyhow::bail!("Claude ChannelBridge SSE closed during the HTTP headers");
-            }
+            read_handshake_line(
+                &mut reader,
+                &mut header,
+                deadline,
+                should_abort,
+                "during the HTTP headers",
+            )?;
             if header == "\r\n" || header == "\n" {
                 break;
             }
         }
+        // Handshake done: back to the long timeout that detects a bridge whose
+        // keepalives stopped.
+        reader.get_ref().set_read_timeout(Some(SSE_READ_TIMEOUT))?;
         Ok(Self { reader })
     }
 
@@ -1883,7 +1937,13 @@ fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
                     }
                     Ok(())
                 };
-                match SseStream::connect(&worker_locator, last_event_id.as_deref(), &publish) {
+                let should_abort = || thread_stop.load(Ordering::Acquire);
+                match SseStream::connect(
+                    &worker_locator,
+                    last_event_id.as_deref(),
+                    &publish,
+                    &should_abort,
+                ) {
                     Ok(mut stream) => {
                         loop {
                             // Checked after the socket is published (and after
@@ -2208,7 +2268,7 @@ impl AgentDeliveryTransport for ClaudeChannelBridge {
 
     async fn next_event(&mut self) -> anyhow::Result<BackendEvent> {
         let locator = self.locator()?;
-        let mut stream = SseStream::connect(&locator, None, &|_| Ok(()))?;
+        let mut stream = SseStream::connect(&locator, None, &|_| Ok(()), &|| false)?;
         loop {
             match stream.next()? {
                 Some(SseItem::Event(event)) => {
