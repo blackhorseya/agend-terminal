@@ -2440,5 +2440,129 @@ fn stop_instance_state_does_not_hold_global_lock_while_joining() {
     let _ = fs::remove_dir_all(home);
 }
 
+/// How a fake bridge misbehaves during the HTTP handshake, before any SSE
+/// event or keepalive is sent.
+#[derive(Clone, Copy)]
+enum HandshakeFault {
+    /// Sends a `200` status line, then closes before the headers end.
+    EofAfterStatusLine,
+    /// Accepts the connection and never answers.
+    Silent,
+}
+
+struct FaultyHandshakeBridge {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    connections: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl FaultyHandshakeBridge {
+    fn start(fault: HandshakeFault) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind faulty bridge");
+        listener.set_nonblocking(true).expect("nonblocking");
+        let port = listener.local_addr().expect("addr").port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (thread_stop, thread_connections) = (Arc::clone(&stop), Arc::clone(&connections));
+        // fire-and-forget: test-only fake bridge; it exits when `stop` is set.
+        thread::spawn(move || {
+            let mut held = Vec::new();
+            while !thread_stop.load(Ordering::Acquire) {
+                match listener.accept() {
+                    Ok((mut conn, _)) => {
+                        thread_connections.fetch_add(1, Ordering::AcqRel);
+                        match fault {
+                            HandshakeFault::EofAfterStatusLine => {
+                                // Drain the request first: closing a socket
+                                // with unread data sends RST, which the client
+                                // sees as an error rather than the clean EOF
+                                // this fault is about.
+                                conn.set_nonblocking(false).expect("blocking");
+                                conn.set_read_timeout(Some(Duration::from_secs(2)))
+                                    .expect("timeout");
+                                let mut request = BufReader::new(conn.try_clone().expect("clone"));
+                                loop {
+                                    let mut line = String::new();
+                                    if request.read_line(&mut line).unwrap_or(0) == 0
+                                        || line == "\r\n"
+                                    {
+                                        break;
+                                    }
+                                }
+                                let _ = conn.write_all(b"HTTP/1.1 200 OK\r\n");
+                                let _ = conn.flush();
+                                let _ = conn.shutdown(std::net::Shutdown::Both);
+                            }
+                            HandshakeFault::Silent => held.push(conn),
+                        }
+                    }
+                    Err(_) => thread::sleep(Duration::from_millis(20)),
+                }
+            }
+        });
+        Self {
+            port,
+            stop,
+            connections,
+        }
+    }
+
+    /// Wait until the worker has connected at least once.
+    fn wait_for_connection(&self) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while self.connections.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "worker never connected");
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+}
+
+impl Drop for FaultyHandshakeBridge {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::Release);
+    }
+}
+
+fn assert_stop_returns_despite_handshake_fault(tag: &str, fault: HandshakeFault) {
+    let home = home(tag);
+    let bridge = FaultyHandshakeBridge::start(fault);
+    let locator = fake_bridge_locator(bridge.port);
+    ensure_event_worker(&home, "handshake-agent", &locator);
+    bridge.wait_for_connection();
+    // Give the worker time to be inside the faulty handshake.
+    thread::sleep(Duration::from_millis(300));
+
+    let stop_home = home.clone();
+    let returned = returns_within(Duration::from_secs(5), move || {
+        stop_instance_state(&stop_home, "handshake-agent");
+    });
+
+    assert!(
+        returned,
+        "stop_instance_state must return within 5s while the bridge handshake is faulty"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A bridge that dies after the status line but before the headers end made
+/// `SseStream::connect` read the same EOF forever (`read_line` returns
+/// `Ok(0)` instantly, so the socket read timeout never fires), and the worker
+/// never reached a stop-flag check.
+#[test]
+fn stop_instance_state_returns_when_bridge_closes_mid_headers() {
+    assert_stop_returns_despite_handshake_fault(
+        "stop-mid-headers-eof",
+        HandshakeFault::EofAfterStatusLine,
+    );
+}
+
+/// The worker must be stoppable while it is still blocked in the handshake
+/// read, not only once the SSE stream is established: otherwise a bridge that
+/// accepts and goes silent holds the stop for the full read timeout.
+#[test]
+fn stop_instance_state_returns_while_handshake_read_is_blocked() {
+    assert_stop_returns_despite_handshake_fault("stop-silent-handshake", HandshakeFault::Silent);
+}
+
 #[path = "claude_channel/tests/self_kick_tests.rs"]
 mod self_kick_tests;
