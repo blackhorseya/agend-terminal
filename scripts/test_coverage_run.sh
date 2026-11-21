@@ -769,14 +769,18 @@ PRODUCER
 # On a corrupt/no-profile failure the wrapper must emit deterministic evidence
 # adequate to continue the RCA — attempt number, the profile path, per-file size
 # and header bytes — and must NOT dump the producer log wholesale.
-test_corrupt_failure_emits_bounded_diagnostics() {
-    local sandbox out
+# Shared body. COV_TEST_NOISE_LINES sizes the producer log and
+# COV_TEST_EARLY_MARKER, when set, is printed as the FIRST producer line so the
+# words the assertions look for appear at the very start of a large capture.
+assert_corrupt_diagnostics() {
+    local label="$1" sandbox out
     sandbox="$(new_sandbox)"
     cat >"$sandbox/producer.sh" <<'PRODUCER'
 #!/usr/bin/env bash
 printf 'CORRUPTHEADER' > "$COVERAGE_PROFILE_DIR/agend-terminal-4242-cafebabe_0.profraw"
+[ -z "${COV_TEST_EARLY_MARKER:-}" ] || echo "$COV_TEST_EARLY_MARKER"
 # a deliberately noisy log the wrapper must not echo back in full
-i=0; while [ "$i" -lt 400 ]; do echo "noise line $i"; i=$((i + 1)); done
+i=0; while [ "$i" -lt "${COV_TEST_NOISE_LINES:-400}" ]; do echo "noise line $i"; i=$((i + 1)); done
 echo "error: no profile can be merged"
 exit 1
 PRODUCER
@@ -799,13 +803,27 @@ PRODUCER
     diag_noise="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p' | grep -c "noise line")"
 
     if [ -n "$missing" ]; then
-        report 1 "corrupt failure emits bounded diagnostics" "missing evidence:$missing"
+        report 1 "$label" "missing evidence:$missing"
     elif [ "$diag_noise" -gt 0 ]; then
-        report 1 "diagnostics stay bounded" "diagnostic block re-dumped $diag_noise producer log lines"
+        report 1 "$label (bounded)" "diagnostic block re-dumped $diag_noise producer log lines"
     else
-        report 0 "corrupt failure emits bounded, deterministic diagnostics"
+        report 0 "$label"
     fi
     rm -rf "$sandbox"
+}
+
+test_corrupt_failure_emits_bounded_diagnostics() {
+    assert_corrupt_diagnostics "corrupt failure emits bounded, deterministic diagnostics"
+}
+
+# A capture far larger than a pipe buffer whose first line already carries the
+# words the assertions grep for. Under pipefail, `echo "$out" | grep -q` lets
+# grep exit on that first line while echo is still writing, so the pipeline
+# reports failure (echo: write error: Broken pipe) for evidence that IS present.
+test_corrupt_diagnostics_survive_large_producer_output() {
+    COV_TEST_NOISE_LINES=20000 \
+        COV_TEST_EARLY_MARKER="attempt header size bytes agend-terminal-4242-cafebabe_0.profraw" \
+        assert_corrupt_diagnostics "corrupt diagnostics hold under a large producer log"
 }
 
 # ── 5. Named-corrupt relevance ───────────────────────────────────────────────
@@ -1544,17 +1562,20 @@ PRODUCER
 # A readerless rescue can fail while the wrapper itself finishes after the
 # soft deadline. The failure must be explicit, but it must not turn ordinary
 # slow completion into a hard timeout.
-test_failed_rescue_is_distinct_from_slow_success() {
-    local sandbox deadline_status diagnostics elapsed waited deadline bad=""
+# Shared body. COV_TEST_PRODUCER_START_DELAY models a runner on which the
+# wrapper reaches the producer late (slow process creation, e.g. MSYS).
+assert_failed_rescue_is_distinct() {
+    local label="$1" sandbox deadline_status diagnostics elapsed waited deadline bad=""
     sandbox="$(new_sandbox)"
     if fifos_unavailable "$sandbox"; then
         rm -rf "$sandbox"
-        report_skip "a failed rescue is distinct from slow success" \
+        report_skip "$label" \
             "this platform does not create FIFOs; premise unavailable"
         return
     fi
     cat >"$sandbox/producer.sh" <<'PRODUCER'
 #!/usr/bin/env bash
+sleep "${COV_TEST_PRODUCER_START_DELAY:-0}"
 mkfifo "$COVERAGE_PROFILE_DIR/readerless-rescue.fifo"
 printf '%s\n' "$$" >"$COVERAGE_PROFILE_DIR/../producer.pid"
 sleep 2 &
@@ -1592,10 +1613,22 @@ PRODUCER
             || bad="$bad waited($waited/$deadline)" ;;
     esac
     if [ -n "$bad" ]; then
-        report 1 "a failed rescue is distinct from slow success" "issues:$bad"
+        report 1 "$label" "issues:$bad"
     else
-        report 0 "a failed rescue is distinct from slow success"
+        report 0 "$label"
     fi
+}
+
+test_failed_rescue_is_distinct_from_slow_success() {
+    assert_failed_rescue_is_distinct "a failed rescue is distinct from slow success"
+}
+
+# The producer only reaches its fixture after the soft deadline has passed. The
+# deadline clock must measure the wrapper against an established premise, not
+# against how long the runner took to start the fixture.
+test_failed_rescue_survives_a_late_producer_start() {
+    COV_TEST_PRODUCER_START_DELAY=2 \
+        assert_failed_rescue_is_distinct "a failed rescue holds when the producer starts late"
 }
 
 # A second, unreferenced FIFO has no reader. Its rescue worker must be bounded
@@ -4894,6 +4927,7 @@ test_set_e_guard_handles_clustered_options
 test_cleanup_failure_is_surfaced
 test_retry_cannot_consume_prior_attempt_profraw
 test_corrupt_failure_emits_bounded_diagnostics
+test_corrupt_diagnostics_survive_large_producer_output
 test_named_corrupt_path_is_cap_exempt
 test_membership_is_exact_not_substring
 test_quoted_absolute_named_path_resolves
@@ -4962,6 +4996,7 @@ test_named_fifo_does_not_block_the_wrapper
 test_fifo_response_file_does_not_block_the_wrapper
 test_slow_success_is_not_classified_as_blocked
 test_failed_rescue_is_distinct_from_slow_success
+test_failed_rescue_survives_a_late_producer_start
 test_readerless_fifo_rescue_is_hard_bounded
 test_genuine_hard_timeout_is_recorded
 test_soft_deadline_precedes_hard_deadline
