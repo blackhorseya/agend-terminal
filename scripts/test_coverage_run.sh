@@ -18,6 +18,15 @@ wrapper="$script_dir/coverage-run.sh"
 # `set -o pipefail` outside both branches: pipefail is required by the wrapper.
 errexit_guard_pattern='^[[:space:]]*set[[:space:]]+-[[:alpha:]]*e[[:alpha:]]*([[:space:]]|$)|^[[:space:]]*set[[:space:]]+-o[[:space:]]+errexit([[:space:]]|$)'
 
+# `grep -q` exits on its first match. In `printf ... | grep -q` under pipefail
+# the writer can then take EPIPE (echo: write error: Broken pipe) and fail the
+# pipeline although the evidence was found. qgrep reads its whole input and
+# only discards the output, so a match is judged by grep's own status. Pass
+# grep's options without -q.
+qgrep() {
+    grep "$@" >/dev/null
+}
+
 native_symlink_host() {
     case "${RUNNER_OS:-}" in
         Windows) return 0 ;;
@@ -449,9 +458,9 @@ PRODUCER
 
     if [ "$rc" -ne 7 ]; then
         report 1 "implausible git common-dir diagnostic is bounded" "wrapper exited $rc"
-    elif ! printf '%s\n' "$out" | grep -q 'git_common_dir=implausible reason=oversized bytes='; then
+    elif ! printf '%s\n' "$out" | qgrep 'git_common_dir=implausible reason=oversized bytes='; then
         report 1 "implausible git common-dir diagnostic is bounded" "missing classification: $out"
-    elif printf '%s\n' "$out" | grep -q -- '-END-COMMON-DIR'; then
+    elif printf '%s\n' "$out" | qgrep -- '-END-COMMON-DIR'; then
         report 1 "implausible git common-dir diagnostic is bounded" "raw payload tail leaked"
     elif [ "${#out}" -gt 12000 ]; then
         report 1 "implausible git common-dir diagnostic is bounded" "diagnostic grew to ${#out} bytes"
@@ -489,11 +498,11 @@ PRODUCER
         COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     rc=$?
     [ "$rc" -eq 0 ] || bad="$bad mixed-exit($rc)"
-    echo "$out" | grep -q 'coverage completed from valid profiles while the producer reported at least one unreadable profile' \
+    echo "$out" | qgrep 'coverage completed from valid profiles while the producer reported at least one unreadable profile' \
         || bad="$bad mixed-warning-missing"
-    echo "$out" | grep -qE 'skipped [0-9]+|[0-9]+ unreadable profile warning' \
+    echo "$out" | qgrep -E 'skipped [0-9]+|[0-9]+ unreadable profile warning' \
         && bad="$bad mixed-warning-fabricated-tally"
-    echo "$out" | grep -q 'corrupt=agend-terminal-42-777_0.profraw' \
+    echo "$out" | qgrep 'corrupt=agend-terminal-42-777_0.profraw' \
         || bad="$bad mixed-evidence-missing"
 
     out="$(cd "$sandbox" && COV_TEST_CASE=all-bad \
@@ -502,7 +511,7 @@ PRODUCER
         COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     rc=$?
     [ "$rc" -ne 0 ] || bad="$bad all-bad-succeeded"
-    echo "$out" | grep -q 'coverage failed with llvm-cov profile corruption' \
+    echo "$out" | qgrep 'coverage failed with llvm-cov profile corruption' \
         || bad="$bad all-bad-failure-missing"
 
     rm -rf "$sandbox"
@@ -543,7 +552,7 @@ PRODUCER
     # contains the word "flake" in "NOT a flake".
     if [ "$attempts" -ne 1 ]; then
         report 1 "real failure is not retried" "producer ran $attempts times, expected 1"
-    elif echo "$out" | grep -qiE "hit .*flake|flake retries|is a flake|corruption flake"; then
+    elif echo "$out" | qgrep -iE "hit .*flake|flake retries|is a flake|corruption flake"; then
         report 1 "real failure is not relabelled as a flake" "output claimed a flake: $(echo "$out" | grep -iE 'hit .*flake|flake retries|is a flake|corruption flake' | head -1)"
     elif [ "$rc" -ne 101 ]; then
         report 1 "real failure preserves the producer exit code" "wrapper exited $rc, producer exited 101"
@@ -567,7 +576,7 @@ test_sink_failure_after_success_is_truthful() {
     if [ "$rc" -eq 0 ]; then
         report 1 "tee sink failure cannot become success" \
             "wrapper exited 0 despite an unwritable log: $out"
-    elif ! echo "$out" | grep -qi 'log sink'; then
+    elif ! echo "$out" | qgrep -i 'log sink'; then
         report 1 "tee sink failure cannot become success" \
             "no framed log-sink failure: $out"
     else
@@ -590,13 +599,13 @@ test_sink_failure_preserves_producer_failure_without_classification() {
     if [ "$rc" -ne 101 ]; then
         report 1 "tee sink failure preserves producer exit" \
             "wrapper exited $rc, producer exited 101: $out"
-    elif ! echo "$out" | grep -qi 'log sink'; then
+    elif ! echo "$out" | qgrep -i 'log sink'; then
         report 1 "tee sink failure preserves producer exit" \
             "no framed log-sink failure: $out"
-    elif echo "$out" | grep -qiE 'unclassified|grep:'; then
+    elif echo "$out" | qgrep -iE 'unclassified|grep:'; then
         report 1 "tee sink failure skips log classification" \
             "log-dependent diagnostic leaked: $out"
-    elif echo "$out" | grep -qiE 'coverage attempt .*retrying|llvm-cov profile corruption'; then
+    elif echo "$out" | qgrep -iE 'coverage attempt .*retrying|llvm-cov profile corruption'; then
         report 1 "tee sink failure skips retry classification" \
             "sink failure entered retry/classification path: $out"
     else
@@ -719,7 +728,7 @@ PRODUCER
 
     if [ "$rc" -eq 0 ]; then
         report 1 "cleanup failure is surfaced" "wrapper exited 0 despite a failing cleanup"
-    elif ! echo "$out" | grep -qi "cleanup"; then
+    elif ! echo "$out" | qgrep -i "cleanup"; then
         report 1 "cleanup failure is surfaced" "no cleanup failure reported in output"
     else
         report 0 "cleanup failure is surfaced, not swallowed"
@@ -793,10 +802,10 @@ PRODUCER
         "$wrapper" 2>&1)"
 
     local missing=""
-    echo "$out" | grep -q "agend-terminal-4242-cafebabe_0.profraw" || missing="$missing filename"
-    echo "$out" | grep -qiE "size|bytes" || missing="$missing size"
-    echo "$out" | grep -qiE "header" || missing="$missing header"
-    echo "$out" | grep -qiE "attempt" || missing="$missing attempt"
+    echo "$out" | qgrep "agend-terminal-4242-cafebabe_0.profraw" || missing="$missing filename"
+    echo "$out" | qgrep -iE "size|bytes" || missing="$missing size"
+    echo "$out" | qgrep -iE "header" || missing="$missing header"
+    echo "$out" | qgrep -iE "attempt" || missing="$missing attempt"
     # The producer's own output is streamed once by design (CI needs progress).
     # What must stay bounded is the DIAGNOSTIC block: it must not re-dump the log.
     local diag_noise
@@ -863,12 +872,12 @@ PRODUCER
     line="$(echo "$block" | grep -F "$corrupt" | grep -E '^\s*corrupt=' | head -n 1)"
     [ -n "$line" ] || missing="$missing named-path"
     if [ -n "$line" ]; then
-        echo "$line" | grep -q 'exists=' || missing="$missing exists"
-        echo "$line" | grep -q 'in_response=' || missing="$missing response-membership"
-        echo "$line" | grep -q 'size_bytes=' || missing="$missing size"
-        echo "$line" | grep -q 'header=' || missing="$missing header"
-        echo "$line" | grep -q 'mtime=' || missing="$missing mtime"
-        echo "$line" | grep -q 'module=' || missing="$missing module-token"
+        echo "$line" | qgrep 'exists=' || missing="$missing exists"
+        echo "$line" | qgrep 'in_response=' || missing="$missing response-membership"
+        echo "$line" | qgrep 'size_bytes=' || missing="$missing size"
+        echo "$line" | qgrep 'header=' || missing="$missing header"
+        echo "$line" | qgrep 'mtime=' || missing="$missing mtime"
+        echo "$line" | qgrep 'module=' || missing="$missing module-token"
     fi
     # It must come BEFORE the ordinary capped listing, not after it.
     local corrupt_at file_at
@@ -944,7 +953,7 @@ test_tab_containing_path_is_reported() {
     printf 'partial' >"$sandbox/profiles/$name"
     line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/$name")"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'exists=yes'; then
+    if echo "$line" | qgrep 'exists=yes'; then
         report 0 "a path containing a tab is still reported"
     else
         report 1 "a path containing a tab is still reported" "got: $line"
@@ -985,7 +994,7 @@ SHIM
     line="$(drive_named_with_path "$shim" "$sandbox/profiles" "$victim")"
     rm -rf "$sandbox"
     # 4f 55 54 53 49 44 45 2d = "OUTSIDE-"
-    if echo "$line" | grep -q '4f 55 54 53 49 44 45 2d'; then
+    if echo "$line" | qgrep '4f 55 54 53 49 44 45 2d'; then
         report 1 "reads are pinned against a post-validation swap" "outside bytes disclosed: $line"
     else
         report 0 "reads are pinned against a post-validation swap"
@@ -1008,7 +1017,7 @@ SHIM
     chmod +x "$shim/cat"
     line="$(drive_named_with_path "$shim" "$sandbox/profiles" "$sandbox/profiles/fail-1-2_0.profraw")"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'exists=yes' && echo "$line" | grep -q 'size_bytes=0'; then
+    if echo "$line" | qgrep 'exists=yes' && echo "$line" | qgrep 'size_bytes=0'; then
         report 1 "a failed pinned read is not reported as success" "fabricated: $line"
     else
         report 0 "a failed pinned read is not reported as success"
@@ -1063,7 +1072,7 @@ PRODUCER
         COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     rm -rf "$sandbox"
-    if echo "$out" | grep -qE 'corrupt=|unparseable'; then
+    if echo "$out" | qgrep -E 'corrupt=|unparseable'; then
         report 0 "an unparseable named path is disclosed, not dropped"
     else
         report 1 "an unparseable named path is disclosed, not dropped" \
@@ -1223,7 +1232,7 @@ run_wrapper_with_deadline() {
     local rescue_unreleased=0 rescue_completion=not-attempted
     local reason soft_pause_secs soft_deadline_reached=no hard_deadline_reached=no
     local status_path fifo_path process_path completion_path completion_tmp
-    local wrapper_pid_path wrapper_pid_tmp snapshot_pid
+    local wrapper_pid_path wrapper_pid_tmp snapshot_pid ready_waited
     status_path="$(deadline_status_for "$contract")"
     fifo_path="$(deadline_fifos_for "$contract")"
     process_path="$(deadline_processes_for "$contract")"
@@ -1255,6 +1264,20 @@ run_wrapper_with_deadline() {
         exit "$wrapper_status"
     ) &
         pid=$!
+    # Fixtures that name a readiness marker establish their premise (for
+    # example the FIFO to be rescued) only once the producer has run. The
+    # deadline clock starts then, so it measures the wrapper's behaviour and
+    # not how long this runner took to start the producer. The wait is bounded;
+    # a producer that never signals is judged by the contract as before.
+    if [ "${3:-}" = ready ]; then
+        ready_waited=0
+        while [ ! -f "$sandbox/producer-ready" ] && [ "$ready_waited" -lt 300 ] \
+            && [ ! -f "$completion_path" ]; do
+            sleep 0.1
+            ready_waited=$((ready_waited + 1))
+        done
+        started_epoch="$(date +%s 2>/dev/null || echo 0)"
+    fi
     while [ ! -f "$completion_path" ] && [ "$waited" -lt "$secs" ]; do
         snapshot_pid="$pid"
         if [ -f "$wrapper_pid_path" ]; then
@@ -1462,16 +1485,16 @@ PRODUCER
     [ "$forced_stop" = "no" ] || bad="$bad hard-stop"
     # It must still finish the block it started — a truncated group is the CI
     # symptom that makes a hang worse than a failure.
-    echo "$out" | grep -q '::endgroup::' || bad="$bad block-truncated"
+    echo "$out" | qgrep '::endgroup::' || bad="$bad block-truncated"
     # And describe the object honestly rather than claiming bytes it never read.
-    echo "$out" | grep -qE '^[[:space:]]*corrupt=fifo-1-1_0\.profraw' || bad="$bad not-described"
-    echo "$out" | grep -q 'exists=not-a-regular-file' || bad="$bad not-labelled-non-regular"
-    echo "$deadline_status" | grep -q '^outcome=completed$' || bad="$bad deadline-not-recorded"
-    echo "$deadline_status" | grep -q '^reason=released_blockage$' || bad="$bad reason-not-released"
-    echo "$deadline_status" | grep -q '^rescue=released$' || bad="$bad rescue-not-released"
-    echo "$deadline_status" | grep -q '^rescue_completion=bounded$' || bad="$bad rescue-not-bounded"
-    echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
-    echo "$deadline_status" | grep -q '^hard_deadline_reached=no$' || bad="$bad hard-reached"
+    echo "$out" | qgrep -E '^[[:space:]]*corrupt=fifo-1-1_0\.profraw' || bad="$bad not-described"
+    echo "$out" | qgrep 'exists=not-a-regular-file' || bad="$bad not-labelled-non-regular"
+    echo "$deadline_status" | qgrep '^outcome=completed$' || bad="$bad deadline-not-recorded"
+    echo "$deadline_status" | qgrep '^reason=released_blockage$' || bad="$bad reason-not-released"
+    echo "$deadline_status" | qgrep '^rescue=released$' || bad="$bad rescue-not-released"
+    echo "$deadline_status" | qgrep '^rescue_completion=bounded$' || bad="$bad rescue-not-bounded"
+    echo "$deadline_status" | qgrep '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
+    echo "$deadline_status" | qgrep '^hard_deadline_reached=no$' || bad="$bad hard-reached"
     echo "$diagnostics" | grep '^deadline_reason=released_blockage$' >/dev/null || bad="$bad diagnostic-reason"
     echo "$diagnostics" | grep '^deadline_elapsed_seconds=[0-9][0-9]*$' >/dev/null || bad="$bad diagnostic-elapsed"
     echo "$diagnostics" | grep '^deadline_rescue=released$' >/dev/null || bad="$bad diagnostic-rescue"
@@ -1512,10 +1535,10 @@ PRODUCER
     rm -f "$sandbox/profiles"/* 2>/dev/null
     rm -rf "$sandbox"
     [ "$forced_stop" = "no" ] || bad="$bad hard-stop"
-    echo "$out" | grep -q '::endgroup::' || bad="$bad block-truncated"
+    echo "$out" | qgrep '::endgroup::' || bad="$bad block-truncated"
     # The real profile alongside it must still be described.
-    echo "$out" | grep -qE '^[[:space:]]*corrupt=real-1-1_0\.profraw' || bad="$bad real-path-lost"
-    echo "$deadline_status" | grep -q '^outcome=completed$' || bad="$bad deadline-not-recorded"
+    echo "$out" | qgrep -E '^[[:space:]]*corrupt=real-1-1_0\.profraw' || bad="$bad real-path-lost"
+    echo "$deadline_status" | qgrep '^outcome=completed$' || bad="$bad deadline-not-recorded"
     if [ -n "$bad" ]; then
         report 1 "a FIFO response file does not block the wrapper" "issues:$bad"
     else
@@ -1542,11 +1565,11 @@ PRODUCER
         "synthetic slow success" "deadline control")"
     elapsed="$(echo "$deadline_status" | sed -n 's/^elapsed_seconds=//p')"
     rm -rf "$sandbox"
-    echo "$deadline_status" | grep -q '^outcome=completed$' || bad="$bad outcome"
-    echo "$deadline_status" | grep -q '^reason=slow_success$' || bad="$bad reason"
-    echo "$deadline_status" | grep -q '^forced_stop=no$' || bad="$bad forced-stop"
-    echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
-    echo "$deadline_status" | grep -q '^hard_deadline_reached=no$' || bad="$bad hard-reached"
+    echo "$deadline_status" | qgrep '^outcome=completed$' || bad="$bad outcome"
+    echo "$deadline_status" | qgrep '^reason=slow_success$' || bad="$bad reason"
+    echo "$deadline_status" | qgrep '^forced_stop=no$' || bad="$bad forced-stop"
+    echo "$deadline_status" | qgrep '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
+    echo "$deadline_status" | qgrep '^hard_deadline_reached=no$' || bad="$bad hard-reached"
     echo "$diagnostics" | grep '^deadline_reason=slow_success$' >/dev/null || bad="$bad diagnostic-reason"
     echo "$diagnostics" | grep '^deadline_elapsed_seconds=[0-9][0-9]*$' >/dev/null || bad="$bad diagnostic-elapsed"
     echo "$diagnostics" | grep '^deadline_rescue=none$' >/dev/null || bad="$bad diagnostic-rescue"
@@ -1578,6 +1601,7 @@ assert_failed_rescue_is_distinct() {
 sleep "${COV_TEST_PRODUCER_START_DELAY:-0}"
 mkfifo "$COVERAGE_PROFILE_DIR/readerless-rescue.fifo"
 printf '%s\n' "$$" >"$COVERAGE_PROFILE_DIR/../producer.pid"
+: >"$COVERAGE_PROFILE_DIR/../producer-ready"
 sleep 2 &
 printf '%s\n' "$!" >"$COVERAGE_PROFILE_DIR/../producer-child.pid"
 wait
@@ -1585,7 +1609,7 @@ echo "error: no profile can be merged"
 exit 1
 PRODUCER
     chmod +x "$sandbox/producer.sh"
-    run_wrapper_with_deadline "$sandbox" 1 >/dev/null
+    run_wrapper_with_deadline "$sandbox" 1 ready >/dev/null
     deadline_status="$(cat "$(deadline_status_for "${FUNCNAME[0]}")" 2>/dev/null)"
     diagnostics="$(emit_failure_diagnostics "${FUNCNAME[0]}" \
         "synthetic failed rescue" "deadline control")"
@@ -1595,11 +1619,11 @@ PRODUCER
     cleanup_deadline_producer "$sandbox" \
         || bad="$bad leftover-producer-process"
     rm -rf "$sandbox"
-    echo "$deadline_status" | grep -q '^outcome=completed$' || bad="$bad outcome"
-    echo "$deadline_status" | grep -q '^reason=slow_success$' || bad="$bad reason"
-    echo "$deadline_status" | grep -q '^rescue=failed$' || bad="$bad rescue"
-    echo "$deadline_status" | grep -q '^rescue_completion=bounded$' || bad="$bad rescue-not-bounded"
-    echo "$deadline_status" | grep -q '^forced_stop=no$' || bad="$bad forced-stop"
+    echo "$deadline_status" | qgrep '^outcome=completed$' || bad="$bad outcome"
+    echo "$deadline_status" | qgrep '^reason=slow_success$' || bad="$bad reason"
+    echo "$deadline_status" | qgrep '^rescue=failed$' || bad="$bad rescue"
+    echo "$deadline_status" | qgrep '^rescue_completion=bounded$' || bad="$bad rescue-not-bounded"
+    echo "$deadline_status" | qgrep '^forced_stop=no$' || bad="$bad forced-stop"
     echo "$diagnostics" | grep '^deadline_reason=slow_success$' >/dev/null || bad="$bad diagnostic-reason"
     echo "$diagnostics" | grep '^deadline_rescue=failed$' >/dev/null || bad="$bad diagnostic-rescue"
     echo "$diagnostics" | grep '^deadline_rescue_completion=bounded$' >/dev/null || bad="$bad diagnostic-completion"
@@ -1648,6 +1672,7 @@ test_readerless_fifo_rescue_is_hard_bounded() {
 printf '%s\n' "$$" >"$COVERAGE_PROFILE_DIR/../producer.pid"
 mkfifo "$COVERAGE_PROFILE_DIR/fifo-2-2_0.profraw"
 mkfifo "$COVERAGE_PROFILE_DIR/readerless-rescue.fifo"
+: >"$COVERAGE_PROFILE_DIR/../producer-ready"
 printf 'warning: %s/fifo-2-2_0.profraw: invalid instrumentation profile data (file header is corrupt)\n' "$COVERAGE_PROFILE_DIR"
 exec 4<"$COVERAGE_PROFILE_DIR/fifo-2-2_0.profraw"
 exec 4<&-
@@ -1659,7 +1684,7 @@ exit 1
 PRODUCER
     chmod +x "$sandbox/producer.sh"
     t0="$(date +%s)"
-    run_wrapper_with_deadline "$sandbox" 1 >/dev/null
+    run_wrapper_with_deadline "$sandbox" 1 ready >/dev/null
     t1="$(date +%s)"
     deadline_status="$(cat "$(deadline_status_for "${FUNCNAME[0]}")" 2>/dev/null)"
     diagnostics="$(emit_failure_diagnostics "${FUNCNAME[0]}" \
@@ -1677,13 +1702,13 @@ PRODUCER
     rm -f "$sandbox/profiles"/*.profraw "$sandbox/profiles"/*.fifo 2>/dev/null
     rm -rf "$sandbox"
     [ $((t1 - t0)) -le 10 ] || bad="$bad unbounded($((t1-t0))s)"
-    echo "$deadline_status" | grep -q '^outcome=timeout$' || bad="$bad outcome"
-    echo "$deadline_status" | grep -q '^reason=hard_timeout$' || bad="$bad reason"
-    echo "$deadline_status" | grep -q '^rescue=partial$' || bad="$bad rescue"
-    echo "$deadline_status" | grep -q '^rescue_completion=bounded$' || bad="$bad rescue-not-bounded"
-    echo "$deadline_status" | grep -q '^forced_stop=yes$' || bad="$bad forced-stop"
-    echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
-    echo "$deadline_status" | grep -q '^hard_deadline_reached=yes$' || bad="$bad hard-not-reached"
+    echo "$deadline_status" | qgrep '^outcome=timeout$' || bad="$bad outcome"
+    echo "$deadline_status" | qgrep '^reason=hard_timeout$' || bad="$bad reason"
+    echo "$deadline_status" | qgrep '^rescue=partial$' || bad="$bad rescue"
+    echo "$deadline_status" | qgrep '^rescue_completion=bounded$' || bad="$bad rescue-not-bounded"
+    echo "$deadline_status" | qgrep '^forced_stop=yes$' || bad="$bad forced-stop"
+    echo "$deadline_status" | qgrep '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
+    echo "$deadline_status" | qgrep '^hard_deadline_reached=yes$' || bad="$bad hard-not-reached"
     echo "$diagnostics" | grep '^deadline_reason=hard_timeout$' >/dev/null || bad="$bad diagnostic-reason"
     echo "$diagnostics" | grep '^deadline_elapsed_seconds=[0-9][0-9]*$' >/dev/null || bad="$bad diagnostic-elapsed"
     echo "$diagnostics" | grep '^deadline_rescue=partial$' >/dev/null || bad="$bad diagnostic-rescue"
@@ -1720,11 +1745,11 @@ PRODUCER
     cleanup_deadline_producer "$sandbox" \
         || bad="$bad leftover-producer-process"
     rm -rf "$sandbox"
-    echo "$deadline_status" | grep -q '^outcome=timeout$' || bad="$bad outcome"
-    echo "$deadline_status" | grep -q '^reason=hard_timeout$' || bad="$bad reason"
-    echo "$deadline_status" | grep -q '^forced_stop=yes$' || bad="$bad forced-stop"
-    echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
-    echo "$deadline_status" | grep -q '^hard_deadline_reached=yes$' || bad="$bad hard-not-reached"
+    echo "$deadline_status" | qgrep '^outcome=timeout$' || bad="$bad outcome"
+    echo "$deadline_status" | qgrep '^reason=hard_timeout$' || bad="$bad reason"
+    echo "$deadline_status" | qgrep '^forced_stop=yes$' || bad="$bad forced-stop"
+    echo "$deadline_status" | qgrep '^soft_deadline_reached=yes$' || bad="$bad soft-not-reached"
+    echo "$deadline_status" | qgrep '^hard_deadline_reached=yes$' || bad="$bad hard-not-reached"
     echo "$diagnostics" | grep '^deadline_reason=hard_timeout$' >/dev/null || bad="$bad diagnostic-reason"
     echo "$diagnostics" | grep '^deadline_elapsed_seconds=[0-9][0-9]*$' >/dev/null || bad="$bad diagnostic-elapsed"
     case "$elapsed" in
@@ -1761,10 +1786,10 @@ PRODUCER
     cleanup_deadline_producer "$sandbox" \
         || bad="$bad leftover-producer-process"
     rm -rf "$sandbox"
-    echo "$deadline_status" | grep -q '^soft_deadline_reached=yes$' || bad="$bad soft"
-    echo "$deadline_status" | grep -q '^hard_deadline_reached=yes$' || bad="$bad hard"
-    echo "$deadline_status" | grep -q '^reason=hard_timeout$' || bad="$bad reason"
-    echo "$deadline_status" | grep -q '^forced_stop=yes$' || bad="$bad forced-stop"
+    echo "$deadline_status" | qgrep '^soft_deadline_reached=yes$' || bad="$bad soft"
+    echo "$deadline_status" | qgrep '^hard_deadline_reached=yes$' || bad="$bad hard"
+    echo "$deadline_status" | qgrep '^reason=hard_timeout$' || bad="$bad reason"
+    echo "$deadline_status" | qgrep '^forced_stop=yes$' || bad="$bad forced-stop"
     case "$waited" in
         '' | *[!0-9]*) bad="$bad waited-invalid" ;;
         *) [ "$waited" -ge 4 ] || bad="$bad hard-not-later" ;;
@@ -1884,7 +1909,7 @@ PRODUCER
     rm -rf "$sandbox"
     # Exactly ONE bounded generic marker for the one logical warning.
     [ "$markers" -eq 1 ] || bad="$bad expected-1-marker-got-$markers"
-    echo "$block" | grep -q 'count=' && bad="$bad asserts-exact-count"
+    echo "$block" | qgrep 'count=' && bad="$bad asserts-exact-count"
     if [ -n "$bad" ]; then
         report 1 "a phrase-bearing path fragment claims no count" \
             "issues:$bad; got: $(echo "$block" | grep 'unparseable' | head -1)"
@@ -1912,8 +1937,8 @@ PRODUCER
     block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
     rm -rf "$sandbox"
     # Premise: the one real warning must have been parsed and described.
-    echo "$block" | grep -q 'corrupt=ok-1-1_0.profraw' || bad="$bad premise-not-described"
-    echo "$block" | grep -q 'unparseable' && bad="$bad fabricated-unparseable"
+    echo "$block" | qgrep 'corrupt=ok-1-1_0.profraw' || bad="$bad premise-not-described"
+    echo "$block" | qgrep 'unparseable' && bad="$bad fabricated-unparseable"
     if [ -n "$bad" ]; then
         report 1 "benign raw-profile prose fabricates no record" "issues:$bad"
     else
@@ -1941,9 +1966,9 @@ PRODUCER
             COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
         line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
         rm -rf "$sandbox"
-        echo "$line" | grep -q "corrupt=$name" || bad="$bad [$msg]not-parsed"
-        echo "$line" | grep -q 'exists=yes' || bad="$bad [$msg]not-described"
-        echo "$out" | grep -q 'unparseable' && bad="$bad [$msg]spurious-unparseable"
+        echo "$line" | qgrep "corrupt=$name" || bad="$bad [$msg]not-parsed"
+        echo "$line" | qgrep 'exists=yes' || bad="$bad [$msg]not-described"
+        echo "$out" | qgrep 'unparseable' && bad="$bad [$msg]spurious-unparseable"
     done
     if [ -n "$bad" ]; then
         report 1 "exact raw-profile messages are parsed and described" "issues:$bad"
@@ -1974,9 +1999,9 @@ PRODUCER
     [ -n "$line" ] || bad="$bad not-disclosed"
     # Generic: it must carry no facts attributed to a path it never resolved,
     # and no exact tally — see the overcount test below for why.
-    echo "$line" | grep -q 'corrupt=(unparseable)' || bad="$bad not-generic"
-    echo "$line" | grep -q 'count=' && bad="$bad asserts-exact-count"
-    echo "$line" | grep -q 'name-1-2_0' && bad="$bad leaked-partial-name"
+    echo "$line" | qgrep 'corrupt=(unparseable)' || bad="$bad not-generic"
+    echo "$line" | qgrep 'count=' && bad="$bad asserts-exact-count"
+    echo "$line" | qgrep 'name-1-2_0' && bad="$bad leaked-partial-name"
     if [ -n "$bad" ]; then
         report 1 "a split exact raw-profile warning stays generically unparseable" \
             "issues:$bad; got: $line"
@@ -2019,8 +2044,8 @@ PRODUCER
     chmod -R u+rwX "$sandbox" 2>/dev/null
     rm -rf "$sandbox"
     [ -n "$line" ] || bad="$bad premise-not-described"
-    echo "$line" | grep -q 'exists=no' && bad="$bad claims-absent"
-    echo "$line" | grep -q 'exists=unreadable' || bad="$bad not-labelled-unreadable"
+    echo "$line" | qgrep 'exists=no' && bad="$bad claims-absent"
+    echo "$line" | qgrep 'exists=unreadable' || bad="$bad not-labelled-unreadable"
     if [ -n "$bad" ]; then
         report 1 "an unreadable named path is not reported absent" "issues:$bad; got: $line"
     else
@@ -2046,9 +2071,9 @@ PRODUCER
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
     rm -rf "$sandbox"
-    echo "$line" | grep -q 'size_bytes=0' || bad="$bad premise-not-zero-byte"
-    echo "$line" | grep -qE 'header=[[:space:]]*mtime=' && bad="$bad blank-header"
-    echo "$line" | grep -q 'header=n/a' || bad="$bad header-not-na"
+    echo "$line" | qgrep 'size_bytes=0' || bad="$bad premise-not-zero-byte"
+    echo "$line" | qgrep -E 'header=[[:space:]]*mtime=' && bad="$bad blank-header"
+    echo "$line" | qgrep 'header=n/a' || bad="$bad header-not-na"
     if [ -n "$bad" ]; then
         report 1 "a zero-byte named path reports header=n/a, not blank" "issues:$bad; got: $line"
     else
@@ -2077,8 +2102,8 @@ PRODUCER
     block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
     rm -rf "$sandbox"
     # Premise: the one real path must have been described.
-    echo "$block" | grep -q 'corrupt=dup-1-1_0.profraw' || bad="$bad premise-not-described"
-    echo "$block" | grep -q 'unparseable' && bad="$bad fabricated-unparseable"
+    echo "$block" | qgrep 'corrupt=dup-1-1_0.profraw' || bad="$bad premise-not-described"
+    echo "$block" | qgrep 'unparseable' && bad="$bad fabricated-unparseable"
     if [ -n "$bad" ]; then
         report 1 "a duplicated warning fabricates no unparseable record" "issues:$bad"
     else
@@ -2113,7 +2138,7 @@ PRODUCER
     rc=$?
     chmod -R u+rwX "$sandbox" 2>/dev/null
     rm -rf "$sandbox"
-    echo "$out" | grep -qi 'cannot isolate' || bad="$bad no-isolation-error"
+    echo "$out" | qgrep -i 'cannot isolate' || bad="$bad no-isolation-error"
     [ "$rc" -ne 0 ] || bad="$bad exited-zero"
     if [ -n "$bad" ]; then
         report 1 "an unreadable profile dir fails isolation closed" \
@@ -2143,11 +2168,11 @@ PRODUCER
         COVERAGE_DIAG_MAX_FILES=abc "$wrapper" 2>&1)"
     block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
     rm -rf "$sandbox"
-    echo "$block" | grep -q 'profile_dir=' || bad="$bad premise-no-block"
-    echo "$block" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$block" | qgrep 'profile_dir=' || bad="$bad premise-no-block"
+    echo "$block" | qgrep -E ': line [0-9]+:' && bad="$bad raw-shell-error"
     # A bad cap must not silently swallow the evidence either.
-    echo "$block" | grep -q 'response_line=' || bad="$bad lost-response-lines"
-    echo "$block" | grep -q 'file=cap-1-1_0.profraw' || bad="$bad lost-survey"
+    echo "$block" | qgrep 'response_line=' || bad="$bad lost-response-lines"
+    echo "$block" | qgrep 'file=cap-1-1_0.profraw' || bad="$bad lost-survey"
     if [ -n "$bad" ]; then
         report 1 "a non-numeric diagnostic cap emits no raw shell error" \
             "issues:$bad; block: $(echo "$block" | grep -E ': line [0-9]+:' | head -1)"
@@ -2178,10 +2203,10 @@ PRODUCER
         COVERAGE_DIAG_MAX_FILES=99999999999999999999 "$wrapper" 2>&1)"
     block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
     rm -rf "$sandbox"
-    echo "$block" | grep -q 'profile_dir=' || bad="$bad premise-no-block"
-    echo "$block" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
-    echo "$block" | grep -q 'response_line=' || bad="$bad lost-response-lines"
-    echo "$block" | grep -q 'file=cap-2-2_0.profraw' || bad="$bad lost-survey"
+    echo "$block" | qgrep 'profile_dir=' || bad="$bad premise-no-block"
+    echo "$block" | qgrep -E ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$block" | qgrep 'response_line=' || bad="$bad lost-response-lines"
+    echo "$block" | qgrep 'file=cap-2-2_0.profraw' || bad="$bad lost-survey"
     if [ -n "$bad" ]; then
         report 1 "an out-of-range diagnostic cap emits no raw shell error" \
             "issues:$bad; block: $(echo "$block" | grep -E ': line [0-9]+:' | head -1)"
@@ -2242,11 +2267,11 @@ PRODUCER
     chmod -R u+rwX "$sandbox" 2>/dev/null
     rm -rf "$sandbox"
     [ -n "$line" ] || bad="$bad premise-not-surveyed"
-    echo "$block" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
-    echo "$block" | grep -qE '^[[:space:]]*corrupt=FORGEDCORRUPT' && bad="$bad forged-record"
+    echo "$block" | qgrep -E ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$block" | qgrep -E '^[[:space:]]*corrupt=FORGEDCORRUPT' && bad="$bad forged-record"
     # A read that did not happen is `n/a`, never an empty field.
-    echo "$line" | grep -qE 'size_bytes=[[:space:]]*$|size_bytes= ' && bad="$bad blank-size"
-    echo "$line" | grep -q 'size_bytes=n/a' || bad="$bad size-not-na"
+    echo "$line" | qgrep -E 'size_bytes=[[:space:]]*$|size_bytes= ' && bad="$bad blank-size"
+    echo "$line" | qgrep 'size_bytes=n/a' || bad="$bad size-not-na"
     if [ -n "$bad" ]; then
         report 1 "an unreadable profraw emits no raw shell error" "issues:$bad; got: $line"
     else
@@ -2284,9 +2309,9 @@ PRODUCER
     chmod -R u+rwX "$sandbox" 2>/dev/null
     rm -rf "$sandbox"
     [ -n "$line" ] || bad="$bad premise-no-response-line"
-    echo "$block" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
-    echo "$line" | grep -qE 'lines=[[:space:]]*$' && bad="$bad blank-count"
-    echo "$line" | grep -q 'lines=n/a' || bad="$bad count-not-na"
+    echo "$block" | qgrep -E ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$line" | qgrep -E 'lines=[[:space:]]*$' && bad="$bad blank-count"
+    echo "$line" | qgrep 'lines=n/a' || bad="$bad count-not-na"
     if [ -n "$bad" ]; then
         report 1 "an unreadable response file emits no raw shell error" \
             "issues:$bad; got: $line"
@@ -2323,13 +2348,13 @@ PRODUCER
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=2 "$wrapper" 2>&1)"
     rm -rf "$sandbox"
     # Premise: the survivor must have been detected at all.
-    if ! echo "$out" | grep -q 'cannot isolate attempts'; then
+    if ! echo "$out" | qgrep 'cannot isolate attempts'; then
         report 1 "the isolation error counts files, not lines" \
             "premise: no isolation error fired despite a surviving profraw"
         return
     fi
     # One file whose name spans three lines is ONE file.
-    echo "$out" | grep -qE 'cannot isolate attempts: 1 \.profraw' || bad="$bad wrong-count"
+    echo "$out" | qgrep -E 'cannot isolate attempts: 1 \.profraw' || bad="$bad wrong-count"
     if [ -n "$bad" ]; then
         report 1 "the isolation error counts files, not lines" \
             "issues:$bad; got: $(echo "$out" | grep 'cannot isolate attempts' | head -1)"
@@ -2365,9 +2390,9 @@ PRODUCER
     rm -rf "$sandbox"
     local shown
     shown="$(echo "$block" | grep -c 'response_line=')"
-    echo "$block" | grep -q 'lines=5' || bad="$bad premise-wrong-count"
+    echo "$block" | qgrep 'lines=5' || bad="$bad premise-wrong-count"
     [ "$shown" -eq 2 ] || bad="$bad expected-2-shown-got-$shown"
-    echo "$block" | grep -qi 'more response lines not shown' || bad="$bad no-truncation-marker"
+    echo "$block" | qgrep -i 'more response lines not shown' || bad="$bad no-truncation-marker"
     if [ -n "$bad" ]; then
         report 1 "response-line truncation is disclosed" "issues:$bad"
     else
@@ -2422,10 +2447,10 @@ PRODUCER
     block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
     rm -rf "$sandbox"
     # Premise: the swap must actually have happened, or the case proves nothing.
-    echo "$block" | grep -q 'in_response=' || bad="$bad premise-no-membership"
+    echo "$block" | qgrep 'in_response=' || bad="$bad premise-no-membership"
     # The captured object is the pre-swap list. Fragments from the replacement
     # mean the block mixed versions.
-    echo "$block" | grep -q 'response_line=.*REPLACEMENT-' && bad="$bad fragments-from-replacement"
+    echo "$block" | qgrep 'response_line=.*REPLACEMENT-' && bad="$bad fragments-from-replacement"
     # `lines=` and the rendered fragments must describe the same object.
     lines="$(echo "$block" | sed -nE 's/^response_file=.* lines=([0-9]+)$/\1/p' | head -n 1)"
     shown="$(echo "$block" | grep -c 'response_line=')"
@@ -2481,9 +2506,9 @@ PRODUCER
     [ -n "$membership" ] || bad="$bad premise-no-membership"
     # A list that appeared after the snapshot is not part of the captured set,
     # so it must not be disclosed in this block at all.
-    echo "$block" | grep -q 'zzz-profraw-list' && bad="$bad post-snapshot-list-disclosed"
+    echo "$block" | qgrep 'zzz-profraw-list' && bad="$bad post-snapshot-list-disclosed"
     # And absence must never be asserted while such a list exists unexamined.
-    if [ "$membership" = "no" ] && echo "$block" | grep -q 'zzz-profraw-list'; then
+    if [ "$membership" = "no" ] && echo "$block" | qgrep 'zzz-profraw-list'; then
         bad="$bad false-no-contradicted-in-same-block"
     fi
     if [ -n "$bad" ]; then
@@ -2523,8 +2548,8 @@ PRODUCER
     rm -rf "$sandbox"
     membership="$(echo "$block" | sed -nE 's/.*in_response=([a-z/]+).*/\1/p' | head -n 1)"
     [ "$membership" = "unknown" ] || bad="$bad membership-$membership-not-unknown"
-    echo "$block" | grep -qE '^response_file=.* lines=n/a$' || bad="$bad lines-not-na"
-    echo "$block" | grep -q 'exceeded the 200-byte capture cap' || bad="$bad no-truncation-disclosure"
+    echo "$block" | qgrep -E '^response_file=.* lines=n/a$' || bad="$bad lines-not-na"
+    echo "$block" | qgrep 'exceeded the 200-byte capture cap' || bad="$bad no-truncation-disclosure"
     if [ -n "$bad" ]; then
         report 1 "snapshot truncation degrades absence, not presence" \
             "issues:$bad; block: $(echo "$block" | tr '\n' '|' | cut -c1-400)"
@@ -2564,7 +2589,7 @@ PRODUCER
     membership="$(echo "$block" | sed -nE 's/.*in_response=([a-z/]+).*/\1/p' | head -n 1)"
     [ "$membership" = "yes" ] || bad="$bad membership-$membership-not-yes"
     # Premise: the capture really was truncated, or this proves nothing.
-    echo "$block" | grep -q 'exceeded the 200-byte capture cap' || bad="$bad premise-not-truncated"
+    echo "$block" | qgrep 'exceeded the 200-byte capture cap' || bad="$bad premise-not-truncated"
     if [ -n "$bad" ]; then
         report 1 "a prefix match survives snapshot truncation" \
             "issues:$bad; block: $(echo "$block" | tr '\n' '|' | cut -c1-400)"
@@ -2598,9 +2623,9 @@ PRODUCER
     rc=$?
     rm -rf "$sandbox" 2>/dev/null
     [ "$rc" -eq 17 ] || bad="$bad exit-$rc-not-17"
-    echo "$out" | grep -q 'could not remove its diagnostic scratch' \
+    echo "$out" | qgrep 'could not remove its diagnostic scratch' \
         || bad="$bad no-cleanup-warning"
-    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$out" | qgrep -E ': line [0-9]+:' && bad="$bad raw-shell-error"
     if [ -n "$bad" ]; then
         report 1 "snapshot cleanup failure never replaces the producer exit" \
             "issues:$bad; rc=$rc"
@@ -2663,7 +2688,7 @@ PRODUCER
     block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
     rm -rf "$sandbox" 2>/dev/null
     # Premise: a diagnostic block with a membership verdict was produced at all.
-    echo "$block" | grep -q 'in_response=' || bad="$bad premise-no-membership"
+    echo "$block" | qgrep 'in_response=' || bad="$bad premise-no-membership"
     # Every name captured before the allocation is still disclosed, exactly once
     # and without a fabricated count.
     aaa="$(echo "$block" | grep -c 'response_file=.*aaa-profraw-list lines=n/a')"
@@ -2673,15 +2698,15 @@ PRODUCER
     membership="$(echo "$block" | sed -nE 's/.*in_response=([a-z/]+).*/\1/p' | head -n 1)"
     [ "$membership" = "unknown" ] || bad="$bad membership-$membership-not-unknown"
     # A list created during the failed allocation is outside the captured set.
-    echo "$block" | grep -q 'zzz-late-profraw-list' && bad="$bad late-list-disclosed"
+    echo "$block" | qgrep 'zzz-late-profraw-list' && bad="$bad late-list-disclosed"
     # No storage means no captured bytes; a fragment here could only come from a
     # read this wrapper never made.
-    echo "$block" | grep -q 'response_line=' && bad="$bad fragments-without-storage"
+    echo "$block" | qgrep 'response_line=' && bad="$bad fragments-without-storage"
     # The producer's exit stays authoritative and the failure stays framed.
     [ "$rc" -eq 9 ] || bad="$bad exit-$rc-not-9"
-    echo "$out" | grep -q 'failed to create directory via template' \
+    echo "$out" | qgrep 'failed to create directory via template' \
         && bad="$bad raw-mktemp-error-leaked"
-    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$out" | qgrep -E ': line [0-9]+:' && bad="$bad raw-shell-error"
     if [ -n "$bad" ]; then
         report 1 "a failed scratch allocation never erases the captured lists" \
             "issues:$bad; rc=$rc; block: $(echo "$block" | tr '\n' '|' | cut -c1-400)"
@@ -2712,7 +2737,7 @@ PRODUCER
     line="$(echo "$block" | grep -E '^[[:space:]]*file=esc-1-1' | head -n 1)"
     rm -rf "$sandbox"
     [ -n "$line" ] || bad="$bad premise-not-surveyed"
-    echo "$line" | grep -qF 'esc-1-1\?x-and-?-literal_0.profraw' || bad="$bad not-distinguishable"
+    echo "$line" | qgrep -F 'esc-1-1\?x-and-?-literal_0.profraw' || bad="$bad not-distinguishable"
     if [ -n "$bad" ]; then
         report 1 "a residual control byte is escaped unambiguously" "issues:$bad; got: $line"
     else
@@ -2760,10 +2785,10 @@ PRODUCER
     rm -rf "$sandbox"
     # Premise: the name must actually have reached the block. Without this the
     # forgery assertions hold for a file that was never surveyed.
-    echo "$block" | grep -q 'forge-1-1_0.profraw' || bad="$bad premise-not-rendered"
-    echo "$block" | grep -qE '^[[:space:]]*corrupt=FORGEDCORRUPT' && bad="$bad forged-corrupt-record"
-    echo "$block" | grep -qE '^[[:space:]]*file=FORGEDFILE' && bad="$bad forged-file-record"
-    echo "$block" | grep -qE '^[[:space:]]*member: FORGEDMEMBER' && bad="$bad forged-member-record"
+    echo "$block" | qgrep 'forge-1-1_0.profraw' || bad="$bad premise-not-rendered"
+    echo "$block" | qgrep -E '^[[:space:]]*corrupt=FORGEDCORRUPT' && bad="$bad forged-corrupt-record"
+    echo "$block" | qgrep -E '^[[:space:]]*file=FORGEDFILE' && bad="$bad forged-file-record"
+    echo "$block" | qgrep -E '^[[:space:]]*member: FORGEDMEMBER' && bad="$bad forged-member-record"
     if [ -n "$bad" ]; then
         report 1 "no diagnostic field can forge a record" "issues:$bad"
     else
@@ -2793,8 +2818,8 @@ PRODUCER
     line="$(echo "$block" | grep -E '^response_file=' | head -n 1)"
     rm -rf "$sandbox"
     [ -n "$line" ] || bad="$bad premise-no-response-line"
-    echo "$line" | grep -q 'entries=' && bad="$bad claims-path-entries"
-    echo "$line" | grep -q 'lines=' || bad="$bad no-line-count"
+    echo "$line" | qgrep 'entries=' && bad="$bad claims-path-entries"
+    echo "$line" | qgrep 'lines=' || bad="$bad no-line-count"
     if [ -n "$bad" ]; then
         report 1 "the response count is labelled by lines, not path entries" \
             "issues:$bad; got: $line"
@@ -2821,8 +2846,8 @@ PRODUCER
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
     rm -rf "$sandbox"
-    echo "$block" | grep -q 'evil-1-1' || bad="$bad premise-not-rendered"
-    echo "$block" | grep -qE '^[[:space:]]*corrupt=FORGEDLIST' && bad="$bad forged-corrupt-record"
+    echo "$block" | qgrep 'evil-1-1' || bad="$bad premise-not-rendered"
+    echo "$block" | qgrep -E '^[[:space:]]*corrupt=FORGEDLIST' && bad="$bad forged-corrupt-record"
     if [ -n "$bad" ]; then
         report 1 "a response-file name cannot forge a record" "issues:$bad"
     else
@@ -2855,8 +2880,8 @@ PRODUCER
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
     rm -rf "$sandbox"
-    echo "$block" | grep -q 'p1' || bad="$bad premise-not-rendered"
-    echo "$block" | grep -qE '^[[:space:]]*corrupt=FORGEDDIR' && bad="$bad forged-corrupt-record"
+    echo "$block" | qgrep 'p1' || bad="$bad premise-not-rendered"
+    echo "$block" | qgrep -E '^[[:space:]]*corrupt=FORGEDDIR' && bad="$bad forged-corrupt-record"
     if [ -n "$bad" ]; then
         report 1 "a profile_dir field cannot forge a record" "issues:$bad"
     else
@@ -2890,8 +2915,8 @@ PRODUCER
     line="$(echo "$block" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
     rm -rf "$sandbox"
     # Premise: the missing path must actually have been described.
-    echo "$line" | grep -q 'exists=no' || bad="$bad premise-not-described"
-    echo "$block" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$line" | qgrep 'exists=no' || bad="$bad premise-not-described"
+    echo "$block" | qgrep -E ': line [0-9]+:' && bad="$bad raw-shell-error"
     if [ -n "$bad" ]; then
         report 1 "a missing named path emits no raw shell error" \
             "issues:$bad; block: $(echo "$block" | grep -E ': line [0-9]+:' | head -1)"
@@ -2922,11 +2947,11 @@ PRODUCER
     block="$(echo "$out" | sed -n '/::group::coverage corruption evidence/,/::endgroup::/p')"
     rm -rf "$sandbox"
     # Premise: the block must have been emitted at all.
-    echo "$block" | grep -q 'profile_dir=' || bad="$bad premise-no-block"
-    echo "$block" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$block" | qgrep 'profile_dir=' || bad="$bad premise-no-block"
+    echo "$block" | qgrep -E ': line [0-9]+:' && bad="$bad raw-shell-error"
     # No warning was parseable and none was named: the honest answer is the
     # "named nothing" line, not an unparseable count.
-    echo "$block" | grep -q 'producer named no corrupt profile path' || bad="$bad no-named-nothing-line"
+    echo "$block" | qgrep 'producer named no corrupt profile path' || bad="$bad no-named-nothing-line"
     if [ -n "$bad" ]; then
         report 1 "an unmatched warning count emits no raw shell error" \
             "issues:$bad; block: $(echo "$block" | grep -E ': line [0-9]+:' | head -1)"
@@ -2970,15 +2995,15 @@ test_stale_deadline_sidecar_is_not_attributed() {
     cp "$stale_status" "$status_path"
     cp "$stale_fifos" "$fifo_path"
     failure="$(report 1 "stale sidecar is not attributed" "sidecar=foreign")"
-    echo "$failure" | grep -q '^deadline_outcome=not-recorded$' \
+    echo "$failure" | qgrep '^deadline_outcome=not-recorded$' \
         || bad="$bad stale-deadline-was-attributed"
-    echo "$failure" | grep -qE '^deadline_(waited_seconds|seconds|wait_status)=' \
+    echo "$failure" | qgrep -E '^deadline_(waited_seconds|seconds|wait_status)=' \
         && bad="$bad stale-deadline-fields-leaked"
-    echo "$failure" | grep -q '^deadline_fifo_state=not-recorded$' \
+    echo "$failure" | qgrep '^deadline_fifo_state=not-recorded$' \
         || bad="$bad stale-fifo-state-not-recorded-missing"
-    echo "$failure" | grep -q 'foreign-' \
+    echo "$failure" | qgrep 'foreign-' \
         && bad="$bad foreign-fifo-path-leaked"
-    echo "$failure" | grep -q '^fifo_state=none$' \
+    echo "$failure" | qgrep '^fifo_state=none$' \
         || bad="$bad foreign-fifo-state-not-none"
     rm -f "$status_path" "$fifo_path" "$stale_status" "$stale_fifos" \
         "$legacy_status" "$legacy_fifos"
@@ -3003,7 +3028,7 @@ test_process_authority_unavailable_is_not_passed() {
         bad="authority-reported-available"
     fi
     state="$(emit_process_diagnostics "$contract")"
-    echo "$state" | grep -q '^process_state=unavailable$' \
+    echo "$state" | qgrep '^process_state=unavailable$' \
         || bad="$bad unavailable-state-not-classified"
     rm -f "$process_path"
     if [ -n "$bad" ]; then
@@ -3073,7 +3098,7 @@ PRODUCER
     wait "$foreign_pid" 2>/dev/null || true
     rm -rf "$sandbox"
     rm -rf "$foreign_root"
-    echo "$failure" | grep -qE '^process_state=present(-capped)?$' \
+    echo "$failure" | qgrep -E '^process_state=present(-capped)?$' \
         || bad="$bad process-state-present-missing"
     process_rows="$(echo "$failure" | grep '^process=' || true)"
     [ -n "$process_rows" ] || bad="$bad process-sidecar-empty"
@@ -3088,7 +3113,7 @@ PRODUCER
             *) bad="$bad unscoped-process-row" ;;
         esac
     done <<<"$process_rows"
-    echo "$process_rows" | grep -q 'foreign-' && bad="$bad foreign-path-leaked"
+    echo "$process_rows" | qgrep 'foreign-' && bad="$bad foreign-path-leaked"
     if [ -n "$bad" ]; then
         report 1 "a foreign process is not run evidence" "issues:$bad"
     else
@@ -3110,26 +3135,26 @@ test_failure_diagnostics_are_bounded_and_failure_only() {
     failure="$(report 1 "synthetic failure assertion" "actual=Disconnected expected=Empty")"
     success="$(report 0 "synthetic success assertion")"
     lines="$(printf '%s\n' "$failure" | wc -l | tr -d ' ')"
-    echo "$failure" | grep -q '::group::coverage contract failure diagnostics' \
+    echo "$failure" | qgrep '::group::coverage contract failure diagnostics' \
         || bad="$bad missing-failure-block"
-    echo "$failure" | grep -q 'contract=test_failure_diagnostics_are_bounded_and_failure_only' \
+    echo "$failure" | qgrep 'contract=test_failure_diagnostics_are_bounded_and_failure_only' \
         || bad="$bad missing-contract"
-    echo "$failure" | grep -q 'assertion=synthetic failure assertion' \
+    echo "$failure" | qgrep 'assertion=synthetic failure assertion' \
         || bad="$bad missing-assertion"
-    echo "$failure" | grep -q 'run_tmpdir=' || bad="$bad missing-run-tmpdir"
-    echo "$failure" | grep -q 'sandbox=' || bad="$bad missing-sandbox"
-    echo "$failure" | grep -q 'deadline_outcome=' \
+    echo "$failure" | qgrep 'run_tmpdir=' || bad="$bad missing-run-tmpdir"
+    echo "$failure" | qgrep 'sandbox=' || bad="$bad missing-sandbox"
+    echo "$failure" | qgrep 'deadline_outcome=' \
         || bad="$bad missing-deadline-outcome"
-    echo "$failure" | grep -q 'fifo_state=' || bad="$bad missing-fifo-state"
-    echo "$failure" | grep -q 'process_state=' || bad="$bad missing-process-state"
+    echo "$failure" | qgrep 'fifo_state=' || bad="$bad missing-fifo-state"
+    echo "$failure" | qgrep 'process_state=' || bad="$bad missing-process-state"
     if [ "$fifo_created" -eq 1 ]; then
-        echo "$failure" | grep -q '^fifo=' || bad="$bad missing-fifo-entry"
+        echo "$failure" | qgrep '^fifo=' || bad="$bad missing-fifo-entry"
     fi
     [ "$lines" -le 80 ] || bad="$bad unbounded-lines-$lines"
-    echo "$success" | grep -q '::group::' && bad="$bad success-emitted-diagnostics"
+    echo "$success" | qgrep '::group::' && bad="$bad success-emitted-diagnostics"
     rm -rf "$sandbox"
     deleted_failure="$(report 1 "deleted sandbox state is explicit" "sandbox=deleted")"
-    echo "$deleted_failure" | grep -q 'state=deleted-before-report' \
+    echo "$deleted_failure" | qgrep 'state=deleted-before-report' \
         || bad="$bad deleted-sandbox-not-explicit"
     if [ -n "$bad" ]; then
         report 1 "failure diagnostics preserve bounded contract context" "issues:$bad"
@@ -3158,7 +3183,7 @@ PRODUCER
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     line="$(echo "$out" | grep -E '^\s*corrupt=' | head -n 1)"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'in_response=no'; then
+    if echo "$line" | qgrep 'in_response=no'; then
         report 0 "response membership is exact, not substring"
     else
         report 1 "response membership is exact, not substring" "got: $line"
@@ -3182,7 +3207,7 @@ PRODUCER
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     line="$(echo "$out" | grep -E '^\s*corrupt=' | head -n 1)"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'exists=yes'; then
+    if echo "$line" | qgrep 'exists=yes'; then
         report 0 "quoted absolute named path resolves"
     else
         report 1 "quoted absolute named path resolves" "got: $line"
@@ -3193,7 +3218,7 @@ PRODUCER
 test_bare_relative_named_path_resolves() {
     local line
     line="$(run_named_case "bare-7-6_0.profraw" "bare-7-6_0.profraw")"
-    if echo "$line" | grep -q 'exists=yes'; then
+    if echo "$line" | qgrep 'exists=yes'; then
         report 0 "bare relative named path resolves against the profile dir"
     else
         report 1 "bare relative named path resolves against the profile dir" "got: $line"
@@ -3227,7 +3252,7 @@ test_benign_dots_in_filename_are_not_traversal() {
     printf 'partial' >"$sandbox/profiles/weird..name-1-2_0.profraw"
     line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/weird..name-1-2_0.profraw")"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'exists=yes'; then
+    if echo "$line" | qgrep 'exists=yes'; then
         report 0 "a filename containing dots is not treated as traversal"
     else
         report 1 "a filename containing dots is not treated as traversal" "got: $line"
@@ -3243,7 +3268,7 @@ test_response_entries_tolerate_crlf_and_no_final_newline() {
         >"$sandbox/profiles/agend-terminal-profraw-list"
     line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/crlf-3-4_0.profraw")"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'in_response=yes'; then
+    if echo "$line" | qgrep 'in_response=yes'; then
         report 0 "response entries tolerate CRLF and a missing final newline"
     else
         report 1 "response entries tolerate CRLF and a missing final newline" "got: $line"
@@ -3260,7 +3285,7 @@ test_membership_compares_full_paths_not_basenames() {
         >"$sandbox/profiles/agend-terminal-profraw-list"
     line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/dup-5-6_0.profraw")"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'in_response=no'; then
+    if echo "$line" | qgrep 'in_response=no'; then
         report 0 "membership compares full paths, not basenames"
     else
         report 1 "membership compares full paths, not basenames" "got: $line"
@@ -3289,7 +3314,7 @@ test_membership_unknown_when_list_is_non_regular() {
     mkdir "$sandbox/profiles/agend-terminal-profraw-list"
     line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/nonreg-1-2_0.profraw")"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'in_response=unknown'; then
+    if echo "$line" | qgrep 'in_response=unknown'; then
         report 0 "a non-regular response list is not evidence of non-membership"
     else
         report 1 "a non-regular response list is not evidence of non-membership" \
@@ -3323,7 +3348,7 @@ PRODUCER
     rm -f "$sandbox/profiles"/* 2>/dev/null
     rm -rf "$sandbox"
     line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=fifomem' | head -n 1)"
-    if echo "$line" | grep -q 'in_response=unknown'; then
+    if echo "$line" | qgrep 'in_response=unknown'; then
         report 0 "a FIFO response list is not evidence of non-membership"
     else
         report 1 "a FIFO response list is not evidence of non-membership" \
@@ -3360,7 +3385,7 @@ PRODUCER
     line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
     chmod -R u+rwX "$sandbox" 2>/dev/null
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'in_response=unknown'; then
+    if echo "$line" | qgrep 'in_response=unknown'; then
         report 0 "an unreadable response list is not evidence of non-membership"
     else
         report 1 "an unreadable response list is not evidence of non-membership" \
@@ -3377,7 +3402,7 @@ test_membership_unknown_when_no_response_list_exists() {
     printf 'partial' >"$sandbox/profiles/nolist-1-2_0.profraw"
     line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/nolist-1-2_0.profraw")"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'in_response=unknown'; then
+    if echo "$line" | qgrep 'in_response=unknown'; then
         report 0 "an absent response list is not evidence of non-membership"
     else
         report 1 "an absent response list is not evidence of non-membership" \
@@ -3397,7 +3422,7 @@ test_membership_no_survives_a_fully_examined_list() {
         >"$sandbox/profiles/agend-terminal-profraw-list"
     line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/present-1-2_0.profraw")"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'in_response=no'; then
+    if echo "$line" | qgrep 'in_response=no'; then
         report 0 "a fully examined list still yields no"
     else
         report 1 "a fully examined list still yields no" "got: $line"
@@ -3411,7 +3436,7 @@ test_named_path_with_spaces_is_extracted() {
     printf 'partial' >"$sandbox/profiles/has space-7-8_0.profraw"
     line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/has space-7-8_0.profraw")"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'corrupt=has space-7-8_0.profraw' && echo "$line" | grep -q 'exists=yes'; then
+    if echo "$line" | qgrep 'corrupt=has space-7-8_0.profraw' && echo "$line" | qgrep 'exists=yes'; then
         report 0 "a named path containing spaces is extracted intact"
     else
         report 1 "a named path containing spaces is extracted intact" "got: $line"
@@ -3426,7 +3451,7 @@ test_absolute_token_outside_profile_dir_is_out_of_scope() {
     printf 'OUTSIDEDATA' >"$outside"
     line="$(drive_named "$sandbox/profiles" "$outside")"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'exists=out-of-scope'; then
+    if echo "$line" | qgrep 'exists=out-of-scope'; then
         report 0 "an absolute token outside the profile dir is out-of-scope"
     else
         report 1 "an absolute token outside the profile dir is out-of-scope" "got: $line"
@@ -3454,7 +3479,7 @@ test_symlink_leaf_cannot_escape_containment() {
     fi
     line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/leaf-1-2_0.profraw")"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'exists=out-of-scope' && ! echo "$line" | grep -qi '4f 55 54 53 49 44 45'; then
+    if echo "$line" | qgrep 'exists=out-of-scope' && ! echo "$line" | qgrep -i '4f 55 54 53 49 44 45'; then
         report 0 "a symlinked leaf cannot escape containment"
     else
         report 1 "a symlinked leaf cannot escape containment" "got: $line"
@@ -3503,9 +3528,9 @@ test_symlinked_response_list_discloses_nothing_outside() {
     out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/listlink-1-2_0.profraw")"
     rm -rf "$sandbox"
     line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
-    echo "$out" | grep -q 'OUTSIDE-SENTINEL-LIST' && bad="$bad content-disclosed"
-    echo "$out" | grep -qE '^response_file=.*lines=n/a' || bad="$bad list-not-marked-unread"
-    echo "$line" | grep -q 'in_response=unknown' || bad="$bad membership-not-unknown"
+    echo "$out" | qgrep 'OUTSIDE-SENTINEL-LIST' && bad="$bad content-disclosed"
+    echo "$out" | qgrep -E '^response_file=.*lines=n/a' || bad="$bad list-not-marked-unread"
+    echo "$line" | qgrep 'in_response=unknown' || bad="$bad membership-not-unknown"
     if [ -n "$bad" ]; then
         report 1 "a symlinked response list discloses nothing from outside" \
             "issues:$bad; got: $line"
@@ -3529,8 +3554,8 @@ test_symlinked_survey_profile_discloses_no_outside_bytes() {
     out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/real-1-2_0.profraw")"
     rm -rf "$sandbox"
     # 'SECR' — the first bytes od would print for the outside file.
-    echo "$out" | grep -qi '53 45 43 52' && bad="$bad header-disclosed"
-    echo "$out" | grep -qE '^[[:space:]]*file=leak-9-9_0\.profraw size_bytes=n/a header=n/a' ||
+    echo "$out" | qgrep -i '53 45 43 52' && bad="$bad header-disclosed"
+    echo "$out" | qgrep -E '^[[:space:]]*file=leak-9-9_0\.profraw size_bytes=n/a header=n/a' ||
         bad="$bad not-marked-unread"
     if [ -n "$bad" ]; then
         report 1 "the survey discloses no bytes from an escaping profile" \
@@ -3556,8 +3581,8 @@ test_symlinked_exemplar_discloses_no_outside_bytes() {
     rm -rf "$sandbox"
     line="$(echo "$out" | grep -E '^[[:space:]]*exemplar=' | head -n 1)"
     # 'EXEM' — the first bytes od would print for the outside file.
-    echo "$out" | grep -qi '45 58 45 4d' && bad="$bad header-disclosed"
-    echo "$line" | grep -q 'exemplar=none' || bad="$bad escaping-peer-offered"
+    echo "$out" | qgrep -i '45 58 45 4d' && bad="$bad header-disclosed"
+    echo "$line" | qgrep 'exemplar=none' || bad="$bad escaping-peer-offered"
     if [ -n "$bad" ]; then
         report 1 "an escaping peer is never offered as an exemplar" \
             "issues:$bad; got: $line"
@@ -3586,9 +3611,9 @@ test_in_scope_symlinks_are_still_read() {
     out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/victim-3-88_0.profraw")"
     rm -rf "$sandbox"
     # 9 bytes, and the header od prints for 'REALBYTES'.
-    echo "$out" | grep -qE 'exemplar=alias-2-88_0\.profraw size_bytes=9 header=52 45 41 4c' ||
+    echo "$out" | qgrep -E 'exemplar=alias-2-88_0\.profraw size_bytes=9 header=52 45 41 4c' ||
         bad="$bad exemplar-blinded"
-    echo "$out" | grep -qE '^[[:space:]]*file=alias-2-88_0\.profraw size_bytes=9' ||
+    echo "$out" | qgrep -E '^[[:space:]]*file=alias-2-88_0\.profraw size_bytes=9' ||
         bad="$bad survey-blinded"
     if [ -n "$bad" ]; then
         report 1 "an in-scope symlink is still surveyed and still an exemplar" \
@@ -3643,8 +3668,8 @@ test_dangling_response_list_is_disclosed_not_dropped() {
     # The disclosure line is the part that was missing; membership already lands
     # on `unknown` here, by the empty-glob rule rather than by refusal. Both are
     # required after the fix, so both are pinned.
-    echo "$out" | grep -qE '^response_file=.*lines=n/a' || bad="$bad list-entry-dropped"
-    echo "$line" | grep -q 'in_response=unknown' || bad="$bad membership-not-unknown"
+    echo "$out" | qgrep -E '^response_file=.*lines=n/a' || bad="$bad list-entry-dropped"
+    echo "$line" | qgrep 'in_response=unknown' || bad="$bad membership-not-unknown"
     if [ -n "$bad" ]; then
         report 1 "a dangling response list is disclosed by name and never followed" \
             "issues:$bad; got: $(echo "$out" | grep -E '^response_file=' | head -1)"
@@ -3673,9 +3698,9 @@ test_dangling_profraw_is_surveyed_not_dropped() {
     fi
     out="$(drive_named_block "$sandbox/profiles" "$sandbox/profiles/real-6-6_0.profraw")"
     rm -rf "$sandbox"
-    echo "$out" | grep -qE '^[[:space:]]*file=gone-7-7_0\.profraw size_bytes=n/a header=n/a' ||
+    echo "$out" | qgrep -E '^[[:space:]]*file=gone-7-7_0\.profraw size_bytes=n/a header=n/a' ||
         bad="$bad outside-target-entry-dropped"
-    echo "$out" | grep -qE '^[[:space:]]*file=inly-8-7_0\.profraw size_bytes=n/a header=n/a' ||
+    echo "$out" | qgrep -E '^[[:space:]]*file=inly-8-7_0\.profraw size_bytes=n/a header=n/a' ||
         bad="$bad in-scope-target-entry-dropped"
     if [ -n "$bad" ]; then
         report 1 "the survey names a dangling profile it will not open" \
@@ -3714,7 +3739,7 @@ PRODUCER
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=2 \
         COVERAGE_DIAG_GRACE_SECS=0 "$wrapper" 2>&1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -qE 'inventory=[^ ]+ profraw_files=2' || bad="$bad undercounted"
+    echo "$out" | qgrep -E 'inventory=[^ ]+ profraw_files=2' || bad="$bad undercounted"
     if [ -n "$bad" ]; then
         report 1 "the inventory counts an entry it never opens" \
             "issues:$bad; got: $(echo "$out" | grep -E 'inventory=' | head -1)"
@@ -3742,8 +3767,8 @@ test_in_scope_symlinked_response_list_is_refused_not_read() {
     line="$(echo "$out" | grep -E '^[[:space:]]*corrupt=' | head -n 1)"
     # It names the profile, so a reader that FOLLOWED it would answer `yes`.
     # Refusing to read it is exactly why the answer must be `unknown` instead.
-    echo "$line" | grep -q 'in_response=unknown' || bad="$bad membership-not-unknown"
-    echo "$out" | grep -qE '^response_file=.*lines=n/a' || bad="$bad list-not-marked-unread"
+    echo "$line" | qgrep 'in_response=unknown' || bad="$bad membership-not-unknown"
+    echo "$out" | qgrep -E '^response_file=.*lines=n/a' || bad="$bad list-not-marked-unread"
     if [ -n "$bad" ]; then
         report 1 "an in-scope symlinked response list is refused, not read" \
             "issues:$bad; got: $line"
@@ -3771,7 +3796,7 @@ PRODUCER
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     line="$(echo "$out" | grep -E '^\s*corrupt=' | head -n 1)"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'exists=no'; then
+    if echo "$line" | qgrep 'exists=no'; then
         report 0 "an absolute missing profile dir keeps its own boundary"
     else
         report 1 "an absolute missing profile dir keeps its own boundary" "got: $line"
@@ -3812,7 +3837,7 @@ PRODUCER
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     line="$(echo "$out" | grep -E '^\s*corrupt=' | head -n 1)"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q 'exists=yes'; then
+    if echo "$line" | qgrep 'exists=yes'; then
         report 0 "a relative missing profile_dir keeps its boundary under a symlinked CWD"
     else
         report 1 "a relative missing profile_dir keeps its boundary under a symlinked CWD" "got: $line"
@@ -3836,7 +3861,7 @@ test_in_scope_symlink_opens_the_validated_target() {
         >"$sandbox/profiles/agend-terminal-profraw-list"
     line="$(drive_named "$sandbox/profiles" "$sandbox/profiles/alias-3-4_0.profraw")"
     rm -rf "$sandbox"
-    if echo "$line" | grep -q '54 41 52 47 45 54 4f 4b' && echo "$line" | grep -q 'in_response=yes'; then
+    if echo "$line" | qgrep '54 41 52 47 45 54 4f 4b' && echo "$line" | qgrep 'in_response=yes'; then
         report 0 "an in-scope symlink opens the validated target without losing membership"
     else
         report 1 "an in-scope symlink opens the validated target without losing membership" "got: $line"
@@ -3882,7 +3907,7 @@ PRODUCER
         grep -E '^\s*corrupt=' | head -n 1)"
     rm -rf "$sandbox"
     # 4f 55 54 53 49 44 45 4d = "OUTSIDEM"
-    if echo "$line" | grep -q '4f 55 54 53 49 44 45 4d'; then
+    if echo "$line" | qgrep '4f 55 54 53 49 44 45 4d'; then
         report 1 "the validated target is the one opened" "outside marker bytes disclosed: $line"
     else
         report 0 "the validated target is the one opened"
@@ -3928,8 +3953,8 @@ PRODUCER
     kill "$live" 2>/dev/null
     wait "$live" 2>/dev/null
     rm -rf "$sandbox"
-    echo "$out" | grep -q "writer_pid=$live" || bad="$bad pid-not-reported"
-    echo "$out" | grep -q 'pid_alive=yes' || bad="$bad not-alive"
+    echo "$out" | qgrep "writer_pid=$live" || bad="$bad pid-not-reported"
+    echo "$out" | qgrep 'pid_alive=yes' || bad="$bad not-alive"
     if [ -n "$bad" ]; then
         report 1 "a live writer is reported alive" "issues:$bad; got: $(echo "$out" | grep -o 'writer_[a-z]*=[^ ]*' | tr '\n' ' ')"
     else
@@ -3952,8 +3977,8 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     out="$(drive_writer_case "$sandbox" "" 1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -q 'pid_alive=' || bad="$bad no-liveness-field"
-    echo "$out" | grep -q 'pid_alive=yes' && bad="$bad claims-alive"
+    echo "$out" | qgrep 'pid_alive=' || bad="$bad no-liveness-field"
+    echo "$out" | qgrep 'pid_alive=yes' && bad="$bad claims-alive"
     if [ -n "$bad" ]; then
         report 1 "an exited writer is not reported alive" "issues:$bad"
     else
@@ -3975,8 +4000,8 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     out="$(drive_writer_case "$sandbox" "" 1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -q 'writer_pid=unknown' || bad="$bad not-unknown"
-    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$out" | qgrep 'writer_pid=unknown' || bad="$bad not-unknown"
+    echo "$out" | qgrep -E ': line [0-9]+:' && bad="$bad raw-shell-error"
     if [ -n "$bad" ]; then
         report 1 "an unparseable writer pid is reported unknown" "issues:$bad"
     else
@@ -4001,8 +4026,8 @@ PRODUCER
     order="$(echo "$out" | grep -o 'inventory=[a-z-]*' | tr '\n' ',')"
     [ "$order" = "inventory=pre-clean,inventory=post-clean,inventory=post-grace," ] \
         || bad="$bad wrong-order($order)"
-    echo "$out" | grep -q 'profraw_files=' || bad="$bad no-file-count"
-    echo "$out" | grep -q 'live_writers=' || bad="$bad no-live-count"
+    echo "$out" | qgrep 'profraw_files=' || bad="$bad no-file-count"
+    echo "$out" | qgrep 'live_writers=' || bad="$bad no-live-count"
     if [ -n "$bad" ]; then
         report 1 "three inventories bracket cleanup" "issues:$bad"
     else
@@ -4021,7 +4046,7 @@ test_grace_and_inventory_only_on_corrupt_path() {
     out="$(drive_writer_case "$sandbox" "" 1)"
     t1=$(date +%s)
     rm -rf "$sandbox"
-    echo "$out" | grep -q 'inventory=' && bad="$bad inventory-on-success"
+    echo "$out" | qgrep 'inventory=' && bad="$bad inventory-on-success"
     [ $((t1 - t0)) -le 1 ] || bad="$bad success-path-delayed($((t1-t0))s)"
     if [ -n "$bad" ]; then
         report 1 "grace and inventory are corrupt-path only" "issues:$bad"
@@ -4072,9 +4097,9 @@ PRODUCER
     line="$(echo "$out" | grep -o 'toolchain .*' | head -n 1)"
     rm -rf "$sandbox"
     [ -n "$line" ] || bad="$bad no-toolchain-line"
-    echo "$line" | grep -q 'LLVM_COV=set' || bad="$bad presence-not-reported"
+    echo "$line" | qgrep 'LLVM_COV=set' || bad="$bad presence-not-reported"
     # The VALUE must never appear anywhere in the output.
-    echo "$out" | grep -q '/secret/path' && bad="$bad LEAKED-ENV-VALUE"
+    echo "$out" | qgrep '/secret/path' && bad="$bad LEAKED-ENV-VALUE"
     if [ -n "$bad" ]; then
         report 1 "toolchain presence is reported without env values" "issues:$bad"
     else
@@ -4099,8 +4124,8 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     out="$(drive_writer_case "$sandbox" "" 1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -q 'exemplar=agend-terminal-9999-782_0.profraw' || bad="$bad no-exemplar"
-    echo "$out" | grep -qE 'exemplar=[^ ]+ size_bytes=22' || bad="$bad no-exemplar-size"
+    echo "$out" | qgrep 'exemplar=agend-terminal-9999-782_0.profraw' || bad="$bad no-exemplar"
+    echo "$out" | qgrep -E 'exemplar=[^ ]+ size_bytes=22' || bad="$bad no-exemplar-size"
     if [ -n "$bad" ]; then
         report 1 "a healthy same-module exemplar is emitted" "issues:$bad; got: $(echo "$out" | grep -o 'exemplar=.*' | head -1)"
     else
@@ -4122,7 +4147,7 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     out="$(drive_writer_case "$sandbox" "" 1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -q 'exemplar=none' || bad="$bad not-explicit"
+    echo "$out" | qgrep 'exemplar=none' || bad="$bad not-explicit"
     if [ -n "$bad" ]; then
         report 1 "a missing exemplar is stated explicitly" "issues:$bad"
     else
@@ -4148,8 +4173,8 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     out="$(drive_writer_case "$sandbox" "" 1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -q 'pid_alive=yes' && bad="$bad false-alive-for-pid-0"
-    echo "$out" | grep -q 'writer_pid=' || bad="$bad no-pid-field"
+    echo "$out" | qgrep 'pid_alive=yes' && bad="$bad false-alive-for-pid-0"
+    echo "$out" | qgrep 'writer_pid=' || bad="$bad no-pid-field"
     if [ -n "$bad" ]; then
         report 1 "pid 0 is never reported alive" "issues:$bad; got: $(echo "$out" | grep -o 'writer_[a-z]*=[^ ]*' | tr '\n' ' ')"
     else
@@ -4175,9 +4200,9 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     out="$(drive_writer_case "$sandbox" "" 1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -q 'exemplar=agend-terminal-123-777_0.profraw' && bad="$bad corrupt-123-as-exemplar"
-    echo "$out" | grep -q 'exemplar=agend-terminal-124-777_0.profraw' && bad="$bad corrupt-124-as-exemplar"
-    echo "$out" | grep -q 'exemplar=none' || bad="$bad should-be-none"
+    echo "$out" | qgrep 'exemplar=agend-terminal-123-777_0.profraw' && bad="$bad corrupt-123-as-exemplar"
+    echo "$out" | qgrep 'exemplar=agend-terminal-124-777_0.profraw' && bad="$bad corrupt-124-as-exemplar"
+    echo "$out" | qgrep 'exemplar=none' || bad="$bad should-be-none"
     if [ -n "$bad" ]; then
         report 1 "the exemplar excludes other named-corrupt files" "issues:$bad; got: $(echo "$out" | grep -o 'exemplar=[^ ]*' | tr '\n' ' ')"
     else
@@ -4200,8 +4225,8 @@ PRODUCER
         COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=2 "$wrapper" 2>&1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -qi 'invalid time interval' && bad="$bad raw-sleep-error"
-    echo "$out" | grep -q 'inventory=post-grace' || bad="$bad grace-inventory-lost"
+    echo "$out" | qgrep -i 'invalid time interval' && bad="$bad raw-sleep-error"
+    echo "$out" | qgrep 'inventory=post-grace' || bad="$bad grace-inventory-lost"
     if [ -n "$bad" ]; then
         report 1 "an invalid grace is validated, not passed to sleep" "issues:$bad"
     else
@@ -4229,7 +4254,7 @@ PRODUCER
     # 45 is over the cap; a correct build spends ~2s here. Deliberately NOT a
     # huge value: a test for an unbounded wait must not itself become one.
     [ $((t1 - t0)) -le 35 ] || bad="$bad unbounded($((t1-t0))s)"
-    echo "$out" | grep -q 'inventory=post-grace' || bad="$bad grace-inventory-lost"
+    echo "$out" | qgrep 'inventory=post-grace' || bad="$bad grace-inventory-lost"
     if [ -n "$bad" ]; then
         report 1 "the grace is hard-bounded" "issues:$bad"
     else
@@ -4258,8 +4283,8 @@ PRODUCER
     kill "$live" 2>/dev/null; wait "$live" 2>/dev/null
     rm -rf "$sandbox"
     # The claim must be about the PID, not about "the writer".
-    echo "$out" | grep -q 'pid_alive=yes' || bad="$bad no-pid-alive"
-    echo "$out" | grep -q 'writer_alive=' && bad="$bad claims-writer-alive"
+    echo "$out" | qgrep 'pid_alive=yes' || bad="$bad no-pid-alive"
+    echo "$out" | qgrep 'writer_alive=' && bad="$bad claims-writer-alive"
     if [ -n "$bad" ]; then
         report 1 "a live pid is reported as pid_alive, not writer_alive" "issues:$bad"
     else
@@ -4315,7 +4340,7 @@ PRODUCER
         COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -q 'llvm_profdata=SHIMMED-PROFDATA 9.9' || bad="$bad not-discovered"
+    echo "$out" | qgrep 'llvm_profdata=SHIMMED-PROFDATA 9.9' || bad="$bad not-discovered"
     if [ -n "$bad" ]; then
         report 1 "llvm-profdata is discovered beside the rustc target libdir" \
             "issues:$bad; got: $(echo "$out" | grep -o 'llvm_profdata=[^ ]*' | head -1)"
@@ -4353,8 +4378,8 @@ PRODUCER
         COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -q 'llvm_profdata=unavailable' || bad="$bad not-unavailable"
-    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$out" | qgrep 'llvm_profdata=unavailable' || bad="$bad not-unavailable"
+    echo "$out" | qgrep -E ': line [0-9]+:' && bad="$bad raw-shell-error"
     if [ -n "$bad" ]; then
         report 1 "absent tools degrade to unavailable" "issues:$bad"
     else
@@ -4379,9 +4404,9 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     out="$(drive_writer_case "$sandbox" "" 1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
-    echo "$out" | grep -qi 'integer expression expected' && bad="$bad integer-error"
-    echo "$out" | grep -q 'pid_alive=unknown' || bad="$bad not-unknown"
+    echo "$out" | qgrep -E ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$out" | qgrep -i 'integer expression expected' && bad="$bad integer-error"
+    echo "$out" | qgrep 'pid_alive=unknown' || bad="$bad not-unknown"
     if [ -n "$bad" ]; then
         report 1 "an oversized pid token emits no raw shell error" \
             "issues:$bad; got: $(echo "$out" | grep -E ': line [0-9]+:' | head -1)"
@@ -4433,9 +4458,9 @@ PRODUCER
     out="$(drive_writer_case "$sandbox" "" 1)"
     rm -rf "$sandbox"
     # If an executable was identified, absence cannot also be asserted.
-    if echo "$out" | grep -q 'pid_alive=no' \
-        && echo "$out" | grep -qE 'writer_exe=[^ ]+' \
-        && ! echo "$out" | grep -q 'writer_exe=unavailable'; then
+    if echo "$out" | qgrep 'pid_alive=no' \
+        && echo "$out" | qgrep -E 'writer_exe=[^ ]+' \
+        && ! echo "$out" | qgrep 'writer_exe=unavailable'; then
         bad="$bad names-exe-while-claiming-absent"
     fi
     if [ -n "$bad" ]; then
@@ -4460,8 +4485,8 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     out="$(drive_writer_case "$sandbox" "" 1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -q 'pid_alive=unknown' || bad="$bad not-unknown"
-    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$out" | qgrep 'pid_alive=unknown' || bad="$bad not-unknown"
+    echo "$out" | qgrep -E ': line [0-9]+:' && bad="$bad raw-shell-error"
     if [ -n "$bad" ]; then
         report 1 "a leading-zero pid token is not reinterpreted" \
             "issues:$bad; got: $(echo "$out" | grep -o 'pid_alive=[a-z]*' | head -1)"
@@ -4484,8 +4509,8 @@ PRODUCER
     chmod +x "$sandbox/producer.sh"
     out="$(drive_writer_case "$sandbox" "" 1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -qE 'pid_alive=(yes|no|unknown)' || bad="$bad unclassified"
-    echo "$out" | grep -qE ': line [0-9]+:' && bad="$bad raw-shell-error"
+    echo "$out" | qgrep -E 'pid_alive=(yes|no|unknown)' || bad="$bad unclassified"
+    echo "$out" | qgrep -E ': line [0-9]+:' && bad="$bad raw-shell-error"
     if [ -n "$bad" ]; then
         report 1 "a max-length pid token classifies without error" "issues:$bad"
     else
@@ -4590,9 +4615,9 @@ PRODUCER
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     kill "$live" 2>/dev/null; wait "$live" 2>/dev/null
     rm -rf "$sandbox"
-    echo "$out" | grep -q 'pid_alive=unknown' || bad="$bad not-unknown"
-    echo "$out" | grep -q 'writer_exe=unavailable' || bad="$bad exe-resolved-anyway"
-    echo "$out" | grep -q 'writer_start=unavailable' || bad="$bad start-resolved-anyway"
+    echo "$out" | qgrep 'pid_alive=unknown' || bad="$bad not-unknown"
+    echo "$out" | qgrep 'writer_exe=unavailable' || bad="$bad exe-resolved-anyway"
+    echo "$out" | qgrep 'writer_start=unavailable' || bad="$bad start-resolved-anyway"
     if [ -n "$bad" ]; then
         report 1 "a non-canonical live pid is not resolved by exe/start" \
             "issues:$bad; got: $(echo "$out" | grep -o 'pid_alive=[a-z]*\|writer_exe=[^ ]*\|writer_start=[^ ]*' | tr '\n' ' ')"
@@ -4628,7 +4653,7 @@ PRODUCER
         rm -rf "$sandbox"
         # PID 1 may be signallable (yes) or not (unknown) — but NEVER `no`,
         # because this platform cannot prove absence.
-        echo "$out" | grep -q 'pid_alive=no' && bad="$bad [$plat]claims-absence-without-authority"
+        echo "$out" | qgrep 'pid_alive=no' && bad="$bad [$plat]claims-absence-without-authority"
     done
     if [ -n "$bad" ]; then
         report 1 "absence is only asserted with platform authority" "issues:$bad"
@@ -4695,8 +4720,8 @@ PRODUCER
         COVERAGE_CLEAN="true" COVERAGE_PROFILE_DIR="$sandbox/profiles" \
         COVERAGE_LOG="$sandbox/cov.log" COVERAGE_MAX_ATTEMPTS=1 "$wrapper" 2>&1)"
     rm -rf "$sandbox"
-    echo "$out" | grep -q 'pid_alive=no' && bad="$bad absence-from-failed-query"
-    echo "$out" | grep -q 'pid_alive=unknown' || bad="$bad not-unknown"
+    echo "$out" | qgrep 'pid_alive=no' && bad="$bad absence-from-failed-query"
+    echo "$out" | qgrep 'pid_alive=unknown' || bad="$bad not-unknown"
     if [ -n "$bad" ]; then
         report 1 "a failed authority query is not absence" \
             "issues:$bad; got: $(echo "$out" | grep -o 'pid_alive=[a-z]*' | head -1)"
