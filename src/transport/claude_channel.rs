@@ -46,10 +46,11 @@ const MAX_BODY: usize = 1024 * 1024;
 const HTTP_TIMEOUT: Duration = Duration::from_secs(3);
 const CHANNEL_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const SSE_READ_TIMEOUT: Duration = Duration::from_secs(20);
-/// While the SSE handshake is in flight the socket is read in slices this long,
-/// so a stop request is noticed even where `shutdown` from another thread does
-/// not wake a blocked read (observed on Windows CI).
-const SSE_HANDSHAKE_POLL: Duration = Duration::from_millis(250);
+/// The SSE socket is read in slices this long — during the handshake AND while
+/// streaming — so a stop request is noticed even where `shutdown` from another
+/// thread does not wake a blocked read (observed on Windows CI). The overall
+/// idle limit stays `SSE_READ_TIMEOUT`.
+const SSE_POLL_SLICE: Duration = Duration::from_millis(250);
 /// A fresh-restart self-kick must prove consumer admission promptly. This is
 /// deliberately a bounded ambiguity window, not a retry timer: accepted
 /// without an exact consumer ack is never resent automatically.
@@ -1782,9 +1783,18 @@ fn read_handshake_line(
 
 struct SseStream {
     reader: BufReader<TcpStream>,
+    /// A line read so far but not yet terminated. Kept across poll timeouts so
+    /// a slow peer never loses or duplicates a partial line.
+    line: Vec<u8>,
+    /// `data:` payload gathered for the event in progress, kept across polls.
+    data: String,
+    /// When any byte last arrived; the idle limit is measured from here.
+    last_activity: Instant,
+    idle_timeout: Duration,
 }
 
 /// What one pass of [`SseStream::next`] produced.
+#[derive(Debug)]
 enum SseItem {
     /// A complete reply event.
     Event(ReplyEvent),
@@ -1813,7 +1823,7 @@ impl SseStream {
         let address = endpoint_address(locator)?;
         let mut stream = TcpStream::connect_timeout(&address.parse()?, HTTP_TIMEOUT)?;
         publish(&stream)?;
-        stream.set_read_timeout(Some(SSE_HANDSHAKE_POLL))?;
+        stream.set_read_timeout(Some(SSE_POLL_SLICE))?;
         stream.set_write_timeout(Some(HTTP_TIMEOUT))?;
         let token = token(locator)?;
         let cursor = last_event_id
@@ -1849,39 +1859,93 @@ impl SseStream {
                 break;
             }
         }
-        // Handshake done: back to the long timeout that detects a bridge whose
-        // keepalives stopped.
-        reader.get_ref().set_read_timeout(Some(SSE_READ_TIMEOUT))?;
-        Ok(Self { reader })
+        // Handshake done. The stream keeps reading in `SSE_POLL_SLICE` slices;
+        // a bridge whose keepalives stopped is still detected, by the idle
+        // deadline (`SSE_READ_TIMEOUT` without any byte) instead of by the
+        // socket timeout.
+        Ok(Self {
+            reader,
+            line: Vec::new(),
+            data: String::new(),
+            last_activity: Instant::now(),
+            idle_timeout: SSE_READ_TIMEOUT,
+        })
     }
 
-    fn next(&mut self) -> anyhow::Result<Option<SseItem>> {
-        let mut data = String::new();
+    /// Advance the stream. Returns `Idle` whenever the socket had no data for one
+    /// poll slice, on a keepalive/blank line between events, or when
+    /// `should_abort` is set, so the caller regains control (to check its stop
+    /// flag) at least every `SSE_POLL_SLICE`. A silent peer is dropped with an
+    /// error once `idle_timeout` passes without any byte (checked when a read
+    /// finds nothing, never ahead of already-available data).
+    fn next(&mut self, should_abort: &dyn Fn() -> bool) -> anyhow::Result<Option<SseItem>> {
         loop {
-            let mut line = String::new();
-            if self.reader.read_line(&mut line)? == 0 {
-                return Ok(None);
+            if should_abort() {
+                return Ok(Some(SseItem::Idle));
             }
-            if line == "\n" || line == "\r\n" {
-                if data.is_empty() {
+            let available = match self.reader.fill_buf() {
+                Ok(available) => available,
+                Err(error)
+                    if matches!(
+                        error.kind(),
+                        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                    ) =>
+                {
+                    // Idle means no byte arrived for the whole window. It is
+                    // judged only here, after the socket really had nothing:
+                    // data already buffered, or readable, is consumed first and
+                    // refreshes `last_activity`, so a caller that was slow
+                    // between two calls is never mistaken for a silent peer.
+                    if self.last_activity.elapsed() >= self.idle_timeout {
+                        anyhow::bail!("Claude ChannelBridge SSE idle timed out");
+                    }
                     return Ok(Some(SseItem::Idle));
                 }
+                Err(error) => return Err(error.into()),
+            };
+            if available.is_empty() {
+                return Ok(None);
+            }
+            self.last_activity = Instant::now();
+            let (take, complete) = match available.iter().position(|byte| *byte == b'\n') {
+                Some(end) => (end + 1, true),
+                None => (available.len(), false),
+            };
+            self.line.extend_from_slice(&available[..take]);
+            self.reader.consume(take);
+            if !complete {
+                continue;
+            }
+            let line = String::from_utf8(std::mem::take(&mut self.line))
+                .map_err(|_| anyhow::anyhow!("Claude ChannelBridge SSE sent non-UTF-8"))?;
+            if line == "\n" || line == "\r\n" {
+                if self.data.is_empty() {
+                    return Ok(Some(SseItem::Idle));
+                }
+                let data = std::mem::take(&mut self.data);
                 return Ok(Some(SseItem::Event(serde_json::from_str(data.trim())?)));
             }
             if line.starts_with(':') {
                 // SSE comment (the bridge's `: keepalive`). Mid-event it must
                 // not drop the data gathered so far; between events it is the
                 // worker's chance to look at its stop flag.
-                if data.is_empty() {
+                if self.data.is_empty() {
                     return Ok(Some(SseItem::Idle));
                 }
                 continue;
             }
             if let Some(value) = line.strip_prefix("data:") {
-                data.push_str(value.trim_start());
+                self.data.push_str(value.trim_start());
             }
         }
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// When set on the calling thread, [`EventWorker::signal_stop`] only stores
+    /// the stop flag and skips `shutdown` on the socket.
+    static SUPPRESS_SOCKET_SHUTDOWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 struct EventWorker {
@@ -1901,6 +1965,13 @@ impl EventWorker {
     /// published earlier has its socket shut down here.
     fn signal_stop(&self) {
         self.stop.store(true, Ordering::Release);
+        // Test-only: model a platform where `shutdown` from another thread does
+        // not wake a blocked read (observed on Windows), so a test can prove a
+        // stop is noticed by the worker's own polling.
+        #[cfg(test)]
+        if SUPPRESS_SOCKET_SHUTDOWN.with(|flag| flag.get()) {
+            return;
+        }
         if let Some(conn) = self.conn.lock().as_ref() {
             let _ = conn.shutdown(std::net::Shutdown::Both);
         }
@@ -1983,7 +2054,7 @@ fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
                                 *thread_conn.lock() = None;
                                 return;
                             }
-                            match stream.next() {
+                            match stream.next(&should_abort) {
                                 Ok(Some(SseItem::Idle)) => {}
                                 Ok(Some(SseItem::Event(event))) => {
                                     if seen_reply_ids.contains(&event.reply_id) {
@@ -2027,8 +2098,9 @@ fn ensure_event_worker(home: &Path, instance: &str, locator: &SessionLocator) {
 
 /// #3515 follow-up: set an events worker's stop flag WITHOUT waiting for it.
 ///
-/// A worker only observes its flag when the SSE read it is blocked in returns,
-/// which `SSE_READ_TIMEOUT` bounds at 20s. [`stop_instance_state`] both signals
+/// A worker observes its flag between SSE poll slices (`SSE_POLL_SLICE`), so a
+/// stop is bounded to about that long even where `shutdown` cannot wake a
+/// blocked read. [`stop_instance_state`] both signals
 /// and joins, so walking a fleet one instance at a time paid that window N
 /// times: each wait began only after the previous one ended. Signalling every
 /// worker first lets the windows overlap, so a fleet-wide stop costs about one
@@ -2301,7 +2373,7 @@ impl AgentDeliveryTransport for ClaudeChannelBridge {
         let locator = self.locator()?;
         let mut stream = SseStream::connect(&locator, None, &|_| Ok(()), &|| false)?;
         loop {
-            match stream.next()? {
+            match stream.next(&|| false)? {
                 Some(SseItem::Event(event)) => {
                     return Ok(BackendEvent::Completed {
                         delivery_id: event.delivery_id,

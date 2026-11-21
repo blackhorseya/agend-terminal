@@ -2806,3 +2806,289 @@ fn sse_connect_rejects_an_oversized_handshake() {
 
 #[path = "claude_channel/tests/self_kick_tests.rs"]
 mod self_kick_tests;
+
+/// A bridge that completes the SSE handshake and then goes completely silent:
+/// no events, no keepalives, no disconnect — the state a hung or paused
+/// ChannelBridge is in. The connection is held open until the fixture drops.
+struct SilentStreamBridge {
+    port: u16,
+    release: Arc<AtomicBool>,
+    streaming: mpsc::Receiver<()>,
+}
+
+impl SilentStreamBridge {
+    fn start() -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind silent SSE");
+        let port = listener.local_addr().expect("addr").port();
+        let release = Arc::new(AtomicBool::new(false));
+        let thread_release = Arc::clone(&release);
+        let (streaming_tx, streaming) = mpsc::channel();
+        // fire-and-forget: test-only fake SSE server; it exits when released by Drop.
+        thread::spawn(move || {
+            let Ok((mut conn, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(conn.try_clone().expect("clone"));
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 || line == "\r\n" {
+                    break;
+                }
+            }
+            if conn
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n")
+                .is_err()
+                || conn.flush().is_err()
+            {
+                return;
+            }
+            let _ = streaming_tx.send(());
+            while !thread_release.load(Ordering::Acquire) {
+                thread::sleep(Duration::from_millis(50));
+            }
+        });
+        Self {
+            port,
+            release,
+            streaming,
+        }
+    }
+}
+
+impl Drop for SilentStreamBridge {
+    fn drop(&mut self) {
+        self.release.store(true, Ordering::Release);
+    }
+}
+
+/// Once the SSE stream is established, a silent bridge leaves the worker parked
+/// in a read for the whole `SSE_READ_TIMEOUT` (20s). Where `shutdown` from
+/// another thread cannot wake that read (Windows), `stop_instance_state` — which
+/// fresh restart calls while holding the DeleteFence — then takes that long. The
+/// stop flag alone must be enough, so this test suppresses the socket shutdown
+/// and requires a bounded return.
+///
+/// Fails on the pre-fix code on EVERY platform (the suppression switch models
+/// the Windows behaviour); without the switch the pre-fix code passes on Unix,
+/// where `shutdown` does wake the read — see the control test below.
+#[test]
+fn stop_instance_state_is_bounded_in_stream_phase_without_socket_shutdown() {
+    let home = home("stop-stream-silent");
+    let bridge = SilentStreamBridge::start();
+    let locator = fake_bridge_locator(bridge.port);
+    ensure_event_worker(&home, "silent-agent", &locator);
+    bridge
+        .streaming
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the event worker must reach the SSE stream");
+    // Let the worker leave the handshake and park in the stream read.
+    thread::sleep(Duration::from_millis(600));
+
+    let stop_home = home.clone();
+    let returned = returns_within(Duration::from_secs(2), move || {
+        SUPPRESS_SOCKET_SHUTDOWN.with(|flag| flag.set(true));
+        stop_instance_state(&stop_home, "silent-agent");
+    });
+
+    assert!(
+        returned,
+        "stop_instance_state must return within 2s of a silent SSE stream even when \
+         socket shutdown cannot wake the read (pre-fix: waits out the 20s read timeout)"
+    );
+    let _ = fs::remove_dir_all(home);
+}
+
+/// Control for the test above: with `shutdown` working (Unix) a silent stream
+/// already stops promptly, so the bound is not an artefact of the fixture.
+#[test]
+fn stop_instance_state_is_bounded_in_stream_phase_with_socket_shutdown() {
+    let home = home("stop-stream-silent-shutdown");
+    let bridge = SilentStreamBridge::start();
+    let locator = fake_bridge_locator(bridge.port);
+    ensure_event_worker(&home, "silent-agent-2", &locator);
+    bridge
+        .streaming
+        .recv_timeout(Duration::from_secs(5))
+        .expect("the event worker must reach the SSE stream");
+    thread::sleep(Duration::from_millis(600));
+
+    let stop_home = home.clone();
+    let returned = returns_within(Duration::from_secs(2), move || {
+        stop_instance_state(&stop_home, "silent-agent-2");
+    });
+
+    assert!(returned, "stop must return within 2s with shutdown enabled");
+    let _ = fs::remove_dir_all(home);
+}
+
+/// A connected `SseStream` over a loopback pair, bypassing the HTTP handshake.
+/// Returns the stream and the server-side socket the test writes SSE bytes to.
+fn sse_stream_pair(idle_timeout: Duration) -> (SseStream, TcpStream) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind");
+    let client = TcpStream::connect(listener.local_addr().expect("addr")).expect("connect");
+    let (server, _) = listener.accept().expect("accept");
+    client
+        .set_read_timeout(Some(SSE_POLL_SLICE))
+        .expect("poll slice");
+    let stream = SseStream {
+        reader: BufReader::new(client),
+        line: Vec::new(),
+        data: String::new(),
+        last_activity: Instant::now(),
+        idle_timeout,
+    };
+    (stream, server)
+}
+
+fn sample_reply_event() -> ReplyEvent {
+    ReplyEvent {
+        delivery_id: Uuid::new_v4(),
+        chat_id: "chat".to_string(),
+        text: "hello".to_string(),
+        reply_id: "reply-1".to_string(),
+        recorded_at: "2026-11-20T00:00:00Z".to_string(),
+    }
+}
+
+/// A silent stream returns `Idle` roughly every poll slice (so the caller can
+/// look at its stop flag) instead of blocking for the whole idle window.
+#[test]
+fn sse_stream_next_yields_idle_each_poll_slice_while_silent() {
+    let (mut stream, _server) = sse_stream_pair(Duration::from_secs(20));
+    let started = Instant::now();
+    let item = stream
+        .next(&|| false)
+        .expect("silent stream is not an error");
+    assert!(matches!(item, Some(SseItem::Idle)), "silent poll is Idle");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "one poll slice, not the idle window: {:?}",
+        started.elapsed()
+    );
+}
+
+/// The overall idle semantics are unchanged: a peer that sends nothing at all
+/// for the idle window is dropped with an error (the old 20s read timeout).
+#[test]
+fn sse_stream_next_errors_after_the_idle_window() {
+    let (mut stream, _server) = sse_stream_pair(Duration::from_millis(700));
+    let started = Instant::now();
+    let error = loop {
+        match stream.next(&|| false) {
+            Ok(Some(SseItem::Idle)) => {
+                assert!(
+                    started.elapsed() < Duration::from_secs(5),
+                    "the idle window never expired"
+                );
+            }
+            other => break other,
+        }
+    };
+    assert!(error.is_err(), "idle timeout must be an error: {error:?}");
+    assert!(
+        started.elapsed() >= Duration::from_millis(700),
+        "must not fire before the idle window: {:?}",
+        started.elapsed()
+    );
+}
+
+/// Bytes arriving — even just keepalives — keep the stream alive past the idle
+/// window, exactly as a socket read timeout that resets on data did.
+#[test]
+fn sse_stream_next_keepalives_reset_the_idle_window() {
+    let (mut stream, mut server) = sse_stream_pair(Duration::from_millis(900));
+    let started = Instant::now();
+    let mut keepalives = 0;
+    while started.elapsed() < Duration::from_millis(1800) {
+        if keepalives < 12 {
+            server.write_all(b": keepalive\n\n").expect("keepalive");
+            keepalives += 1;
+        }
+        match stream.next(&|| false) {
+            Ok(Some(SseItem::Idle)) => thread::sleep(Duration::from_millis(100)),
+            other => panic!("keepalive-fed stream must stay Idle, got {other:?}"),
+        }
+    }
+}
+
+/// A line split across poll timeouts is kept in the buffer: nothing is lost or
+/// duplicated, and the event is delivered whole once its terminator arrives.
+#[test]
+fn sse_stream_next_keeps_a_partial_event_across_poll_timeouts() {
+    let (mut stream, mut server) = sse_stream_pair(Duration::from_secs(20));
+    let event = sample_reply_event();
+    let json = serde_json::to_string(&event).expect("json");
+    let wire = format!("data: {json}\n\n");
+    let (first, rest) = wire.as_bytes().split_at(wire.len() / 2);
+
+    server.write_all(first).expect("first half");
+    // Longer than one poll slice: the stream must report Idle, not fail or
+    // return a truncated event.
+    let item = stream
+        .next(&|| false)
+        .expect("partial data is not an error");
+    assert!(matches!(item, Some(SseItem::Idle)), "half a line is Idle");
+    thread::sleep(SSE_POLL_SLICE + Duration::from_millis(100));
+    let item = stream.next(&|| false).expect("still partial");
+    assert!(matches!(item, Some(SseItem::Idle)), "still half a line");
+
+    server.write_all(rest).expect("second half");
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match stream.next(&|| false).expect("completed event") {
+            Some(SseItem::Event(got)) => {
+                assert_eq!(got, event, "the event must arrive intact");
+                break;
+            }
+            Some(SseItem::Idle) => assert!(Instant::now() < deadline, "event never arrived"),
+            None => panic!("stream closed before the event"),
+        }
+    }
+}
+
+/// `should_abort` hands control back immediately, without waiting for a slice.
+#[test]
+fn sse_stream_next_returns_idle_at_once_when_aborted() {
+    let (mut stream, _server) = sse_stream_pair(Duration::from_secs(20));
+    let started = Instant::now();
+    let item = stream.next(&|| true).expect("abort is not an error");
+    assert!(matches!(item, Some(SseItem::Idle)));
+    assert!(started.elapsed() < Duration::from_millis(100));
+}
+
+/// Events already buffered must be delivered even when the caller was away for
+/// longer than the idle window between two `next` calls (the resident worker
+/// does synchronous receipt work between events). Idle means "no byte arrived",
+/// not "the caller was slow".
+#[test]
+fn sse_stream_next_delivers_a_buffered_event_after_a_slow_caller() {
+    let (mut stream, mut server) = sse_stream_pair(Duration::from_millis(20));
+    let first = sample_reply_event();
+    let mut second = sample_reply_event();
+    second.reply_id = "reply-2".to_string();
+    let wire = format!(
+        "data: {}\n\ndata: {}\n\n",
+        serde_json::to_string(&first).expect("json"),
+        serde_json::to_string(&second).expect("json")
+    );
+    // One write so both events land in the BufReader with the first read.
+    server.write_all(wire.as_bytes()).expect("two events");
+
+    let got = match stream.next(&|| false).expect("first event") {
+        Some(SseItem::Event(event)) => event,
+        other => panic!("expected the first event, got {other:?}"),
+    };
+    assert_eq!(got, first);
+    assert!(
+        !stream.reader.buffer().is_empty(),
+        "fixture: the second event must already be buffered"
+    );
+
+    // The caller is busy (receipt persistence, scheduling) for longer than the
+    // idle window before asking for the next event.
+    thread::sleep(Duration::from_millis(80));
+    match stream.next(&|| false) {
+        Ok(Some(SseItem::Event(event))) => assert_eq!(event, second),
+        other => panic!("a buffered event must not be lost to the idle check: {other:?}"),
+    }
+}
