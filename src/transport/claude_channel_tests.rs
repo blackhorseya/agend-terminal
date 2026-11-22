@@ -3092,3 +3092,107 @@ fn sse_stream_next_delivers_a_buffered_event_after_a_slow_caller() {
         other => panic!("a buffered event must not be lost to the idle check: {other:?}"),
     }
 }
+
+/// Spawn a long-lived child so a locator can name a live pid that is NOT the
+/// test process (the real incident: a second bridge replacing another process).
+#[cfg(unix)]
+fn spawn_live_other_owner() -> std::process::Child {
+    std::process::Command::new("sleep")
+        .arg("60")
+        .spawn()
+        .expect("spawn sleep child")
+}
+
+#[cfg(unix)]
+fn event_log_text(home: &Path) -> String {
+    fs::read_to_string(home.join("event-log.jsonl")).unwrap_or_default()
+}
+
+#[cfg(unix)]
+#[test]
+fn publish_over_live_foreign_owner_logs_supersede_event() {
+    let home = home("live-supersede");
+    let mut owner = spawn_live_other_owner();
+    let owner_pid = owner.id();
+    let mut live = SessionLocator::claude(
+        "http://127.0.0.1:43123".to_string(),
+        "claude-old-session".to_string(),
+        "old-secret-token".to_string(),
+    );
+    live.managed = true;
+    live.server_pid = Some(owner_pid);
+    live.server_start_token = crate::process::process_start_token(owner_pid);
+    assert!(live.server_start_token.is_some(), "child must be live");
+    super::super::registry::save_session_locator(&home, "claude-agent", &live)
+        .expect("plant live foreign owner");
+
+    let (fresh, listener) =
+        bind_and_publish_channel(&home, "claude-agent").expect("publish over live owner");
+
+    // Publish behavior is unchanged: the new bridge still wins.
+    let stored = super::super::registry::load_session_locator(&home, "claude-agent")
+        .expect("stored locator");
+    assert_eq!(stored.session_id, fresh.session_id);
+    // But the supersede of a still-live owner must be observable.
+    let log = event_log_text(&home);
+    assert!(
+        log.contains("channel_bridge_live_supersede"),
+        "live supersede must leave an event-log entry, got: {log}"
+    );
+    assert!(log.contains(&owner_pid.to_string()), "old pid in detail");
+    assert!(
+        !log.contains("old-secret-token")
+            && fresh.password.as_deref().is_none_or(|p| !log.contains(p)),
+        "event detail must not leak tokens"
+    );
+    drop(listener);
+    let _ = owner.kill();
+    let _ = owner.wait();
+    let _ = fs::remove_dir_all(home);
+}
+
+#[cfg(unix)]
+#[test]
+fn publish_over_dead_owner_does_not_log_supersede_event() {
+    let home = home("dead-no-supersede");
+    let mut owner = spawn_live_other_owner();
+    let owner_pid = owner.id();
+    let mut stale = SessionLocator::claude(
+        "http://127.0.0.1:43123".to_string(),
+        "claude-old-session".to_string(),
+        "old-secret-token".to_string(),
+    );
+    stale.managed = true;
+    stale.server_pid = Some(owner_pid);
+    // Start token mismatch == the pid was recycled / the owner is dead.
+    stale.server_start_token =
+        crate::process::process_start_token(owner_pid).map(|t| t.wrapping_add(1));
+    super::super::registry::save_session_locator(&home, "claude-agent", &stale)
+        .expect("plant dead owner");
+
+    let (_fresh, listener) =
+        bind_and_publish_channel(&home, "claude-agent").expect("recover dead owner");
+    assert!(
+        !event_log_text(&home).contains("channel_bridge_live_supersede"),
+        "a dead owner goes through the recover path, not live-supersede"
+    );
+    drop(listener);
+    let _ = owner.kill();
+    let _ = owner.wait();
+    let _ = fs::remove_dir_all(home);
+}
+
+#[cfg(unix)]
+#[test]
+fn republish_over_own_pid_does_not_log_supersede_event() {
+    let home = home("self-no-supersede");
+    let _live = test_published_locator(&home, "claude-agent");
+    let (_fresh, listener) =
+        bind_and_publish_channel(&home, "claude-agent").expect("re-publish over self");
+    assert!(
+        !event_log_text(&home).contains("channel_bridge_live_supersede"),
+        "same-pid republish is not a second live owner"
+    );
+    drop(listener);
+    let _ = fs::remove_dir_all(home);
+}
