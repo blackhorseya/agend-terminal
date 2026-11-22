@@ -8,7 +8,7 @@
 
 /// Upper bound on tab-bar rows. Tabs that would need a row past this cap are
 /// hidden (not drawn, not clickable) so the bar can never eat the pane area.
-pub const MAX_TAB_BAR_ROWS: u16 = 3;
+pub const MAX_TAB_BAR_ROWS: u16 = 5;
 
 /// Width of the trailing ` [+] ` button (leading and trailing space included).
 pub const NEW_TAB_WIDTH: u16 = 5;
