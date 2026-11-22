@@ -1485,6 +1485,40 @@ fn recover_stale_locator_for_bridge(home: &Path, instance: &str) -> anyhow::Resu
     Ok(())
 }
 
+/// Pure decision: does publishing a fresh bridge from `own_pid` supersede a
+/// still-live Claude owner? Returns the old owner's pid when it does.
+///
+/// A locator owned by a different, still-running claude bridge is replaced
+/// silently by `save_session_locator`; daemon pushes then go to the new bridge
+/// and the old session is never woken (2026-11-22 mango-gp-lead fork incident).
+/// Observability only: the caller still publishes, because a normal restart can
+/// briefly overlap the old bridge (it exits on stdin EOF).
+fn live_owner_superseded(existing: Option<&SessionLocator>, own_pid: u32) -> Option<u32> {
+    let locator = existing?;
+    if locator.backend != "claude" || !claude_bridge_identity_live(locator) {
+        return None;
+    }
+    locator.server_pid.filter(|pid| *pid != own_pid)
+}
+
+/// Record a live-owner supersede. Detail carries pids only — never the
+/// locator's token or endpoint.
+fn report_live_supersede(home: &Path, instance: &str, old_pid: u32, new_pid: u32) {
+    tracing::warn!(
+        agent = %instance,
+        old_pid,
+        new_pid,
+        "#live-bridge-supersede channel-bridge replaced a still-live claude locator owner; \
+         pushes now go to the new bridge (possible duplicate claude session)"
+    );
+    crate::event_log::log(
+        home,
+        "channel_bridge_live_supersede",
+        instance,
+        &format!("old_pid={old_pid} new_pid={new_pid}"),
+    );
+}
+
 fn bind_and_publish_channel(
     home: &Path,
     instance: &str,
@@ -1494,8 +1528,16 @@ fn bind_and_publish_channel(
     // A live claude-owned locator is left untouched and atomically superseded by
     // the fresh listener (safe even across daemon restart — the same-process
     // restart reuses a now-free numeric port).
+    //
+    // A live owner is still superseded (never rejected: a restart overlaps the
+    // old bridge until stdin EOF), but it must not be silent. Capture it before
+    // recover runs, publish, then report only once the publish succeeded.
+    let existing = super::registry::claude_attach_locator(home, instance)
+        .ok()
+        .flatten();
     recover_stale_locator_for_bridge(home, instance)?;
     let pid = std::process::id();
+    let superseded = live_owner_superseded(existing.as_ref(), pid);
     let start_token = crate::process::process_start_token(pid)
         .ok_or_else(|| anyhow::anyhow!("Claude ChannelBridge process identity is unavailable"))?;
 
@@ -1513,6 +1555,9 @@ fn bind_and_publish_channel(
     // publishes this exact endpoint, so a port squatter cannot win the
     // bind/persist gap that existed in the old probe-then-drop flow.
     super::registry::save_session_locator(home, instance, &locator)?;
+    if let Some(old_pid) = superseded {
+        report_live_supersede(home, instance, old_pid, pid);
+    }
     Ok((locator, listener))
 }
 
