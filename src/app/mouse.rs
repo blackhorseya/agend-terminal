@@ -1051,9 +1051,10 @@ mod tests {
         };
         let mut layout = Layout::new();
         layout.add_tab(Tab::with_root("x".repeat(cols as usize), root));
-        for i in 0..3 {
-            layout.add_tab(Tab::new("x".repeat(cols as usize), leaf(4 + i, "other")));
-        }
+        // Two full-width tabs take rows 0 and 1; `[+]` no longer fits beside the
+        // second one, so it wraps onto row 2 -> exactly 3 rows (the bar's cap is
+        // 5, so adding more full-width tabs would grow it past the intended 3).
+        layout.add_tab(Tab::new("x".repeat(cols as usize), leaf(4, "other")));
         layout.active = 0;
         layout.set_tab_bar_width(cols, None);
         assert_eq!(layout.tab_bar_rows(), 3, "fixture must wrap to 3 rows");

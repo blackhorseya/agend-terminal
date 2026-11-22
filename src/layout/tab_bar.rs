@@ -8,7 +8,7 @@
 
 /// Upper bound on tab-bar rows. Tabs that would need a row past this cap are
 /// hidden (not drawn, not clickable) so the bar can never eat the pane area.
-pub const MAX_TAB_BAR_ROWS: u16 = 3;
+pub const MAX_TAB_BAR_ROWS: u16 = 5;
 
 /// Width of the trailing ` [+] ` button (leading and trailing space included).
 pub const NEW_TAB_WIDTH: u16 = 5;
@@ -230,6 +230,31 @@ mod tests {
             }
         }
         assert_eq!(g.hit(g.new_tab.row, g.new_tab.col), Some(TabBarHit::NewTab));
+    }
+
+    /// Sean 2026-11-23: the bar may wrap onto up to 5 rows. 12 tabs of width 10
+    /// in a 24-column bar fit two per row, so they need the 4th and 5th rows;
+    /// the overflow is hidden and `[+]` stays visible on the 5th row.
+    #[test]
+    fn bar_wraps_up_to_five_rows() {
+        let widths = vec![10u16; 12];
+        let g = tab_bar_geometry(&widths, 24);
+        assert_eq!(g.rows, 5, "bar must use all five rows, not stop at three");
+        for row in [3u16, 4] {
+            assert!(
+                g.tabs.iter().flatten().any(|s| s.row == row),
+                "row {row} must hold at least one tab"
+            );
+        }
+        assert!(g.tabs.iter().any(|s| s.is_none()), "overflow tabs hidden");
+        assert!(g.tabs.iter().flatten().all(|s| s.row < 5));
+        assert_eq!(g.new_tab.row, 4, "[+] stays visible on the last row");
+        assert_eq!(g.hit(g.new_tab.row, g.new_tab.col), Some(TabBarHit::NewTab));
+        for s in g.tabs.iter().flatten() {
+            if s.row == g.new_tab.row {
+                assert!(s.col + s.width <= g.new_tab.col, "no overlap with [+]");
+            }
+        }
     }
 
     #[test]
