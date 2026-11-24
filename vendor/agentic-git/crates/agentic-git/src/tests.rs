@@ -473,7 +473,9 @@ fn deny_message_unbound_points_at_getting_a_worktree_2379() {
     }
     // The shared builder is what the canonical-bypass deny (no Binding) reuses.
     assert!(
-        deny_remedy_lines(None).join("\n").contains("agentic-git run"),
+        deny_remedy_lines(None)
+            .join("\n")
+            .contains("agentic-git run"),
         "the shared remedy builder serves the no-binding deny too"
     );
 }
@@ -1096,7 +1098,8 @@ fn push_default_is_matching_reads_config_s3() {
         std::process::Command::new("git")
             .args(args)
             .current_dir(&dir)
-            .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+            .env("AGENTIC_GIT_BYPASS", "1")
+            .env("AGEND_GIT_BYPASS", "1")
             .output()
             .unwrap();
     };
@@ -1900,7 +1903,8 @@ fn count_commits_above_base(worktree: &std::path::Path, base: &str) -> usize {
     let output = Command::new("git")
         .args(["log", &format!("{base}..HEAD"), "--format=%H"])
         .current_dir(worktree)
-        .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+        .env("AGENTIC_GIT_BYPASS", "1")
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
         .expect("git log spawn");
     if !output.status.success() {
@@ -1920,7 +1924,8 @@ fn rev_parse(worktree: &std::path::Path, refname: &str) -> String {
     let output = Command::new("git")
         .args(["rev-parse", refname])
         .current_dir(worktree)
-        .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+        .env("AGENTIC_GIT_BYPASS", "1")
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
         .expect("rev-parse spawn");
     String::from_utf8_lossy(&output.stdout).trim().to_string()
@@ -2972,7 +2977,8 @@ fn git_run_2379(args: &[&str], dir: &std::path::Path) -> std::process::Output {
     Command::new("git")
         .args(args)
         .current_dir(dir)
-        .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+        .env("AGENTIC_GIT_BYPASS", "1")
+        .env("AGEND_GIT_BYPASS", "1")
         .env("GIT_AUTHOR_NAME", "test")
         .env("GIT_AUTHOR_EMAIL", "test@test")
         .env("GIT_COMMITTER_NAME", "test")
@@ -3245,7 +3251,8 @@ fn denylist_fails_closed_when_origin_main_missing_2379() {
 fn tracked_tree_has_zero_trust_root_hits_persistent_guard_2379() {
     let out = Command::new("git")
         .args(["ls-files"])
-        .env("AGENTIC_GIT_BYPASS", "1").env("AGEND_GIT_BYPASS", "1")
+        .env("AGENTIC_GIT_BYPASS", "1")
+        .env("AGEND_GIT_BYPASS", "1")
         .output()
         .expect("git ls-files spawn");
     assert!(
@@ -3666,7 +3673,8 @@ fn cross_branch_push_denied_forms() {
     );
     // push.default=matching with no refspec
     assert!(
-        push_cross_branch_violation(&vargs(&["push", "origin"]), "feat/a", "feat/a", true).is_some(),
+        push_cross_branch_violation(&vargs(&["push", "origin"]), "feat/a", "feat/a", true)
+            .is_some(),
         "matching no-refspec push must be denied"
     );
 }
@@ -3692,10 +3700,20 @@ fn cross_branch_push_allowed_forms() {
         &["push", "--force-with-lease", "origin", "feat/a"][..],
         &["push", "origin", "feat/a", "refs/tags/v2"][..], // own branch + a tag
     ] {
-        assert!(allow(a).is_none(), "must be ALLOWED: {a:?} -> {:?}", allow(a));
+        assert!(
+            allow(a).is_none(),
+            "must be ALLOWED: {a:?} -> {:?}",
+            allow(a)
+        );
     }
     // an unbound caller (empty assigned) is never restricted here
-    assert!(push_cross_branch_violation(&vargs(&["push", "origin", "feat/b"]), "", "feat/a", false).is_none());
+    assert!(push_cross_branch_violation(
+        &vargs(&["push", "origin", "feat/b"]),
+        "",
+        "feat/a",
+        false
+    )
+    .is_none());
 }
 
 // ── #2677 embedder P0: bare force-push requires a lease (feature branches). ──
@@ -3739,8 +3757,19 @@ fn push_force_without_lease_allows_lease_and_normal_forms_2677() {
     let allow = |a: &[&str]| push_force_without_lease_violation(&vargs(a));
     for a in [
         &["push", "--force-with-lease", "origin", "feat/x"][..],
-        &["push", "--force-with-lease=origin/feat/x", "origin", "feat/x"][..],
-        &["push", "--force-if-includes", "--force-with-lease", "origin", "feat/x"][..],
+        &[
+            "push",
+            "--force-with-lease=origin/feat/x",
+            "origin",
+            "feat/x",
+        ][..],
+        &[
+            "push",
+            "--force-if-includes",
+            "--force-with-lease",
+            "origin",
+            "feat/x",
+        ][..],
         &["push", "origin", "feat/x"][..],
         &["push", "-u", "origin", "feat/x"][..],
         &["push"][..],
@@ -3748,7 +3777,11 @@ fn push_force_without_lease_allows_lease_and_normal_forms_2677() {
         &["push", "-o", "ci.skip", "origin", "feat/x"][..], // push-option value not mis-read
         &["push", "-o", "+val", "origin", "feat/x"][..],    // + inside an option value ≠ force
     ] {
-        assert!(allow(a).is_none(), "must be ALLOWED: {a:?} -> {:?}", allow(a));
+        assert!(
+            allow(a).is_none(),
+            "must be ALLOWED: {a:?} -> {:?}",
+            allow(a)
+        );
     }
 }
 
@@ -3757,7 +3790,11 @@ fn push_force_trailing_bare_force_overrides_lease_2677() {
     // git makes a trailing `--force` override a `--force-with-lease`, so a bare
     // `--force` present alongside a lease flag is still unconditional → denied.
     assert!(push_force_without_lease_violation(&vargs(&[
-        "push", "--force-with-lease", "--force", "origin", "feat/x"
+        "push",
+        "--force-with-lease",
+        "--force",
+        "origin",
+        "feat/x"
     ]))
     .is_some());
 }
@@ -3773,7 +3810,11 @@ fn push_force_pure_deletion_is_exempt_2677() {
         &["push", "--delete", "origin", "foo"][..], // --delete flag (no force needed)
         &["push", "--force", "--delete", "origin", "foo"][..], // force + --delete
     ] {
-        assert!(allow(a).is_none(), "pure deletion must be EXEMPT: {a:?} -> {:?}", allow(a));
+        assert!(
+            allow(a).is_none(),
+            "pure deletion must be EXEMPT: {a:?} -> {:?}",
+            allow(a)
+        );
     }
 }
 
@@ -3785,12 +3826,15 @@ fn push_force_mixed_delete_and_overwrite_stays_gated_2677_f1() {
     // `is_pure_delete_push` returns true here → these wrongly return None.
     let deny = |a: &[&str]| push_force_without_lease_violation(&vargs(a));
     for a in [
-        &["push", "--force", "origin", ":del", "real"][..],  // delete + overwrite
-        &["push", "--force", "origin", "real", ":del"][..],  // order-independent
+        &["push", "--force", "origin", ":del", "real"][..], // delete + overwrite
+        &["push", "--force", "origin", "real", ":del"][..], // order-independent
         &["push", "--force", "origin", "+:del", "real"][..], // +delete + overwrite
-        &["push", "origin", "+:del", "real"][..],            // force via + on the delete refspec
+        &["push", "origin", "+:del", "real"][..],           // force via + on the delete refspec
     ] {
-        assert!(deny(a).is_some(), "mixed delete+overwrite must stay GATED: {a:?}");
+        assert!(
+            deny(a).is_some(),
+            "mixed delete+overwrite must stay GATED: {a:?}"
+        );
     }
 }
 
@@ -3803,7 +3847,7 @@ fn is_pure_delete_push_is_all_not_any_2677_f1() {
     assert!(pure(&["push", "origin", ":a", ":b"]));
     assert!(pure(&["push", "origin", "+:a"]));
     assert!(pure(&["push", "--delete", "origin", "foo"])); // --delete → every ref a deletion
-    // a single non-delete refspec means NOT pure (force on `real` must stay gated).
+                                                           // a single non-delete refspec means NOT pure (force on `real` must stay gated).
     assert!(!pure(&["push", "origin", ":a", "real"]));
     assert!(!pure(&["push", "origin", "real", ":a"]));
     assert!(!pure(&["push", "origin", "feat/x"]));
@@ -3843,7 +3887,11 @@ fn push_force_option_value_not_misclassified_as_force_2677_f1() {
         &["push", "--push-option=+x", "origin", "feat/x"][..], // long attached (already `--`-safe)
         &["push", "-o", "ci.f", "origin", "feat/x"][..],       // separate form, control
     ] {
-        assert!(allow(a).is_none(), "push-option value ≠ force: {a:?} -> {:?}", allow(a));
+        assert!(
+            allow(a).is_none(),
+            "push-option value ≠ force: {a:?} -> {:?}",
+            allow(a)
+        );
     }
     // The fix must NOT open a reverse fail-open — genuine force STAYS denied even
     // when clustered with other short flags or sitting next to a push-option.
@@ -4076,7 +4124,8 @@ fn mixed_multi_globals_do_not_bypass_deny_27() {
 /// (`gc`) behind a global DOES fail closed. Guards allowlist/classify drift.
 #[test]
 fn known_subcommands_mirror_classify_arms_27() {
-    let unrecognized = |a: &Action| matches!(a, Action::Deny(r) if r.contains("unrecognized subcommand"));
+    let unrecognized =
+        |a: &Action| matches!(a, Action::Deny(r) if r.contains("unrecognized subcommand"));
     for sub in KNOWN_SUBCOMMANDS {
         let action = classify_argv(
             &s(&["-C", "/x", sub]),
@@ -4091,7 +4140,13 @@ fn known_subcommands_mirror_classify_arms_27() {
         );
     }
     // A real git subcommand classify has NO policy for, behind a global → fail closed.
-    let action = classify_argv(&s(&["-C", "/x", "gc"]), &Binding::default(), false, false, true);
+    let action = classify_argv(
+        &s(&["-C", "/x", "gc"]),
+        &Binding::default(),
+        false,
+        false,
+        true,
+    );
     assert!(
         unrecognized(&action),
         "unhandled `gc` behind -C must fail closed, got {action:?}"
@@ -4206,27 +4261,140 @@ fn leading_c_globals_archive_in_foreign_repo_passes_through() {
 fn known_subcommands_cover_every_classify_policy_token() {
     use crate::classify::is_readonly_local;
     const POOL: &[&str] = &[
-        "status", "log", "diff", "show", "blame", "ls-files", "ls-tree", "rev-parse", "fetch",
-        "remote", "branch", "tag", "describe", "shortlog", "reflog", "config", "help", "version",
-        "init", "clone", "push", "commit", "pull", "reset", "revert", "cherry-pick", "stash",
-        "merge", "rebase", "am", "add", "rm", "mv", "read-tree", "update-index", "apply",
-        "checkout", "switch", "worktree", "restore", "update-ref", "symbolic-ref", "submodule",
-        "submodule--helper", "archive", "cat-file", "rev-list", "show-ref", "for-each-ref",
-        "merge-base", "merge-tree", "name-rev", "ls-remote", "grep", "check-ignore",
-        "check-attr", "diff-tree", "diff-index", "diff-files", "count-objects", "fsck",
-        "verify-commit", "verify-tag", "whatchanged", "cherry", "range-diff", "format-patch",
-        "var", "hash-object", "write-tree", "commit-tree", "mktree", "mktag", "unpack-file",
-        "pack-refs", "notes", "replace", "clean", "gc", "prune", "repack", "maintenance",
-        "bisect", "sparse-checkout", "bundle", "gitk", "send-email", "difftool", "mergetool",
-        "filter-branch", "fast-import", "fast-export", "index-pack", "pack-objects",
-        "unpack-objects", "prune-packed", "multi-pack-index", "commit-graph", "fsmonitor--daemon",
-        "scalar", "credential", "daemon", "http-backend", "instaweb", "request-pull", "svn",
-        "rerere", "stripspace", "interpret-trailers", "mailinfo", "mailsplit",
-        "patch-id", "quiltimport", "shell", "show-branch", "verify-pack", "web--browse",
+        "status",
+        "log",
+        "diff",
+        "show",
+        "blame",
+        "ls-files",
+        "ls-tree",
+        "rev-parse",
+        "fetch",
+        "remote",
+        "branch",
+        "tag",
+        "describe",
+        "shortlog",
+        "reflog",
+        "config",
+        "help",
+        "version",
+        "init",
+        "clone",
+        "push",
+        "commit",
+        "pull",
+        "reset",
+        "revert",
+        "cherry-pick",
+        "stash",
+        "merge",
+        "rebase",
+        "am",
+        "add",
+        "rm",
+        "mv",
+        "read-tree",
+        "update-index",
+        "apply",
+        "checkout",
+        "switch",
+        "worktree",
+        "restore",
+        "update-ref",
+        "symbolic-ref",
+        "submodule",
+        "submodule--helper",
+        "archive",
+        "cat-file",
+        "rev-list",
+        "show-ref",
+        "for-each-ref",
+        "merge-base",
+        "merge-tree",
+        "name-rev",
+        "ls-remote",
+        "grep",
+        "check-ignore",
+        "check-attr",
+        "diff-tree",
+        "diff-index",
+        "diff-files",
+        "count-objects",
+        "fsck",
+        "verify-commit",
+        "verify-tag",
+        "whatchanged",
+        "cherry",
+        "range-diff",
+        "format-patch",
+        "var",
+        "hash-object",
+        "write-tree",
+        "commit-tree",
+        "mktree",
+        "mktag",
+        "unpack-file",
+        "pack-refs",
+        "notes",
+        "replace",
+        "clean",
+        "gc",
+        "prune",
+        "repack",
+        "maintenance",
+        "bisect",
+        "sparse-checkout",
+        "bundle",
+        "gitk",
+        "send-email",
+        "difftool",
+        "mergetool",
+        "filter-branch",
+        "fast-import",
+        "fast-export",
+        "index-pack",
+        "pack-objects",
+        "unpack-objects",
+        "prune-packed",
+        "multi-pack-index",
+        "commit-graph",
+        "fsmonitor--daemon",
+        "scalar",
+        "credential",
+        "daemon",
+        "http-backend",
+        "instaweb",
+        "request-pull",
+        "svn",
+        "rerere",
+        "stripspace",
+        "interpret-trailers",
+        "mailinfo",
+        "mailsplit",
+        "patch-id",
+        "quiltimport",
+        "shell",
+        "show-branch",
+        "verify-pack",
+        "web--browse",
     ];
     for tok in [
-        "status", "log", "diff", "show", "blame", "ls-files", "ls-tree", "rev-parse", "fetch",
-        "remote", "branch", "tag", "describe", "shortlog", "reflog",
+        "status",
+        "log",
+        "diff",
+        "show",
+        "blame",
+        "ls-files",
+        "ls-tree",
+        "rev-parse",
+        "fetch",
+        "remote",
+        "branch",
+        "tag",
+        "describe",
+        "shortlog",
+        "reflog",
     ] {
         assert!(is_readonly_local(tok), "{tok:?} should be a readonly token");
         assert!(
@@ -4312,7 +4480,13 @@ fn archive_behind_target_changing_global_stays_denied() {
 /// classifies exactly like the bare form.
 #[test]
 fn archive_behind_config_only_globals_is_still_recognised() {
-    let tail = ["archive", "--format=zip", "--prefix=prefix/", "--end-of-options", "HEAD"];
+    let tail = [
+        "archive",
+        "--format=zip",
+        "--prefix=prefix/",
+        "--end-of-options",
+        "HEAD",
+    ];
     let globals: &[&[&str]] = &[
         &["-c", "core.autocrlf=input", "-c", "core.eol=lf"],
         &["-ccore.eol=lf"],
@@ -4408,7 +4582,14 @@ fn submodule_write_unbound_must_deny_34() {
         worktree: None,
     };
     for op in [
-        "init", "update", "deinit", "add", "set-branch", "set-url", "sync", "foreach",
+        "init",
+        "update",
+        "deinit",
+        "add",
+        "set-branch",
+        "set-url",
+        "sync",
+        "foreach",
         "absorbgitdirs",
     ] {
         let args = s(&["submodule", op]);
@@ -4483,7 +4664,11 @@ fn submodule_write_has_destructive_op_slug_34() {
             "submodule {op} must have a destructive_op_slug for pre-op snapshot"
         );
     }
-    for read in [&["submodule"][..], &["submodule", "status"][..], &["submodule", "summary"][..]] {
+    for read in [
+        &["submodule"][..],
+        &["submodule", "status"][..],
+        &["submodule", "summary"][..],
+    ] {
         assert!(
             super::snapshot::destructive_op_slug(&s(read)).is_none(),
             "submodule read {read:?} must NOT have a destructive_op_slug"
@@ -4697,8 +4882,20 @@ fn binding_golden_fixtures_decode_26() {
     let agend = include_str!("../tests/fixtures/binding-agend-v1.json");
     let run = include_str!("../tests/fixtures/binding-run-v1.json");
     let cases = [
-        ("agend", agend, "/tmp/golden/worktree", "t-20260719-golden-agend", "feat/26-golden-agend"),
-        ("run", run, "/tmp/golden/run-worktree", "run-session-1789000000", "feat/26-golden-run"),
+        (
+            "agend",
+            agend,
+            "/tmp/golden/worktree",
+            "t-20260719-golden-agend",
+            "feat/26-golden-agend",
+        ),
+        (
+            "run",
+            run,
+            "/tmp/golden/run-worktree",
+            "run-session-1789000000",
+            "feat/26-golden-run",
+        ),
     ];
     for (tag, fixture, wt_placeholder, task_id, branch) in cases {
         let home = home_1651(&format!("golden-{tag}"));
@@ -4835,7 +5032,10 @@ fn canonical_event_fields_win_over_extras_26() {
     extra.insert("disposition".into(), serde_json::json!("info"));
     extra.insert("agent".into(), serde_json::json!("spoofed_agent"));
     extra.insert("subcommand".into(), serde_json::json!("spoofed_sub"));
-    extra.insert("timestamp".into(), serde_json::json!("1970-01-01T00:00:00Z"));
+    extra.insert(
+        "timestamp".into(),
+        serde_json::json!("1970-01-01T00:00:00Z"),
+    );
     extra.insert("argv".into(), serde_json::json!(["push"]));
     let ev = build_git_event("deny", "real-agent", "push", extra);
     assert_eq!(ev["kind"], "git_event", "kind is canonical");
@@ -4850,7 +5050,10 @@ fn canonical_event_fields_win_over_extras_26() {
         ev["timestamp"], "1970-01-01T00:00:00Z",
         "timestamp is canonical (now), not the injected value"
     );
-    assert_eq!(ev["argv"][0], "push", "non-reserved extras still pass through");
+    assert_eq!(
+        ev["argv"][0], "push",
+        "non-reserved extras still pass through"
+    );
 }
 
 /// #26 RED 6: the forensic/audit event types get EXPLICIT dispositions —
@@ -4950,11 +5153,7 @@ fn doc_event_disposition_table_matches_code_26() {
 // ── Arch14: cross-agent sibling read boundary unit tests ──────────────
 
 fn arch14_home(tag: &str) -> PathBuf {
-    let p = std::env::temp_dir().join(format!(
-        "agentic-git-arch14-{}-{}",
-        std::process::id(),
-        tag
-    ));
+    let p = std::env::temp_dir().join(format!("agentic-git-arch14-{}-{}", std::process::id(), tag));
     let _ = std::fs::remove_dir_all(&p);
     std::fs::create_dir_all(&p).unwrap();
     p
@@ -4974,29 +5173,50 @@ fn arch14_git(dir: &Path, args: &[&str]) {
     );
 }
 
-fn arch14_sibling_fixture(
-    home: &Path,
-) -> (PathBuf, PathBuf, PathBuf) {
+fn arch14_sibling_fixture(home: &Path) -> (PathBuf, PathBuf, PathBuf) {
     let src = home.join("source");
     std::fs::create_dir_all(&src).unwrap();
     arch14_git(&src, &["init", "-b", "main"]);
     arch14_git(
         &src,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "init"],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
     );
     let wt_a = home.join("wt-a");
     let wt_b = home.join("wt-b");
-    arch14_git(&src, &["worktree", "add", wt_a.to_str().unwrap(), "-b", "feat/a"]);
-    arch14_git(&src, &["worktree", "add", wt_b.to_str().unwrap(), "-b", "feat/b"]);
+    arch14_git(
+        &src,
+        &["worktree", "add", wt_a.to_str().unwrap(), "-b", "feat/a"],
+    );
+    arch14_git(
+        &src,
+        &["worktree", "add", wt_b.to_str().unwrap(), "-b", "feat/b"],
+    );
 
     std::fs::write(
         wt_a.join(".agend-managed"),
-        format!("agent=agent-a\nbranch=feat/a\nsource_repo={}\n", src.display()),
-    ).unwrap();
+        format!(
+            "agent=agent-a\nbranch=feat/a\nsource_repo={}\n",
+            src.display()
+        ),
+    )
+    .unwrap();
     std::fs::write(
         wt_b.join(".agend-managed"),
-        format!("agent=agent-b\nbranch=feat/b\nsource_repo={}\n", src.display()),
-    ).unwrap();
+        format!(
+            "agent=agent-b\nbranch=feat/b\nsource_repo={}\n",
+            src.display()
+        ),
+    )
+    .unwrap();
 
     (src, wt_a, wt_b)
 }
@@ -5019,7 +5239,11 @@ fn arch14_resolve_marker_walks_up_from_nested() {
     let root = home.join("wt");
     let nested = root.join("src").join("deep");
     std::fs::create_dir_all(&nested).unwrap();
-    std::fs::write(root.join(".agend-managed"), "agent=nested-agent\nbranch=x\n").unwrap();
+    std::fs::write(
+        root.join(".agend-managed"),
+        "agent=nested-agent\nbranch=x\n",
+    )
+    .unwrap();
     let (agent, found_root) = resolve_managed_marker(&nested).expect("marker via walk-up");
     assert_eq!(agent, "nested-agent");
     assert_eq!(found_root, root);
@@ -5055,7 +5279,11 @@ fn arch14_detect_sibling_denies_cross_agent_same_source() {
         worktree: Some(wt_a.to_str().unwrap().into()),
     };
     let result = detect_cross_agent_sibling_target("agent-a", &binding_a, &wt_b);
-    assert_eq!(result, Some("agent-b".into()), "cross-agent same-source must detect");
+    assert_eq!(
+        result,
+        Some("agent-b".into()),
+        "cross-agent same-source must detect"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -5071,7 +5299,11 @@ fn arch14_detect_sibling_denies_nested_path() {
         worktree: Some(wt_a.to_str().unwrap().into()),
     };
     let result = detect_cross_agent_sibling_target("agent-a", &binding_a, &nested);
-    assert_eq!(result, Some("agent-b".into()), "nested path inside sibling must detect");
+    assert_eq!(
+        result,
+        Some("agent-b".into()),
+        "nested path inside sibling must detect"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -5114,14 +5346,33 @@ fn arch14_detect_sibling_passes_different_source() {
     arch14_git(&src2, &["init", "-b", "main"]);
     arch14_git(
         &src2,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "init"],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "init",
+        ],
     );
     let wt_foreign = home.join("wt-foreign");
-    arch14_git(&src2, &["worktree", "add", wt_foreign.to_str().unwrap(), "-b", "feat/f"]);
+    arch14_git(
+        &src2,
+        &[
+            "worktree",
+            "add",
+            wt_foreign.to_str().unwrap(),
+            "-b",
+            "feat/f",
+        ],
+    );
     std::fs::write(
         wt_foreign.join(".agend-managed"),
         "agent=agent-c\nbranch=feat/f\n",
-    ).unwrap();
+    )
+    .unwrap();
     let binding_a = Binding {
         task_id: Some("t".into()),
         branch: Some("feat/a".into()),
@@ -5145,7 +5396,11 @@ fn arch14_detect_sibling_denies_symlink_into_sibling() {
         worktree: Some(wt_a.to_str().unwrap().into()),
     };
     let result = detect_cross_agent_sibling_target("agent-a", &binding_a, &alias);
-    assert_eq!(result, Some("agent-b".into()), "symlink alias into sibling must deny");
+    assert_eq!(
+        result,
+        Some("agent-b".into()),
+        "symlink alias into sibling must deny"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -5164,7 +5419,11 @@ fn arch14_detect_sibling_denies_deep_nested_path() {
         worktree: Some(wt_a.to_str().unwrap().into()),
     };
     let result = detect_cross_agent_sibling_target("agent-a", &binding_a, &deep);
-    assert_eq!(result, Some("agent-b".into()), ">64-deep nested path must still deny");
+    assert_eq!(
+        result,
+        Some("agent-b".into()),
+        ">64-deep nested path must still deny"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -5177,7 +5436,16 @@ fn arch14_detect_sibling_passes_scratch_nested_under_sibling() {
     arch14_git(&scratch, &["init", "-b", "scratch-main"]);
     arch14_git(
         &scratch,
-        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "--allow-empty", "-m", "s"],
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "s",
+        ],
     );
     let binding_a = Binding {
         task_id: Some("t".into()),
@@ -5185,7 +5453,10 @@ fn arch14_detect_sibling_passes_scratch_nested_under_sibling() {
         worktree: Some(wt_a.to_str().unwrap().into()),
     };
     let result = detect_cross_agent_sibling_target("agent-a", &binding_a, &scratch);
-    assert_eq!(result, None, "independent scratch repo nested under sibling must pass");
+    assert_eq!(
+        result, None,
+        "independent scratch repo nested under sibling must pass"
+    );
     std::fs::remove_dir_all(&home).ok();
 }
 
@@ -5212,7 +5483,9 @@ fn bare_checkout_pathspec_deny_recommends_restore_3479() {
     match action {
         Action::Deny(r) => {
             assert!(
-                r.contains("cross-branch — assigned to 'review/x', cannot switch to 'scripts/foo.js'"),
+                r.contains(
+                    "cross-branch — assigned to 'review/x', cannot switch to 'scripts/foo.js'"
+                ),
                 "existing cross-branch sentence must stay intact: {r}"
             );
             assert!(
@@ -5393,12 +5666,19 @@ fn foreign_cwd_preserves_existing_denies_and_exempts() {
         Action::Deny(_)
     ));
     // Native Passthrough (config/help/…) is untouched.
-    assert_eq!(foreign_route(&["config", "--list"], true, false), Action::Passthrough);
+    assert_eq!(
+        foreign_route(&["config", "--list"], true, false),
+        Action::Passthrough
+    );
     // #34's issue only requires foreign submodule WRITES to fail closed; it gives no
     // reason a foreign-cwd READ must be redirected, and the redirect silently reads
     // the bound worktree's submodules instead of the foreign repo's. Reads run in
     // the foreign repo; writes (incl. `foreach`, which runs arbitrary commands) deny.
-    for argv in [&["submodule"][..], &["submodule", "status"], &["submodule", "summary"]] {
+    for argv in [
+        &["submodule"][..],
+        &["submodule", "status"],
+        &["submodule", "summary"],
+    ] {
         assert_eq!(
             foreign_route(argv, true, false),
             Action::Passthrough,
@@ -5413,8 +5693,19 @@ fn foreign_cwd_leading_git_dir_or_work_tree_fails_closed() {
     // Passthrough runs argv verbatim: a leading --git-dir/--work-tree could aim a
     // newly-allowed write at canonical.
     for argv in [
-        &["--git-dir=/canon/.git", "update-ref", "refs/heads/x", "HEAD"][..],
-        &["--git-dir", "/canon/.git", "update-ref", "refs/heads/x", "HEAD"],
+        &[
+            "--git-dir=/canon/.git",
+            "update-ref",
+            "refs/heads/x",
+            "HEAD",
+        ][..],
+        &[
+            "--git-dir",
+            "/canon/.git",
+            "update-ref",
+            "refs/heads/x",
+            "HEAD",
+        ],
         &["--work-tree=/canon", "checkout", "-b", "x"],
         &["--work-tree", "/canon", "diff"],
     ] {
@@ -5427,13 +5718,23 @@ fn foreign_cwd_leading_git_dir_or_work_tree_fails_closed() {
     }
     // Plain `-C <foreign>` (the x-monorepo fixture form) is NOT a retarget guard hit.
     assert_eq!(
-        foreign_route(&["-C", "/tmp/fx", "update-ref", "refs/heads/x", "HEAD"], true, false),
+        foreign_route(
+            &["-C", "/tmp/fx", "update-ref", "refs/heads/x", "HEAD"],
+            true,
+            false
+        ),
         Action::Passthrough
     );
-    assert!(has_leading_target_override(&s(&["--git-dir=/x", "status"]), 1));
+    assert!(has_leading_target_override(
+        &s(&["--git-dir=/x", "status"]),
+        1
+    ));
     assert!(!has_leading_target_override(&s(&["-C", "/x", "status"]), 2));
     // A POST-subcommand --work-tree-looking token is an operand, not a global.
-    assert!(!has_leading_target_override(&s(&["status", "--git-dir=/x"]), 0));
+    assert!(!has_leading_target_override(
+        &s(&["status", "--git-dir=/x"]),
+        0
+    ));
 }
 
 #[test]
@@ -5481,7 +5782,10 @@ fn workspace_clone_keeps_legacy_routing() {
         Action::CleanupAndChdirPushPass(_)
     ));
     // legacy mutating-local foreign Passthrough is unchanged there too.
-    assert_eq!(foreign_route(&["commit", "-m", "m"], true, true), Action::Passthrough);
+    assert_eq!(
+        foreign_route(&["commit", "-m", "m"], true, true),
+        Action::Passthrough
+    );
 }
 
 // No subcommand → no operation to protect (or to misroute): `git --version` /
@@ -5509,10 +5813,22 @@ fn foreign_cwd_without_subcommand_is_untouched() {
 fn foreign_cwd_config_retarget_fails_closed() {
     for argv in [
         &["-c", "core.worktree=/canon", "checkout", "-b", "x"][..],
-        &["-c", "core.worktree=/canon", "update-ref", "refs/heads/x", "HEAD"],
+        &[
+            "-c",
+            "core.worktree=/canon",
+            "update-ref",
+            "refs/heads/x",
+            "HEAD",
+        ],
         &["-c", "CORE.WorkTree=/canon", "diff"],
         &["-c", "core.bare=true", "update-ref", "refs/heads/x", "HEAD"],
-        &["-c", "protocol.file.allow=always", "-c", "core.worktree=/canon", "diff"],
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "core.worktree=/canon",
+            "diff",
+        ],
         &["--config-env=core.worktree=SOME_VAR", "diff"],
         &["--config-env", "core.worktree=SOME_VAR", "diff"],
     ] {
@@ -5535,10 +5851,19 @@ fn foreign_cwd_config_retarget_fails_closed() {
             argv.join(" ")
         );
     }
-    assert!(has_leading_target_override(&s(&["-c", "core.worktree=/x", "status"]), 2));
-    assert!(!has_leading_target_override(&s(&["-c", "core.quotepath=x", "status"]), 2));
+    assert!(has_leading_target_override(
+        &s(&["-c", "core.worktree=/x", "status"]),
+        2
+    ));
+    assert!(!has_leading_target_override(
+        &s(&["-c", "core.quotepath=x", "status"]),
+        2
+    ));
     // a post-subcommand `-c` is an operand, not a global
-    assert!(!has_leading_target_override(&s(&["log", "-c", "core.worktree=/x"]), 0));
+    assert!(!has_leading_target_override(
+        &s(&["log", "-c", "core.worktree=/x"]),
+        0
+    ));
 }
 
 // ── ChdirPass must keep the caller's repo-relative subdirectory ─────────────

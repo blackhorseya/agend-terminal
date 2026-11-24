@@ -234,8 +234,7 @@ fn find_repo_root(start: &Path) -> Option<PathBuf> {
 /// symlinked directory) cannot make the prefix computation miss.
 pub(crate) fn chdir_target(worktree: &str, base: &Path) -> Result<String, String> {
     let root_fallback = || Ok(worktree.to_string());
-    let (Ok(wt), Ok(base)) = (std::fs::canonicalize(worktree), std::fs::canonicalize(base))
-    else {
+    let (Ok(wt), Ok(base)) = (std::fs::canonicalize(worktree), std::fs::canonicalize(base)) else {
         return root_fallback();
     };
     let wt_common = resolve_commondir(&wt);

@@ -616,9 +616,12 @@ pub(crate) fn apply_foreign_policy(
     let subcmd = sub_idx.and_then(|i| args.get(i)).map_or("", |s| s.as_str());
     let norm_args = sub_idx.map_or(args, |i| &args[i..]);
     let action = match sub_idx {
-        Some(i) if foreign && !workspace_clone => {
-            apply_foreign_strict(action, subcmd, norm_args, has_leading_target_override(args, i))
-        }
+        Some(i) if foreign && !workspace_clone => apply_foreign_strict(
+            action,
+            subcmd,
+            norm_args,
+            has_leading_target_override(args, i),
+        ),
         _ => action,
     };
     apply_foreign_repo_passthrough(action, subcmd, norm_args, foreign)
@@ -1747,8 +1750,7 @@ pub(crate) fn detect_cross_agent_sibling_target(
     binding: &Binding,
     target_dir: &Path,
 ) -> Option<String> {
-    let canonical = std::fs::canonicalize(target_dir)
-        .unwrap_or_else(|_| target_dir.to_path_buf());
+    let canonical = std::fs::canonicalize(target_dir).unwrap_or_else(|_| target_dir.to_path_buf());
     let (target_agent, _managed_root) = resolve_managed_marker(&canonical)?;
     if target_agent == agent {
         return None;
