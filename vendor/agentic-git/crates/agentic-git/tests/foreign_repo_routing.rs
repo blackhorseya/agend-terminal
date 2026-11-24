@@ -366,11 +366,19 @@ fn foreign_cwd_update_ref_writes_foreign_not_canonical() {
         &["update-ref", "refs/heads/probe", "HEAD"],
         &fx.real_git,
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_bound_repos_untouched(&fx, &before);
     assert!(
-        git_out(&fx.real_git, &fx.foreign, &["for-each-ref", "refs/heads/probe"])
-            .contains("refs/heads/probe"),
+        git_out(
+            &fx.real_git,
+            &fx.foreign,
+            &["for-each-ref", "refs/heads/probe"]
+        )
+        .contains("refs/heads/probe"),
         "the foreign repo must receive the ref"
     );
     std::fs::remove_dir_all(&fx.root).unwrap();
@@ -386,7 +394,11 @@ fn foreign_cwd_symbolic_ref_writes_foreign_not_canonical() {
         &["symbolic-ref", "HEAD", "refs/heads/x"],
         &fx.real_git,
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_bound_repos_untouched(&fx, &before);
     assert_eq!(
         git_out(&fx.real_git, &fx.foreign, &["symbolic-ref", "HEAD"]),
@@ -399,8 +411,17 @@ fn foreign_cwd_symbolic_ref_writes_foreign_not_canonical() {
 fn foreign_cwd_checkout_new_branch_leaves_bound_worktree_alone() {
     let fx = fixture("checkout");
     let before = bound_snapshot(&fx);
-    let out = run_shim(&fx.foreign, &fx.home, &["checkout", "-q", "-b", "change"], &fx.real_git);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run_shim(
+        &fx.foreign,
+        &fx.home,
+        &["checkout", "-q", "-b", "change"],
+        &fx.real_git,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_bound_repos_untouched(&fx, &before);
     assert_eq!(
         git_out(&fx.real_git, &fx.foreign, &["symbolic-ref", "HEAD"]),
@@ -446,7 +467,10 @@ fn foreign_cwd_git_dir_retarget_cannot_reach_canonical() {
         &[&git_dir, "update-ref", "refs/heads/evil", "HEAD"],
         &fx.real_git,
     );
-    assert!(!out.status.success(), "a --git-dir retarget from a foreign cwd must be denied");
+    assert!(
+        !out.status.success(),
+        "a --git-dir retarget from a foreign cwd must be denied"
+    );
     assert_bound_repos_untouched(&fx, &before);
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
@@ -462,7 +486,10 @@ fn foreign_cwd_core_worktree_retarget_cannot_reach_canonical() {
         &["-c", &worktree_cfg, "checkout", "-q", "-b", "evil"],
         &fx.real_git,
     );
-    assert!(!out.status.success(), "a core.worktree retarget from a foreign cwd must be denied");
+    assert!(
+        !out.status.success(),
+        "a core.worktree retarget from a foreign cwd must be denied"
+    );
     assert_bound_repos_untouched(&fx, &before);
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
@@ -481,14 +508,28 @@ fn dash_c_foreign_forms_keep_working() {
         &["-C", foreign, "diff", "--name-only", "HEAD~1", "HEAD"],
         &fx.real_git,
     );
-    assert!(diff.status.success(), "{}", String::from_utf8_lossy(&diff.stderr));
+    assert!(
+        diff.status.success(),
+        "{}",
+        String::from_utf8_lossy(&diff.stderr)
+    );
     assert_eq!(stdout(&diff), "b");
     for args in [
-        &["-C", foreign, "update-ref", "refs/remotes/origin/main", "main"][..],
+        &[
+            "-C",
+            foreign,
+            "update-ref",
+            "refs/remotes/origin/main",
+            "main",
+        ][..],
         &["-C", foreign, "checkout", "-q", "-b", "change"],
     ] {
         let out = run_shim(&fx.worktree, &fx.home, args, &fx.real_git);
-        assert!(out.status.success(), "{args:?}: {}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
     assert_bound_repos_untouched(&fx, &before);
     assert_eq!(
@@ -507,14 +548,31 @@ fn workspace_clone_cwd_keeps_legacy_routing_for_writes_and_unlisted() {
     let ws = fx.home.join("workspace").join(AGENT);
     init_repo_with_two_commits(&fx.real_git, &ws);
     let ws_before = ref_state(&fx.real_git, &ws);
-    let out = run_shim(&ws, &fx.home, &["update-ref", "refs/heads/probe", "HEAD"], &fx.real_git);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run_shim(
+        &ws,
+        &fx.home,
+        &["update-ref", "refs/heads/probe", "HEAD"],
+        &fx.real_git,
+    );
     assert!(
-        git_out(&fx.real_git, &fx.source, &["for-each-ref", "refs/heads/probe"])
-            .contains("refs/heads/probe"),
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        git_out(
+            &fx.real_git,
+            &fx.source,
+            &["for-each-ref", "refs/heads/probe"]
+        )
+        .contains("refs/heads/probe"),
         "workspace-clone update-ref keeps routing to the bound worktree's repo (#2234)"
     );
-    assert_eq!(ref_state(&fx.real_git, &ws), ws_before, "the stale clone is not touched");
+    assert_eq!(
+        ref_state(&fx.real_git, &ws),
+        ws_before,
+        "the stale clone is not touched"
+    );
     let unlisted = run_shim(&ws, &fx.home, &["frobnicate"], &fx.real_git);
     assert!(
         !String::from_utf8_lossy(&unlisted.stderr).contains("foreign repository"),

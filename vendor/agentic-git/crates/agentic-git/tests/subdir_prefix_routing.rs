@@ -19,7 +19,11 @@ const AGENT: &str = "agent-subdir";
 const FILE: &str = "pkgs/identity/domain/x.txt";
 
 fn real_git() -> PathBuf {
-    for candidate in ["/usr/bin/git", "/opt/homebrew/bin/git", "/usr/local/bin/git"] {
+    for candidate in [
+        "/usr/bin/git",
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+    ] {
         let path = PathBuf::from(candidate);
         if path.exists() {
             return path;
@@ -124,14 +128,25 @@ fn fixture(tag: &str) -> Fixture {
     std::fs::create_dir_all(source.join("pkgs/identity/domain")).unwrap();
     run_real_git(&real_git, &source, &["init", "-q", "-b", "main"]);
     run_real_git(&real_git, &source, &["config", "user.name", "test"]);
-    run_real_git(&real_git, &source, &["config", "user.email", "test@example.com"]);
+    run_real_git(
+        &real_git,
+        &source,
+        &["config", "user.email", "test@example.com"],
+    );
     std::fs::write(source.join(FILE), "original\n").unwrap();
     run_real_git(&real_git, &source, &["add", "."]);
     run_real_git(&real_git, &source, &["commit", "-q", "-m", "init"]);
     run_real_git(
         &real_git,
         &source,
-        &["worktree", "add", "-q", "-b", "agent/subdir", worktree.to_str().unwrap()],
+        &[
+            "worktree",
+            "add",
+            "-q",
+            "-b",
+            "agent/subdir",
+            worktree.to_str().unwrap(),
+        ],
     );
     std::fs::create_dir_all(source.join("only-in-canonical")).unwrap();
     write_binding(&home, "agent/subdir", &worktree, &source);
@@ -159,8 +174,17 @@ fn modify_in_worktree(fx: &Fixture) {
 #[test]
 fn subdir_show_prefix_reports_the_prefix() {
     let fx = fixture("prefix");
-    let out = run_shim(&sub(&fx), &fx.home, &["rev-parse", "--show-prefix"], &fx.real_git);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run_shim(
+        &sub(&fx),
+        &fx.home,
+        &["rev-parse", "--show-prefix"],
+        &fx.real_git,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(stdout(&out), "pkgs/identity/");
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
@@ -169,17 +193,31 @@ fn subdir_show_prefix_reports_the_prefix() {
 fn subdir_diff_quiet_on_a_modified_file_is_not_a_false_green() {
     let fx = fixture("diffquiet");
     // control: unmodified → 0
-    let clean = run_shim(&sub(&fx), &fx.home, &["diff", "--quiet", "--", "domain/x.txt"], &fx.real_git);
+    let clean = run_shim(
+        &sub(&fx),
+        &fx.home,
+        &["diff", "--quiet", "--", "domain/x.txt"],
+        &fx.real_git,
+    );
     assert_eq!(clean.status.code(), Some(0));
     modify_in_worktree(&fx);
-    let dirty = run_shim(&sub(&fx), &fx.home, &["diff", "--quiet", "--", "domain/x.txt"], &fx.real_git);
+    let dirty = run_shim(
+        &sub(&fx),
+        &fx.home,
+        &["diff", "--quiet", "--", "domain/x.txt"],
+        &fx.real_git,
+    );
     assert_eq!(
         dirty.status.code(),
         Some(1),
         "a modified file must make `git diff --quiet -- <relpath>` exit 1, not 0"
     );
     let status = run_shim(&sub(&fx), &fx.home, &["status", "--short"], &fx.real_git);
-    assert_eq!(stdout(&status), "M domain/x.txt", "status paths are relative to the subdir");
+    assert_eq!(
+        stdout(&status),
+        "M domain/x.txt",
+        "status paths are relative to the subdir"
+    );
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
 
@@ -188,16 +226,36 @@ fn subdir_checkout_and_add_accept_relative_pathspecs() {
     let fx = fixture("pathspec");
     modify_in_worktree(&fx);
     let add = run_shim(&sub(&fx), &fx.home, &["add", "domain/x.txt"], &fx.real_git);
-    assert!(add.status.success(), "add: {}", String::from_utf8_lossy(&add.stderr));
+    assert!(
+        add.status.success(),
+        "add: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
     assert_eq!(
-        stdout(&run_real_git(&fx.real_git, &fx.worktree, &["diff", "--cached", "--name-only"])),
+        stdout(&run_real_git(
+            &fx.real_git,
+            &fx.worktree,
+            &["diff", "--cached", "--name-only"]
+        )),
         FILE,
         "the relative pathspec must stage the file"
     );
     run_real_git(&fx.real_git, &fx.worktree, &["reset", "-q"]);
-    let checkout = run_shim(&sub(&fx), &fx.home, &["checkout", "--", "domain/x.txt"], &fx.real_git);
-    assert!(checkout.status.success(), "checkout: {}", String::from_utf8_lossy(&checkout.stderr));
-    assert_eq!(std::fs::read_to_string(fx.worktree.join(FILE)).unwrap(), "original\n");
+    let checkout = run_shim(
+        &sub(&fx),
+        &fx.home,
+        &["checkout", "--", "domain/x.txt"],
+        &fx.real_git,
+    );
+    assert!(
+        checkout.status.success(),
+        "checkout: {}",
+        String::from_utf8_lossy(&checkout.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.worktree.join(FILE)).unwrap(),
+        "original\n"
+    );
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
 
@@ -210,15 +268,26 @@ fn canonical_subdir_cwd_maps_to_the_same_worktree_subdir() {
         &["rev-parse", "--show-prefix"],
         &fx.real_git,
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(stdout(&out), "pkgs/identity/", "(b) mapped into the worktree's same subdir");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout(&out),
+        "pkgs/identity/",
+        "(b) mapped into the worktree's same subdir"
+    );
     let top = run_shim(
         &fx.source.join("pkgs/identity"),
         &fx.home,
         &["rev-parse", "--show-toplevel"],
         &fx.real_git,
     );
-    assert_eq!(PathBuf::from(stdout(&top)).canonicalize().unwrap(), fx.worktree);
+    assert_eq!(
+        PathBuf::from(stdout(&top)).canonicalize().unwrap(),
+        fx.worktree
+    );
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
 
@@ -233,15 +302,28 @@ fn canonical_subdir_missing_from_the_worktree_falls_back_to_the_root() {
         &["rev-parse", "--show-prefix"],
         &fx.real_git,
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(stdout(&out), "", "(b) no such subdir in the worktree → root, as before");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout(&out),
+        "",
+        "(b) no such subdir in the worktree → root, as before"
+    );
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
 
 #[test]
 fn worktree_root_cwd_keeps_an_empty_prefix() {
     let fx = fixture("root");
-    let out = run_shim(&fx.worktree, &fx.home, &["rev-parse", "--show-prefix"], &fx.real_git);
+    let out = run_shim(
+        &fx.worktree,
+        &fx.home,
+        &["rev-parse", "--show-prefix"],
+        &fx.real_git,
+    );
     assert_eq!(stdout(&out), "");
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
@@ -258,8 +340,16 @@ fn foreign_repo_subdir_is_never_mapped_into_the_worktree() {
         &["rev-parse", "--show-prefix"],
         &fx.real_git,
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(stdout(&out), "pkgs/identity/", "reads in a foreign repo stay in that repo");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        stdout(&out),
+        "pkgs/identity/",
+        "reads in a foreign repo stay in that repo"
+    );
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
 
@@ -272,10 +362,23 @@ fn foreign_repo_subdir_is_never_mapped_into_the_worktree() {
 fn leading_relative_dash_c_add_uses_the_dash_c_directory() {
     let fx = fixture("dashc-add");
     modify_in_worktree(&fx);
-    let out = run_shim(&sub(&fx), &fx.home, &["-C", "../..", "add", FILE], &fx.real_git);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run_shim(
+        &sub(&fx),
+        &fx.home,
+        &["-C", "../..", "add", FILE],
+        &fx.real_git,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(
-        stdout(&run_real_git(&fx.real_git, &fx.worktree, &["diff", "--cached", "--name-only"])),
+        stdout(&run_real_git(
+            &fx.real_git,
+            &fx.worktree,
+            &["diff", "--cached", "--name-only"]
+        )),
         FILE
     );
     std::fs::remove_dir_all(&fx.root).unwrap();
@@ -287,8 +390,17 @@ fn leading_relative_dash_c_add_uses_the_dash_c_directory() {
 fn leading_relative_dash_c_read_matches_native_git() {
     let fx = fixture("dashc-read");
     modify_in_worktree(&fx);
-    let out = run_shim(&sub(&fx), &fx.home, &["-C", "../..", "diff", "--name-only"], &fx.real_git);
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+    let out = run_shim(
+        &sub(&fx),
+        &fx.home,
+        &["-C", "../..", "diff", "--name-only"],
+        &fx.real_git,
+    );
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     assert_eq!(stdout(&out), FILE);
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
@@ -310,14 +422,21 @@ fn symlinked_worktree_subdir_cannot_redirect_a_write_into_another_repo() {
         &["add", "injected"],
         &fx.real_git,
     );
-    assert!(!out.status.success(), "an escaping mapped subdir must be denied, not run");
+    assert!(
+        !out.status.success(),
+        "an escaping mapped subdir must be denied, not run"
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("outside"),
         "deny must say the mapped directory is outside the bound worktree: {}",
         String::from_utf8_lossy(&out.stderr)
     );
     assert_eq!(
-        stdout(&run_real_git(&fx.real_git, &foreign, &["diff", "--cached", "--name-only"])),
+        stdout(&run_real_git(
+            &fx.real_git,
+            &foreign,
+            &["diff", "--cached", "--name-only"]
+        )),
         "",
         "the shim must not stage files in a repository outside the bound worktree"
     );
@@ -335,7 +454,14 @@ fn leading_relative_dash_c_checkout_uses_the_dash_c_directory() {
         &["-C", "../..", "checkout", "--", FILE],
         &fx.real_git,
     );
-    assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
-    assert_eq!(std::fs::read_to_string(fx.worktree.join(FILE)).unwrap(), "original\n");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        std::fs::read_to_string(fx.worktree.join(FILE)).unwrap(),
+        "original\n"
+    );
     std::fs::remove_dir_all(&fx.root).unwrap();
 }
