@@ -2615,8 +2615,38 @@ fn source_repo_for_worktree(wt_path: &Path) -> PathBuf {
         .to_path_buf()
 }
 
+/// Panic-safe fixture home: the directory is removed on `Drop`, so an assert
+/// failing mid-test no longer leaks the directory.
 #[cfg(unix)]
-fn release_tmp_home(name: &str) -> PathBuf {
+struct FixtureHome(PathBuf);
+
+#[cfg(unix)]
+impl std::ops::Deref for FixtureHome {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl AsRef<Path> for FixtureHome {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FixtureHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+#[cfg(unix)]
+fn release_tmp_home(name: &str) -> FixtureHome {
+    // Must stay under `$HOME`: the release path check rejects `/var`, `/tmp`
+    // and `/private` prefixes (`src/mcp/handlers/ci/release.rs`, "rejected:
+    // system path"), and macOS `temp_dir()` resolves to `/private/var/...`.
     let root = PathBuf::from(std::env::var("HOME").expect("HOME for release fixture"));
     let dir = root.join(format!(
         ".agend-nested-release-{}-{name}-{}",
@@ -2624,7 +2654,7 @@ fn release_tmp_home(name: &str) -> PathBuf {
         COUNTER.fetch_add(1, Ordering::Relaxed)
     ));
     std::fs::create_dir_all(&dir).expect("release fixture home");
-    dir
+    FixtureHome(dir)
 }
 
 /// Invoke the actual path-addressed `repo action=release` route. The fixture

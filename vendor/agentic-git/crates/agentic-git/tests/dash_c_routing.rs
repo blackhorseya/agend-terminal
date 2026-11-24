@@ -39,12 +39,35 @@ fn setup_git(dir: &Path, args: &[&str]) {
     );
 }
 
-fn fixture_home() -> PathBuf {
+/// Panic-safe fixture home: removed on `Drop`, so a failing assert no longer
+/// leaks the directory.
+struct FixtureHome(PathBuf);
+
+impl std::ops::Deref for FixtureHome {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl AsRef<Path> for FixtureHome {
+    fn as_ref(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for FixtureHome {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+fn fixture_home() -> FixtureHome {
     // pid + clock alone collide when tests of this binary run in parallel (the
     // macOS clock ticks in microseconds), so add a per-process counter.
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let home = PathBuf::from(std::env::var("HOME").expect("HOME set")).join(format!(
+    let home = std::env::temp_dir().join(format!(
         ".agend-dash-c-routing-{}-{}-{}",
         std::process::id(),
         seq,
@@ -55,7 +78,7 @@ fn fixture_home() -> PathBuf {
     ));
     std::fs::create_dir_all(&home).unwrap();
     std::fs::write(home.join(".config-integrity-key"), [7u8; 32]).unwrap();
-    home
+    FixtureHome(home)
 }
 
 fn write_signed_binding(home: &Path, worktree: &Path, source_repo: &Path) {
@@ -212,8 +235,6 @@ fn explicit_dash_c_add_and_commit_mutate_foreign_repo_only() {
         bound_status_before.stdout,
         "bound worktree state must remain unchanged"
     );
-
-    std::fs::remove_dir_all(home).unwrap();
 }
 
 /// Give the bound worktree a commit the canonical source does not have, so a
@@ -318,8 +339,6 @@ fn bound_relative_dash_c_reads_the_repo_it_names() {
         "cumulative relative -C must work"
     );
     assert_eq!(stdout_trimmed(&cumulative), "worktree-only");
-
-    std::fs::remove_dir_all(home).unwrap();
 }
 
 /// Unbound-style Passthrough and absolute `-C` keep their behaviour: an absolute
@@ -344,7 +363,6 @@ fn bound_absolute_dash_c_is_unchanged() {
         log.status.success(),
         "absolute -C cat-file must keep working"
     );
-    std::fs::remove_dir_all(home).unwrap();
 }
 
 /// r2 review P2: git defines an EMPTY `-C ""` as "do not change directory". The
@@ -374,6 +392,4 @@ fn bound_empty_dash_c_is_a_no_op() {
             "{args:?} must read like the plain form"
         );
     }
-
-    std::fs::remove_dir_all(home).unwrap();
 }
