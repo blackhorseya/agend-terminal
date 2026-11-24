@@ -92,7 +92,14 @@ impl Drop for FixtureHome {
         restore_tree_permissions(&self.0);
         if let Err(err) = std::fs::remove_dir_all(&self.0) {
             if self.0.exists() {
-                eprintln!("FixtureHome: failed to remove {}: {err}", self.0.display());
+                // `eprintln!` panics on a broken stderr pipe (SIGABRT while
+                // unwinding), so write best-effort and ignore I/O errors.
+                use std::io::Write;
+                let _ = writeln!(
+                    std::io::stderr(),
+                    "FixtureHome: failed to remove {}: {err}",
+                    self.0.display()
+                );
             }
         }
     }
