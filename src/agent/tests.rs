@@ -7082,3 +7082,71 @@ fn reaper_must_not_touch_successor_with_different_generation_deleted_false() {
 fn reaper_must_not_touch_successor_with_different_generation_deleted_true() {
     reaper_vs_successor_probe(true);
 }
+
+/// RED (-73 B'): when the reaped handle is no longer in the registry (someone
+/// else already evicted it), the reaper must treat that as "already claimed"
+/// and do NOTHING — in particular it must not spawn a shell fallback.
+///
+/// Today `wait_for_process_exit` maps "not in registry" to `Some(0)`, which
+/// `classify_exit` turns into `UserExit`; `is_startup_failure` is false for an
+/// absent entry, so `on_clean_exit_shell_fallback` runs and registers a fresh
+/// shell under the same name.
+#[test]
+#[cfg(unix)]
+#[allow(clippy::unwrap_used)]
+fn reaper_must_not_spawn_shell_fallback_when_entry_already_removed() {
+    use std::collections::HashMap;
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = crate::types::InstanceId::new();
+    let g1 = crate::agent::crash_disposition::owner_generation_source().next();
+    let deleted_old = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let core_old = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+        vterm: VTerm::new(80, 24),
+        subscribers: Vec::new(),
+        state: StateTracker::new(None),
+        health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+
+    /// Reap whatever the reaper registered, even if an assertion panics.
+    struct RegistryGuard(AgentRegistry);
+    impl Drop for RegistryGuard {
+        fn drop(&mut self) {
+            let handles: Vec<AgentHandle> = self.0.lock().drain().map(|(_, h)| h).collect();
+            for h in handles {
+                let mut c = h.child.lock();
+                if let Some(pid) = c.process_id() {
+                    crate::process::kill_process_tree(pid);
+                }
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+    let _guard = RegistryGuard(Arc::clone(&registry));
+
+    handle_pty_close(
+        "reaper-removed",
+        &id,
+        &registry,
+        &None,
+        &None,
+        &None,
+        &deleted_old,
+        &core_old,
+        g1,
+    );
+
+    let names: Vec<String> = registry
+        .lock()
+        .values()
+        .map(|h| h.name.to_string())
+        .collect();
+    assert!(
+        names.is_empty(),
+        "reaper must not register anything after its own entry was already \
+         removed (no shell fallback); registry now holds: {names:?}"
+    );
+}
