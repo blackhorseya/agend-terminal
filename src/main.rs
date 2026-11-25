@@ -123,7 +123,7 @@ mod team_ops_tests;
 mod team_order;
 mod team_view;
 mod teams;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 mod test_fixture;
 mod thread_census;
 mod token_cost;
