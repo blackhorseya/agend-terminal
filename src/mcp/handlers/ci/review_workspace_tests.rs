@@ -1053,7 +1053,7 @@ fn checkout_disposable_review_persists_provenance_and_terminal_release_deletes()
 /// `release_guard_tmp` in `ci/tests.rs`: it is compile-time stable, so a sibling
 /// test that reassigns `$HOME` mid-run cannot move it underneath us.
 #[cfg(unix)]
-fn releasable_home(tag: &str) -> std::path::PathBuf {
+fn releasable_home(tag: &str) -> crate::test_fixture::FixtureDir {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let dir = manifest.parent().unwrap_or(manifest).join(format!(
         ".agend-roundtrip-{tag}-{}-{}",
@@ -1064,7 +1064,31 @@ fn releasable_home(tag: &str) -> std::path::PathBuf {
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&dir).expect("fixture root");
-    dir
+    // Drop-based cleanup survives a panicking test; the old trailing
+    // `remove_dir_all(..).ok()` did not.
+    crate::test_fixture::FixtureDir::new(dir)
+}
+
+/// A `releasable_home` fixture must not outlive a test that panics mid-way
+/// (cleanup used to be a trailing `remove_dir_all(..).ok()` a panic skips).
+#[test]
+#[cfg(unix)]
+fn releasable_home_is_removed_when_the_test_panics() {
+    let slot = std::sync::Mutex::new(None::<std::path::PathBuf>);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let dir = releasable_home("panic-safe");
+        *slot.lock().unwrap() = Some(dir.to_path_buf());
+        panic!("simulated mid-test assertion failure");
+    }));
+    assert!(outcome.is_err(), "the closure must have panicked");
+    let leaked = slot.lock().unwrap().clone().expect("fixture path recorded");
+    let still_there = leaked.exists();
+    // Never leave residue behind, even when this test is the one failing.
+    let _ = std::fs::remove_dir_all(&leaked);
+    assert!(
+        !still_there,
+        "releasable_home fixture leaked after a panic: {leaked:?}"
+    );
 }
 
 /// The public round trip this lane is named for: `repo action=checkout` and
@@ -1185,9 +1209,6 @@ fn checkout_then_public_repo_release_round_trip_marker_symmetry() {
         !crate::git_helpers::git_ok(&source, &["rev-parse", "--verify", "review/roundtrip"]),
         "the disposable review branch must be deleted: {released}"
     );
-
-    std::fs::remove_dir_all(&home).ok();
-    std::fs::remove_dir_all(&parent).ok();
 }
 
 #[test]
