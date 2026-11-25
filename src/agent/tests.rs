@@ -3738,8 +3738,12 @@ fn pty_read_error_triggers_cleanup() {
 }
 
 // ── Rank4 bug-audit spike follow-up: lock the `handle_pty_close` source-side
-// `deleted` guard — the ONLY net that stops `restart_instance` from
-// double-spawning.
+// `deleted` guard — the earliest net that stops `restart_instance` from
+// double-spawning. (Since the generation-scoped reaper, #57, it is no longer the
+// only one: a reaper whose entry was removed or replaced by a successor now
+// returns early as `ExitWait::Evicted`, and shell fallback registers only into a
+// vacant slot. The `deleted` guard still matters for the case where the entry is
+// still present and owned.)
 //
 // WHY THIS MATTERS — do NOT move or delete these without re-reading the Rank4
 // double-spawn spike conclusion:
@@ -3751,7 +3755,7 @@ fn pty_read_error_triggers_cleanup() {
 //   these source-side tests remain the first guard because a deleted handle must
 //   never publish a recovery wake in the first place.
 //
-//   The ONLY reliable protection is the SOURCE guard inside `handle_pty_close`:
+//   The earliest and most precise protection is the SOURCE guard inside `handle_pty_close`:
 //   it checks the OLD handle's OWN `deleted` Arc — captured by Arc identity at
 //   spawn (`Arc::clone(&h.deleted)`), NOT a by-name registry lookup — BEFORE it
 //   classifies the exit, so the torn-down process emits NO exit event at all.
@@ -7282,4 +7286,57 @@ fn stale_fallback_must_not_overwrite_successor_published_before_spawn() {
         successor_alive,
         "successor child must survive the stale fallback"
     );
+}
+
+/// PR #57 r2 (reviewer's unmeasured "cleanup vs name-keyed port" window): the
+/// name-keyed IPC port file must be unlinked only while the id is vacant, with
+/// the check made under the registry lock. A successor that is already
+/// registered keeps its port; a vacant id has its port removed.
+///
+/// Note: this pins the helper's contract. The exact interleaving (successor
+/// registers and publishes between `remove_owned_and_unregister` and the
+/// unlink) cannot be forced without a production hook, so it is not driven
+/// end-to-end here.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn port_file_is_removed_only_while_the_id_is_vacant() {
+    use std::collections::HashMap;
+    let home = std::env::temp_dir().join(format!("agend-port-vacant-{}", uuid::Uuid::new_v4()));
+    let run_dir = crate::daemon::run_dir(&home);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let name = "port-vacant";
+    let id = crate::types::InstanceId::new();
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Occupied: a registered successor keeps its port file.
+    let (successor, _) = {
+        let mut h = mk_test_handle(name, id);
+        h.generation = crash_disposition::owner_generation_source().next();
+        (h, ())
+    };
+    let child = Arc::clone(&successor.child);
+    registry.lock().insert(id, successor);
+    crate::ipc::write_port(&run_dir, name, 4321).unwrap();
+    remove_port_if_vacant(name, &id, &registry, &Some(home.clone()));
+    assert_eq!(
+        crate::ipc::read_port(&run_dir, name),
+        Some(4321),
+        "an occupied id must keep its port file"
+    );
+
+    // Vacant: the port file is removed.
+    registry.lock().remove(&id);
+    remove_port_if_vacant(name, &id, &registry, &Some(home.clone()));
+    assert_eq!(
+        crate::ipc::read_port(&run_dir, name),
+        None,
+        "a vacant id must have its port file removed"
+    );
+
+    {
+        let mut c = child.lock();
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    std::fs::remove_dir_all(&home).ok();
 }

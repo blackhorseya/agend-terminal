@@ -1235,6 +1235,64 @@ pub(crate) fn spawn_agent_with_capture_home(
     capture_home: Option<&std::path::Path>,
     capture_done: Option<crossbeam_channel::Sender<()>>,
 ) -> anyhow::Result<crate::types::InstanceId> {
+    spawn_agent_admitted(
+        config,
+        registry,
+        capture_home,
+        capture_done,
+        SpawnAdmission::Always,
+    )
+}
+
+/// Registration policy of a spawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnAdmission {
+    /// Ordinary spawn: registers unconditionally (replacing any entry).
+    Always,
+    /// Shell fallback of a reaped handle: register only if the id is still
+    /// vacant. The reaper's `cleanup_agent` proved ownership only at the instant
+    /// it removed its own entry; a competing spawn may publish a successor
+    /// before this spawn is admitted to the transport lane, and the fallback
+    /// must never overwrite it.
+    VacantOnly,
+}
+
+/// Returned (inside `anyhow::Error`) by a [`SpawnAdmission::VacantOnly`] spawn
+/// that found the id already taken by someone else. It is not a spawn failure:
+/// the caller must not emit crash/clean-exit events or tear down by name.
+#[derive(Debug)]
+struct SlotOccupied;
+
+impl std::fmt::Display for SlotOccupied {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("registry slot already taken by a successor; spawn not admitted")
+    }
+}
+
+impl std::error::Error for SlotOccupied {}
+
+/// Shell-fallback spawn: like [`spawn_agent`] but refuses (with [`SlotOccupied`])
+/// to register over an existing entry for the same id. See [`SpawnAdmission`].
+fn spawn_agent_if_vacant(
+    config: &SpawnConfig,
+    registry: &AgentRegistry,
+) -> anyhow::Result<crate::types::InstanceId> {
+    spawn_agent_admitted(
+        config,
+        registry,
+        config.home,
+        None,
+        SpawnAdmission::VacantOnly,
+    )
+}
+
+fn spawn_agent_admitted(
+    config: &SpawnConfig,
+    registry: &AgentRegistry,
+    capture_home: Option<&std::path::Path>,
+    capture_done: Option<crossbeam_channel::Sender<()>>,
+    admission: SpawnAdmission,
+) -> anyhow::Result<crate::types::InstanceId> {
     let SpawnConfig {
         name,
         backend: _,
@@ -1282,6 +1340,19 @@ pub(crate) fn spawn_agent_with_capture_home(
             anyhow::bail!(
                 "#1915: refusing to spawn '{name}' — instance entered deletion after lane admission"
             );
+        }
+    }
+
+    // Vacancy-only spawns re-check INSIDE the lane, before any side effect. A
+    // competing spawn that already held the lane has published its registration
+    // by now (the lane is released only after its rollback commits), so this
+    // refuses before `build_command` can touch the successor's files. The
+    // authoritative check is repeated under the registry lock at registration.
+    if admission == SpawnAdmission::VacantOnly {
+        let id = resolve_spawn_instance_id(*home, name)?;
+        if lock_registry(registry).contains_key(&id) {
+            drop(transport_generation_guard);
+            return Err(SlotOccupied.into());
         }
     }
 
@@ -1432,6 +1503,17 @@ pub(crate) fn spawn_agent_with_capture_home(
     // Register in registry
     {
         let mut reg = lock_registry(registry);
+        if admission == SpawnAdmission::VacantOnly && reg.contains_key(&instance_id) {
+            // Someone published this id between the admission check and now
+            // (e.g. a spawn that does not use the transport lane). Do not
+            // overwrite. Returning here, before `mark_registered`, makes the
+            // armed `SpawnRollback` kill+reap the child we just spawned without
+            // touching the registry; only the writer registration needs undoing.
+            drop(reg);
+            #[cfg(unix)]
+            write_actor::unregister(&pty_writer);
+            return Err(SlotOccupied.into());
+        }
         reg.insert(
             instance_id,
             AgentHandle {
@@ -2278,6 +2360,25 @@ fn remove_owned_and_unregister(
     removed.is_some()
 }
 
+/// Delete the name-keyed IPC port file only while the id is still vacant, with
+/// the registry lock held across the check and the unlink. A successor publishes
+/// its port only after it is registered (which needs this same lock), so either
+/// we observe it and leave its port alone, or we unlink first and it republishes
+/// afterwards. The unlink is a leaf syscall; holding the registry lock for it
+/// adds no lock edge.
+fn remove_port_if_vacant(
+    name: &str,
+    id: &crate::types::InstanceId,
+    registry: &AgentRegistry,
+    home: &Option<std::path::PathBuf>,
+) {
+    let Some(ref home) = home else { return };
+    let reg = lock_registry(registry);
+    if !reg.contains_key(id) {
+        crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
+    }
+}
+
 /// Generation-scoped cleanup. Returns `false` (and touches nothing, including
 /// the IPC port file keyed by name) when the entry is no longer ours.
 fn cleanup_agent(
@@ -2290,9 +2391,7 @@ fn cleanup_agent(
     if !remove_owned_and_unregister(registry, id, generation) {
         return false;
     }
-    if let Some(ref home) = home {
-        crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
-    }
+    remove_port_if_vacant(name, id, registry, home);
     true
 }
 
@@ -2416,7 +2515,7 @@ fn on_clean_exit_shell_fallback(
     }
 
     let shell = crate::default_shell();
-    let spawn_result = spawn_agent(
+    let spawn_result = spawn_agent_if_vacant(
         &SpawnConfig {
             name,
             backend: None,
@@ -2446,6 +2545,15 @@ fn on_clean_exit_shell_fallback(
                     .name(format!("{n}_tui"))
                     .spawn(move || crate::daemon::serve_agent_tui(&n, &rdir, &reg));
             }
+        }
+        Err(e) if e.downcast_ref::<SlotOccupied>().is_some() => {
+            // A successor took the id after our cleanup. It owns recovery and
+            // teardown: emit no clean-exit/crash event, never DELETE by name
+            // (that would remove the successor), and leave its port alone.
+            tracing::info!(
+                agent = name,
+                "successor registered before shell fallback; fallback skipped"
+            );
         }
         Err(e) => {
             tracing::warn!(agent = name, error = %e, "shell fallback failed");
