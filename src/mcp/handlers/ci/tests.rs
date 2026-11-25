@@ -48,9 +48,12 @@ fn validate_release_path_rejects_shallow() {
     assert!(result.is_err(), "/tmp must be rejected: {:?}", result);
 }
 
-#[test]
+/// Body of the non-worktree deep-dir refusal test, split out so the panic-safety
+/// test below can drive it with an injected mid-test failure. `seen` records the
+/// fixture root; `fail_midway` panics after the fixture exists, like a failing
+/// assert would.
 #[cfg(unix)]
-fn validate_release_path_refuses_non_worktree_deep_dir_83936() {
+fn refuse_non_worktree_deep_dir(seen: &mut Option<std::path::PathBuf>, fail_midway: bool) {
     // #t-…83936-6: SEMANTIC TIGHTENING (was `..._accepts_deep_existing`, which
     // asserted a plain deep dir is ACCEPTED — that permissive accept is exactly
     // what let a canonical repo through to the `remove_dir_all` fallback). Under
@@ -62,12 +65,40 @@ fn validate_release_path_refuses_non_worktree_deep_dir_83936() {
         std::path::PathBuf::from(home).join(format!(".agend-release-test-{}", std::process::id()));
     let deep = dir.join("sub");
     std::fs::create_dir_all(&deep).ok();
+    *seen = Some(dir.clone());
+    if fail_midway {
+        panic!("simulated mid-test assertion failure");
+    }
     let result = super::validate_release_path(deep.to_str().expect("valid UTF-8"));
     assert!(
         result.is_err(),
         "a non-worktree deep dir must now be REFUSED (whitelist), got {result:?}"
     );
     std::fs::remove_dir_all(&dir).ok();
+}
+
+#[test]
+#[cfg(unix)]
+fn validate_release_path_refuses_non_worktree_deep_dir_83936() {
+    refuse_non_worktree_deep_dir(&mut None, false);
+}
+
+/// A failing assert mid-test must not leave `.agend-release-test-{pid}` behind.
+#[test]
+#[cfg(unix)]
+fn non_worktree_deep_dir_fixture_is_removed_when_the_test_panics() {
+    let mut seen = None;
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        refuse_non_worktree_deep_dir(&mut seen, true);
+    }));
+    assert!(outcome.is_err(), "the closure must have panicked");
+    let leaked = seen.expect("fixture path recorded");
+    let still_there = leaked.exists();
+    command_remove_dir_all_for_test(&leaked);
+    assert!(
+        !still_there,
+        "non-worktree deep-dir fixture leaked after a panic: {leaked:?}"
+    );
 }
 
 // ── #t-…83936-6 P0: NEVER release a primary/main working tree ───────────────
