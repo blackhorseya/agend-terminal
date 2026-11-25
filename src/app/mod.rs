@@ -1116,7 +1116,18 @@ fn kill_unmanaged_agents(
 ) {
     let drained: Vec<(String, crate::daemon::ChildHandle)> = instance_ids
         .into_iter()
-        .filter_map(|instance_id| agent::remove_and_unregister(registry, &instance_id))
+        .filter_map(|instance_id| {
+            // Mark the handle deleted BEFORE evicting it (same order as the
+            // daemon DELETE path, `lifecycle.rs`): once the entry is gone the
+            // PTY-close reaper reads "not in registry" as a clean user exit
+            // and would spawn an orphan same-name shell fallback.
+            if let Some(handle) = agent::lock_registry(registry).get(&instance_id) {
+                handle
+                    .deleted
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            agent::remove_and_unregister(registry, &instance_id)
+        })
         .map(|handle| (handle.name.to_string(), handle.child))
         .collect();
     if drained.is_empty() {
