@@ -1087,6 +1087,28 @@ mod tests {
         cleanup_agent(&ctx, "meta-stale");
     }
 
+    /// -301: `cleanup_agent` must set `deleted` before killing, otherwise the
+    /// reaper cannot find the removed entry, treats the exit as a clean user
+    /// exit and re-registers a same-name shell fallback.
+    #[test]
+    fn cleanup_agent_does_not_let_reaper_respawn_same_name_301() {
+        let name = "cleanup-no-respawn";
+        let (ctx, _home) = test_ctx_with_agent(name);
+        std::thread::sleep(std::time::Duration::from_millis(500));
+        cleanup_agent(&ctx, name);
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while std::time::Instant::now() < deadline {
+            let reg = agent::lock_registry(ctx.registry);
+            assert!(
+                !reg.values().any(|h| h.name.as_str() == name),
+                "reaper respawned '{name}' after cleanup_agent"
+            );
+            drop(reg);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+    }
+
     #[test]
     fn spawn_with_no_prior_metadata_does_not_panic() {
         let (ctx, home) = test_ctx_with_agent("meta-fresh");
