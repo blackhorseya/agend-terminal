@@ -21,10 +21,18 @@ mod executable;
 #[allow(unused_imports)]
 pub use dismiss::try_dismiss_dialog;
 pub(crate) mod crash_disposition;
+mod reaper;
+mod spawn_admission;
 use dismiss::{
     dismiss_scan_armed, dismiss_scan_scope, is_dismissible_prompt_state, prepare_dismiss_patterns,
     try_prepared_dismiss_dialog_with_cooldown, PreparedDismissPattern,
 };
+use reaper::{
+    cleanup_agent, is_startup_failure, sweep_child_tree, wait_for_process_exit, ExitWait,
+};
+#[cfg(test)]
+use reaper::{remove_port_if_vacant, startup_failure_from};
+use spawn_admission::{SlotOccupied, SpawnAdmission};
 
 pub mod deleting;
 pub(crate) mod deletion_recovery;
@@ -1235,6 +1243,37 @@ pub(crate) fn spawn_agent_with_capture_home(
     capture_home: Option<&std::path::Path>,
     capture_done: Option<crossbeam_channel::Sender<()>>,
 ) -> anyhow::Result<crate::types::InstanceId> {
+    spawn_agent_admitted(
+        config,
+        registry,
+        capture_home,
+        capture_done,
+        SpawnAdmission::Always,
+    )
+}
+
+/// Shell-fallback spawn: like [`spawn_agent`] but refuses (with [`SlotOccupied`])
+/// to register over an existing entry for the same id. See [`SpawnAdmission`].
+fn spawn_agent_if_vacant(
+    config: &SpawnConfig,
+    registry: &AgentRegistry,
+) -> anyhow::Result<crate::types::InstanceId> {
+    spawn_agent_admitted(
+        config,
+        registry,
+        config.home,
+        None,
+        SpawnAdmission::VacantOnly,
+    )
+}
+
+fn spawn_agent_admitted(
+    config: &SpawnConfig,
+    registry: &AgentRegistry,
+    capture_home: Option<&std::path::Path>,
+    capture_done: Option<crossbeam_channel::Sender<()>>,
+    admission: SpawnAdmission,
+) -> anyhow::Result<crate::types::InstanceId> {
     let SpawnConfig {
         name,
         backend: _,
@@ -1282,6 +1321,19 @@ pub(crate) fn spawn_agent_with_capture_home(
             anyhow::bail!(
                 "#1915: refusing to spawn '{name}' — instance entered deletion after lane admission"
             );
+        }
+    }
+
+    // Vacancy-only spawns re-check INSIDE the lane, before any side effect. A
+    // competing spawn that already held the lane has published its registration
+    // by now (the lane is released only after its rollback commits), so this
+    // refuses before `build_command` can touch the successor's files. The
+    // authoritative check is repeated under the registry lock at registration.
+    if admission == SpawnAdmission::VacantOnly {
+        let id = resolve_spawn_instance_id(*home, name)?;
+        if lock_registry(registry).contains_key(&id) {
+            drop(transport_generation_guard);
+            return Err(SlotOccupied.into());
         }
     }
 
@@ -1432,6 +1484,17 @@ pub(crate) fn spawn_agent_with_capture_home(
     // Register in registry
     {
         let mut reg = lock_registry(registry);
+        if admission == SpawnAdmission::VacantOnly && reg.contains_key(&instance_id) {
+            // Someone published this id between the admission check and now
+            // (e.g. a spawn that does not use the transport lane). Do not
+            // overwrite. Returning here, before `mark_registered`, makes the
+            // armed `SpawnRollback` kill+reap the child we just spawned without
+            // touching the registry; only the writer registration needs undoing.
+            drop(reg);
+            #[cfg(unix)]
+            write_actor::unregister(&pty_writer);
+            return Err(SlotOccupied.into());
+        }
         reg.insert(
             instance_id,
             AgentHandle {
@@ -2122,23 +2185,6 @@ fn pty_read_loop(
     );
 }
 
-/// Sprint 21 F-NEW1: kill the process tree rooted at the agent's child PID,
-/// if still registered. Looks up the PID through the registry → child mutex
-/// chain, then delegates to [`crate::process::kill_process_tree`] (PR-U #158).
-///
-/// No-op if the agent is not in the registry (already cleaned up) or if the
-/// child has no live PID (already reaped). Idempotent on dead PIDs — safe to
-/// call multiple times during the same crash-detection sequence.
-fn sweep_child_tree(id: &crate::types::InstanceId, registry: &AgentRegistry) {
-    let pid: Option<u32> = {
-        let reg = lock_registry(registry);
-        reg.get(id).and_then(|h| h.child.lock().process_id())
-    };
-    if let Some(pid) = pid {
-        crate::process::kill_process_tree(pid);
-    }
-}
-
 /// Handle PTY close: determine if crash, graceful exit, or daemon shutdown.
 /// Exit classification for handle_pty_close dispatch.
 // pub(crate) + derives so the daemon respawn tests can assert on the real
@@ -2187,29 +2233,6 @@ pub(crate) fn classify_exit(exit_code: Option<i32>) -> ExitKind {
     }
 }
 
-fn wait_for_process_exit(
-    name: &str,
-    id: &crate::types::InstanceId,
-    registry: &AgentRegistry,
-) -> Option<i32> {
-    for _ in 0..20 {
-        let reg = lock_registry(registry);
-        if reg.get(id).is_none() {
-            tracing::debug!(agent = name, "not in registry, skipping crash handling");
-            return Some(0);
-        }
-        if let Some(handle) = reg.get(id) {
-            let mut c = handle.child.lock();
-            if let Ok(Some(status)) = c.try_wait() {
-                return Some(status.exit_code() as i32);
-            }
-        }
-        drop(reg);
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    None
-}
-
 /// Eviction chokepoint -- see `write_actor::remove_and_unregister`'s doc.
 #[cfg(unix)]
 pub(crate) fn remove_and_unregister(
@@ -2225,46 +2248,6 @@ pub(crate) fn remove_and_unregister(
     id: &crate::types::InstanceId,
 ) -> Option<AgentHandle> {
     lock_registry(registry).remove(id)
-}
-
-fn cleanup_agent(
-    name: &str,
-    id: &crate::types::InstanceId,
-    registry: &AgentRegistry,
-    home: &Option<std::path::PathBuf>,
-) {
-    remove_and_unregister(registry, id);
-    if let Some(ref home) = home {
-        crate::ipc::remove_port(&crate::daemon::run_dir(home), name);
-    }
-}
-
-/// Pure startup-grace decision, split out of [`is_startup_failure`] so it is
-/// unit-testable without a live registry / PTY-backed `AgentHandle` (which can't
-/// be constructed in a unit test). An exit is a startup FAILURE — meaning NO
-/// shell fallback — when the agent has been up < 5s AND no user input arrived
-/// since it was spawned. `uptime` is `(elapsed, spawned_at_epoch_ms)` for the
-/// agent, or `None` when it is absent from the registry.
-fn startup_failure_from(uptime: Option<(std::time::Duration, u64)>, last_input_at_ms: u64) -> bool {
-    match uptime {
-        // Input at/after the spawn epoch is a real user session → not a startup
-        // failure. Input timestamped before the spawn epoch is stale (a prior
-        // session) and must NOT suppress the startup-failure path.
-        Some((elapsed, spawned_at_epoch_ms)) => {
-            elapsed < std::time::Duration::from_secs(5) && last_input_at_ms < spawned_at_epoch_ms
-        }
-        None => false,
-    }
-}
-
-fn is_startup_failure(name: &str, id: &crate::types::InstanceId, registry: &AgentRegistry) -> bool {
-    let uptime = {
-        let reg = lock_registry(registry);
-        reg.get(id)
-            .map(|h| (h.spawned_at.elapsed(), h.spawned_at_epoch_ms))
-    };
-    let last_input_at_ms = crate::daemon::heartbeat_pair::snapshot_for(name).last_input_at_ms;
-    startup_failure_from(uptime, last_input_at_ms)
 }
 
 fn on_startup_failure(
@@ -2295,6 +2278,7 @@ fn on_startup_failure(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn on_clean_exit_shell_fallback(
     name: &str,
     id: &crate::types::InstanceId,
@@ -2303,6 +2287,7 @@ fn on_clean_exit_shell_fallback(
     home: &Option<std::path::PathBuf>,
     crash_tx: &Option<CrashChannel>,
     shutdown: &Option<Arc<std::sync::atomic::AtomicBool>>,
+    generation: crash_disposition::SpawnGeneration,
 ) {
     tracing::info!(
         agent = name,
@@ -2316,6 +2301,7 @@ fn on_clean_exit_shell_fallback(
     let (cols, rows) = {
         let reg = lock_registry(registry);
         reg.get(id)
+            .filter(|h| h.generation == generation)
             .map(|h| {
                 // registry → core order; `c` is a short non-self-IPC temporary
                 // (vterm dims read) dropped at the closure end. Safe per the
@@ -2340,10 +2326,17 @@ fn on_clean_exit_shell_fallback(
             })
     });
 
-    cleanup_agent(name, id, registry, home);
+    if !cleanup_agent(name, id, registry, home, generation) {
+        // Entry was removed/replaced since the exit check: not ours to replace.
+        tracing::info!(
+            agent = name,
+            "entry no longer ours, skipping shell fallback"
+        );
+        return;
+    }
 
     let shell = crate::default_shell();
-    let spawn_result = spawn_agent(
+    let spawn_result = spawn_agent_if_vacant(
         &SpawnConfig {
             name,
             backend: None,
@@ -2373,6 +2366,15 @@ fn on_clean_exit_shell_fallback(
                     .name(format!("{n}_tui"))
                     .spawn(move || crate::daemon::serve_agent_tui(&n, &rdir, &reg));
             }
+        }
+        Err(e) if e.downcast_ref::<SlotOccupied>().is_some() => {
+            // A successor took the id after our cleanup. It owns recovery and
+            // teardown: emit no clean-exit/crash event, never DELETE by name
+            // (that would remove the successor), and leave its port alone.
+            tracing::info!(
+                agent = name,
+                "successor registered before shell fallback; fallback skipped"
+            );
         }
         Err(e) => {
             tracing::warn!(agent = name, error = %e, "shell fallback failed");
@@ -2423,7 +2425,7 @@ fn handle_pty_close(
         .unwrap_or(false);
     if is_shutdown {
         tracing::info!(agent = name, "stopped (daemon shutdown)");
-        cleanup_agent(name, id, registry, home);
+        cleanup_agent(name, id, registry, home, generation);
         return;
     }
 
@@ -2431,13 +2433,20 @@ fn handle_pty_close(
     // #t-41673 gap-instrument: time the per-agent exit wait so a slow child reap
     // is attributable in the restart-freeze breakdown. Pure tracing.
     let exit_wait_started = std::time::Instant::now();
-    let exit_code = wait_for_process_exit(name, id, registry);
+    let exit_wait = wait_for_process_exit(name, id, registry, generation);
     tracing::info!(
         agent = name,
         exit_wait_ms = exit_wait_started.elapsed().as_millis() as u64,
         "process exit wait complete"
     );
-    sweep_child_tree(id, registry);
+    let exit_code = match exit_wait {
+        ExitWait::Exited(code) => Some(code),
+        ExitWait::NoExit => None,
+        // The entry was removed or replaced by someone else: they own teardown
+        // and recovery. Do not sweep, classify, fall back, or clean up.
+        ExitWait::Evicted => return,
+    };
+    sweep_child_tree(id, registry, generation);
 
     if deleted.load(std::sync::atomic::Ordering::SeqCst) {
         tracing::info!(agent = name, "agent deleted, skipping shell fallback");
@@ -2456,7 +2465,7 @@ fn handle_pty_close(
 
     match classify_exit(exit_code) {
         ExitKind::UserExit => {
-            if is_startup_failure(name, id, registry) {
+            if is_startup_failure(name, id, registry, generation) {
                 on_startup_failure(
                     &crash_disposition::CrashObservation {
                         instance_id: *id,
@@ -2471,7 +2480,7 @@ fn handle_pty_close(
                 );
             } else {
                 on_clean_exit_shell_fallback(
-                    name, id, exit_code, registry, home, crash_tx, shutdown,
+                    name, id, exit_code, registry, home, crash_tx, shutdown, generation,
                 );
             }
         }
@@ -2504,7 +2513,7 @@ fn handle_pty_close(
                     false,
                 );
             }
-            cleanup_agent(name, id, registry, home);
+            cleanup_agent(name, id, registry, home, generation);
         }
         ExitKind::Crash => {
             on_crash_exit(

@@ -1118,9 +1118,11 @@ fn kill_unmanaged_agents(
         .into_iter()
         .filter_map(|instance_id| {
             // Mark the handle deleted BEFORE evicting it (same order as the
-            // daemon DELETE path, `lifecycle.rs`): once the entry is gone the
-            // PTY-close reaper reads "not in registry" as a clean user exit
-            // and would spawn an orphan same-name shell fallback.
+            // daemon DELETE path, `lifecycle.rs`). The generation-scoped
+            // PTY-close reaper now treats a missing/replaced entry as `Evicted`
+            // and does nothing, so this ordering is defence in depth: it still
+            // suppresses the shell fallback and crash recovery for the case where
+            // the reaper observes the entry before it is evicted.
             if let Some(handle) = agent::lock_registry(registry).get(&instance_id) {
                 handle
                     .deleted

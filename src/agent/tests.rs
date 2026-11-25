@@ -1423,7 +1423,11 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
     );
 
     // Invoke the new helper. Should kill the entire process group.
-    sweep_child_tree(&agent_id, &registry);
+    sweep_child_tree(
+        &agent_id,
+        &registry,
+        crate::agent::crash_disposition::SpawnGeneration::default(),
+    );
 
     // Reap the shell child so kill(pid, 0) doesn't see it as a zombie.
     // Use the bounded try_wait loop so a stuck child fails this iteration
@@ -1591,7 +1595,11 @@ fn sweep_child_tree_unregistered_name_is_no_op() {
     use std::collections::HashMap;
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     // Should not panic, should not error.
-    sweep_child_tree(&crate::types::InstanceId::default(), &registry);
+    sweep_child_tree(
+        &crate::types::InstanceId::default(),
+        &registry,
+        crate::agent::crash_disposition::SpawnGeneration::default(),
+    );
 }
 
 /// §3.5.10 concurrent-state fixture: multi-threaded producer/consumer
@@ -3730,8 +3738,12 @@ fn pty_read_error_triggers_cleanup() {
 }
 
 // ── Rank4 bug-audit spike follow-up: lock the `handle_pty_close` source-side
-// `deleted` guard — the ONLY net that stops `restart_instance` from
-// double-spawning.
+// `deleted` guard — the earliest net that stops `restart_instance` from
+// double-spawning. (Since the generation-scoped reaper, #57, it is no longer the
+// only one: a reaper whose entry was removed or replaced by a successor now
+// returns early as `ExitWait::Evicted`, and shell fallback registers only into a
+// vacant slot. The `deleted` guard still matters for the case where the entry is
+// still present and owned.)
 //
 // WHY THIS MATTERS — do NOT move or delete these without re-reading the Rank4
 // double-spawn spike conclusion:
@@ -3743,7 +3755,7 @@ fn pty_read_error_triggers_cleanup() {
 //   these source-side tests remain the first guard because a deleted handle must
 //   never publish a recovery wake in the first place.
 //
-//   The ONLY reliable protection is the SOURCE guard inside `handle_pty_close`:
+//   The earliest and most precise protection is the SOURCE guard inside `handle_pty_close`:
 //   it checks the OLD handle's OWN `deleted` Arc — captured by Arc identity at
 //   spawn (`Arc::clone(&h.deleted)`), NOT a by-name registry lookup — BEFORE it
 //   classifies the exit, so the torn-down process emits NO exit event at all.
@@ -6983,4 +6995,348 @@ fn pty_read_loop_dev_modal_dismissed_even_if_in_cooldown_after_idle_3616() {
         b"\r\r",
         "PR #3616 F2: dev modal arriving in cooldown past idle must retry upon cooldown expiry even without subsequent PTY output"
     );
+}
+
+/// RED spike (-73 hypothesis 2): a stale reaper must not touch a successor.
+///
+/// `restart` rebuilds a handle under the SAME fleet `InstanceId`. If the old
+/// reaper's `handle_pty_close` runs while the registry already holds that
+/// successor, the id-only helpers (`wait_for_process_exit`, `sweep_child_tree`,
+/// `cleanup_agent`) resolve to the SUCCESSOR, not the handle being reaped.
+/// `generation` is passed in but never compared against the registry entry.
+///
+/// The successor's child is a real long-lived `sleep 300` under generation G2;
+/// the reaper is invoked with G1 != G2. Both observations are recorded before
+/// asserting so one run reports registry survival AND child liveness.
+#[cfg(unix)]
+#[allow(clippy::unwrap_used)]
+fn reaper_vs_successor_probe(deleted_old: bool) {
+    use std::collections::HashMap;
+
+    /// Always reap the successor's child, even when an assertion panics.
+    struct ChildGuard(Arc<Mutex<Box<dyn portable_pty::Child + Send>>>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let mut c = self.0.lock();
+            if let Some(pid) = c.process_id() {
+                crate::process::kill_process_tree(pid);
+            }
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    let id = crate::types::InstanceId::new();
+    let g1 = crate::agent::crash_disposition::owner_generation_source().next();
+    let g2 = crate::agent::crash_disposition::owner_generation_source().next();
+    assert_ne!(g1, g2);
+
+    let mut cmd = CommandBuilder::new("sleep");
+    cmd.arg("300");
+    let mut successor = mk_test_handle_over("reaper-successor", id, cmd, "sleep");
+    successor.generation = g2;
+    let successor_child = Arc::clone(&successor.child);
+    let _guard = ChildGuard(Arc::clone(&successor_child));
+    assert!(
+        successor_child.lock().try_wait().unwrap().is_none(),
+        "fixture: successor child must be alive before the stale reaper runs"
+    );
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    registry.lock().insert(id, successor);
+
+    // The OLD handle's own Arcs; it is no longer in the registry.
+    let deleted_old_flag = Arc::new(std::sync::atomic::AtomicBool::new(deleted_old));
+    let core_old = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+        vterm: VTerm::new(80, 24),
+        subscribers: Vec::new(),
+        state: StateTracker::new(None),
+        health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+
+    let started = std::time::Instant::now();
+    handle_pty_close(
+        "reaper-successor",
+        &id,
+        &registry,
+        &None,
+        &None,
+        &None,
+        &deleted_old_flag,
+        &core_old,
+        g1,
+    );
+    let elapsed = started.elapsed();
+
+    let still_registered = registry
+        .lock()
+        .get(&id)
+        .map(|h| h.generation == g2 && Arc::ptr_eq(&h.child, &successor_child));
+    let child_alive = matches!(successor_child.lock().try_wait(), Ok(None));
+
+    assert!(
+        still_registered == Some(true) && child_alive,
+        "stale reaper (G1, deleted_old={deleted_old}) touched successor (G2) after {elapsed:?}: \
+         registry_still_holds_successor={still_registered:?} successor_child_alive={child_alive}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn reaper_must_not_touch_successor_with_different_generation_deleted_false() {
+    reaper_vs_successor_probe(false);
+}
+
+#[test]
+#[cfg(unix)]
+fn reaper_must_not_touch_successor_with_different_generation_deleted_true() {
+    reaper_vs_successor_probe(true);
+}
+
+/// RED (-73 B'): when the reaped handle is no longer in the registry (someone
+/// else already evicted it), the reaper must treat that as "already claimed"
+/// and do NOTHING — in particular it must not spawn a shell fallback.
+///
+/// Today `wait_for_process_exit` maps "not in registry" to `Some(0)`, which
+/// `classify_exit` turns into `UserExit`; `is_startup_failure` is false for an
+/// absent entry, so `on_clean_exit_shell_fallback` runs and registers a fresh
+/// shell under the same name.
+#[test]
+#[cfg(unix)]
+#[allow(clippy::unwrap_used)]
+fn reaper_must_not_spawn_shell_fallback_when_entry_already_removed() {
+    use std::collections::HashMap;
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let id = crate::types::InstanceId::new();
+    let g1 = crate::agent::crash_disposition::owner_generation_source().next();
+    let deleted_old = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let core_old = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+        vterm: VTerm::new(80, 24),
+        subscribers: Vec::new(),
+        state: StateTracker::new(None),
+        health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+
+    /// Reap whatever the reaper registered, even if an assertion panics.
+    struct RegistryGuard(AgentRegistry);
+    impl Drop for RegistryGuard {
+        fn drop(&mut self) {
+            let handles: Vec<AgentHandle> = self.0.lock().drain().map(|(_, h)| h).collect();
+            for h in handles {
+                let mut c = h.child.lock();
+                if let Some(pid) = c.process_id() {
+                    crate::process::kill_process_tree(pid);
+                }
+                let _ = c.kill();
+                let _ = c.wait();
+            }
+        }
+    }
+    let _guard = RegistryGuard(Arc::clone(&registry));
+
+    handle_pty_close(
+        "reaper-removed",
+        &id,
+        &registry,
+        &None,
+        &None,
+        &None,
+        &deleted_old,
+        &core_old,
+        g1,
+    );
+
+    let names: Vec<String> = registry
+        .lock()
+        .values()
+        .map(|h| h.name.to_string())
+        .collect();
+    assert!(
+        names.is_empty(),
+        "reaper must not register anything after its own entry was already \
+         removed (no shell fallback); registry now holds: {names:?}"
+    );
+}
+
+/// RED (PR #57 r2, third-reviewer P1): a stale fallback must not overwrite a
+/// successor that was published after its own cleanup.
+///
+/// `cleanup_agent` succeeding only proves ownership at the instant of removal.
+/// The fallback then queues on the transport lane inside `spawn_agent`; if a
+/// competing spawn (holding that lane) publishes generation G2 for the same id
+/// first, the stale G1 fallback used to run its unconditional `reg.insert` and
+/// replace G2 with G3. The competing spawn is modelled by holding the real
+/// transport lane and inserting a live G2 handle while the fallback is blocked.
+/// Adapted from the reviewer's `fallback-race.rs` probe.
+#[test]
+#[cfg(unix)]
+#[allow(clippy::unwrap_used)]
+fn stale_fallback_must_not_overwrite_successor_published_before_spawn() {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Reap every child this test owns, even if an assertion panics.
+    struct OwnedChildren(Vec<crate::daemon::ChildHandle>);
+    impl Drop for OwnedChildren {
+        fn drop(&mut self) {
+            for child in &self.0 {
+                let mut c = child.lock();
+                if matches!(c.try_wait(), Ok(None)) {
+                    if let Some(pid) = c.process_id() {
+                        crate::process::kill_process_tree(pid);
+                    }
+                    let _ = c.kill();
+                }
+                let _ = c.wait();
+            }
+        }
+    }
+
+    let name = "stale-fallback-race";
+    let home = std::env::temp_dir().join(format!("agend-stale-fallback-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&home).unwrap();
+    let id = crate::types::InstanceId::new();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!("instances:\n  {name}:\n    id: {}\n", id.full()),
+    )
+    .unwrap();
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let g1 = crash_disposition::owner_generation_source().next();
+    let g2 = crash_disposition::owner_generation_source().next();
+
+    let mut old = mk_test_handle(name, id);
+    old.generation = g1;
+    old.spawned_at = Instant::now() - Duration::from_secs(10);
+    let old_core = Arc::clone(&old.core);
+    let old_deleted = Arc::clone(&old.deleted);
+    let mut children = OwnedChildren(vec![Arc::clone(&old.child)]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while matches!(old.child.lock().try_wait(), Ok(None)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    registry.lock().insert(id, old);
+
+    // The competing successor spawn owns the real transport lane, so the stale
+    // fallback blocks at its spawn admission right after its cleanup.
+    let lane = crate::daemon::delivery_worker::begin_transport_generation_transition(&home, name);
+    let reaper_registry = Arc::clone(&registry);
+    let reaper_home = home.clone();
+    let done = Arc::new(AtomicBool::new(false));
+    let done_worker = Arc::clone(&done);
+    let worker = std::thread::spawn(move || {
+        handle_pty_close(
+            name,
+            &id,
+            &reaper_registry,
+            &Some(reaper_home),
+            &None,
+            &None,
+            &old_deleted,
+            &old_core,
+            g1,
+        );
+        done_worker.store(true, Ordering::SeqCst);
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while registry.lock().contains_key(&id) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let cleanup_completed = !registry.lock().contains_key(&id);
+
+    let mut cmd = CommandBuilder::new("sleep");
+    cmd.arg("300");
+    let mut successor = mk_test_handle_over(name, id, cmd, "sleep");
+    successor.generation = g2;
+    let successor_child = Arc::clone(&successor.child);
+    children.0.push(Arc::clone(&successor_child));
+    // The competing spawn publishes G2 while it still holds the lane.
+    registry.lock().insert(id, successor);
+    drop(lane);
+    worker.join().unwrap();
+
+    let observed = registry.lock().get(&id).map(|h| h.generation);
+    let successor_alive = matches!(successor_child.lock().try_wait(), Ok(None));
+    // Reap whatever else got registered (a replacing shell, in the buggy case).
+    let leftovers: Vec<_> = registry.lock().drain().map(|(_, h)| h).collect();
+    for h in leftovers {
+        h.deleted.store(true, Ordering::SeqCst);
+        children.0.push(Arc::clone(&h.child));
+    }
+    drop(children);
+    std::fs::remove_dir_all(&home).ok();
+
+    assert!(
+        cleanup_completed,
+        "probe never reached the cleanup boundary"
+    );
+    assert!(done.load(Ordering::SeqCst));
+    assert_eq!(
+        observed,
+        Some(g2),
+        "stale G1 fallback replaced G2 after cleanup; successor_child_alive={successor_alive}"
+    );
+    assert!(
+        successor_alive,
+        "successor child must survive the stale fallback"
+    );
+}
+
+/// PR #57 r2 (reviewer's unmeasured "cleanup vs name-keyed port" window): the
+/// name-keyed IPC port file must be unlinked only while the id is vacant, with
+/// the check made under the registry lock. A successor that is already
+/// registered keeps its port; a vacant id has its port removed.
+///
+/// Note: this pins the helper's contract. The exact interleaving (successor
+/// registers and publishes between `remove_owned_and_unregister` and the
+/// unlink) cannot be forced without a production hook, so it is not driven
+/// end-to-end here.
+#[test]
+#[allow(clippy::unwrap_used)]
+fn port_file_is_removed_only_while_the_id_is_vacant() {
+    use std::collections::HashMap;
+    let home = std::env::temp_dir().join(format!("agend-port-vacant-{}", uuid::Uuid::new_v4()));
+    let run_dir = crate::daemon::run_dir(&home);
+    std::fs::create_dir_all(&run_dir).unwrap();
+    let name = "port-vacant";
+    let id = crate::types::InstanceId::new();
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+
+    // Occupied: a registered successor keeps its port file.
+    let (successor, _) = {
+        let mut h = mk_test_handle(name, id);
+        h.generation = crash_disposition::owner_generation_source().next();
+        (h, ())
+    };
+    let child = Arc::clone(&successor.child);
+    registry.lock().insert(id, successor);
+    crate::ipc::write_port(&run_dir, name, 4321).unwrap();
+    remove_port_if_vacant(name, &id, &registry, &Some(home.clone()));
+    assert_eq!(
+        crate::ipc::read_port(&run_dir, name),
+        Some(4321),
+        "an occupied id must keep its port file"
+    );
+
+    // Vacant: the port file is removed.
+    registry.lock().remove(&id);
+    remove_port_if_vacant(name, &id, &registry, &Some(home.clone()));
+    assert_eq!(
+        crate::ipc::read_port(&run_dir, name),
+        None,
+        "a vacant id must have its port file removed"
+    );
+
+    {
+        let mut c = child.lock();
+        let _ = c.kill();
+        let _ = c.wait();
+    }
+    std::fs::remove_dir_all(&home).ok();
 }
