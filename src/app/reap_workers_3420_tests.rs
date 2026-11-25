@@ -238,3 +238,87 @@ fn close_then_quit_reaps_unmanaged_child_before_return_3420() {
     );
     std::fs::remove_dir_all(home).ok();
 }
+
+/// Unmanaged-close respawn witness: closing a scratch/overlay shell must NOT
+/// leave the PTY-close reaper free to run its clean-exit shell fallback.
+///
+/// `kill_unmanaged_agents` evicts the exact registry entry and then
+/// terminates the child, but (unlike the daemon DELETE path, which stores
+/// `deleted = true` before it kills) it never marks the handle deleted. The
+/// reaper thread `spawn_agent` started for the shell then sees: shutdown flag
+/// false, `wait_for_process_exit` -> entry gone -> `Some(0)` (UserExit),
+/// `is_startup_failure` -> false, and `on_clean_exit_shell_fallback` spawns a
+/// brand-new same-name shell (home=None mints a fresh UUID) that no pane owns.
+///
+/// The fixture mirrors `pane_factory`'s `UnmanagedLocalShell`: home=None,
+/// crash_tx=None, shutdown flag present and false (a private flag, so a
+/// sibling test's `app_teardown` cannot flip it and make this vacuous).
+#[cfg(unix)]
+#[test]
+fn closing_unmanaged_shell_does_not_respawn_orphan_shell() {
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let name = "scratch-unmanaged-respawn";
+    let id = agent::spawn_agent(
+        &agent::SpawnConfig {
+            name,
+            backend: None,
+            backend_command: crate::default_shell(),
+            args: &[],
+            spawn_mode: crate::backend::SpawnMode::Fresh,
+            cols: 80,
+            rows: 24,
+            env: None,
+            working_dir: None,
+            submit_key: "\r",
+            home: None,
+            crash_tx: None,
+            shutdown: Some(Arc::clone(&shutdown)),
+        },
+        &registry,
+    )
+    .expect("spawn unmanaged shell fixture");
+
+    // A real pane has been running for a while when the operator closes it.
+    std::thread::sleep(std::time::Duration::from_millis(500));
+
+    let mut reap_workers = Vec::new();
+    kill_unmanaged_agents(&registry, [id], &mut reap_workers);
+
+    // Poll for a same-name entry under a DIFFERENT id (the orphan fallback).
+    let mut orphan_ids = Vec::new();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while std::time::Instant::now() < deadline {
+        orphan_ids = agent::lock_registry(&registry)
+            .iter()
+            .filter(|(k, h)| **k != id && &*h.name == name)
+            .map(|(k, _)| *k)
+            .collect();
+        if !orphan_ids.is_empty() {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    // Cleanup FIRST (before asserting) so a failing run leaks no child: mark
+    // every same-name handle deleted so no further fallback chain starts,
+    // then evict and terminate them.
+    let leftovers: Vec<_> = agent::lock_registry(&registry)
+        .iter()
+        .filter(|(_, h)| &*h.name == name)
+        .map(|(k, h)| {
+            h.deleted.store(true, std::sync::atomic::Ordering::SeqCst);
+            *k
+        })
+        .collect();
+    kill_unmanaged_agents(&registry, leftovers, &mut reap_workers);
+    for worker in reap_workers {
+        worker.join().ok();
+    }
+
+    assert!(
+        orphan_ids.is_empty(),
+        "closing an unmanaged shell must not let the reaper respawn a same-name \
+         orphan shell; found orphan registry ids: {orphan_ids:?}"
+    );
+}
