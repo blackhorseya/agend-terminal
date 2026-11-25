@@ -6984,3 +6984,101 @@ fn pty_read_loop_dev_modal_dismissed_even_if_in_cooldown_after_idle_3616() {
         "PR #3616 F2: dev modal arriving in cooldown past idle must retry upon cooldown expiry even without subsequent PTY output"
     );
 }
+
+/// RED spike (-73 hypothesis 2): a stale reaper must not touch a successor.
+///
+/// `restart` rebuilds a handle under the SAME fleet `InstanceId`. If the old
+/// reaper's `handle_pty_close` runs while the registry already holds that
+/// successor, the id-only helpers (`wait_for_process_exit`, `sweep_child_tree`,
+/// `cleanup_agent`) resolve to the SUCCESSOR, not the handle being reaped.
+/// `generation` is passed in but never compared against the registry entry.
+///
+/// The successor's child is a real long-lived `sleep 300` under generation G2;
+/// the reaper is invoked with G1 != G2. Both observations are recorded before
+/// asserting so one run reports registry survival AND child liveness.
+#[cfg(unix)]
+#[allow(clippy::unwrap_used)]
+fn reaper_vs_successor_probe(deleted_old: bool) {
+    use std::collections::HashMap;
+
+    /// Always reap the successor's child, even when an assertion panics.
+    struct ChildGuard(Arc<Mutex<Box<dyn portable_pty::Child + Send>>>);
+    impl Drop for ChildGuard {
+        fn drop(&mut self) {
+            let mut c = self.0.lock();
+            if let Some(pid) = c.process_id() {
+                crate::process::kill_process_tree(pid);
+            }
+            let _ = c.kill();
+            let _ = c.wait();
+        }
+    }
+
+    let id = crate::types::InstanceId::new();
+    let g1 = crate::agent::crash_disposition::owner_generation_source().next();
+    let g2 = crate::agent::crash_disposition::owner_generation_source().next();
+    assert_ne!(g1, g2);
+
+    let mut cmd = CommandBuilder::new("sleep");
+    cmd.arg("300");
+    let mut successor = mk_test_handle_over("reaper-successor", id, cmd, "sleep");
+    successor.generation = g2;
+    let successor_child = Arc::clone(&successor.child);
+    let _guard = ChildGuard(Arc::clone(&successor_child));
+    assert!(
+        successor_child.lock().try_wait().unwrap().is_none(),
+        "fixture: successor child must be alive before the stale reaper runs"
+    );
+
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    registry.lock().insert(id, successor);
+
+    // The OLD handle's own Arcs; it is no longer in the registry.
+    let deleted_old_flag = Arc::new(std::sync::atomic::AtomicBool::new(deleted_old));
+    let core_old = Arc::new(crate::sync_audit::CoreMutex::new(AgentCore {
+        vterm: VTerm::new(80, 24),
+        subscribers: Vec::new(),
+        state: StateTracker::new(None),
+        health: HealthTracker::new(),
+        api_activity: crate::agent::ApiActivity::default(),
+        observed_status: None,
+    }));
+
+    let started = std::time::Instant::now();
+    handle_pty_close(
+        "reaper-successor",
+        &id,
+        &registry,
+        &None,
+        &None,
+        &None,
+        &deleted_old_flag,
+        &core_old,
+        g1,
+    );
+    let elapsed = started.elapsed();
+
+    let still_registered = registry
+        .lock()
+        .get(&id)
+        .map(|h| h.generation == g2 && Arc::ptr_eq(&h.child, &successor_child));
+    let child_alive = matches!(successor_child.lock().try_wait(), Ok(None));
+
+    assert!(
+        still_registered == Some(true) && child_alive,
+        "stale reaper (G1, deleted_old={deleted_old}) touched successor (G2) after {elapsed:?}: \
+         registry_still_holds_successor={still_registered:?} successor_child_alive={child_alive}"
+    );
+}
+
+#[test]
+#[cfg(unix)]
+fn reaper_must_not_touch_successor_with_different_generation_deleted_false() {
+    reaper_vs_successor_probe(false);
+}
+
+#[test]
+#[cfg(unix)]
+fn reaper_must_not_touch_successor_with_different_generation_deleted_true() {
+    reaper_vs_successor_probe(true);
+}
