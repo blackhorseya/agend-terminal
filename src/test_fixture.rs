@@ -56,6 +56,20 @@ impl AsRef<Path> for FixtureDir {
     }
 }
 
+/// Diagnostic to emit when the final `remove_dir_all` of `path` failed with
+/// `err`, or `None` when nothing needs reporting.
+#[cfg(unix)]
+fn leftover_report(path: &Path, err: &std::io::Error) -> Option<String> {
+    if path.exists() {
+        Some(format!(
+            "FixtureDir: failed to remove {}: {err}",
+            path.display()
+        ))
+    } else {
+        None
+    }
+}
+
 #[cfg(unix)]
 impl Drop for FixtureDir {
     fn drop(&mut self) {
@@ -66,16 +80,75 @@ impl Drop for FixtureDir {
         // and retry. Never panic in `Drop` (a double panic aborts).
         restore_tree_permissions(&self.0);
         if let Err(err) = std::fs::remove_dir_all(&self.0) {
-            if self.0.exists() {
+            if let Some(msg) = leftover_report(&self.0, &err) {
                 // `eprintln!` panics on a broken stderr pipe (SIGABRT while
                 // unwinding), so write best-effort and ignore I/O errors.
                 use std::io::Write;
-                let _ = writeln!(
-                    std::io::stderr(),
-                    "FixtureDir: failed to remove {}: {err}",
-                    self.0.display()
-                );
+                let _ = writeln!(std::io::stderr(), "{msg}");
             }
         }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// Restores the parent's mode on every exit path (including a failing
+    /// assert) so the surrounding tempdir can always be deleted.
+    struct ModeRestore(PathBuf);
+    impl Drop for ModeRestore {
+        fn drop(&mut self) {
+            let _ = std::fs::set_permissions(&self.0, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// A parent without search permission makes the fixture unreachable, so
+    /// `exists()` answers false while the directory is still on disk. That is
+    /// "cannot confirm it is gone", which must be reported, not swallowed.
+    #[test]
+    fn unconfirmable_removal_is_reported() {
+        let root = std::env::temp_dir().join(format!(
+            "agend-fixture-dir-unsearchable-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let parent = root.join("parent");
+        let fixture = parent.join("fixture");
+        std::fs::create_dir_all(&fixture).expect("mkdir fixture");
+        let _restore = ModeRestore(parent.clone());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o000))
+            .expect("chmod parent 000");
+        let err = std::fs::remove_dir_all(&fixture).expect_err("unreachable fixture");
+        let report = leftover_report(&fixture, &err);
+        // Restore before asserting so the residue below is always cleaned.
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).ok();
+        let still_there = fixture.exists();
+        let _ = std::fs::remove_dir_all(&root);
+        assert!(still_there, "probe premise: the fixture must still exist");
+        assert!(
+            report.is_some(),
+            "removal failed on an unreachable path but nothing would be reported"
+        );
+    }
+
+    /// Negative control: a path that is positively gone stays silent.
+    #[test]
+    fn confirmed_missing_path_is_not_reported() {
+        let gone = std::env::temp_dir().join(format!(
+            "agend-fixture-dir-gone-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let err = std::fs::remove_dir_all(&gone).expect_err("missing path");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+        assert_eq!(leftover_report(&gone, &err), None);
     }
 }
