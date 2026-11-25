@@ -1067,6 +1067,28 @@ fn releasable_home(tag: &str) -> std::path::PathBuf {
     dir
 }
 
+/// A `releasable_home` fixture must not outlive a test that panics mid-way
+/// (cleanup used to be a trailing `remove_dir_all(..).ok()` a panic skips).
+#[test]
+#[cfg(unix)]
+fn releasable_home_is_removed_when_the_test_panics() {
+    let slot = std::sync::Mutex::new(None::<std::path::PathBuf>);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let dir = releasable_home("panic-safe");
+        *slot.lock().unwrap() = Some(dir.to_path_buf());
+        panic!("simulated mid-test assertion failure");
+    }));
+    assert!(outcome.is_err(), "the closure must have panicked");
+    let leaked = slot.lock().unwrap().clone().expect("fixture path recorded");
+    let still_there = leaked.exists();
+    // Never leave residue behind, even when this test is the one failing.
+    let _ = std::fs::remove_dir_all(&leaked);
+    assert!(
+        !still_there,
+        "releasable_home fixture leaked after a panic: {leaked:?}"
+    );
+}
+
 /// The public round trip this lane is named for: `repo action=checkout` and
 /// `repo action=release`, the two entries an agent actually calls, driven end to
 /// end against each other.

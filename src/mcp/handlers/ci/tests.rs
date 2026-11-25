@@ -140,6 +140,57 @@ fn release_guard_tmp_is_stable_and_outside_this_repo() {
     std::fs::remove_dir_all(&dir).ok();
 }
 
+/// A fixture whose test panics (an assert failing mid-test) must not leak its
+/// directory under the manifest parent (`~/.agend/worktrees` for agent runs).
+/// Cleanup used to be a trailing `remove_dir_all(..).ok()` that a panic skips.
+#[cfg(unix)]
+#[test]
+fn release_guard_tmp_is_removed_when_the_test_panics() {
+    let slot = std::sync::Mutex::new(None::<std::path::PathBuf>);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let dir = release_guard_tmp("panic-safe");
+        *slot.lock().unwrap() = Some(dir.to_path_buf());
+        panic!("simulated mid-test assertion failure");
+    }));
+    assert!(outcome.is_err(), "the closure must have panicked");
+    let leaked = slot.lock().unwrap().clone().expect("fixture path recorded");
+    let still_there = leaked.exists();
+    // Never leave residue behind, even when this test is the one failing.
+    command_remove_dir_all_for_test(&leaked);
+    assert!(
+        !still_there,
+        "release_guard_tmp fixture leaked after a panic: {leaked:?}"
+    );
+}
+
+/// `managed_wt_fixture` is what most release tests actually call; it must
+/// carry the same panic-safe cleanup through its returned tuple.
+#[cfg(unix)]
+#[test]
+fn managed_wt_fixture_is_removed_when_the_test_panics() {
+    let slot = std::sync::Mutex::new(None::<std::path::PathBuf>);
+    let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let (base, _home, _repo, _wt) = managed_wt_fixture("panic-safe-wt");
+        *slot.lock().unwrap() = Some(base.to_path_buf());
+        panic!("simulated mid-test assertion failure");
+    }));
+    assert!(outcome.is_err(), "the closure must have panicked");
+    let leaked = slot.lock().unwrap().clone().expect("fixture path recorded");
+    let still_there = leaked.exists();
+    command_remove_dir_all_for_test(&leaked);
+    assert!(
+        !still_there,
+        "managed_wt_fixture leaked after a panic: {leaked:?}"
+    );
+}
+
+/// Residue cleanup for the two panic-safety tests above, so a RED run does not
+/// itself pollute the directory it is reporting on.
+#[cfg(unix)]
+fn command_remove_dir_all_for_test(path: &Path) {
+    let _ = std::fs::remove_dir_all(path);
+}
+
 #[cfg(unix)]
 fn release_guard_git_init(dir: &Path) {
     std::fs::create_dir_all(dir).ok();
