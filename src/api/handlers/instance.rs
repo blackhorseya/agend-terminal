@@ -433,6 +433,9 @@ mod tests {
         if let Some(id) = id {
             let mut reg = agent::lock_registry(ctx.registry);
             if let Some(h) = reg.get(&id) {
+                // Mirror production DELETE (daemon/lifecycle.rs): set `deleted`
+                // before kill so the reaper skips the shell fallback respawn.
+                h.deleted.store(true, std::sync::atomic::Ordering::SeqCst);
                 let _ = h.child.lock().kill();
             }
             reg.remove(&id);
