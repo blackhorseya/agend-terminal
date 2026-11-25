@@ -58,15 +58,23 @@ impl AsRef<Path> for FixtureDir {
 
 /// Diagnostic to emit when the final `remove_dir_all` of `path` failed with
 /// `err`, or `None` when nothing needs reporting.
+///
+/// Silent only when `path` is positively confirmed gone (`NotFound`). Any
+/// other outcome of the probe, such as `PermissionDenied` because a parent
+/// lost search permission, means "cannot confirm" and is reported:
+/// `Path::exists()` folds those errors into `false` and would hide residue.
 #[cfg(unix)]
 fn leftover_report(path: &Path, err: &std::io::Error) -> Option<String> {
-    if path.exists() {
-        Some(format!(
+    match std::fs::symlink_metadata(path) {
+        Err(probe) if probe.kind() == std::io::ErrorKind::NotFound => None,
+        Ok(_) => Some(format!(
             "FixtureDir: failed to remove {}: {err}",
             path.display()
-        ))
-    } else {
-        None
+        )),
+        Err(probe) => Some(format!(
+            "FixtureDir: failed to remove {}: {err} (cannot confirm it is gone: {probe})",
+            path.display()
+        )),
     }
 }
 
