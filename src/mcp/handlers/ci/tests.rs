@@ -60,21 +60,24 @@ fn refuse_non_worktree_deep_dir(seen: &mut Option<std::path::PathBuf>, fail_midw
     // the whitelist, validate now accepts ONLY a real linked worktree; a deep
     // non-worktree dir is refused. The positive control (a legit linked worktree
     // IS accepted) is `handle_release_repo_still_removes_linked_worktree_83936`.
-    let home = std::env::var("HOME").expect("HOME must be set");
-    let dir =
-        std::path::PathBuf::from(home).join(format!(".agend-release-test-{}", std::process::id()));
+    // Anchored by `release_guard_tmp` (compile-time manifest parent, outside any
+    // repo, immune to `$HOME` mutation) and cleaned up by Drop, so a panic or
+    // failed assert cannot leak it. NOT `temp_dir`: `/var`→`/private` would hit
+    // the system-prefix check and mask the whitelist guard under test.
+    let dir = release_guard_tmp("deep-non-worktree");
+    *seen = Some(dir.to_path_buf());
     let deep = dir.join("sub");
     std::fs::create_dir_all(&deep).ok();
-    *seen = Some(dir.clone());
     if fail_midway {
         panic!("simulated mid-test assertion failure");
     }
     let result = super::validate_release_path(deep.to_str().expect("valid UTF-8"));
+    // Pin the refusal REASON: it must be the whitelist, not system-prefix/shallow.
+    let err = result.expect_err("a non-worktree deep dir must now be REFUSED (whitelist)");
     assert!(
-        result.is_err(),
-        "a non-worktree deep dir must now be REFUSED (whitelist), got {result:?}"
+        err.contains("not a releasable linked worktree"),
+        "must be refused by the whitelist, not another guard: {err}"
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[test]
