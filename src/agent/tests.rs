@@ -1423,7 +1423,11 @@ fn sweep_child_tree_body(pid_file: &std::path::Path) {
     );
 
     // Invoke the new helper. Should kill the entire process group.
-    sweep_child_tree(&agent_id, &registry);
+    sweep_child_tree(
+        &agent_id,
+        &registry,
+        crate::agent::crash_disposition::SpawnGeneration::default(),
+    );
 
     // Reap the shell child so kill(pid, 0) doesn't see it as a zombie.
     // Use the bounded try_wait loop so a stuck child fails this iteration
@@ -1591,7 +1595,11 @@ fn sweep_child_tree_unregistered_name_is_no_op() {
     use std::collections::HashMap;
     let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
     // Should not panic, should not error.
-    sweep_child_tree(&crate::types::InstanceId::default(), &registry);
+    sweep_child_tree(
+        &crate::types::InstanceId::default(),
+        &registry,
+        crate::agent::crash_disposition::SpawnGeneration::default(),
+    );
 }
 
 /// §3.5.10 concurrent-state fixture: multi-threaded producer/consumer
