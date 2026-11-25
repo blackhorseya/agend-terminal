@@ -2358,6 +2358,7 @@ fn on_startup_failure(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn on_clean_exit_shell_fallback(
     name: &str,
     id: &crate::types::InstanceId,
