@@ -88,7 +88,7 @@ fn validate_release_path_refuses_non_worktree_deep_dir_83936() {
 // non-repo guard below could no longer be exercised.
 
 #[cfg(unix)]
-fn release_guard_tmp(tag: &str) -> std::path::PathBuf {
+fn release_guard_tmp(tag: &str) -> crate::test_fixture::FixtureDir {
     let manifest = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let d = manifest.parent().unwrap_or(manifest).join(format!(
         ".agend-release-guard-{tag}-{}-{}",
@@ -99,7 +99,9 @@ fn release_guard_tmp(tag: &str) -> std::path::PathBuf {
             .unwrap_or(0)
     ));
     std::fs::create_dir_all(&d).ok();
-    d
+    // Drop-based cleanup survives a panicking test; the old trailing
+    // `remove_dir_all(..).ok()` did not.
+    crate::test_fixture::FixtureDir::new(d)
 }
 
 /// The fixtures must sit on a compile-time-stable path that no `$HOME`-mutating
@@ -137,7 +139,6 @@ fn release_guard_tmp_is_stable_and_outside_this_repo() {
         "git must not classify the fixture as being in ANY repository (got {classified:?}) \
          — inside one, the non-repo guard is masked: {dir:?}"
     );
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// A fixture whose test panics (an assert failing mid-test) must not leak its
@@ -232,7 +233,6 @@ fn validate_release_path_refuses_primary_working_tree_83936() {
             .is_err_and(|e| e.contains("linked worktree")),
         "a primary/main working tree must be refused, got {result:?}"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// reviewer5's bypass (#2668 r0): a BARE repo has NO `.git` child (it IS a git
@@ -263,7 +263,6 @@ fn handle_release_repo_never_deletes_bare_repo_83936() {
         bare.exists() && bare.join("HEAD").exists(),
         "a bare source repo MUST survive a release call (reviewer5 bare-repo bypass)"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// reviewer4's bypass (#2668 r0'): a `git init --separate-git-dir` MAIN tree has
@@ -302,7 +301,6 @@ fn handle_release_repo_never_deletes_separate_git_dir_main_83936() {
         worktree.exists() && keep.exists(),
         "a --separate-git-dir MAIN tree MUST survive (reviewer4 gitlink-file bypass)"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Fail-safe (⑤): a non-repo dir git cannot classify must be REFUSED, not
@@ -325,7 +323,6 @@ fn handle_release_repo_refuses_non_repo_dir_83936() {
         dir.exists(),
         "a non-repo dir must be refused (git can't classify → fail-safe)"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Incident repro (RED against pre-fix code, which `remove_dir_all`s the repo):
@@ -351,7 +348,6 @@ fn handle_release_repo_never_deletes_main_repo_83936() {
     );
     assert!(repo.join(".git").is_dir(), ".git MUST survive");
     assert!(keep.exists(), "repo contents MUST survive");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Counter-example: a genuine LINKED worktree (`.git` is a gitlink file) is
@@ -392,7 +388,6 @@ fn handle_release_repo_still_removes_linked_worktree_83936() {
         !wt.exists(),
         "a linked worktree must still be releasable/removed"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 #[test]
@@ -4266,7 +4261,7 @@ fn ordinary_resubscribe_preserves_notify_cursors_and_generation() {
 fn managed_wt_fixture(
     tag: &str,
 ) -> (
-    std::path::PathBuf,
+    crate::test_fixture::FixtureDir,
     std::path::PathBuf,
     std::path::PathBuf,
     std::path::PathBuf,
@@ -4353,7 +4348,7 @@ fn dispatch_repo_release(home: &std::path::Path, caller: &str, path: &str) -> se
 #[test]
 #[cfg(unix)]
 fn repo_release_managed_clears_binding_via_dispatch() {
-    let (base, home, repo, wt) = managed_wt_fixture("a1");
+    let (_base, home, repo, wt) = managed_wt_fixture("a1");
     seed_managed_marker(&wt, &repo, &home, "agent-a1", "feat/test");
     assert!(
         crate::binding::read(&home, "agent-a1").is_some(),
@@ -4364,21 +4359,19 @@ fn repo_release_managed_clears_binding_via_dispatch() {
         crate::binding::read(&home, "agent-a1").is_none(),
         "managed release must clear binding (RED: currently orphaned)"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// RED A3: corrupt marker must fail-closed — worktree preserved.
 #[test]
 #[cfg(unix)]
 fn repo_release_corrupt_marker_refuses_via_dispatch() {
-    let (base, home, _repo, wt) = managed_wt_fixture("a3");
+    let (_base, home, _repo, wt) = managed_wt_fixture("a3");
     std::fs::write(wt.join(".agend-managed"), "corrupt\n").expect("corrupt");
     let _ = dispatch_repo_release(&home, "anyone", wt.to_str().unwrap());
     assert!(
         wt.exists(),
         "corrupt-marker managed worktree must be preserved (RED)"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// RED A5: stale marker naming agent-a while agent-a's binding is at
@@ -4431,7 +4424,6 @@ fn repo_release_stale_marker_preserves_live_binding() {
         live_wt.to_str().unwrap(),
         "binding must still point to live worktree"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// RED A2: dirty managed worktree → WIP preserved in recovery ref,
@@ -4439,7 +4431,7 @@ fn repo_release_stale_marker_preserves_live_binding() {
 #[test]
 #[cfg(unix)]
 fn repo_release_dirty_managed_preserves_wip() {
-    let (base, home, repo, wt) = managed_wt_fixture("a2");
+    let (_base, home, repo, wt) = managed_wt_fixture("a2");
     seed_managed_marker(&wt, &repo, &home, "agent-a2", "feat/test");
     // Seed tracked file + dirty it.
     std::fs::write(wt.join("tracked.txt"), "v1\n").expect("tracked");
@@ -4504,14 +4496,13 @@ fn repo_release_dirty_managed_preserves_wip() {
         String::from_utf8_lossy(&show.stdout).contains("DIRTY"),
         "recovery ref must contain the DIRTY modification (RED)"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// RED A4: non-owner peer caller is refused; owner succeeds.
 #[test]
 #[cfg(unix)]
 fn repo_release_non_owner_refused_owner_succeeds() {
-    let (base, home, repo, wt) = managed_wt_fixture("a4");
+    let (_base, home, repo, wt) = managed_wt_fixture("a4");
     seed_managed_marker(&wt, &repo, &home, "owner-agent", "feat/test");
 
     // Peer caller (not owner) → must be refused.
@@ -4536,7 +4527,6 @@ fn repo_release_non_owner_refused_owner_succeeds() {
         "owner release must clear binding (RED)"
     );
     let _ = r; // response structure TBD
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Marker says branch=feat/other but binding has branch=feat/test → refuse,
@@ -4544,7 +4534,7 @@ fn repo_release_non_owner_refused_owner_succeeds() {
 #[test]
 #[cfg(unix)]
 fn repo_release_marker_branch_mismatch_refuses() {
-    let (base, home, repo, wt) = managed_wt_fixture("br-mm");
+    let (_base, home, repo, wt) = managed_wt_fixture("br-mm");
     // Bind normally (branch=feat/test from the worktree add).
     seed_managed_marker(&wt, &repo, &home, "agent-brmm", "feat/test");
     // Overwrite marker with a DIFFERENT branch — simulates stale/tampered marker.
@@ -4568,7 +4558,6 @@ fn repo_release_marker_branch_mismatch_refuses() {
         crate::binding::read(&home, "agent-brmm").is_some(),
         "binding must be preserved on branch mismatch"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Marker says source_repo=/other but binding has the real repo → refuse,
@@ -4576,7 +4565,7 @@ fn repo_release_marker_branch_mismatch_refuses() {
 #[test]
 #[cfg(unix)]
 fn repo_release_marker_source_mismatch_refuses() {
-    let (base, home, repo, wt) = managed_wt_fixture("sr-mm");
+    let (_base, home, repo, wt) = managed_wt_fixture("sr-mm");
     seed_managed_marker(&wt, &repo, &home, "agent-srmm", "feat/test");
     // Overwrite marker with a DIFFERENT source_repo.
     std::fs::write(
@@ -4596,7 +4585,6 @@ fn repo_release_marker_source_mismatch_refuses() {
         crate::binding::read(&home, "agent-srmm").is_some(),
         "binding must be preserved on source mismatch"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Marker rewritten AFTER pre-read but BEFORE canonical locks — proves
@@ -4606,7 +4594,7 @@ fn repo_release_marker_source_mismatch_refuses() {
 fn repo_release_marker_rewritten_after_snapshot_refuses() {
     use crate::worktree_pool::{release_test_seam, ReleaseTestPhase};
 
-    let (base, home, repo, wt) = managed_wt_fixture("seam");
+    let (_base, home, repo, wt) = managed_wt_fixture("seam");
     seed_managed_marker(&wt, &repo, &home, "agent-seam", "feat/test");
 
     let wt_clone = wt.clone();
@@ -4634,7 +4622,6 @@ fn repo_release_marker_rewritten_after_snapshot_refuses() {
         crate::binding::read(&home, "agent-seam").is_some(),
         "binding must be preserved when marker is tampered"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// RED #2875: marker already absent at entry with a live binding must refuse,
@@ -4642,7 +4629,7 @@ fn repo_release_marker_rewritten_after_snapshot_refuses() {
 #[test]
 #[cfg(unix)]
 fn repo_release_marker_absent_with_live_binding_refuses_2875() {
-    let (base, home, repo, wt) = managed_wt_fixture("2875");
+    let (_base, home, repo, wt) = managed_wt_fixture("2875");
     seed_managed_marker(&wt, &repo, &home, "agent-2875", "feat/test");
 
     // Remove ONLY the marker — binding stays live.
@@ -4666,7 +4653,6 @@ fn repo_release_marker_absent_with_live_binding_refuses_2875() {
         crate::binding::read(&home, "agent-2875").is_some(),
         "binding must be preserved when marker is absent — not left stale"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Marker DELETED after pre-read — under-lock re-read must refuse.
@@ -4675,7 +4661,7 @@ fn repo_release_marker_absent_with_live_binding_refuses_2875() {
 fn repo_release_marker_deleted_after_snapshot_refuses() {
     use crate::worktree_pool::{release_test_seam, ReleaseTestPhase};
 
-    let (base, home, repo, wt) = managed_wt_fixture("del");
+    let (_base, home, repo, wt) = managed_wt_fixture("del");
     seed_managed_marker(&wt, &repo, &home, "agent-del", "feat/test");
 
     let wt_clone = wt.clone();
@@ -4699,7 +4685,6 @@ fn repo_release_marker_deleted_after_snapshot_refuses() {
         crate::binding::read(&home, "agent-del").is_some(),
         "binding must be preserved when marker is deleted"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Marker rewritten with BLANK branch/source after pre-read — must refuse.
@@ -4708,7 +4693,7 @@ fn repo_release_marker_deleted_after_snapshot_refuses() {
 fn repo_release_marker_blanked_after_snapshot_refuses() {
     use crate::worktree_pool::{release_test_seam, ReleaseTestPhase};
 
-    let (base, home, repo, wt) = managed_wt_fixture("blank");
+    let (_base, home, repo, wt) = managed_wt_fixture("blank");
     seed_managed_marker(&wt, &repo, &home, "agent-blank", "feat/test");
 
     let wt_clone = wt.clone();
@@ -4736,7 +4721,6 @@ fn repo_release_marker_blanked_after_snapshot_refuses() {
         crate::binding::read(&home, "agent-blank").is_some(),
         "binding must be preserved when marker is blanked"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Both binding and marker share the same non-existent source_repo path.
@@ -4744,7 +4728,7 @@ fn repo_release_marker_blanked_after_snapshot_refuses() {
 #[test]
 #[cfg(unix)]
 fn repo_release_nonexistent_source_refuses() {
-    let (base, home, _repo, wt) = managed_wt_fixture("nosrc");
+    let (_base, home, _repo, wt) = managed_wt_fixture("nosrc");
     let bogus = "/nonexistent/source/repo/for/test";
     // Write marker with non-existent source.
     std::fs::write(
@@ -4778,7 +4762,6 @@ fn repo_release_nonexistent_source_refuses() {
         crate::binding::read(&home, "agent-nosrc").is_some(),
         "binding must be preserved on non-existent source"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 // ═══ Arch14 managed-marker source parity + safe legacy adoption ═══════════
@@ -4835,7 +4818,6 @@ fn arch14_checkout_then_path_release_succeeds() {
         "path-addressed release of a checkout-provisioned worktree must succeed: {r}"
     );
     assert!(!wt.exists(), "released worktree must be removed: {r}");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// RED 2: the checkout producer itself writes the canonical four-field
@@ -4911,7 +4893,7 @@ fn arch14_worktree_create_first_marker_writes_source_repo() {
 #[test]
 #[cfg(unix)]
 fn arch14_legacy_three_line_marker_adopted_on_release() {
-    let (base, home, repo, wt) = managed_wt_fixture("arch14-adopt");
+    let (_base, home, repo, wt) = managed_wt_fixture("arch14-adopt");
     arch14_write_legacy_marker(&wt, "arch14-adopt-agent", "feat/test");
     crate::binding::bind_full(
         &home,
@@ -4930,7 +4912,6 @@ fn arch14_legacy_three_line_marker_adopted_on_release() {
         "legacy sourceless marker with corroborating authoritative binding must be adopted and released: {r}"
     );
     assert!(!wt.exists(), "adopted worktree must be removed: {r}");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// RED 5: a producer write failure must surface — a reused-worktree lease
@@ -4974,7 +4955,7 @@ fn arch14_lease_marker_write_failure_fails_loud() {
 #[test]
 #[cfg(unix)]
 fn arch14_release_still_refuses_agentless_marker() {
-    let (base, home, repo, wt) = managed_wt_fixture("arch14-noagent");
+    let (_base, home, repo, wt) = managed_wt_fixture("arch14-noagent");
     std::fs::write(wt.join(".agend-managed"), "").expect("empty marker");
     crate::binding::bind_full(&home, "arch14-na-agent", "", "feat/test", &wt, &repo, false)
         .expect("bind");
@@ -4984,7 +4965,6 @@ fn arch14_release_still_refuses_agentless_marker() {
         "agentless marker must be refused: {r}"
     );
     assert!(wt.exists(), "worktree must be preserved on refusal");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Guard B: an EXPLICIT blank `source_repo=` line is NOT the legacy-missing
@@ -4992,7 +4972,7 @@ fn arch14_release_still_refuses_agentless_marker() {
 #[test]
 #[cfg(unix)]
 fn arch14_release_still_refuses_explicit_blank_source() {
-    let (base, home, repo, wt) = managed_wt_fixture("arch14-blank");
+    let (_base, home, repo, wt) = managed_wt_fixture("arch14-blank");
     std::fs::write(
         wt.join(".agend-managed"),
         "agent=arch14-blank-agent\nbranch=feat/test\nsource_repo=\nleased_at=2026-07-18T00:00:00+00:00\n",
@@ -5014,7 +4994,6 @@ fn arch14_release_still_refuses_explicit_blank_source() {
         "explicit blank source_repo= must stay refused: {r}"
     );
     assert!(wt.exists(), "worktree must be preserved on refusal");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Guard C: identity drift — the marker claims a different agent than the
@@ -5022,7 +5001,7 @@ fn arch14_release_still_refuses_explicit_blank_source() {
 #[test]
 #[cfg(unix)]
 fn arch14_release_still_refuses_identity_drift() {
-    let (base, home, repo, wt) = managed_wt_fixture("arch14-drift");
+    let (_base, home, repo, wt) = managed_wt_fixture("arch14-drift");
     arch14_write_legacy_marker(&wt, "someone-else", "feat/test");
     crate::binding::bind_full(
         &home,
@@ -5040,7 +5019,6 @@ fn arch14_release_still_refuses_identity_drift() {
         "marker/binding agent drift must stay refused: {r}"
     );
     assert!(wt.exists(), "worktree must be preserved on refusal");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Guard D: an explicit marker source_repo that MISMATCHES the binding's
@@ -5067,7 +5045,6 @@ fn arch14_release_still_refuses_mismatching_source() {
         "marker/binding source mismatch must stay refused: {r}"
     );
     assert!(wt.exists(), "worktree must be preserved on refusal");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Guard E: a malformed worktree Git pointer stays refused even when marker
@@ -5075,7 +5052,7 @@ fn arch14_release_still_refuses_mismatching_source() {
 #[test]
 #[cfg(unix)]
 fn arch14_release_still_refuses_malformed_git_pointer() {
-    let (base, home, repo, wt) = managed_wt_fixture("arch14-gitptr");
+    let (_base, home, repo, wt) = managed_wt_fixture("arch14-gitptr");
     seed_managed_marker(&wt, &repo, &home, "arch14-gp-agent", "feat/test");
     std::fs::write(
         wt.join(".git"),
@@ -5088,7 +5065,6 @@ fn arch14_release_still_refuses_malformed_git_pointer() {
         "malformed git pointer must stay refused: {r}"
     );
     assert!(wt.exists(), "worktree must be preserved on refusal");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Guard F: legacy adoption never proceeds off a NON-authoritative binding —
@@ -5097,7 +5073,7 @@ fn arch14_release_still_refuses_malformed_git_pointer() {
 #[test]
 #[cfg(unix)]
 fn arch14_adoption_refused_without_authoritative_binding() {
-    let (base, home, repo, wt) = managed_wt_fixture("arch14-noauth");
+    let (_base, home, repo, wt) = managed_wt_fixture("arch14-noauth");
     arch14_write_legacy_marker(&wt, "arch14-nb-agent", "feat/test");
     crate::binding::bind_full(&home, "arch14-nb-agent", "", "feat/test", &wt, &repo, false)
         .expect("bind");
@@ -5118,7 +5094,6 @@ fn arch14_adoption_refused_without_authoritative_binding() {
         "legacy adoption must be refused when the binding is not authoritative: {r}"
     );
     assert!(wt.exists(), "worktree must be preserved on refusal");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 // ── Supplemental (root RED-gate 1 additions, m-20260720000244982995-64) ──
@@ -5166,7 +5141,6 @@ fn arch14_lease_rewrite_marker_source_parity() {
         .expect("re-lease of an existing worktree succeeds");
     assert_eq!(first.path, second.path, "re-lease reuses the same worktree");
     assert_canonical(&second.path, "re-lease rewrite");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Guard G: legacy missing-source marker whose BRANCH drifts from the
@@ -5175,7 +5149,7 @@ fn arch14_lease_rewrite_marker_source_parity() {
 #[test]
 #[cfg(unix)]
 fn arch14_adoption_refused_on_branch_drift() {
-    let (base, home, repo, wt) = managed_wt_fixture("arch14-bdrift");
+    let (_base, home, repo, wt) = managed_wt_fixture("arch14-bdrift");
     arch14_write_legacy_marker(&wt, "arch14-bd-agent", "feat/other-branch");
     crate::binding::bind_full(&home, "arch14-bd-agent", "", "feat/test", &wt, &repo, false)
         .expect("bind");
@@ -5185,7 +5159,6 @@ fn arch14_adoption_refused_on_branch_drift() {
         "legacy marker with branch drift must stay refused: {r}"
     );
     assert!(wt.exists(), "worktree must be preserved on refusal");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Guard H: a VALID Git pointer that resolves to a DIFFERENT real repo —
@@ -5225,7 +5198,6 @@ fn arch14_release_still_refuses_wrong_repo_git_pointer() {
         "valid-but-wrong-repo git pointer must stay refused: {r}"
     );
     assert!(wt.exists(), "worktree must be preserved on refusal");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Guard I: an otherwise fully parseable marker that lacks ONLY the agent=
@@ -5234,7 +5206,7 @@ fn arch14_release_still_refuses_wrong_repo_git_pointer() {
 #[test]
 #[cfg(unix)]
 fn arch14_release_still_refuses_missing_agent_parseable_marker() {
-    let (base, home, repo, wt) = managed_wt_fixture("arch14-noagentline");
+    let (_base, home, repo, wt) = managed_wt_fixture("arch14-noagentline");
     std::fs::write(
         wt.join(".agend-managed"),
         format!(
@@ -5259,7 +5231,6 @@ fn arch14_release_still_refuses_missing_agent_parseable_marker() {
         "parseable marker missing only agent= must stay refused: {r}"
     );
     assert!(wt.exists(), "worktree must be preserved on refusal");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// arch14 correction (root-validated review of 6fafa912): producers persist
@@ -5319,7 +5290,6 @@ fn arch14_symlink_alias_lease_survives_alias_removal() {
         !lease.path.exists(),
         "released worktree must be removed: {r}"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// The absent-binding release arm must compare a present marker source by
@@ -5383,7 +5353,6 @@ fn arch14_bind_false_release_canonicalizes_marker_source() {
         !worktree.exists(),
         "accepted release must remove the worktree"
     );
-    std::fs::remove_dir_all(&base).ok();
 
     let (base, home, _source, worktree) = checkout("arch14-bindfalse-divergent");
     let divergent = base.join("other-source");
@@ -5411,7 +5380,6 @@ fn arch14_bind_false_release_canonicalizes_marker_source() {
         worktree.exists(),
         "refused divergent-source release must preserve the worktree"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 // ═══ Arch14 legacy marker: absent-binding release (t-…-39872-18) ══════════
@@ -5429,7 +5397,7 @@ fn arch14_bind_false_release_canonicalizes_marker_source() {
 #[test]
 #[cfg(unix)]
 fn arch14_absent_binding_legacy_marker_releases_via_git_linkage() {
-    let (base, home, _repo, wt) = managed_wt_fixture("arch14-nobind");
+    let (_base, home, _repo, wt) = managed_wt_fixture("arch14-nobind");
     arch14_write_legacy_marker(&wt, "arch14-nb2-agent", "feat/test");
     // Deliberately NO binding — the legacy worktree's agent is long gone.
 
@@ -5439,7 +5407,6 @@ fn arch14_absent_binding_legacy_marker_releases_via_git_linkage() {
         "absent-binding legacy marker with verified .git linkage must release: {r}"
     );
     assert!(!wt.exists(), "released worktree must be removed: {r}");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// RED for #2878: an old flat checkout can be fully identified even after its
@@ -5452,7 +5419,7 @@ fn legacy_flat_registered_fixture(
     agent: &str,
     branch: &str,
 ) -> (
-    std::path::PathBuf,
+    crate::test_fixture::FixtureDir,
     std::path::PathBuf,
     std::path::PathBuf,
     std::path::PathBuf,
@@ -5606,7 +5573,7 @@ fn legacy_flat_active_holder_stays_preserved_2878() {
 #[test]
 #[cfg(unix)]
 fn full_marker_unproven_nested_target_stays_preserved_2878() {
-    let (base, home, repo, target) = managed_wt_fixture("2878-unproven-nested");
+    let (_base, home, repo, target) = managed_wt_fixture("2878-unproven-nested");
     std::fs::write(
         target.join(crate::worktree_pool::MANAGED_MARKER),
         format!(
@@ -5625,7 +5592,6 @@ fn full_marker_unproven_nested_target_stays_preserved_2878() {
         target.exists(),
         "unproven target must remain preserved: {r}"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Over-correction guard (green today, must stay green): ABSENT binding +
@@ -5634,7 +5600,7 @@ fn full_marker_unproven_nested_target_stays_preserved_2878() {
 #[test]
 #[cfg(unix)]
 fn arch14_release_still_refuses_missing_branch_marker() {
-    let (base, home, repo, wt) = managed_wt_fixture("arch14-nobranch");
+    let (_base, home, repo, wt) = managed_wt_fixture("arch14-nobranch");
     std::fs::write(
         wt.join(".agend-managed"),
         format!(
@@ -5650,7 +5616,6 @@ fn arch14_release_still_refuses_missing_branch_marker() {
         "marker missing only branch= must stay refused: {r}"
     );
     assert!(wt.exists(), "worktree must be preserved on refusal");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Over-correction guard (green today, must stay green): absent binding +
@@ -5659,7 +5624,7 @@ fn arch14_release_still_refuses_missing_branch_marker() {
 #[test]
 #[cfg(unix)]
 fn arch14_absent_binding_zero_byte_marker_still_refused() {
-    let (base, home, _repo, wt) = managed_wt_fixture("arch14-nb-zero");
+    let (_base, home, _repo, wt) = managed_wt_fixture("arch14-nb-zero");
     std::fs::write(wt.join(".agend-managed"), "").expect("empty marker");
 
     let r = dispatch_repo_release(&home, "arch14-nbz-agent", wt.to_str().unwrap());
@@ -5668,7 +5633,6 @@ fn arch14_absent_binding_zero_byte_marker_still_refused() {
         "absent binding + zero-byte marker must stay refused: {r}"
     );
     assert!(wt.exists(), "worktree must be preserved on refusal");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 // ── Supplemental RED 2 (root rejection of 98df/7e81 GREEN,
@@ -5686,7 +5650,7 @@ fn arch14_absent_binding_zero_byte_marker_still_refused() {
 #[test]
 #[cfg(unix)]
 fn arch14_absent_binding_relative_gitlink_releases() {
-    let (base, home, _repo, wt) = managed_wt_fixture("arch14-relgit");
+    let (_base, home, _repo, wt) = managed_wt_fixture("arch14-relgit");
     // Rewrite the absolute gitlink to the equivalent RELATIVE form; git
     // resolves it relative to the worktree, so identity stays valid.
     std::fs::write(
@@ -5709,7 +5673,6 @@ fn arch14_absent_binding_relative_gitlink_releases() {
         "valid RELATIVE gitlink identity must release like the absolute form: {r}"
     );
     assert!(!wt.exists(), "released worktree must be removed: {r}");
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// RED B (fail today): a deterministic marker rewrite injected at the
@@ -5722,7 +5685,7 @@ fn arch14_absent_binding_relative_gitlink_releases() {
 #[test]
 #[cfg(unix)]
 fn arch14_absent_binding_seam_marker_rewrite_refused() {
-    let (base, home, _repo, wt) = managed_wt_fixture("arch14-seam");
+    let (_base, home, _repo, wt) = managed_wt_fixture("arch14-seam");
     arch14_write_legacy_marker(&wt, "arch14-seam-agent", "feat/test");
     // Deliberately NO binding.
 
@@ -5747,7 +5710,6 @@ fn arch14_absent_binding_seam_marker_rewrite_refused() {
         wt.exists(),
         "worktree must be preserved when the seam rewrite is refused"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// Supplemental RED 3 (root gate d-20260720060251593745-8, reviewer finding
@@ -5760,7 +5722,7 @@ fn arch14_absent_binding_seam_marker_rewrite_refused() {
 #[test]
 #[cfg(unix)]
 fn arch14_absent_binding_seam_head_drift_refused() {
-    let (base, home, _repo, wt) = managed_wt_fixture("arch14-headdrift");
+    let (_base, home, _repo, wt) = managed_wt_fixture("arch14-headdrift");
     arch14_write_legacy_marker(&wt, "arch14-hd-agent", "feat/test");
     // Deliberately NO binding.
 
@@ -5790,7 +5752,6 @@ fn arch14_absent_binding_seam_head_drift_refused() {
         wt.exists(),
         "worktree must be preserved when the HEAD drift is refused"
     );
-    std::fs::remove_dir_all(&base).ok();
 }
 
 /// RED for decision `d-20260726055029475978-81`: a `repo action=checkout` whose
