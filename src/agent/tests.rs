@@ -7158,3 +7158,128 @@ fn reaper_must_not_spawn_shell_fallback_when_entry_already_removed() {
          removed (no shell fallback); registry now holds: {names:?}"
     );
 }
+
+/// RED (PR #57 r2, third-reviewer P1): a stale fallback must not overwrite a
+/// successor that was published after its own cleanup.
+///
+/// `cleanup_agent` succeeding only proves ownership at the instant of removal.
+/// The fallback then queues on the transport lane inside `spawn_agent`; if a
+/// competing spawn (holding that lane) publishes generation G2 for the same id
+/// first, the stale G1 fallback used to run its unconditional `reg.insert` and
+/// replace G2 with G3. The competing spawn is modelled by holding the real
+/// transport lane and inserting a live G2 handle while the fallback is blocked.
+/// Adapted from the reviewer's `fallback-race.rs` probe.
+#[test]
+#[cfg(unix)]
+#[allow(clippy::unwrap_used)]
+fn stale_fallback_must_not_overwrite_successor_published_before_spawn() {
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::{Duration, Instant};
+
+    /// Reap every child this test owns, even if an assertion panics.
+    struct OwnedChildren(Vec<crate::daemon::ChildHandle>);
+    impl Drop for OwnedChildren {
+        fn drop(&mut self) {
+            for child in &self.0 {
+                let mut c = child.lock();
+                if matches!(c.try_wait(), Ok(None)) {
+                    if let Some(pid) = c.process_id() {
+                        crate::process::kill_process_tree(pid);
+                    }
+                    let _ = c.kill();
+                }
+                let _ = c.wait();
+            }
+        }
+    }
+
+    let name = "stale-fallback-race";
+    let home = std::env::temp_dir().join(format!("agend-stale-fallback-{}", uuid::Uuid::new_v4()));
+    std::fs::create_dir_all(&home).unwrap();
+    let id = crate::types::InstanceId::new();
+    std::fs::write(
+        crate::fleet::fleet_yaml_path(&home),
+        format!("instances:\n  {name}:\n    id: {}\n", id.full()),
+    )
+    .unwrap();
+    let registry: AgentRegistry = Arc::new(Mutex::new(HashMap::new()));
+    let g1 = crash_disposition::owner_generation_source().next();
+    let g2 = crash_disposition::owner_generation_source().next();
+
+    let mut old = mk_test_handle(name, id);
+    old.generation = g1;
+    old.spawned_at = Instant::now() - Duration::from_secs(10);
+    let old_core = Arc::clone(&old.core);
+    let old_deleted = Arc::clone(&old.deleted);
+    let mut children = OwnedChildren(vec![Arc::clone(&old.child)]);
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while matches!(old.child.lock().try_wait(), Ok(None)) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    registry.lock().insert(id, old);
+
+    // The competing successor spawn owns the real transport lane, so the stale
+    // fallback blocks at its spawn admission right after its cleanup.
+    let lane = crate::daemon::delivery_worker::begin_transport_generation_transition(&home, name);
+    let reaper_registry = Arc::clone(&registry);
+    let reaper_home = home.clone();
+    let done = Arc::new(AtomicBool::new(false));
+    let done_worker = Arc::clone(&done);
+    let worker = std::thread::spawn(move || {
+        handle_pty_close(
+            name,
+            &id,
+            &reaper_registry,
+            &Some(reaper_home),
+            &None,
+            &None,
+            &old_deleted,
+            &old_core,
+            g1,
+        );
+        done_worker.store(true, Ordering::SeqCst);
+    });
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while registry.lock().contains_key(&id) && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    let cleanup_completed = !registry.lock().contains_key(&id);
+
+    let mut cmd = CommandBuilder::new("sleep");
+    cmd.arg("300");
+    let mut successor = mk_test_handle_over(name, id, cmd, "sleep");
+    successor.generation = g2;
+    let successor_child = Arc::clone(&successor.child);
+    children.0.push(Arc::clone(&successor_child));
+    // The competing spawn publishes G2 while it still holds the lane.
+    registry.lock().insert(id, successor);
+    drop(lane);
+    worker.join().unwrap();
+
+    let observed = registry.lock().get(&id).map(|h| h.generation);
+    let successor_alive = matches!(successor_child.lock().try_wait(), Ok(None));
+    // Reap whatever else got registered (a replacing shell, in the buggy case).
+    let leftovers: Vec<_> = registry.lock().drain().map(|(_, h)| h).collect();
+    for h in leftovers {
+        h.deleted.store(true, Ordering::SeqCst);
+        children.0.push(Arc::clone(&h.child));
+    }
+    drop(children);
+    std::fs::remove_dir_all(&home).ok();
+
+    assert!(
+        cleanup_completed,
+        "probe never reached the cleanup boundary"
+    );
+    assert!(done.load(Ordering::SeqCst));
+    assert_eq!(
+        observed,
+        Some(g2),
+        "stale G1 fallback replaced G2 after cleanup; successor_child_alive={successor_alive}"
+    );
+    assert!(
+        successor_alive,
+        "successor child must survive the stale fallback"
+    );
+}
